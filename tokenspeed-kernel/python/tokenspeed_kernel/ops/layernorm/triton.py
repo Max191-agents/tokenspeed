@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.jit
@@ -35,6 +37,16 @@ def _rmsnorm_kernel(
     tl.store(out_ptr + row_offsets, x * weight, mask=mask)
 
 
+@register_kernel(
+    "norm",
+    "rmsnorm",
+    name="triton_rmsnorm",
+    solution="triton",
+    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
+    traits={},
+    priority=Priority.PORTABLE,
+    tags={"latency", "portability"},
+)
 def rmsnorm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -160,9 +172,9 @@ def qk_rmsnorm(
     head_dim = q_weight.shape[0]
     assert k_weight.shape[0] == head_dim, "q/k_weight must share head_dim"
     assert q.shape[-1] % head_dim == 0 and k.shape[-1] % head_dim == 0
-    assert (
-        q.stride(-1) == 1 and k.stride(-1) == 1
-    ), "qk_rmsnorm requires the last dim to be contiguous"
+    assert q.stride(-1) == 1 and k.stride(-1) == 1, (
+        "qk_rmsnorm requires the last dim to be contiguous"
+    )
 
     num_q_heads = q.shape[-1] // head_dim
     num_kv_heads = k.shape[-1] // head_dim

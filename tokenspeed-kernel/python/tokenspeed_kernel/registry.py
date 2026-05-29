@@ -453,6 +453,7 @@ def load_builtin_kernels() -> None:
                 del sys.modules[key]
     import tokenspeed_kernel.ops.embedding  # noqa: F401
     import tokenspeed_kernel.ops.gemm  # noqa: F401
+    import tokenspeed_kernel.ops.layernorm  # noqa: F401
     import tokenspeed_kernel.ops.moe  # noqa: F401
     import tokenspeed_kernel.ops.quantization  # noqa: F401
 
