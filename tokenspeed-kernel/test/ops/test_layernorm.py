@@ -5,6 +5,7 @@ import torch
 from tokenspeed_kernel.ops.layernorm.gluon import (
     rmsnorm as gluon_rmsnorm,
     rmsnorm_block_full as gluon_rmsnorm_block_full,
+    rmsnorm_streaming_block as gluon_rmsnorm_streaming_block,
     rmsnorm_wave_row as gluon_rmsnorm_wave_row,
 )
 from tokenspeed_kernel.ops.layernorm.triton import (
@@ -169,6 +170,37 @@ def test_gluon_rmsnorm_wave_row_shapes(
     weight = torch.randn(hidden_size, device=device, dtype=torch.float32)
 
     result = gluon_rmsnorm_wave_row(x, weight, eps, residual=residual)
+
+    _assert_rmsnorm_matches_ref(result, x, weight, eps, residual, dtype)
+
+
+@pytest.mark.skipif(
+    not platform.is_cdna4,
+    reason="Gluon RMSNorm streaming-block coverage requires AMD CDNA4.",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size",
+    [(1, 2880), (8, 2880), (32, 2880), (128, 2880), (11, 2897)],
+)
+@pytest.mark.parametrize("has_residual", [False, True])
+def test_gluon_rmsnorm_streaming_block_shapes(
+    dtype: torch.dtype,
+    num_tokens: int,
+    hidden_size: int,
+    has_residual: bool,
+    device: str,
+) -> None:
+    eps = 1e-6
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
+    residual = (
+        torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
+        if has_residual
+        else None
+    )
+    weight = torch.randn(hidden_size, device=device, dtype=torch.float32)
+
+    result = gluon_rmsnorm_streaming_block(x, weight, eps, residual=residual)
 
     _assert_rmsnorm_matches_ref(result, x, weight, eps, residual, dtype)
 

@@ -100,3 +100,61 @@ Assembly metadata:
   `sgpr_spill_count=0`, `private_segment_fixed_size=0`;
 - residual: `vgpr_count=195`, `vgpr_spill_count=0`,
   `sgpr_spill_count=0`, `private_segment_fixed_size=0`.
+
+## `gluon_rmsnorm_streaming_block`
+
+Command:
+
+```bash
+rm -rf /tmp/tokenspeed_rmsnorm_streaming_block_cache
+HIP_VISIBLE_DEVICES=3 \
+TRITON_CACHE_DIR=/tmp/tokenspeed_rmsnorm_streaming_block_cache \
+PYTHONPATH=tokenspeed-kernel/python \
+../.venv/bin/python ../claude_tmp/compile_streaming_block_ir.py
+```
+
+The compile script ran two GPT-OSS-shaped bf16 cases:
+
+- non-residual: `x=[1, 2880]`, `weight=[2880]`;
+- residual: `x=[1, 2880]`, `residual=[1, 2880]`, `weight=[2880]`.
+
+Generated artifacts:
+
+- non-residual:
+  `/tmp/tokenspeed_rmsnorm_streaming_block_cache/TTSCFFYQ7XVYNS5C2LBLHQTXTX7YW3AZOS6AGOO5PSK5NBL5XV3Q/_rmsnorm_streaming_block_kernel.{ttgir,llir,amdgcn,s}`;
+- residual:
+  `/tmp/tokenspeed_rmsnorm_streaming_block_cache/ZGESFITIIMEG3RQ4WXN7MYNNCJ7W732A5QS3LA5NMIAD5Y7PMDNA/_rmsnorm_streaming_block_kernel.{ttgir,llir,amdgcn,s}`.
+
+Evidence:
+
+- Both metadata files target `hip:gfx950`, use `num_ctas=1`,
+  `num_warps=4`, and `warp_size=64`.
+- TTGIR uses one row program id:
+  `tt.get_program_id x`, then `row * 2880 + chunk_offsets`.
+- TTGIR uses chunk tensors, not full-row tensors. The visible layout is
+  `tensor<1024xf32, #blocked>`, and there are no `tensor<2880...>` or
+  `tensor<4096...>` values in the source-level IR.
+- For `hidden_size=2880` and `COL_BLOCK=1024`, the static loop unrolls into
+  chunk bases `0`, `1024`, and `2048`.
+- The first pass has three sum calls over `tensor<1024xf32, #blocked>`.
+  The non-residual variant has 9 `tt.load` operations and 3 `tt.store`
+  operations; the residual variant has 12 `tt.load` operations and 6
+  `tt.store` operations.
+- `rstd` is computed only after those three chunk reductions. The second pass
+  then splats the scalar `rstd` into each 1024-wide chunk and stores the
+  normalized output chunk by chunk.
+- Residual policy: the residual variant stores `x + residual` to
+  `residual_out` during the first pass, then the second pass reloads
+  `residual_out` for the normalized output. It does not reload both `x` and
+  `residual` in the second pass.
+- There is no multi-CTA row splitting: metadata has `num_ctas=1`, and the
+  kernel only uses the row program id on the x dimension.
+
+Assembly metadata:
+
+- non-residual: `.max_flat_workgroup_size=256`, `vgpr_count=30`,
+  `vgpr_spill_count=0`, `sgpr_spill_count=0`,
+  `private_segment_fixed_size=0`;
+- residual: `.max_flat_workgroup_size=256`, `vgpr_count=31`,
+  `vgpr_spill_count=0`, `sgpr_spill_count=0`,
+  `private_segment_fixed_size=0`.
