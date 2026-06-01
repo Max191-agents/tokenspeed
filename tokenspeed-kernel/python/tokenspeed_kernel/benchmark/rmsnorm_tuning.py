@@ -46,6 +46,7 @@ _DTYPES: dict[str, torch.dtype] = {
 }
 
 _DEFAULT_TOKEN_COUNTS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+_SIZE_PER_THREAD_SWEEP = (1, 2, 4)
 _TOLERANCE = 2e-2
 
 
@@ -66,67 +67,147 @@ class Candidate:
         return self.launcher(x, weight, eps, residual=residual)
 
 
+def _make_block_full_launcher(
+    *,
+    num_warps: int,
+    size_per_thread: int,
+) -> Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+    def launcher(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return _rmsnorm_block_full(
+            x,
+            weight,
+            eps,
+            residual=residual,
+            num_warps=num_warps,
+            size_per_thread=size_per_thread,
+        )
+
+    return launcher
+
+
+def _make_wave_row_launcher(
+    *,
+    size_per_thread: int,
+) -> Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+    def launcher(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return _rmsnorm_wave_row(
+            x,
+            weight,
+            eps,
+            residual=residual,
+            size_per_thread=size_per_thread,
+        )
+
+    return launcher
+
+
+def _make_streaming_block_launcher(
+    *,
+    col_block: int,
+    num_warps: int,
+    size_per_thread: int,
+) -> Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+    def launcher(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return _rmsnorm_streaming_block(
+            x,
+            weight,
+            eps,
+            residual=residual,
+            col_block=col_block,
+            num_warps=num_warps,
+            size_per_thread=size_per_thread,
+        )
+
+    return launcher
+
+
+def _block_full_candidate_name(num_warps: int, size_per_thread: int) -> str:
+    if size_per_thread == 1:
+        return f"block_full_w{num_warps}"
+    return f"block_full_spt{size_per_thread}_w{num_warps}"
+
+
+def _streaming_block_candidate_name(
+    col_block: int,
+    num_warps: int,
+    size_per_thread: int,
+) -> str:
+    if size_per_thread == 1:
+        return f"stream_c{col_block}_w{num_warps}"
+    return f"stream_c{col_block}_spt{size_per_thread}_w{num_warps}"
+
+
 def build_default_candidates() -> list[Candidate]:
     candidates: list[Candidate] = [
         Candidate("triton_rmsnorm", "baseline", {}, triton_rmsnorm),
         Candidate("gluon_rmsnorm", "baseline", {}, gluon_rmsnorm),
     ]
 
-    for num_warps in (1, 2, 4, 8):
-        candidates.append(
-            Candidate(
-                f"block_full_w{num_warps}",
-                "block_full",
-                {"num_warps": num_warps, "size_per_thread": 1},
-                lambda x, weight, eps, residual, num_warps=num_warps: _rmsnorm_block_full(
-                    x,
-                    weight,
-                    eps,
-                    residual=residual,
-                    num_warps=num_warps,
-                    size_per_thread=1,
-                ),
+    for size_per_thread in _SIZE_PER_THREAD_SWEEP:
+        for num_warps in (1, 2, 4, 8):
+            candidates.append(
+                Candidate(
+                    _block_full_candidate_name(num_warps, size_per_thread),
+                    "block_full",
+                    {
+                        "num_warps": num_warps,
+                        "size_per_thread": size_per_thread,
+                    },
+                    _make_block_full_launcher(
+                        num_warps=num_warps,
+                        size_per_thread=size_per_thread,
+                    ),
+                )
             )
-        )
 
-    for size_per_thread in (1, 2, 4):
+    for size_per_thread in _SIZE_PER_THREAD_SWEEP:
         candidates.append(
             Candidate(
                 f"wave_row_spt{size_per_thread}",
                 "wave_row",
                 {"size_per_thread": size_per_thread},
-                lambda x, weight, eps, residual, size_per_thread=size_per_thread: _rmsnorm_wave_row(
-                    x,
-                    weight,
-                    eps,
-                    residual=residual,
-                    size_per_thread=size_per_thread,
-                ),
+                _make_wave_row_launcher(size_per_thread=size_per_thread),
             )
         )
 
     for col_block in (512, 1024, 2048):
-        for num_warps in (1, 2, 4, 8):
-            candidates.append(
-                Candidate(
-                    f"stream_c{col_block}_w{num_warps}",
-                    "streaming_block",
-                    {
-                        "col_block": col_block,
-                        "num_warps": num_warps,
-                        "size_per_thread": 1,
-                    },
-                    lambda x, weight, eps, residual, col_block=col_block, num_warps=num_warps: _rmsnorm_streaming_block(
-                        x,
-                        weight,
-                        eps,
-                        residual=residual,
-                        col_block=col_block,
-                        num_warps=num_warps,
-                        size_per_thread=1,
-                    ),
+        for size_per_thread in _SIZE_PER_THREAD_SWEEP:
+            for num_warps in (1, 2, 4, 8):
+                candidates.append(
+                    Candidate(
+                        _streaming_block_candidate_name(
+                            col_block,
+                            num_warps,
+                            size_per_thread,
+                        ),
+                        "streaming_block",
+                        {
+                            "col_block": col_block,
+                            "num_warps": num_warps,
+                            "size_per_thread": size_per_thread,
+                        },
+                        _make_streaming_block_launcher(
+                            col_block=col_block,
+                            num_warps=num_warps,
+                            size_per_thread=size_per_thread,
+                        ),
+                    )
                 )
-            )
 
     return candidates
 
