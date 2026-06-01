@@ -55,18 +55,33 @@ def _rmsnorm_block_full_kernel(
     mask = offsets < n_cols
     row_offsets = row * n_cols + offsets
 
-    x = gl.load(x_ptr + row_offsets, mask=mask, other=0.0).to(gl.float32)
+    x = gl.amd.cdna4.buffer_load(
+        ptr=x_ptr, offsets=row_offsets, mask=mask, other=0.0
+    ).to(gl.float32)
     if HAS_RESIDUAL:
-        residual = gl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(
-            gl.float32
-        )
+        residual = gl.amd.cdna4.buffer_load(
+            ptr=residual_ptr, offsets=row_offsets, mask=mask, other=0.0
+        ).to(gl.float32)
         x += residual
-        gl.store(residual_out_ptr + row_offsets, x, mask=mask)
+        gl.amd.cdna4.buffer_store(
+            stored_value=x.to(residual_out_ptr.dtype.element_ty),
+            ptr=residual_out_ptr,
+            offsets=row_offsets,
+            mask=mask,
+        )
 
     variance = gl.sum(x * x, axis=0) / n_cols
     x *= gl.rsqrt(variance + eps)
-    weight = gl.load(weight_ptr + offsets, mask=mask, other=0.0).to(gl.float32)
-    gl.store(out_ptr + row_offsets, x * weight, mask=mask)
+    weight = gl.amd.cdna4.buffer_load(
+        ptr=weight_ptr, offsets=offsets, mask=mask, other=0.0
+    ).to(gl.float32)
+    out = x * weight
+    gl.amd.cdna4.buffer_store(
+        stored_value=out.to(out_ptr.dtype.element_ty),
+        ptr=out_ptr,
+        offsets=row_offsets,
+        mask=mask,
+    )
 
 
 @gluon.jit
@@ -87,18 +102,33 @@ def _rmsnorm_wave_row_kernel(
     mask = offsets < n_cols
     row_offsets = row * n_cols + offsets
 
-    x = gl.load(x_ptr + row_offsets, mask=mask, other=0.0).to(gl.float32)
+    x = gl.amd.cdna4.buffer_load(
+        ptr=x_ptr, offsets=row_offsets, mask=mask, other=0.0
+    ).to(gl.float32)
     if HAS_RESIDUAL:
-        residual = gl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(
-            gl.float32
-        )
+        residual = gl.amd.cdna4.buffer_load(
+            ptr=residual_ptr, offsets=row_offsets, mask=mask, other=0.0
+        ).to(gl.float32)
         x += residual
-        gl.store(residual_out_ptr + row_offsets, x, mask=mask)
+        gl.amd.cdna4.buffer_store(
+            stored_value=x.to(residual_out_ptr.dtype.element_ty),
+            ptr=residual_out_ptr,
+            offsets=row_offsets,
+            mask=mask,
+        )
 
     variance = gl.sum(x * x, axis=0) / n_cols
     x *= gl.rsqrt(variance + eps)
-    weight = gl.load(weight_ptr + offsets, mask=mask, other=0.0).to(gl.float32)
-    gl.store(out_ptr + row_offsets, x * weight, mask=mask)
+    weight = gl.amd.cdna4.buffer_load(
+        ptr=weight_ptr, offsets=offsets, mask=mask, other=0.0
+    ).to(gl.float32)
+    out = x * weight
+    gl.amd.cdna4.buffer_store(
+        stored_value=out.to(out_ptr.dtype.element_ty),
+        ptr=out_ptr,
+        offsets=row_offsets,
+        mask=mask,
+    )
 
 
 @gluon.jit
@@ -123,13 +153,20 @@ def _rmsnorm_streaming_block_kernel(
         cols = chunk * COL_BLOCK + offsets
         mask = cols < n_cols
         row_offsets = row * n_cols + cols
-        x = gl.load(x_ptr + row_offsets, mask=mask, other=0.0).to(gl.float32)
+        x = gl.amd.cdna4.buffer_load(
+            ptr=x_ptr, offsets=row_offsets, mask=mask, other=0.0
+        ).to(gl.float32)
         if HAS_RESIDUAL:
-            residual = gl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(
-                gl.float32
-            )
+            residual = gl.amd.cdna4.buffer_load(
+                ptr=residual_ptr, offsets=row_offsets, mask=mask, other=0.0
+            ).to(gl.float32)
             x += residual
-            gl.store(residual_out_ptr + row_offsets, x, mask=mask)
+            gl.amd.cdna4.buffer_store(
+                stored_value=x.to(residual_out_ptr.dtype.element_ty),
+                ptr=residual_out_ptr,
+                offsets=row_offsets,
+                mask=mask,
+            )
         sum_squares += gl.sum(x * x, axis=0)
 
     rstd = gl.rsqrt(sum_squares / n_cols + eps)
@@ -138,13 +175,23 @@ def _rmsnorm_streaming_block_kernel(
         mask = cols < n_cols
         row_offsets = row * n_cols + cols
         if HAS_RESIDUAL:
-            x = gl.load(residual_out_ptr + row_offsets, mask=mask, other=0.0).to(
-                gl.float32
-            )
+            x = gl.amd.cdna4.buffer_load(
+                ptr=residual_out_ptr, offsets=row_offsets, mask=mask, other=0.0
+            ).to(gl.float32)
         else:
-            x = gl.load(x_ptr + row_offsets, mask=mask, other=0.0).to(gl.float32)
-        weight = gl.load(weight_ptr + cols, mask=mask, other=0.0).to(gl.float32)
-        gl.store(out_ptr + row_offsets, x * rstd * weight, mask=mask)
+            x = gl.amd.cdna4.buffer_load(
+                ptr=x_ptr, offsets=row_offsets, mask=mask, other=0.0
+            ).to(gl.float32)
+        weight = gl.amd.cdna4.buffer_load(
+            ptr=weight_ptr, offsets=cols, mask=mask, other=0.0
+        ).to(gl.float32)
+        out = x * rstd * weight
+        gl.amd.cdna4.buffer_store(
+            stored_value=out.to(out_ptr.dtype.element_ty),
+            ptr=out_ptr,
+            offsets=row_offsets,
+            mask=mask,
+        )
 
 
 def _rmsnorm_block_full(

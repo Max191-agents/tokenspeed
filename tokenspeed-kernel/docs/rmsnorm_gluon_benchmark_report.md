@@ -12,7 +12,7 @@ Benchmarked GPT-OSS RMSNorm shapes:
   4096, 8192
 - `residual=false` and `residual=true`
 - odd sanity shape: `num_tokens=11`, `hidden_size=2897`
-- dtypes: bf16 and fp16
+- dtypes: bf16 and fp16, with fp32 included in the expanded tuning checks
 
 Command:
 
@@ -171,6 +171,64 @@ The larger fp16 SPT values helped within the Gluon candidate set, especially
 for streaming decode configurations, but they did not move the Gluon kernels
 past Triton for most GPT-OSS shapes.
 
+## Explicit AMD Buffer Op Rerun
+
+All three Gluon RMSNorm strategy kernels now use
+`gl.amd.cdna4.buffer_load/store` for x, residual, weight, residual_out, and
+output traffic. This was rerun on GPU 3 with the same expanded shape set:
+GPT-OSS `hidden_size=2880`, token counts 1 through 8192, residual and
+non-residual modes, plus the odd correctness shape
+`num_tokens=11, hidden_size=2897`.
+
+Correctness checks:
+
+```bash
+HIP_VISIBLE_DEVICES=3 ../.venv/bin/python -m pytest \
+  tokenspeed-kernel/test/ops/test_layernorm.py::test_gluon_rmsnorm_odd_shapes \
+  tokenspeed-kernel/test/ops/test_layernorm.py::test_gluon_rmsnorm_block_full_shapes \
+  tokenspeed-kernel/test/ops/test_layernorm.py::test_gluon_rmsnorm_wave_row_shapes \
+  tokenspeed-kernel/test/ops/test_layernorm.py::test_gluon_rmsnorm_streaming_block_shapes -q
+```
+
+Result: 64 passed.
+
+Full tuning commands used `--include-odd`, `--warmup-iters 10`,
+`--bench-iters 100`, and the dtype-aware SPT defaults. The result files are:
+
+- `../claude_tmp/rmsnorm-tuning-bf16-buffer-full.json`
+- `../claude_tmp/rmsnorm-tuning-fp16-buffer-full.json`
+- `../claude_tmp/rmsnorm-tuning-fp32-buffer-full.json`
+
+| dtype | rows | errors | numerical failures | best-candidate wins over 28 GPT-OSS shapes |
+|---|---:|---:|---:|---|
+| bf16 | 2610 | 0 | 0 | Triton 26, `stream_c1024_spt4_w8` 1, `block_full_spt8_w1` 1 |
+| fp16 | 2610 | 0 | 0 | Triton 27, `block_full_spt2_w1` 1 |
+| fp32 | 2100 | 0 | 0 | Triton 25, `block_full_w1` 2, `gluon_rmsnorm` 1 |
+
+Non-Triton overall wins after the buffer-op change:
+
+| dtype | residual | tokens | Triton p50 us | Triton p90 us | Best non-Triton | p50 us | p90 us |
+|---|---|---:|---:|---:|---|---:|---:|
+| bf16 | false | 4096 | 19.44 | 20.44 | `stream_c1024_spt4_w8` | 19.06 | 19.64 |
+| bf16 | true | 8192 | 29.76 | 30.22 | `block_full_spt8_w1` | 29.04 | 29.52 |
+| fp16 | true | 8192 | 29.80 | 30.49 | `block_full_spt2_w1` | 29.08 | 29.89 |
+| fp32 | false | 8192 | 29.76 | 30.73 | `block_full_w1` | 29.12 | 29.72 |
+| fp32 | true | 4096 | 29.72 | 30.12 | `block_full_w1` | 29.08 | 29.81 |
+| fp32 | true | 8192 | 69.84 | 74.00 | `gluon_rmsnorm` | 69.04 | 73.32 |
+
+Against the previous expanded SPT sweep, the best-Gluon p50 geomean moved as
+follows:
+
+| dtype | new/old best-Gluon p50 geomean | improved shapes | flat shapes | degraded shapes |
+|---|---:|---:|---:|---:|
+| bf16 | 1.039 | 9 | 6 | 13 |
+| fp16 | 0.924 | 27 | 1 | 0 |
+| fp32 | 0.961 | 15 | 11 | 2 |
+
+So explicit buffer ops are clearly helpful for fp16 and fp32 in this sweep,
+mixed for bf16, and still not enough to make a Gluon kernel the default across
+GPT-OSS RMSNorm shapes.
+
 ## Tuned IR Notes
 
 Representative tuned configs were compiled with:
@@ -201,12 +259,13 @@ No tuned representative spilled SGPRs or VGPRs, and all use one CTA per row.
 ## Recommendation
 
 Do not make a Gluon RMSNorm variant the GPT-OSS default yet. The existing
-`triton_rmsnorm` baseline is faster for nearly every measured shape:
+`triton_rmsnorm` baseline is faster for nearly every measured shape, even
+after switching the Gluon kernels to explicit AMD buffer ops:
 
-- bf16: in the expanded SPT sweep, Triton won 27/28 GPT-OSS shapes; best Gluon
-  only won the `num_tokens=8192`, `residual=true` corner by about 2%.
-- fp16: same 27/28 result; the same corner favored `block_full_spt4_w1` by
-  about 2%.
+- bf16: in the buffer-op rerun, Triton won 26/28 GPT-OSS shapes. Gluon won
+  `num_tokens=4096`, `residual=false` and `num_tokens=8192`, `residual=true`.
+- fp16: Triton won 27/28 shapes. Gluon only won the largest residual case with
+  `block_full_spt2_w1`.
 - fp32: Gluon won 3 large-token shapes, but fp32 is not the main GPT-OSS
   inference dtype target here.
 

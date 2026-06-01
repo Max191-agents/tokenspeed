@@ -2,6 +2,28 @@
 
 GPU compile and benchmark checks used `HIP_VISIBLE_DEVICES=3`.
 
+## Buffer Op Update
+
+The first comparison below captured the original gap: Triton emitted AMD
+buffer ops while the Gluon RMSNorm kernels lowered through generic
+`tt.load/store` and final `global_load/store` instructions. The Gluon kernels
+have since been updated to use `gl.amd.cdna4.buffer_load/store` directly.
+
+A fresh compile through the tuning CLI for one representative of each Gluon
+strategy, in both residual and non-residual modes, confirmed:
+
+- TTGIR contains `amdg.buffer_load` and `amdg.buffer_store` for
+  `block_full`, `wave_row`, and `streaming_block`.
+- TTGIR contains no remaining `tt.load` or `tt.store` operations in those
+  artifacts.
+- Final ISA contains `buffer_load_*` and `buffer_store_*` instructions and no
+  `global_load_*` or `global_store_*` matches.
+- The same six benchmark rows passed numerics.
+
+The memory-op form is therefore no longer the main Triton-vs-Gluon difference.
+The remaining differences are mostly strategy, layout/SPT choice,
+vectorization shape, and reduction scheduling.
+
 ## Representative Cases
 
 The generated artifacts compare Triton against the best bf16 Gluon candidates
@@ -90,7 +112,7 @@ Important differences:
 - Streaming lowers VGPR pressure, but it creates multiple chunk reductions and
   a second memory pass.
 
-## TTGIR Differences
+## Original TTGIR Differences
 
 Triton's TTGIR is already AMD-specialized for memory:
 
@@ -99,7 +121,8 @@ Triton's TTGIR is already AMD-specialized for memory:
 - x/out bf16 accesses carry `contiguity = 8`
 - weight f32 accesses carry `contiguity = 4`
 
-Gluon TTGIR stayed at generic `tt.load`/`tt.store` for these kernels:
+Before the explicit buffer-op change, Gluon TTGIR stayed at generic
+`tt.load`/`tt.store` for these kernels:
 
 - `block_full_spt4_w4`: 2 `tt.load`, 1 `tt.store`
 - `stream_c512_spt4_w4`: 24 `tt.load`, 12 `tt.store`
@@ -110,10 +133,43 @@ The extra streaming operations are expected: for `COL_BLOCK=512`, the static
 loop unrolls six chunks for a 2880-wide row; residual mode also stores
 `residual_out` in pass 1 and reloads it in pass 2.
 
-## ISA Differences
+## Current Buffer Op Check
+
+The current Gluon path was checked with:
+
+```bash
+rm -rf /tmp/tokenspeed_rmsnorm_buffer_kernel_ir_check
+HIP_VISIBLE_DEVICES=3 \
+TRITON_CACHE_DIR=/tmp/tokenspeed_rmsnorm_buffer_kernel_ir_check \
+PYTHONPATH=tokenspeed-kernel/python \
+../.venv/bin/python -m tokenspeed_kernel.benchmark.rmsnorm_tuning \
+  --dtype bf16 --token-counts 1 \
+  --candidates block_full_w4,wave_row_spt4,stream_c512_spt4_w4 \
+  --warmup-iters 0 --bench-iters 1 --top-k 6 \
+  --export ../claude_tmp/rmsnorm-buffer-ir-check.json
+```
+
+The compile produced six artifacts because each candidate specialized once for
+residual mode and once for non-residual mode:
+
+| candidate | residual | layout | memory ops in TTGIR |
+|---|---|---|---|
+| `block_full_w4` | false | `sizePerThread=[1]`, `warpsPerCTA=[4]` | 2 `amdg.buffer_load`, 1 `amdg.buffer_store` |
+| `block_full_w4` | true | `sizePerThread=[1]`, `warpsPerCTA=[4]` | 3 `amdg.buffer_load`, 2 `amdg.buffer_store` |
+| `wave_row_spt4` | false | `sizePerThread=[4]`, `warpsPerCTA=[1]` | 2 `amdg.buffer_load`, 1 `amdg.buffer_store` |
+| `wave_row_spt4` | true | `sizePerThread=[4]`, `warpsPerCTA=[1]` | 3 `amdg.buffer_load`, 2 `amdg.buffer_store` |
+| `stream_c512_spt4_w4` | false | `sizePerThread=[4]`, `warpsPerCTA=[4]` | 17 `amdg.buffer_load`, 6 `amdg.buffer_store` |
+| `stream_c512_spt4_w4` | true | `sizePerThread=[4]`, `warpsPerCTA=[4]` | 24 `amdg.buffer_load`, 12 `amdg.buffer_store` |
+
+The streaming counts are higher because the six 512-column chunks are
+statically unrolled for a 2880-wide row and the residual path stores
+`residual_out` in pass 1 before reloading it in pass 2.
+
+## Original ISA Differences
 
 Instruction counts below are static counts from the `.amdgcn` text. They are
-useful for comparing code shape, not dynamic instruction counts.
+useful for comparing code shape, not dynamic instruction counts. This table
+describes the original pre-buffer-op Gluon artifacts.
 
 | candidate | ISA body lines | memory op shape | LDS/barriers | VGPR |
 |---|---:|---|---|---:|
@@ -124,13 +180,13 @@ useful for comparing code shape, not dynamic instruction counts.
 | `stream_c2048_spt8_w4` | 229 | 7 `global_load_dwordx4`, 2 `global_store_dwordx4` | 2 LDS write/read + 3 barriers | 32 |
 | `block_full_spt4_w1` | 436 | many `global_load_dwordx2/x4`, `global_store_dwordx2` | no LDS/barrier | 122 |
 
-Key observations:
+Original key observations:
 
 - Triton reaches compact `buffer_*_dwordx4` ISA for row and weight traffic.
   This follows from the AMD buffer ops and contiguity annotations in TTGIR.
-- Gluon generally lowers to `global_*` ISA. Some variants still get dwordx4
-  loads, but stores are often dwordx2 and the full-row one-wave path emits many
-  static memory instructions.
+- Before the buffer-op change, Gluon generally lowered to `global_*` ISA. Some
+  variants still got dwordx4 loads, but stores were often dwordx2 and the
+  full-row one-wave path emitted many static memory instructions.
 - Four-wave full-row reductions use one LDS handoff/barrier. One-wave
   full-row reductions avoid LDS/barriers but pay high VGPR and larger code.
 - Streaming does reduce live row footprint and VGPR count, but each chunk adds
@@ -141,28 +197,31 @@ Key observations:
 ## Takeaways
 
 Triton is faster in most GPT-OSS bf16/fp16 cases because its generated kernel is
-the compact full-row strategy we wanted, with a stronger memory lowering path:
-four waves, SPT 8, one full-row reduction, AMD buffer ops, vectorized dwordx4
-memory instructions, and only one inter-wave reduction barrier.
+the compact full-row strategy we wanted: four waves, SPT 8, one full-row
+reduction, vectorized buffer memory instructions, and only one inter-wave
+reduction barrier. The explicit Gluon buffer-op change closes the high-level
+memory-op gap, but it does not automatically reproduce Triton's exact layout,
+vectorization, or reduction schedule.
 
-The Gluon kernels are exploring useful algorithmic alternatives, but their
-current best cases win for different reasons:
+The Gluon kernels are exploring useful algorithmic alternatives, but the
+occasional wins in these sweeps come from different tradeoffs:
 
 - Small shapes: the best Gluon candidates are still slower. Token count does
   not change kernel code, so small-shape performance is mostly launch overhead
   plus one row of work. Triton's compact buffer-op kernel has the advantage.
-- Large non-residual: `stream_c2048_spt8_w4` gets close, but the second pass
-  and extra reductions still lose to Triton's one-pass full-row implementation.
-- Large residual: `block_full_spt4_w1` narrowly wins. The likely advantage is
-  eliminating LDS/barrier overhead with one wave per row once there are many
-  rows in flight. The cost is high VGPR pressure and much larger static code,
-  so it is not a clear default candidate.
+- Large non-residual: streaming variants can get close or narrowly win in a
+  few large-token cases, but the second pass and extra reductions usually lose
+  to Triton's one-pass full-row implementation.
+- Large residual: one-wave full-row variants can narrowly win. The likely
+  advantage is eliminating LDS/barrier overhead once there are many rows in
+  flight. The cost is high VGPR pressure and much larger static code, so this
+  is not a clear default candidate.
 
 Optimization implications:
 
-- A high-priority experiment is getting Gluon to produce the same AMD buffer
-  memory path as Triton for full-row kernels, including contiguity/vectorization
-  comparable to Triton's SPT 8 layout.
+- The buffer-op experiment is now implemented. The next experiment is matching
+  Triton's contiguity/vectorization and SPT 8 full-row shape more closely,
+  then checking whether the generated ISA converges further.
 - For small decode, avoid chunked streaming unless it materially reduces launch
   floor or codegen overhead; the chunked variants add too much static work for
   one row.
