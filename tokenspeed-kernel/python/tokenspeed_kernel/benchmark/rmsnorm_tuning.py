@@ -43,10 +43,12 @@ from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
 _DTYPES: dict[str, torch.dtype] = {
     "bf16": torch.bfloat16,
     "fp16": torch.float16,
+    "fp32": torch.float32,
 }
 
 _DEFAULT_TOKEN_COUNTS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
-_SIZE_PER_THREAD_SWEEP = (1, 2, 4)
+_F32_SIZE_PER_THREAD_SWEEP = (1, 2, 4, 8)
+_HALF_SIZE_PER_THREAD_SWEEP = (1, 2, 4, 8, 16)
 _TOLERANCE = 2e-2
 
 
@@ -152,13 +154,22 @@ def _streaming_block_candidate_name(
     return f"stream_c{col_block}_spt{size_per_thread}_w{num_warps}"
 
 
-def build_default_candidates() -> list[Candidate]:
+def default_size_per_thread_values(dtype: torch.dtype) -> tuple[int, ...]:
+    if dtype == torch.float32:
+        return _F32_SIZE_PER_THREAD_SWEEP
+    return _HALF_SIZE_PER_THREAD_SWEEP
+
+
+def build_default_candidates(
+    *,
+    size_per_thread_values: tuple[int, ...] = _HALF_SIZE_PER_THREAD_SWEEP,
+) -> list[Candidate]:
     candidates: list[Candidate] = [
         Candidate("triton_rmsnorm", "baseline", {}, triton_rmsnorm),
         Candidate("gluon_rmsnorm", "baseline", {}, gluon_rmsnorm),
     ]
 
-    for size_per_thread in _SIZE_PER_THREAD_SWEEP:
+    for size_per_thread in size_per_thread_values:
         for num_warps in (1, 2, 4, 8):
             candidates.append(
                 Candidate(
@@ -175,7 +186,7 @@ def build_default_candidates() -> list[Candidate]:
                 )
             )
 
-    for size_per_thread in _SIZE_PER_THREAD_SWEEP:
+    for size_per_thread in size_per_thread_values:
         candidates.append(
             Candidate(
                 f"wave_row_spt{size_per_thread}",
@@ -186,7 +197,7 @@ def build_default_candidates() -> list[Candidate]:
         )
 
     for col_block in (512, 1024, 2048):
-        for size_per_thread in _SIZE_PER_THREAD_SWEEP:
+        for size_per_thread in size_per_thread_values:
             for num_warps in (1, 2, 4, 8):
                 candidates.append(
                     Candidate(
@@ -242,6 +253,15 @@ def _parse_token_counts(raw: str) -> list[int]:
         raise ValueError("at least one token count is required")
     if any(value <= 0 for value in values):
         raise ValueError("token counts must be positive")
+    return values
+
+
+def _parse_size_per_thread_values(raw: str) -> tuple[int, ...]:
+    values = tuple(int(item.strip()) for item in raw.split(",") if item.strip())
+    if not values:
+        raise ValueError("at least one size_per_thread value is required")
+    if any(value <= 0 for value in values):
+        raise ValueError("size_per_thread values must be positive")
     return values
 
 
@@ -550,6 +570,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bench-iters", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--candidates", help="Comma-separated candidate name filter")
+    parser.add_argument(
+        "--size-per-thread-values",
+        help=(
+            "Comma-separated SPT sweep override. Defaults to 1,2,4,8,16 for "
+            "half dtypes and 1,2,4,8 for fp32."
+        ),
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--export", help="Write full tuning results as JSON")
     parser.add_argument(
@@ -566,18 +593,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.warmup_iters < 0 or args.bench_iters <= 0:
         raise ValueError("warmup-iters must be >= 0 and bench-iters must be > 0")
 
+    dtype = _DTYPES[args.dtype]
     token_counts = _parse_token_counts(args.token_counts)
+    size_per_thread_values = (
+        _parse_size_per_thread_values(args.size_per_thread_values)
+        if args.size_per_thread_values is not None
+        else default_size_per_thread_values(dtype)
+    )
     shapes = build_shapes(
         token_counts,
         args.hidden_size,
         include_odd=args.include_odd,
         odd_hidden_size=args.odd_hidden_size,
     )
-    candidates = _filter_candidates(build_default_candidates(), args.candidates)
+    candidates = _filter_candidates(
+        build_default_candidates(size_per_thread_values=size_per_thread_values),
+        args.candidates,
+    )
     results = run_tuning(
         candidates,
         shapes,
-        dtype=_DTYPES[args.dtype],
+        dtype=dtype,
         warmup_iters=args.warmup_iters,
         bench_iters=args.bench_iters,
         verify=not args.no_verify,

@@ -357,16 +357,38 @@ def test_rmsnorm_tuning_candidate_names_are_unique():
     names = [candidate.name for candidate in candidates]
 
     assert len(names) == len(set(names))
-    assert len(names) == 53
+    assert len(names) == 87
     assert "triton_rmsnorm" in names
     assert "gluon_rmsnorm" in names
     assert "block_full_w4" in names
     assert "block_full_spt2_w4" in names
     assert "block_full_spt4_w4" in names
+    assert "block_full_spt8_w4" in names
+    assert "block_full_spt16_w4" in names
     assert "wave_row_spt1" in names
     assert "stream_c1024_w4" in names
     assert "stream_c1024_spt2_w4" in names
     assert "stream_c1024_spt4_w4" in names
+    assert "stream_c1024_spt8_w4" in names
+    assert "stream_c1024_spt16_w4" in names
+
+
+def test_rmsnorm_tuning_default_spt_values_are_dtype_aware():
+    assert rmsnorm_tuning.default_size_per_thread_values(torch.float32) == (1, 2, 4, 8)
+    assert rmsnorm_tuning.default_size_per_thread_values(torch.float16) == (
+        1,
+        2,
+        4,
+        8,
+        16,
+    )
+    assert rmsnorm_tuning.default_size_per_thread_values(torch.bfloat16) == (
+        1,
+        2,
+        4,
+        8,
+        16,
+    )
 
 
 def test_benchmark_config_rejects_invalid_proton_data():

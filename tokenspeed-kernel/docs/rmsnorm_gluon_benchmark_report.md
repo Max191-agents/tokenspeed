@@ -27,6 +27,10 @@ PYTHONPATH=tokenspeed-kernel/python \
 The fp16 run used the same command with `--dtype fp16` and exported
 `../claude_tmp/rmsnorm-tuning-fp16-full.json`.
 
+Those initial tables used the first tuned candidate set. The current tuning CLI
+also sweeps `size_per_thread` for `block_full` and `streaming_block`; the
+expanded SPT results are summarized below.
+
 The normal benchmark CLI was also smoke-tested:
 
 ```bash
@@ -131,6 +135,42 @@ The best Gluon configs by regime were similar:
 | fp16 | true | prefill | wave_row | wave_row_spt4 | 24.00 |
 | fp16 | true | prefill | streaming_block | stream_c512_w4 | 24.18 |
 
+## Expanded SPT Sweep
+
+The CLI now uses dtype-aware SPT defaults:
+
+- bf16/fp16: `size_per_thread=1,2,4,8,16`
+- fp32: `size_per_thread=1,2,4,8`
+
+This corresponds to testing up to 256-bit per-thread fp16/bf16 vectors and
+256-bit per-thread fp32 vectors. The expanded runs used the same GPT-OSS shape
+set, `--include-odd`, `--warmup-iters 10`, and `--bench-iters 100`.
+
+| dtype | rows | errors | numerical failures | best-candidate wins over 28 GPT-OSS shapes |
+|---|---:|---:|---:|---|
+| bf16 | 2610 | 0 | 0 | Triton 27, `block_full_spt4_w1` 1 |
+| fp16 | 2610 | 0 | 0 | Triton 27, `block_full_spt4_w1` 1 |
+| fp32 | 2100 | 0 | 0 | Triton 25, `block_full_w8` 2, `wave_row_spt4` 1 |
+
+The only bf16/fp16 Gluon win remained the largest residual case:
+
+| dtype | residual | tokens | Triton p50 us | Best Gluon | Gluon p50 us | Gluon p90 us |
+|---|---|---:|---:|---|---:|---:|
+| bf16 | true | 8192 | 29.76 | `block_full_spt4_w1` | 29.20 | 29.65 |
+| fp16 | true | 8192 | 29.86 | `block_full_spt4_w1` | 29.20 | 29.72 |
+
+For fp32, Gluon wins appeared only at large token counts:
+
+| residual | tokens | Triton p50 us | Best Gluon | Gluon p50 us | Gluon p90 us |
+|---|---:|---:|---|---:|---:|
+| false | 8192 | 29.74 | `block_full_w8` | 29.16 | 29.42 |
+| true | 4096 | 29.56 | `wave_row_spt4` | 28.64 | 29.32 |
+| true | 8192 | 70.00 | `block_full_w8` | 68.92 | 71.93 |
+
+The larger fp16 SPT values helped within the Gluon candidate set, especially
+for streaming decode configurations, but they did not move the Gluon kernels
+past Triton for most GPT-OSS shapes.
+
 ## Tuned IR Notes
 
 Representative tuned configs were compiled with:
@@ -163,17 +203,19 @@ No tuned representative spilled SGPRs or VGPRs, and all use one CTA per row.
 Do not make a Gluon RMSNorm variant the GPT-OSS default yet. The existing
 `triton_rmsnorm` baseline is faster for nearly every measured shape:
 
-- bf16: Triton won 27/28 GPT-OSS shapes; best Gluon only won the
-  `num_tokens=8192`, `residual=true` corner by about 1%.
-- fp16: same 27/28 result; the same corner favored `wave_row_spt4` by about 2%.
+- bf16: in the expanded SPT sweep, Triton won 27/28 GPT-OSS shapes; best Gluon
+  only won the `num_tokens=8192`, `residual=true` corner by about 2%.
+- fp16: same 27/28 result; the same corner favored `block_full_spt4_w1` by
+  about 2%.
+- fp32: Gluon won 3 large-token shapes, but fp32 is not the main GPT-OSS
+  inference dtype target here.
 
-For continued Gluon work, use `stream_c512_w2` or `stream_c512_w4` as the main
-iteration target. It is the best Gluon strategy over most decode and mid-size
-prefill shapes, keeps the chunked strategy visible in IR, and has low VGPR
-usage with no spills. `block_full_w8` has the lowest register count in the
-representative IR but does not convert that into lower latency. `wave_row_spt4`
-is only compelling for the largest residual case and carries much higher VGPR
-pressure.
+For continued Gluon work, keep the streaming family as the main iteration
+target, including the larger SPT variants. It is the best Gluon strategy over
+many decode and mid-size prefill shapes, keeps the chunked strategy visible in
+IR, and has low VGPR usage with no spills. The block/full-row family is still
+worth tracking for large-token residual cases. `wave_row_spt4` is mostly
+compelling for large fp32 residual cases and carries much higher VGPR pressure.
 
 Open performance questions:
 
