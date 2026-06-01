@@ -89,7 +89,9 @@ set_input_generator("norm", "rmsnorm", RMSNormInputGenerator)
 
 RMSNORM_STANDARD_SHAPES: list[dict[str, int]] = [
     {"num_tokens": 1, "hidden_size": 128},
+    {"num_tokens": 3, "hidden_size": 129},
     {"num_tokens": 7, "hidden_size": 2880},
+    {"num_tokens": 11, "hidden_size": 2897},
 ]
 
 
