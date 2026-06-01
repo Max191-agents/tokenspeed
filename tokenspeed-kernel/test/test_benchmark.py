@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import tokenspeed_kernel.benchmark.cli as benchmark_cli
+import tokenspeed_kernel.benchmark.rmsnorm_tuning as rmsnorm_tuning
 import tokenspeed_kernel.benchmark.runner as benchmark_runner_module
 import tokenspeed_kernel.numerics.gemm  # noqa: F401
 import torch
@@ -201,6 +202,7 @@ def test_report_format_contains_expected_columns(setup_gemm_case):
     assert "Kernel" in report
     assert "p50 (us)" in report
     assert "TFLOPs" in report
+    assert "GB/s" in report
     assert "test_gemm_fast" in report
     assert "Numerics" not in report
 
@@ -290,6 +292,76 @@ def test_attention_decode_throughput_missing_required_shape_returns_none():
 
     assert tflops is None
     assert bandwidth is None
+
+
+def test_rmsnorm_throughput_without_residual():
+    shape = {"num_tokens": 1, "hidden_size": 2880}
+
+    tflops, bandwidth = ThroughputCalculator.compute(
+        "norm",
+        "rmsnorm",
+        shape,
+        latency_us=1000.0,
+        dtype=torch.bfloat16,
+    )
+
+    assert tflops is None
+    assert bandwidth == pytest.approx(0.02304)
+
+
+def test_rmsnorm_throughput_with_residual():
+    shape = {"num_tokens": 2, "hidden_size": 2880, "residual": True}
+
+    tflops, bandwidth = ThroughputCalculator.compute(
+        "norm",
+        "rmsnorm",
+        shape,
+        latency_us=1000.0,
+        dtype=torch.bfloat16,
+    )
+
+    assert tflops is None
+    assert bandwidth == pytest.approx(0.06912)
+
+
+def test_rmsnorm_throughput_missing_shape_returns_none():
+    tflops, bandwidth = ThroughputCalculator.compute(
+        "norm",
+        "rmsnorm",
+        {"num_tokens": 1},
+        latency_us=1000.0,
+        dtype=torch.bfloat16,
+    )
+
+    assert tflops is None
+    assert bandwidth is None
+
+
+def test_rmsnorm_tuning_builds_gpt_oss_shapes():
+    shapes = rmsnorm_tuning.build_shapes(
+        [1, 32, 64],
+        2880,
+        include_odd=True,
+        odd_hidden_size=2897,
+    )
+
+    assert {"num_tokens": 1, "hidden_size": 2880, "residual": False} in shapes
+    assert {"num_tokens": 64, "hidden_size": 2880, "residual": True} in shapes
+    assert {"num_tokens": 11, "hidden_size": 2897, "residual": False} in shapes
+    assert {"num_tokens": 11, "hidden_size": 2897, "residual": True} in shapes
+    assert len(shapes) == 8
+
+
+def test_rmsnorm_tuning_candidate_names_are_unique():
+    candidates = rmsnorm_tuning.build_default_candidates()
+    names = [candidate.name for candidate in candidates]
+
+    assert len(names) == len(set(names))
+    assert "triton_rmsnorm" in names
+    assert "gluon_rmsnorm" in names
+    assert "block_full_w4" in names
+    assert "wave_row_spt1" in names
+    assert "stream_c1024_w4" in names
 
 
 def test_benchmark_config_rejects_invalid_proton_data():

@@ -81,6 +81,27 @@ class ThroughputCalculator:
         return (q_elements + 2 * kv_elements + out_elements) * element_size
 
     @staticmethod
+    def rmsnorm_bytes(
+        num_tokens: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        *,
+        residual: bool = False,
+    ) -> int:
+        element_size = _dtype_nbytes(dtype)
+        weight_size = _dtype_nbytes(torch.float32)
+        elements = num_tokens * hidden_size
+        x_read = elements * element_size
+        weight_read = elements * weight_size
+        out_write = elements * element_size
+        bytes_moved = x_read + weight_read + out_write
+        if residual:
+            residual_read = elements * element_size
+            residual_out_write = elements * element_size
+            bytes_moved += residual_read + residual_out_write
+        return bytes_moved
+
+    @staticmethod
     def compute(
         op_family: str,
         op_mode: str,
@@ -104,6 +125,25 @@ class ThroughputCalculator:
             tflops = flops / seconds / 1e12
             bandwidth = bytes_moved / seconds / 1e9
             return tflops, bandwidth
+
+        if op_family == "norm" and op_mode == "rmsnorm":
+            num_tokens = _shape_int(shape_params, "num_tokens")
+            hidden_size = _shape_int(shape_params, "hidden_size")
+            if num_tokens is None or hidden_size is None:
+                return None, None
+            if num_tokens <= 0 or hidden_size <= 0:
+                return None, None
+
+            residual = bool(shape_params.get("residual", False))
+            bytes_moved = ThroughputCalculator.rmsnorm_bytes(
+                num_tokens,
+                hidden_size,
+                dtype,
+                residual=residual,
+            )
+            seconds = latency_us * 1e-6
+            bandwidth = bytes_moved / seconds / 1e9
+            return None, bandwidth
 
         if op_family in {"attention", "attn"} and op_mode == "decode":
             batch = _shape_int(

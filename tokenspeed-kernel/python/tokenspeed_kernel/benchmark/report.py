@@ -52,7 +52,7 @@ def _render_table(headers: list[str], rows: list[list[str]]) -> str:
         for i, cell in enumerate(row):
             widths[i] = max(widths[i], len(cell))
 
-    right_aligned = {1, 2, 3, 4}
+    right_aligned = {1, 2, 3, 4, 5}
     border = "+" + "+".join("-" * (width + 2) for width in widths) + "+"
 
     def render_row(cells: Iterable[str]) -> str:
@@ -91,7 +91,7 @@ def format_report(results: list[BenchmarkResult], *, group_by: str = "shape") ->
     for result in results:
         groups[_shape_key(result.shape_params)].append(result)
 
-    headers = ["Kernel", "p50 (us)", "p90 (us)", "p99 (us)", "TFLOPs"]
+    headers = ["Kernel", "p50 (us)", "p90 (us)", "p99 (us)", "TFLOPs", "GB/s"]
     for shape_key in sorted(groups):
         shape_results = sorted(
             groups[shape_key], key=lambda item: item.median_latency_us
@@ -110,6 +110,7 @@ def format_report(results: list[BenchmarkResult], *, group_by: str = "shape") ->
                     _format_float(result.p90_latency_us),
                     _format_float(result.p99_latency_us),
                     _format_float(result.tflops),
+                    _format_float(result.bandwidth_gb_s),
                 ]
             )
         lines.append(_render_table(headers, rows))
