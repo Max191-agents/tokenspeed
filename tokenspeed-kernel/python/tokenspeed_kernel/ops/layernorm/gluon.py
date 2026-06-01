@@ -27,8 +27,18 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 
+_CDNA4_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(9, 5),
+    max_arch_version=ArchVersion(9, 5),
+    vendors=frozenset({"amd"}),
+)
+_RMSNORM_SIGNATURES = format_signatures(
+    "x", "dense", {torch.float16, torch.bfloat16}
+)
+
+
 @gluon.jit
-def _rmsnorm_kernel(
+def _rmsnorm_block_full_kernel(
     x_ptr,
     residual_ptr,
     weight_ptr,
@@ -59,27 +69,15 @@ def _rmsnorm_kernel(
     gl.store(out_ptr + row_offsets, x * weight, mask=mask)
 
 
-@register_kernel(
-    "norm",
-    "rmsnorm",
-    name="gluon_rmsnorm",
-    solution="gluon",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 5),
-        max_arch_version=ArchVersion(9, 5),
-        vendors=frozenset({"amd"}),
-    ),
-    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
-    traits={},
-    priority=Priority.SPECIALIZED,
-    tags={"latency"},
-)
-def rmsnorm(
+def _rmsnorm_block_full(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
     residual: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    *,
+    num_warps: int = 4,
+    size_per_thread: int = 1,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if x.shape[0] == 0:
         if residual is None:
@@ -113,9 +111,8 @@ def rmsnorm(
     residual_out_arg = residual_out if residual_out is not None else out
 
     block = triton.next_power_of_2(hidden_size)
-    num_warps = 4
-    layout = gl.BlockedLayout([1], [64], [num_warps], [0])
-    _rmsnorm_kernel[(x_2d.shape[0],)](
+    layout = gl.BlockedLayout([size_per_thread], [64], [num_warps], [0])
+    _rmsnorm_block_full_kernel[(x_2d.shape[0],)](
         x_2d,
         residual_arg,
         weight,
@@ -131,3 +128,45 @@ def rmsnorm(
     if residual is None:
         return out
     return out, residual_out
+
+
+@register_kernel(
+    "norm",
+    "rmsnorm",
+    name="gluon_rmsnorm",
+    solution="gluon",
+    capability=_CDNA4_CAPABILITY,
+    signatures=_RMSNORM_SIGNATURES,
+    traits={},
+    priority=Priority.SPECIALIZED,
+    tags={"latency"},
+)
+def rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    return _rmsnorm_block_full(x, weight, eps, residual=residual, out=out)
+
+
+@register_kernel(
+    "norm",
+    "rmsnorm",
+    name="gluon_rmsnorm_block_full",
+    solution="gluon",
+    capability=_CDNA4_CAPABILITY,
+    signatures=_RMSNORM_SIGNATURES,
+    traits={},
+    priority=Priority.SPECIALIZED,
+    tags={"latency", "block_full"},
+)
+def rmsnorm_block_full(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    return _rmsnorm_block_full(x, weight, eps, residual=residual, out=out)

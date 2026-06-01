@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.layernorm.gluon import rmsnorm as gluon_rmsnorm
+from tokenspeed_kernel.ops.layernorm.gluon import (
+    rmsnorm as gluon_rmsnorm,
+    rmsnorm_block_full as gluon_rmsnorm_block_full,
+)
 from tokenspeed_kernel.ops.layernorm.triton import (
     fused_qk_rmsnorm_rope_gate,
     qk_rmsnorm,
@@ -17,6 +20,30 @@ pytestmark = pytest.mark.skipif(
     not (platform.is_nvidia or platform.is_amd),
     reason="Triton layernorm tests require an NVIDIA or AMD GPU.",
 )
+
+
+def _assert_rmsnorm_matches_ref(
+    result: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: torch.Tensor | None,
+    dtype: torch.dtype,
+) -> None:
+    x_float = x.to(torch.float32)
+    if residual is not None:
+        x_float = x_float + residual.to(torch.float32)
+        assert isinstance(result, tuple)
+        out, residual_out = result
+        torch.testing.assert_close(
+            residual_out, x_float.to(dtype), atol=2e-2, rtol=2e-2
+        )
+    else:
+        assert isinstance(result, torch.Tensor)
+        out = result
+    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
+    ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -80,21 +107,38 @@ def test_gluon_rmsnorm_odd_shapes(
     weight = torch.randn(hidden_size, device=device, dtype=torch.float32)
 
     result = gluon_rmsnorm(x, weight, eps, residual=residual)
+    _assert_rmsnorm_matches_ref(result, x, weight, eps, residual, dtype)
 
-    x_float = x.to(torch.float32)
-    if residual is not None:
-        x_float = x_float + residual.to(torch.float32)
-        assert isinstance(result, tuple)
-        out, residual_out = result
-        torch.testing.assert_close(
-            residual_out, x_float.to(dtype), atol=2e-2, rtol=2e-2
-        )
-    else:
-        assert isinstance(result, torch.Tensor)
-        out = result
-    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
-    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+@pytest.mark.skipif(
+    not platform.is_cdna4,
+    reason="Gluon RMSNorm block-full coverage requires AMD CDNA4.",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size",
+    [(1, 2880), (2, 2880), (8, 2880), (32, 2880), (11, 2897)],
+)
+@pytest.mark.parametrize("has_residual", [False, True])
+def test_gluon_rmsnorm_block_full_shapes(
+    dtype: torch.dtype,
+    num_tokens: int,
+    hidden_size: int,
+    has_residual: bool,
+    device: str,
+) -> None:
+    eps = 1e-6
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
+    residual = (
+        torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
+        if has_residual
+        else None
+    )
+    weight = torch.randn(hidden_size, device=device, dtype=torch.float32)
+
+    result = gluon_rmsnorm_block_full(x, weight, eps, residual=residual)
+
+    _assert_rmsnorm_matches_ref(result, x, weight, eps, residual, dtype)
 
 
 def _gemma_ref(
