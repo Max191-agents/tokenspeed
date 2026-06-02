@@ -56,13 +56,7 @@ export default defineConfig({
       },
       {
         text: "Serving",
-        items: [
-          { text: "Parallelism", link: "/serving/parallelism" },
-          {
-            text: "GPT-OSS 120B Graph",
-            link: "/serving/gpt-oss-120b-graph"
-          }
-        ]
+        items: [{ text: "Parallelism", link: "/serving/parallelism" }]
       }
     ],
     search: {
