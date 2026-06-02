@@ -12,6 +12,14 @@ Sources:
   `https://huggingface.co/amd/gpt-oss-120b-w-mxfp4-a-fp8`
 - TokenSpeed implementation:
   `python/tokenspeed/runtime/models/gpt_oss.py`
+- Relevant TokenSpeed runtime/kernel files:
+  `python/tokenspeed/runtime/layers/linear.py`,
+  `python/tokenspeed/runtime/layers/paged_attention.py`,
+  `python/tokenspeed/runtime/layers/attention/backends/mha.py`,
+  `python/tokenspeed/runtime/layers/moe/backends/mxfp4/triton_kernel.py`,
+  `tokenspeed-kernel/python/tokenspeed_kernel/ops/embedding/__init__.py`,
+  `tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/__init__.py`,
+  `tokenspeed-kernel/python/tokenspeed_kernel/ops/moe/triton_kernels.py`
 
 ## Model Constants
 
@@ -36,72 +44,137 @@ Sources:
 | Quantization | AMD Quark; expert weights FP4/MXFP4 group 32 with E8M0 scales; expert inputs FP8 E4M3 |
 | Quantization exclusions | self-attention projections, router, and LM head |
 
-## Causal-LM Graph
+## Kernel-Boundary Legend
 
-`T` is the active token count for the current prefill/decode step. Tensor and
-expert parallel sharding changes local shapes, but the logical graph is:
+`K*` nodes are GPU kernel or collective boundaries in the steady-state forward
+path. `V*` nodes are cheap views/splits/metadata transitions that usually do not
+launch a kernel by themselves.
 
-```mermaid
-flowchart TD
-  ids["input_ids [T]"] --> emb["VocabParallelEmbedding<br/>201088 -> 2880"]
-  emb --> blocks["36 x GptOssDecoderLayer<br/>layers 0..35"]
-  blocks --> final_norm["Final RMSNorm<br/>hidden [T, 2880]"]
-  final_norm --> head["ParallelLMHead / LM head<br/>2880 -> 201088"]
-  head --> logits["LogitsProcessor<br/>gather/select logits for sampling"]
-```
+The exact attention kernel depends on `--attention-backend` and prefill/decode
+mode. The exact collective pattern depends on attention TP, dense TP, MoE TP,
+expert parallelism, and whether compiler-inserted fused reduce-norm is enabled.
 
-The TokenSpeed layer compiler can insert all-reduce, reduce-scatter, all-gather,
-or fused reduce-plus-RMSNorm ops between these nodes depending on the configured
-attention TP, dense TP, MoE TP, and expert parallel placement.
+## Whole Forward Pass
 
-## Decoder Layer
-
-Each layer is a pre-norm attention block followed by a pre-norm routed MoE block:
+`T` is the active local token count for the scheduler step. For decode, `T` is
+usually one token per active sequence. For prefill/extend, `T` is the chunked
+prefill token count.
 
 ```mermaid
 flowchart TD
-  x0["x_l [T, 2880]"] --> n0["input RMSNorm"]
-  n0 --> qkv["QKVParallelLinear + bias<br/>Q [T, 64, 64]<br/>K,V [T, 8, 64]"]
-  qkv --> rope["YaRN RoPE on Q,K<br/>optional fused K/V cache write"]
-  rope --> attn_choice{"layer type"}
-  attn_choice -->|"even layers"| swa["Paged GQA sliding attention<br/>config window 128"]
-  attn_choice -->|"odd layers"| full["Paged GQA full attention"]
-  swa --> sinks["attention sinks<br/>one learned sink per Q head"]
-  full --> sinks
-  sinks --> out_proj["RowParallel o_proj + bias<br/>4096 -> 2880"]
-  out_proj --> add_attn["residual add<br/>x_l + attn"]
-  add_attn --> n1["post-attention RMSNorm"]
-  n1 --> moe["GPT-OSS Sparse MoE<br/>router + top-4 experts"]
-  moe --> add_moe["residual add<br/>x_l + attn + moe"]
-  add_moe --> x1["x_(l+1) [T, 2880]"]
+  ids["input_ids [T]"]
+  ids --> e0["K0 optional vocab-TP mask<br/>torch.compile pointwise"]
+  e0 --> e1["K1 embedding lookup<br/>F.embedding"]
+  e1 --> e2["K2 optional vocab-TP all_reduce<br/>skipped when first norm can fuse embedding reduce"]
+  e2 --> blocks["36x decoder layer kernel chain"]
+  blocks --> fn["K-final final residual + RMSNorm<br/>FinalNormOp / RMSNorm"]
+  fn --> l0["K-lm logits GEMM<br/>torch.matmul hidden @ lm_head.T"]
+  l0 --> l1["K-logits optional all_gather / softcap<br/>TP gather, final-logit softcap if configured"]
 ```
 
-Attention is grouped-query attention: 64 query heads share 8 KV heads, so each KV
-head serves 8 query heads. RoPE is applied over the full 64-d head dimension.
-`PagedAttention` owns the paged KV cache update/read path; TokenSpeed passes the
-learned attention sinks into that attention kernel.
+GPT-OSS does not use TokenSpeed's Kimi-only fused LM-head kernel gate, so the
+LM-head edge is a regular matmul in `LogitsProcessor._get_logits`.
 
-## Routed Expert Graph
+## Per-Layer Kernel Graph
 
-The router and experts operate on the post-attention normalized hidden states:
+This is the logical per-layer order for `GptOssDecoderLayer`. The layer compiler
+wraps these nodes with collectives when placement changes require them.
 
 ```mermaid
 flowchart TD
-  h["post-attn norm h [T, 2880]"] --> router["router / gate<br/>2880 -> 128, bias<br/>BF16 TinyGemm fast path when eligible"]
-  router --> topk["top-4 by router logit<br/>softmax over selected logits"]
-  topk --> dispatch["dispatch token copies to selected experts<br/>ragged metadata / gather indices"]
+  x["x_l [T, 2880]"]
 
-  dispatch --> e1["for each selected expert e"]
-  e1 --> q1["FP8 quantize h<br/>using gate_up input_scale"]
-  q1 --> w13["MXFP4 gate_up matmul + bias<br/>2880 -> 5760"]
-  w13 --> split["interleaved split<br/>gate [2880], up [2880]"]
-  split --> act["GPT-OSS SwiGLU<br/>silu(alpha * gate) * (up + 1)<br/>alpha 1.702, limit 7.0"]
-  act --> q2["FP8 quantize intermediate<br/>using down input_scale"]
-  q2 --> w2["MXFP4 down matmul + bias<br/>2880 -> 2880"]
-  w2 --> weight["multiply by route weight"]
-  weight --> combine["scatter-add top-4 expert outputs"]
-  combine --> y["MoE output [T, 2880]"]
+  x --> n0["K1 RMSNorm or fused reduce+residual+RMSNorm<br/>RMSNorm.forward / FusedReduceNormOp"]
+  n0 --> qkv["K2 QKV GEMM + bias<br/>tokenspeed_kernel.mm<br/>2880 -> q:4096 + k:512 + v:512"]
+  qkv --> split["V1 split q,k,v<br/>q [T, 4096], k [T, 512], v [T, 512]"]
+  split --> rope["K3 RoPE on q,k<br/>embedding.rope<br/>optional fused K-cache write and V-cache write"]
+  rope --> viewkv["V2 reshape q,k,v<br/>Q [T, 64,64], K/V [T, 8,64]"]
+  viewkv --> attn["K4 paged GQA attention<br/>backend kernel reads paged KV cache<br/>uses sinks and optional sliding window"]
+  attn --> oproj["K5 O-proj GEMM + bias<br/>tokenspeed_kernel.mm<br/>4096 -> 2880"]
+  oproj --> n1["K6 residual add + RMSNorm<br/>often fused with attn-TP reduction"]
+  n1 --> router["K7 router GEMM + bias<br/>tinygemm_bf16 fast path or tokenspeed_kernel.mm<br/>2880 -> 128 logits"]
+  router --> route["K8 MoE routing/topk/softmax<br/>moe_route: triton_kernels_routing"]
+  route --> q1["K9 FP8 quantize expert input<br/>quantize_fp8, static input_scale"]
+  q1 --> eg1["K10 dispatch + MXFP4 gate_up GEMM + bias + SwiGLU<br/>moe_experts: triton_kernels_dispatch_gemm<br/>2880 -> 2880 intermediate"]
+  eg1 --> q2["K11 FP8 quantize expert intermediate<br/>quantize_fp8, static input_scale"]
+  q2 --> eg2["K12 MXFP4 down GEMM + route weights + scatter<br/>moe_experts: triton_kernels_gemm_combine<br/>2880 -> top4 outputs"]
+  eg2 --> sum["K13 top-4 sum/reduction<br/>out.view(T,4,H).sum(dim=1)"]
+  sum --> outcomm["K14 optional MoE TP/EP collective<br/>all_reduce, reduce_scatter, or deferred reduce"]
+  outcomm --> y["hidden for next layer input norm"]
 ```
+
+Important residual detail: in the compiled path, the residual add after a compute
+node is commonly consumed by the next RMSNorm kernel. For example, attention
+output plus the pre-attention residual is folded into the post-attention
+RMSNorm, and the MoE output plus residual is folded into the next layer's input
+RMSNorm or the final norm.
+
+## Operation Table
+
+| Boundary | Simple operation | TokenSpeed implementation | Notes |
+|---|---|---|---|
+| K1 | RMSNorm, sometimes residual add | `RMSNorm.forward`; compiler may use `FusedReduceNormOp` | On AMD this calls Triton RMSNorm; with residual it is fused add+RMSNorm. |
+| K2 | Dense GEMM, bias | `QKVParallelLinear` -> `tokenspeed_kernel.mm` | `Mxfp4Config` intentionally does not quantize dense linears; QKV is BF16. |
+| V1 | Split | `qkv.split([q_size, kv_size, kv_size], dim=-1)` | View/slice boundary, not a math kernel. |
+| K3 | RoPE, optional cache write | `tokenspeed_kernel.ops.embedding.apply_rope` | When the backend supports KV prewrite, this fuses RoPE with K/V cache writes. |
+| K4 | Attention | `PagedAttention` -> active attention backend | GQA: 64 Q heads, 8 KV heads. Even layers pass sliding window 127; odd layers pass `-1`. |
+| K5 | Dense GEMM, bias | `RowParallelLinear` -> `tokenspeed_kernel.mm` | `reduce_results=False`; any needed reduction is inserted by the compiler. |
+| K6 | Residual add, RMSNorm, maybe reduction | `RMSNorm.forward` or `FusedReduceNormOp` | This is where the attention residual usually materializes. |
+| K7 | Router GEMM, bias | `TinyGemmLinear` | Uses `tinygemm_bf16` when available for CUDA small batches; otherwise `tokenspeed_kernel.mm`. |
+| K8 | Top-k routing and softmax | `moe_route(..., expected_kernel_name="triton_kernels_routing")` | In the AMD MXFP4 backend, `TopK` is bypassed and routing happens inside this backend kernel. |
+| K9 | FP8 quantize | `tokenspeed_kernel.quantize_fp8(..., solution="triton")` | Static per-tensor scale from Quark `gate_up_proj.input_scale`. |
+| K10 | Dispatch, GEMM, bias, activation | `moe_experts(..., features={"ragged_metadata", "dispatch_gemm"})` | MXFP4 gate/up matmul; fused activation is GPT-OSS SwiGLU: `silu(alpha * gate) * (up + 1)`. |
+| K11 | FP8 quantize | `tokenspeed_kernel.quantize_fp8(..., solution="triton")` | Static per-tensor scale from Quark `down_proj.input_scale`. |
+| K12 | GEMM, bias, route weighting, scatter | `moe_experts(..., features={"ragged_metadata", "gemm_combine"})` | MXFP4 down projection; `gammas` are route weights. |
+| K13 | Top-4 combine reduction | `out.view(T, top_k, H).sum(dim=1)` | PyTorch reduction after `matmul_ogs` when `top_k > 1`. |
+| K14 | Collective | compiler-inserted `AllReduceOp`, `ReduceScatterOp`, `AllGatherOp`, etc. | Present only when the configured parallel placement requires it. |
+
+## Attention Kernel Choices
+
+`GptOssAttention.forward_core` calls `PagedAttention`, which delegates to
+`ctx.attn_backend`. For GPT-OSS' MHA/GQA architecture, the registered runtime
+backend is `MHAAttnBackend`; the backend name (`mha`, `fa3`, `fa4`, `triton`,
+or `flashinfer`) is passed as `solution` to the `tokenspeed_kernel` attention
+APIs.
+
+| Mode | Kernel boundary | Simple operations inside |
+|---|---|---|
+| Decode, one query token per request | `mha_decode_with_kvcache` | Read paged K/V cache, apply GQA attention, causal/sliding-window mask, sinks, softmax, and value accumulation. |
+| Multi-token decode / target verify | `mha_extend_with_kvcache` | Same attention math as extend, using paged cache metadata. |
+| Prefill without cached prefix | `mha_prefill` | Dense variable-length causal attention over new Q/K/V; then cache write when `save_kv_cache` is true. |
+| Prefill with cached prefix | `mha_prefill` + `mha_extend_with_kvcache` + `mha_merge_state` | Attend to the new chunk and cached prefix separately, then merge output/LSE states. |
+
+Attention metadata work such as page-table construction, KV-index construction,
+`torch.cumsum`, and optional scheduler metadata runs once per scheduler step and
+is reused by all layers. In decode, `MHAAttnBackend.support_kv_cache_prewrite`
+allows the RoPE kernel to prewrite K/V cache; in prefill/extend the backend
+performs cache writes around the attention call.
+
+## AMD Quark MXFP4 Expert Path
+
+For `amd/gpt-oss-120b-w-mxfp4-a-fp8`, TokenSpeed promotes the Quark checkpoint
+to `Mxfp4Config`. Dense attention, router, embedding, and LM head remain BF16.
+Only the MoE expert path uses the W4A8 MXFP4/FP8 kernels.
+
+```mermaid
+flowchart TD
+  h["post-attn norm h [T, 2880]"]
+  h --> rg["K7 router GEMM<br/>BF16 -> router_logits [T,128]"]
+  rg --> rmeta["K8 triton_kernels_routing<br/>topk(4), softmax, ragged metadata,<br/>gather_indx, scatter_indx, gate_scal"]
+  h --> qh["K9 triton_quantize_fp8<br/>h / w13_act_scale -> FP8"]
+  rmeta --> dg["K10 triton_kernels_dispatch_gemm"]
+  qh --> dg
+  dg --> act["inside K10:<br/>gather token copies by expert<br/>MXFP4 gate_up GEMM + bias<br/>split gate/up<br/>SwiGLU activation"]
+  act --> qi["K11 triton_quantize_fp8<br/>intermediate / w2_act_scale -> FP8"]
+  qi --> gc["K12 triton_kernels_gemm_combine"]
+  rmeta --> gc
+  gc --> red["K13 top-k output sum<br/>weighted expert outputs -> [T,2880]"]
+```
+
+The `gate_up` rows are stored interleaved for GPT-OSS, so load-time processing
+swizzles/transposes packed weights and scales into the layout consumed by the
+Triton MXFP4 matmul kernels. That swizzle is not part of steady-state forward
+execution.
 
 The AMD checkpoint stores one tensor group per expert:
 
