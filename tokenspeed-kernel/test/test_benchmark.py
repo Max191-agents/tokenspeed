@@ -324,6 +324,22 @@ def test_rmsnorm_throughput_with_residual():
     assert bandwidth == pytest.approx(0.06912)
 
 
+def test_rmsnorm_throughput_accepts_weight_dtype():
+    shape = {"num_tokens": 1, "hidden_size": 2880}
+
+    tflops, bandwidth = ThroughputCalculator.compute(
+        "norm",
+        "rmsnorm",
+        shape,
+        latency_us=1000.0,
+        dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+    )
+
+    assert tflops is None
+    assert bandwidth == pytest.approx(0.01728)
+
+
 def test_rmsnorm_throughput_missing_shape_returns_none():
     tflops, bandwidth = ThroughputCalculator.compute(
         "norm",
@@ -350,6 +366,20 @@ def test_rmsnorm_tuning_builds_gpt_oss_shapes():
     assert {"num_tokens": 11, "hidden_size": 2897, "residual": False} in shapes
     assert {"num_tokens": 11, "hidden_size": 2897, "residual": True} in shapes
     assert len(shapes) == 8
+
+
+def test_rmsnorm_tuning_make_inputs_uses_weight_dtype():
+    inputs = rmsnorm_tuning._make_inputs(
+        {"num_tokens": 2, "hidden_size": 16, "residual": True},
+        torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        seed=42,
+        device="cpu",
+    )
+
+    assert inputs["x"].dtype == torch.bfloat16
+    assert inputs["weight"].dtype == torch.bfloat16
+    assert inputs["residual"].dtype == torch.bfloat16
 
 
 def test_rmsnorm_tuning_candidate_names_are_unique():

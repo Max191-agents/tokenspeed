@@ -86,10 +86,11 @@ class ThroughputCalculator:
         hidden_size: int,
         dtype: torch.dtype,
         *,
+        weight_dtype: torch.dtype | None = None,
         residual: bool = False,
     ) -> int:
         element_size = _dtype_nbytes(dtype)
-        weight_size = _dtype_nbytes(torch.float32)
+        weight_size = _dtype_nbytes(weight_dtype or torch.float32)
         elements = num_tokens * hidden_size
         x_read = elements * element_size
         weight_read = elements * weight_size
@@ -109,6 +110,7 @@ class ThroughputCalculator:
         latency_us: float,
         *,
         dtype: torch.dtype,
+        weight_dtype: torch.dtype | None = None,
     ) -> tuple[float | None, float | None]:
         if latency_us <= 0:
             return None, None
@@ -139,6 +141,7 @@ class ThroughputCalculator:
                 num_tokens,
                 hidden_size,
                 dtype,
+                weight_dtype=weight_dtype,
                 residual=residual,
             )
             seconds = latency_us * 1e-6

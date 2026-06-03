@@ -319,6 +319,7 @@ def _make_inputs(
     shape: dict[str, Any],
     dtype: torch.dtype,
     *,
+    weight_dtype: torch.dtype,
     seed: int,
     device: str = "cuda",
 ) -> dict[str, Any]:
@@ -348,7 +349,7 @@ def _make_inputs(
         device=device,
         dtype=torch.float32,
         generator=generator,
-    )
+    ).to(weight_dtype)
     return {"x": x, "weight": weight, "eps": 1e-6, "residual": residual}
 
 
@@ -359,10 +360,11 @@ def _reference(
     residual: torch.Tensor | None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     x_float = x.to(torch.float32)
+    weight_float = weight.to(torch.float32)
     if residual is not None:
         x_float = x_float + residual.to(torch.float32)
     variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    out = (x_float * torch.rsqrt(variance + eps) * weight).to(x.dtype)
+    out = (x_float * torch.rsqrt(variance + eps) * weight_float).to(x.dtype)
     if residual is None:
         return out
     return out, x_float.to(x.dtype)
@@ -447,6 +449,7 @@ def run_tuning(
     shapes: list[dict[str, Any]],
     *,
     dtype: torch.dtype,
+    weight_dtype: torch.dtype,
     warmup_iters: int,
     bench_iters: int,
     verify: bool,
@@ -454,7 +457,7 @@ def run_tuning(
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for shape in shapes:
-        inputs = _make_inputs(shape, dtype, seed=seed)
+        inputs = _make_inputs(shape, dtype, weight_dtype=weight_dtype, seed=seed)
         for candidate in candidates:
             result: dict[str, Any] = {
                 "candidate": candidate.name,
@@ -463,6 +466,7 @@ def run_tuning(
                 "shape": dict(shape),
                 "regime": _regime(shape),
                 "dtype": str(dtype),
+                "weight_dtype": str(weight_dtype),
                 "num_iters": bench_iters,
                 "numerics_passed": None,
                 "max_abs_diff": None,
@@ -499,6 +503,7 @@ def run_tuning(
                     shape,
                     p50,
                     dtype=dtype,
+                    weight_dtype=weight_dtype,
                 )
                 result.update(
                     {
@@ -589,6 +594,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Tune GPT-OSS RMSNorm kernels")
     parser.add_argument("--dtype", choices=sorted(_DTYPES), default="bf16")
     parser.add_argument(
+        "--weight-dtype",
+        choices=sorted(_DTYPES),
+        default="bf16",
+        help="RMSNorm weight dtype. GPT-OSS norm scales are bf16.",
+    )
+    parser.add_argument(
         "--token-counts",
         default=",".join(str(value) for value in _DEFAULT_TOKEN_COUNTS),
         help="Comma-separated num_tokens values for hidden_size.",
@@ -624,6 +635,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("warmup-iters must be >= 0 and bench-iters must be > 0")
 
     dtype = _DTYPES[args.dtype]
+    weight_dtype = _DTYPES[args.weight_dtype]
     token_counts = _parse_token_counts(args.token_counts)
     size_per_thread_values = (
         _parse_size_per_thread_values(args.size_per_thread_values)
@@ -644,6 +656,7 @@ def main(argv: list[str] | None = None) -> int:
         candidates,
         shapes,
         dtype=dtype,
+        weight_dtype=weight_dtype,
         warmup_iters=args.warmup_iters,
         bench_iters=args.bench_iters,
         verify=not args.no_verify,
