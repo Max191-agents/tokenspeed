@@ -32,6 +32,7 @@ from typing import Any
 import torch
 from tokenspeed_kernel.benchmark.throughput import ThroughputCalculator
 from tokenspeed_kernel.ops.layernorm.gluon import (
+    _rmsnorm_block_full_aiter,
     _rmsnorm_block_full,
     _rmsnorm_streaming_block,
     _rmsnorm_wave_row,
@@ -81,6 +82,29 @@ def _make_block_full_launcher(
         residual: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return _rmsnorm_block_full(
+            x,
+            weight,
+            eps,
+            residual=residual,
+            num_warps=num_warps,
+            size_per_thread=size_per_thread,
+        )
+
+    return launcher
+
+
+def _make_block_full_aiter_launcher(
+    *,
+    num_warps: int,
+    size_per_thread: int,
+) -> Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+    def launcher(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return _rmsnorm_block_full_aiter(
             x,
             weight,
             eps,
@@ -167,6 +191,12 @@ def build_default_candidates(
     candidates: list[Candidate] = [
         Candidate("triton_rmsnorm", "baseline", {}, triton_rmsnorm),
         Candidate("gluon_rmsnorm", "baseline", {}, gluon_rmsnorm),
+        Candidate(
+            "block_full_aiter_spt16_w4",
+            "block_full_aiter",
+            {"num_warps": 4, "size_per_thread": 16},
+            _make_block_full_aiter_launcher(num_warps=4, size_per_thread=16),
+        ),
     ]
 
     for size_per_thread in size_per_thread_values:
