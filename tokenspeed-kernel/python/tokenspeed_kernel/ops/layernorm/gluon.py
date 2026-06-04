@@ -37,6 +37,17 @@ _RMSNORM_SIGNATURES = format_signatures(
 )
 
 
+def _contiguous_elements(tensor: torch.Tensor) -> int:
+    return max(1, 16 // tensor.element_size())
+
+
+def _row_alignment_elements(hidden_size: int, tensor: torch.Tensor) -> int:
+    alignment = _contiguous_elements(tensor)
+    while alignment > 1 and hidden_size % alignment != 0:
+        alignment //= 2
+    return alignment
+
+
 @gluon.jit
 def _rmsnorm_block_full_kernel(
     x_ptr,
@@ -48,12 +59,20 @@ def _rmsnorm_block_full_kernel(
     eps: gl.constexpr,
     BLOCK: gl.constexpr,
     HAS_RESIDUAL: gl.constexpr,
+    ROW_CONTIGUITY: gl.constexpr,
+    WEIGHT_CONTIGUITY: gl.constexpr,
+    ROW_ALIGNMENT: gl.constexpr,
     layout: gl.constexpr,
 ):
     row = gl.program_id(0)
     offsets = gl.arange(0, BLOCK, layout=layout)
+    row_cols = gl.max_contiguous(offsets, ROW_CONTIGUITY)
+    weight_offsets = gl.max_contiguous(offsets + 0, WEIGHT_CONTIGUITY)
     mask = offsets < n_cols
-    row_offsets = row * n_cols + offsets
+    row_start = row * n_cols
+    row_start = gl.multiple_of(row_start, ROW_ALIGNMENT)
+    row_offsets = row_start + row_cols
+    row_offsets = gl.max_contiguous(row_offsets, ROW_CONTIGUITY)
 
     x = gl.amd.cdna4.buffer_load(
         ptr=x_ptr, offsets=row_offsets, mask=mask, other=0.0
@@ -73,7 +92,7 @@ def _rmsnorm_block_full_kernel(
     variance = gl.sum(x * x, axis=0) / n_cols
     x *= gl.rsqrt(variance + eps)
     weight = gl.amd.cdna4.buffer_load(
-        ptr=weight_ptr, offsets=offsets, mask=mask, other=0.0
+        ptr=weight_ptr, offsets=weight_offsets, mask=mask, other=0.0
     ).to(gl.float32)
     out = x * weight
     gl.amd.cdna4.buffer_store(
@@ -95,12 +114,20 @@ def _rmsnorm_wave_row_kernel(
     eps: gl.constexpr,
     BLOCK: gl.constexpr,
     HAS_RESIDUAL: gl.constexpr,
+    ROW_CONTIGUITY: gl.constexpr,
+    WEIGHT_CONTIGUITY: gl.constexpr,
+    ROW_ALIGNMENT: gl.constexpr,
     layout: gl.constexpr,
 ):
     row = gl.program_id(0)
     offsets = gl.arange(0, BLOCK, layout=layout)
+    row_cols = gl.max_contiguous(offsets, ROW_CONTIGUITY)
+    weight_offsets = gl.max_contiguous(offsets + 0, WEIGHT_CONTIGUITY)
     mask = offsets < n_cols
-    row_offsets = row * n_cols + offsets
+    row_start = row * n_cols
+    row_start = gl.multiple_of(row_start, ROW_ALIGNMENT)
+    row_offsets = row_start + row_cols
+    row_offsets = gl.max_contiguous(row_offsets, ROW_CONTIGUITY)
 
     x = gl.amd.cdna4.buffer_load(
         ptr=x_ptr, offsets=row_offsets, mask=mask, other=0.0
@@ -120,7 +147,7 @@ def _rmsnorm_wave_row_kernel(
     variance = gl.sum(x * x, axis=0) / n_cols
     x *= gl.rsqrt(variance + eps)
     weight = gl.amd.cdna4.buffer_load(
-        ptr=weight_ptr, offsets=offsets, mask=mask, other=0.0
+        ptr=weight_ptr, offsets=weight_offsets, mask=mask, other=0.0
     ).to(gl.float32)
     out = x * weight
     gl.amd.cdna4.buffer_store(
@@ -142,12 +169,20 @@ def _rmsnorm_block_full_aiter_kernel(
     eps: gl.constexpr,
     BLOCK: gl.constexpr,
     HAS_RESIDUAL: gl.constexpr,
+    ROW_CONTIGUITY: gl.constexpr,
+    WEIGHT_CONTIGUITY: gl.constexpr,
+    ROW_ALIGNMENT: gl.constexpr,
     layout: gl.constexpr,
 ):
     row = gl.program_id(0)
     offsets = gl.arange(0, BLOCK, layout=layout)
+    row_cols = gl.max_contiguous(offsets, ROW_CONTIGUITY)
+    weight_offsets = gl.max_contiguous(offsets + 0, WEIGHT_CONTIGUITY)
     mask = offsets < n_cols
-    row_offsets = row * n_cols + offsets
+    row_start = row * n_cols
+    row_start = gl.multiple_of(row_start, ROW_ALIGNMENT)
+    row_offsets = row_start + row_cols
+    row_offsets = gl.max_contiguous(row_offsets, ROW_CONTIGUITY)
 
     x = gl.amd.cdna4.buffer_load(
         ptr=x_ptr, offsets=row_offsets, mask=mask, other=0.0, cache=".cs"
@@ -166,7 +201,7 @@ def _rmsnorm_block_full_aiter_kernel(
         )
 
     weight = gl.amd.cdna4.buffer_load(
-        ptr=weight_ptr, offsets=offsets, mask=mask, other=0.0
+        ptr=weight_ptr, offsets=weight_offsets, mask=mask, other=0.0
     ).to(gl.float32)
     variance = gl.sum(x * x, axis=0) / n_cols
     out = x * gl.rsqrt(variance + eps) * weight
@@ -190,16 +225,23 @@ def _rmsnorm_streaming_block_kernel(
     COL_BLOCK: gl.constexpr,
     NUM_CHUNKS: gl.constexpr,
     HAS_RESIDUAL: gl.constexpr,
+    ROW_CONTIGUITY: gl.constexpr,
+    WEIGHT_CONTIGUITY: gl.constexpr,
+    ROW_ALIGNMENT: gl.constexpr,
     layout: gl.constexpr,
 ):
     row = gl.program_id(0)
     offsets = gl.arange(0, COL_BLOCK, layout=layout)
+    row_start = row * n_cols
+    row_start = gl.multiple_of(row_start, ROW_ALIGNMENT)
     sum_squares = gl.full((), value=0.0, dtype=gl.float32)
 
     for chunk in gl.static_range(0, NUM_CHUNKS):
         cols = chunk * COL_BLOCK + offsets
+        row_cols = gl.max_contiguous(cols, ROW_CONTIGUITY)
         mask = cols < n_cols
-        row_offsets = row * n_cols + cols
+        row_offsets = row_start + row_cols
+        row_offsets = gl.max_contiguous(row_offsets, ROW_CONTIGUITY)
         x = gl.amd.cdna4.buffer_load(
             ptr=x_ptr, offsets=row_offsets, mask=mask, other=0.0
         ).to(gl.float32)
@@ -219,8 +261,11 @@ def _rmsnorm_streaming_block_kernel(
     rstd = gl.rsqrt(sum_squares / n_cols + eps)
     for chunk in gl.static_range(0, NUM_CHUNKS):
         cols = chunk * COL_BLOCK + offsets
+        row_cols = gl.max_contiguous(cols, ROW_CONTIGUITY)
+        weight_offsets = gl.max_contiguous(cols + 0, WEIGHT_CONTIGUITY)
         mask = cols < n_cols
-        row_offsets = row * n_cols + cols
+        row_offsets = row_start + row_cols
+        row_offsets = gl.max_contiguous(row_offsets, ROW_CONTIGUITY)
         if HAS_RESIDUAL:
             x = gl.amd.cdna4.buffer_load(
                 ptr=residual_out_ptr, offsets=row_offsets, mask=mask, other=0.0
@@ -230,7 +275,7 @@ def _rmsnorm_streaming_block_kernel(
                 ptr=x_ptr, offsets=row_offsets, mask=mask, other=0.0
             ).to(gl.float32)
         weight = gl.amd.cdna4.buffer_load(
-            ptr=weight_ptr, offsets=cols, mask=mask, other=0.0
+            ptr=weight_ptr, offsets=weight_offsets, mask=mask, other=0.0
         ).to(gl.float32)
         out = x * rstd * weight
         gl.amd.cdna4.buffer_store(
@@ -281,6 +326,9 @@ def _rmsnorm_block_full(
     residual_out = torch.empty_like(x) if residual is not None else None
     residual_arg = residual if residual is not None else x
     residual_out_arg = residual_out if residual_out is not None else out
+    row_contiguity = _contiguous_elements(x)
+    weight_contiguity = _contiguous_elements(weight)
+    row_alignment = _row_alignment_elements(hidden_size, x)
 
     block = triton.next_power_of_2(hidden_size)
     layout = gl.BlockedLayout([size_per_thread], [64], [num_warps], [0])
@@ -294,6 +342,9 @@ def _rmsnorm_block_full(
         eps,
         BLOCK=block,
         HAS_RESIDUAL=residual is not None,
+        ROW_CONTIGUITY=row_contiguity,
+        WEIGHT_CONTIGUITY=weight_contiguity,
+        ROW_ALIGNMENT=row_alignment,
         layout=layout,
         num_warps=num_warps,
     )
@@ -341,6 +392,9 @@ def _rmsnorm_wave_row(
     residual_out = torch.empty_like(x) if residual is not None else None
     residual_arg = residual if residual is not None else x
     residual_out_arg = residual_out if residual_out is not None else out
+    row_contiguity = _contiguous_elements(x)
+    weight_contiguity = _contiguous_elements(weight)
+    row_alignment = _row_alignment_elements(hidden_size, x)
 
     block = triton.next_power_of_2(hidden_size)
     num_warps = 1
@@ -355,6 +409,9 @@ def _rmsnorm_wave_row(
         eps,
         BLOCK=block,
         HAS_RESIDUAL=residual is not None,
+        ROW_CONTIGUITY=row_contiguity,
+        WEIGHT_CONTIGUITY=weight_contiguity,
+        ROW_ALIGNMENT=row_alignment,
         layout=layout,
         num_warps=num_warps,
     )
@@ -403,6 +460,9 @@ def _rmsnorm_block_full_aiter(
     residual_out = torch.empty_like(x) if residual is not None else None
     residual_arg = residual if residual is not None else x
     residual_out_arg = residual_out if residual_out is not None else out
+    row_contiguity = _contiguous_elements(x)
+    weight_contiguity = _contiguous_elements(weight)
+    row_alignment = _row_alignment_elements(hidden_size, x)
 
     block = triton.next_power_of_2(hidden_size)
     layout = gl.BlockedLayout([size_per_thread], [64], [num_warps], [0])
@@ -416,6 +476,9 @@ def _rmsnorm_block_full_aiter(
         eps,
         BLOCK=block,
         HAS_RESIDUAL=residual is not None,
+        ROW_CONTIGUITY=row_contiguity,
+        WEIGHT_CONTIGUITY=weight_contiguity,
+        ROW_ALIGNMENT=row_alignment,
         layout=layout,
         num_warps=num_warps,
     )
@@ -467,6 +530,9 @@ def _rmsnorm_streaming_block(
     residual_out = torch.empty_like(x) if residual is not None else None
     residual_arg = residual if residual is not None else x
     residual_out_arg = residual_out if residual_out is not None else out
+    row_contiguity = _contiguous_elements(x)
+    weight_contiguity = _contiguous_elements(weight)
+    row_alignment = _row_alignment_elements(hidden_size, x)
 
     num_chunks = triton.cdiv(hidden_size, col_block)
     layout = gl.BlockedLayout([size_per_thread], [64], [num_warps], [0])
@@ -481,6 +547,9 @@ def _rmsnorm_streaming_block(
         COL_BLOCK=col_block,
         NUM_CHUNKS=num_chunks,
         HAS_RESIDUAL=residual is not None,
+        ROW_CONTIGUITY=row_contiguity,
+        WEIGHT_CONTIGUITY=weight_contiguity,
+        ROW_ALIGNMENT=row_alignment,
         layout=layout,
         num_warps=num_warps,
     )
