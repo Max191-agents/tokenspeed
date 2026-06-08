@@ -26,14 +26,8 @@ import contextlib
 import importlib
 import importlib.abc
 import importlib.util
+import os
 import sys
-
-import tokenspeed_triton as triton
-import tokenspeed_triton.experimental.gluon.language as gl
-import tokenspeed_triton.profiler as proton
-from tokenspeed_triton import language as tl
-from tokenspeed_triton.experimental import gluon
-from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 
 __all__ = [
     "TensorDescriptor",
@@ -47,14 +41,46 @@ __all__ = [
 
 
 _TRITON_SRC = "triton"
-_TRITON_DST = "tokenspeed_triton"
+_TRITON_DEFAULT_PACKAGE = "tokenspeed_triton"
+_TRITON_PACKAGE_ENV = "TOKENSPEED_TRITON_PACKAGE"
+_TRITON_DST = os.environ.get(_TRITON_PACKAGE_ENV, _TRITON_DEFAULT_PACKAGE).strip()
+if not _TRITON_DST:
+    _TRITON_DST = _TRITON_DEFAULT_PACKAGE
+
+
+def _import_triton_module(suffix: str = ""):
+    module_name = _TRITON_DST if not suffix else f"{_TRITON_DST}.{suffix}"
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            f"Unable to import Triton package {module_name!r}. "
+            f"Set {_TRITON_PACKAGE_ENV} to the import package that provides the "
+            "Triton API, or install the default tokenspeed_triton package."
+        ) from exc
+
+
+triton = _import_triton_module()
+gl = _import_triton_module("experimental.gluon.language")
+proton = _import_triton_module("profiler")
+tl = _import_triton_module("language")
+gluon = _import_triton_module("experimental.gluon")
+TensorDescriptor = _import_triton_module("tools.tensor_descriptor").TensorDescriptor
+
+if not hasattr(triton, "aggregate"):
+    triton_language_core = _import_triton_module("language.core")
+    if hasattr(triton_language_core, "_aggregate"):
+        triton.aggregate = triton_language_core._aggregate
+
+if not hasattr(gluon, "aggregate") and hasattr(triton, "aggregate"):
+    gluon.aggregate = triton.aggregate
 
 
 class _ReuseModuleLoader(importlib.abc.Loader):
     """Loader that re-uses an already-loaded module under an alias name.
 
     Used by :class:`_TritonRedirectFinder` so Python's import machinery
-    reuses the existing ``tokenspeed_triton.*`` module object instead of
+    reuses the existing selected Triton module object instead of
     creating a fresh one (which would yield duplicate classes and break
     ``isinstance`` checks).
     """
@@ -70,7 +96,7 @@ class _ReuseModuleLoader(importlib.abc.Loader):
 
 
 class _TritonRedirectFinder(importlib.abc.MetaPathFinder):
-    """Lazy ``triton[.x.y]`` -> ``tokenspeed_triton[.x.y]`` redirect finder."""
+    """Lazy ``triton[.x.y]`` -> selected Triton package redirect finder."""
 
     def find_spec(self, fullname, path, target=None):
         if fullname != _TRITON_SRC and not fullname.startswith(_TRITON_SRC + "."):
@@ -91,7 +117,7 @@ class _TritonRedirectFinder(importlib.abc.MetaPathFinder):
 
 @contextlib.contextmanager
 def redirect_triton_to_tokenspeed_triton():
-    """Make ``triton[.x.y]`` resolve to ``tokenspeed_triton[.x.y]`` in scope.
+    """Make ``triton[.x.y]`` resolve to the selected Triton package in scope.
 
     Use as a context manager around imports of third-party packages that
     bind ``triton`` at module load time::
@@ -104,6 +130,10 @@ def redirect_triton_to_tokenspeed_triton():
     Outside the ``with`` block ``sys.modules`` is restored to its prior
     state, so unrelated code is unaffected.
     """
+    if _TRITON_DST == _TRITON_SRC:
+        yield
+        return
+
     saved = {
         name: sys.modules[name]
         for name in list(sys.modules)
@@ -112,7 +142,7 @@ def redirect_triton_to_tokenspeed_triton():
     for name in saved:
         del sys.modules[name]
 
-    # Redirect every ``tokenspeed_triton.*`` already in ``sys.modules`` so the
+    # Redirect every selected Triton module already in ``sys.modules`` so the
     # protected imports hit the cache directly (no spec/loader machinery, no
     # risk of accidentally instantiating a duplicate module).
     for name, mod in list(sys.modules.items()):
