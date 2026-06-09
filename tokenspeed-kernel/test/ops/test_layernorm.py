@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.layernorm.gluon import (
+    _rmsnorm_block_full_aiter_pipelined,
     rmsnorm as gluon_rmsnorm,
     rmsnorm_block_full_aiter as gluon_rmsnorm_block_full_aiter,
     rmsnorm_block_full_aiter_pipelined as gluon_rmsnorm_block_full_aiter_pipelined,
@@ -198,6 +199,30 @@ def test_gluon_rmsnorm_block_full_aiter_pipelined_large_tile(
     result = gluon_rmsnorm_block_full_aiter_pipelined(x, weight, eps)
 
     _assert_rmsnorm_matches_ref(result, x, weight, eps, None, dtype)
+
+
+@pytest.mark.skipif(
+    not platform.is_cdna4,
+    reason="Gluon RMSNorm pipelined AITER-style coverage requires AMD CDNA4.",
+)
+@pytest.mark.parametrize("num_buffers", [1, 2, 3, 4])
+def test_gluon_rmsnorm_block_full_aiter_pipelined_buffer_counts(
+    num_buffers: int,
+    device: str,
+) -> None:
+    eps = 1e-6
+    torch.manual_seed(19 + num_buffers)
+    x = torch.randn(4096, 2880, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(2880, device=device, dtype=torch.bfloat16)
+
+    result = _rmsnorm_block_full_aiter_pipelined(
+        x,
+        weight,
+        eps,
+        num_buffers=num_buffers,
+    )
+
+    _assert_rmsnorm_matches_ref(result, x, weight, eps, None, torch.bfloat16)
 
 
 @pytest.mark.skipif(

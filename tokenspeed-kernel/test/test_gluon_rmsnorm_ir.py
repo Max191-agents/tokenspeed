@@ -44,7 +44,7 @@ def _parse_aiter_kernel(kernel):
     )
 
 
-def _parse_pipelined_aiter_kernel(rows_per_cta: int = 4):
+def _parse_pipelined_aiter_kernel(rows_per_cta: int = 4, num_buffers: int = 2):
     if not hasattr(gl.amd.cdna4, "make_buffer_descriptor"):
         pytest.skip("custom tokenspeed_triton descriptor build is not installed")
 
@@ -62,6 +62,8 @@ def _parse_pipelined_aiter_kernel(rows_per_cta: int = 4):
             1e-6,
             4096,
             rows_per_cta,
+            num_buffers,
+            min(rows_per_cta, num_buffers),
             8,
             8,
             8,
@@ -115,8 +117,16 @@ def test_block_full_aiter_aligned_uses_descriptor_bounds_without_load_masks() ->
     _assert_weight_load_after_rstd(ir)
 
 
-def test_block_full_aiter_pipelined_uses_async_lds_pipeline() -> None:
-    mod = _parse_pipelined_aiter_kernel(rows_per_cta=4)
+@pytest.mark.parametrize("num_buffers", [1, 2, 3, 4])
+def test_block_full_aiter_pipelined_uses_async_lds_pipeline(
+    num_buffers: int,
+) -> None:
+    rows_per_cta = 4
+    initial_groups = min(rows_per_cta, num_buffers)
+    mod = _parse_pipelined_aiter_kernel(
+        rows_per_cta=rows_per_cta,
+        num_buffers=num_buffers,
+    )
     ir = mod.str_nodebug()
 
     assert "sizePerThread = [8]" in ir
@@ -126,9 +136,10 @@ def test_block_full_aiter_pipelined_uses_async_lds_pipeline() -> None:
     assert "ttg.async_wait" in ir
     assert "ttg.local_load" in ir
     assert "ttg.amdg.syncedViaAsyncWait = true" in ir
-    assert ir.count("amdg.buffer_load_to_local") == 4
-    assert ir.count("amdg.buffer_store") == 4
-    assert ir.count("math.rsqrt") == 4
+    assert f"!ttg.memdesc<{num_buffers}x4096xbf16" in ir
+    assert ir.count("amdg.buffer_load_to_local") == rows_per_cta
+    assert ir.count("amdg.buffer_store") == rows_per_cta
+    assert ir.count("math.rsqrt") == rows_per_cta
 
     lines = ir.splitlines()
     first_wait = next(i for i, line in enumerate(lines) if "ttg.async_wait" in line)
@@ -140,5 +151,5 @@ def test_block_full_aiter_pipelined_uses_async_lds_pipeline() -> None:
     prologue_commits = [
         i for i, line in enumerate(lines[:first_wait]) if "ttg.async_commit_group" in line
     ]
-    assert len(prologue_commits) == 2
+    assert len(prologue_commits) == initial_groups
     assert prologue_commits[-1] < first_weight_load < first_wait

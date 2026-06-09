@@ -55,6 +55,10 @@ def _select_rows_per_cta(n_rows: int, target_workgroups: int = 512) -> int:
     return min(rows_per_cta, 16)
 
 
+def _select_initial_pipeline_groups(rows_per_cta: int, num_buffers: int) -> int:
+    return min(rows_per_cta, num_buffers)
+
+
 @gluon.jit
 def _rmsnorm_block_full_kernel(
     x_ptr,
@@ -302,6 +306,8 @@ def _rmsnorm_block_full_aiter_pipelined_aligned_kernel(
     eps: gl.constexpr,
     BLOCK: gl.constexpr,
     ROWS_PER_CTA: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    INITIAL_GROUPS: gl.constexpr,
     ROW_CONTIGUITY: gl.constexpr,
     WEIGHT_CONTIGUITY: gl.constexpr,
     ROW_ALIGNMENT: gl.constexpr,
@@ -315,41 +321,34 @@ def _rmsnorm_block_full_aiter_pipelined_aligned_kernel(
 
     shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
     smem = gl.allocate_shared_memory(
-        x_ptr.dtype.element_ty, [2, BLOCK], shared_layout
+        x_ptr.dtype.element_ty, [NUM_BUFFERS, BLOCK], shared_layout
     )
 
     base_row = tile * ROWS_PER_CTA
 
-    row_start = base_row * n_cols
-    row_start = gl.multiple_of(row_start, ROW_ALIGNMENT)
-    row_ptr = x_ptr + row_start
-    row_desc = gl.amd.cdna4.make_buffer_descriptor(row_ptr, (n_cols,), (1,))
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(
-        smem.index(0), row_desc, row_cols, cache_modifier=".cs"
-    )
-    gl.amd.cdna4.async_copy.commit_group()
-
-    if ROWS_PER_CTA > 1:
-        next_row_start = (base_row + 1) * n_cols
-        next_row_start = gl.multiple_of(next_row_start, ROW_ALIGNMENT)
-        next_row_ptr = x_ptr + next_row_start
-        next_row_desc = gl.amd.cdna4.make_buffer_descriptor(
-            next_row_ptr, (n_cols,), (1,)
-        )
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            smem.index(1), next_row_desc, row_cols, cache_modifier=".cs"
-        )
-        gl.amd.cdna4.async_copy.commit_group()
+    for preload_offset in gl.static_range(0, NUM_BUFFERS):
+        if preload_offset < ROWS_PER_CTA:
+            preload_row = base_row + preload_offset
+            preload_row_start = preload_row * n_cols
+            preload_row_start = gl.multiple_of(preload_row_start, ROW_ALIGNMENT)
+            preload_row_ptr = x_ptr + preload_row_start
+            preload_row_desc = gl.amd.cdna4.make_buffer_descriptor(
+                preload_row_ptr, (n_cols,), (1,)
+            )
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                smem.index(preload_offset),
+                preload_row_desc,
+                row_cols,
+                cache_modifier=".cs",
+            )
+            gl.amd.cdna4.async_copy.commit_group()
 
     weight_desc = gl.amd.cdna4.make_buffer_descriptor(weight_ptr, (n_cols,), (1,))
     weight = gl.amd.cdna4.buffer_load(
         ptr=weight_desc, offsets=weight_offsets
     ).to(gl.float32)
 
-    if ROWS_PER_CTA > 1:
-        gl.amd.cdna4.async_copy.wait_group(1)
-    else:
-        gl.amd.cdna4.async_copy.wait_group(0)
+    gl.amd.cdna4.async_copy.wait_group(INITIAL_GROUPS - 1)
 
     x = gl.amd.cdna4.async_copy.load_shared_relaxed(smem.index(0), layout).to(
         gl.float32
@@ -357,8 +356,8 @@ def _rmsnorm_block_full_aiter_pipelined_aligned_kernel(
 
     for row_offset in gl.static_range(0, ROWS_PER_CTA):
         row = base_row + row_offset
-        prefetch_row = row + 2
-        if row_offset + 2 < ROWS_PER_CTA:
+        prefetch_row = row + NUM_BUFFERS
+        if row_offset + NUM_BUFFERS < ROWS_PER_CTA:
             prefetch_row_start = prefetch_row * n_cols
             prefetch_row_start = gl.multiple_of(prefetch_row_start, ROW_ALIGNMENT)
             prefetch_row_ptr = x_ptr + prefetch_row_start
@@ -366,7 +365,7 @@ def _rmsnorm_block_full_aiter_pipelined_aligned_kernel(
                 prefetch_row_ptr, (n_cols,), (1,)
             )
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
-                smem.index(row_offset % 2),
+                smem.index(row_offset % NUM_BUFFERS),
                 prefetch_row_desc,
                 row_cols,
                 cache_modifier=".cs",
@@ -389,12 +388,14 @@ def _rmsnorm_block_full_aiter_pipelined_aligned_kernel(
         )
 
         if row_offset + 1 < ROWS_PER_CTA:
-            if row_offset + 2 < ROWS_PER_CTA:
-                gl.amd.cdna4.async_copy.wait_group(1)
+            if row_offset + NUM_BUFFERS < ROWS_PER_CTA:
+                gl.amd.cdna4.async_copy.wait_group(NUM_BUFFERS - 1)
             else:
-                gl.amd.cdna4.async_copy.wait_group(0)
+                gl.amd.cdna4.async_copy.wait_group(
+                    ROWS_PER_CTA - row_offset - 2
+                )
             x = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                smem.index((row_offset + 1) % 2), layout
+                smem.index((row_offset + 1) % NUM_BUFFERS), layout
             ).to(gl.float32)
 
 
@@ -688,6 +689,7 @@ def _rmsnorm_block_full_aiter_pipelined(
     num_warps: int = 4,
     size_per_thread: int = 8,
     target_workgroups: int = 512,
+    num_buffers: int = 2,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if x.shape[0] == 0:
         if residual is None:
@@ -697,6 +699,8 @@ def _rmsnorm_block_full_aiter_pipelined(
         raise ValueError(
             f"weight shape {tuple(weight.shape)} does not match hidden size {x.shape[-1]}"
         )
+    if num_buffers <= 0:
+        raise ValueError(f"num_buffers must be positive, got {num_buffers}")
     if residual is not None:
         return _rmsnorm_block_full_aiter(
             x,
@@ -724,6 +728,7 @@ def _rmsnorm_block_full_aiter_pipelined(
     weight_contiguity = _contiguous_elements(weight)
     row_alignment = _row_alignment_elements(hidden_size, x)
     rows_per_cta = _select_rows_per_cta(x_2d.shape[0], target_workgroups)
+    initial_groups = _select_initial_pipeline_groups(rows_per_cta, num_buffers)
 
     if (
         rows_per_cta == 1
@@ -755,6 +760,8 @@ def _rmsnorm_block_full_aiter_pipelined(
         eps,
         BLOCK=block,
         ROWS_PER_CTA=rows_per_cta,
+        NUM_BUFFERS=num_buffers,
+        INITIAL_GROUPS=initial_groups,
         ROW_CONTIGUITY=row_contiguity,
         WEIGHT_CONTIGUITY=weight_contiguity,
         ROW_ALIGNMENT=row_alignment,

@@ -122,6 +122,7 @@ def _make_block_full_aiter_pipelined_launcher(
     num_warps: int,
     size_per_thread: int,
     target_workgroups: int,
+    num_buffers: int,
 ) -> Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
     def launcher(
         x: torch.Tensor,
@@ -137,6 +138,7 @@ def _make_block_full_aiter_pipelined_launcher(
             num_warps=num_warps,
             size_per_thread=size_per_thread,
             target_workgroups=target_workgroups,
+            num_buffers=num_buffers,
         )
 
     return launcher
@@ -230,12 +232,36 @@ def build_default_candidates(
                 "num_warps": 4,
                 "size_per_thread": 8,
                 "target_workgroups": 512,
+                "num_buffers": 2,
             },
             _make_block_full_aiter_pipelined_launcher(
-                num_warps=4, size_per_thread=8, target_workgroups=512
+                num_warps=4,
+                size_per_thread=8,
+                target_workgroups=512,
+                num_buffers=2,
             ),
         ),
     ]
+
+    for num_buffers in (1, 3, 4):
+        candidates.append(
+            Candidate(
+                f"block_full_aiter_pipelined_spt8_w4_twg512_b{num_buffers}",
+                "block_full_aiter_pipelined",
+                {
+                    "num_warps": 4,
+                    "size_per_thread": 8,
+                    "target_workgroups": 512,
+                    "num_buffers": num_buffers,
+                },
+                _make_block_full_aiter_pipelined_launcher(
+                    num_warps=4,
+                    size_per_thread=8,
+                    target_workgroups=512,
+                    num_buffers=num_buffers,
+                ),
+            )
+        )
 
     for size_per_thread in size_per_thread_values:
         for num_warps in (1, 2, 4, 8):
