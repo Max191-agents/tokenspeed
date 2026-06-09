@@ -100,6 +100,84 @@ The setup helper:
 Running the helper again without `--custom-triton` removes that venv-local
 selector.
 
+## Build A Custom tokenspeed_triton Wheel
+
+For the descriptor-bounds experiment, branch from LightSeek's vendor-renamed
+`tokenspeed_triton` tree and port the Panditsa changes onto that base:
+
+```bash
+git clone --filter=blob:none --single-branch \
+  --branch release/3.7.10.post20260531 \
+  https://github.com/lightseekorg/triton.git \
+  projects/triton/custom-builds/tokenspeed-buffer-descriptor-bounds
+
+cd projects/triton/custom-builds/tokenspeed-buffer-descriptor-bounds
+git checkout -B agents/buffer-descriptor-bounds
+git remote add panditsa https://github.com/panditsa/triton.git
+git fetch --filter=blob:none panditsa sanketp/buffer-descriptor-bounds
+```
+
+The port keeps LightSeek's `tokenspeed_triton` package layout and carries the
+buffer descriptor bounds changes through Gluon frontend bindings, AMD buffer op
+ODS, and LLVM lowering.
+
+Build the wheel with the repo's normal package name:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip setuptools wheel
+.venv/bin/python -m pip install -r python/requirements.txt
+
+mkdir -p dist .triton-home
+env PATH="$PWD/.venv/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH" \
+  TRITON_HOME="$PWD/.triton-home" \
+  TRITON_BUILD_WITH_CLANG_LLD=1 \
+  TRITON_BUILD_WITH_CCACHE=1 \
+  TRITON_BUILD_RELEASE=1 \
+  TRITON_BUILD_PROTON=OFF \
+  MAX_JOBS=12 \
+  .venv/bin/python -m pip wheel . --no-build-isolation -w dist
+```
+
+The local build produced:
+
+- Branch: `agents/buffer-descriptor-bounds`
+- Commit: `1ecc208e Add buffer descriptor bounds to tokenspeed triton`
+- Wheel:
+  `dist/tokenspeed_triton-3.7.10.post20260609-cp312-cp312-linux_x86_64.whl`
+- Distribution metadata: `tokenspeed-triton==3.7.10.post20260609`
+- Import package: `tokenspeed_triton`
+
+Install it into the TokenSpeed worktree venv:
+
+```bash
+projects/tokenspeed/agents-rmsnorm-gluon-kernel/.venv/bin/python \
+  -m pip install --force-reinstall \
+  projects/triton/custom-builds/tokenspeed-buffer-descriptor-bounds/dist/\
+tokenspeed_triton-3.7.10.post20260609-cp312-cp312-linux_x86_64.whl
+```
+
+Focused validation after installing the wheel:
+
+```bash
+TOKENSPEED_TRITON_PACKAGE=tokenspeed_triton \
+  .venv/bin/python -m pytest \
+  tokenspeed/tokenspeed-kernel/test/test_triton_import.py \
+  tokenspeed/tokenspeed-mla/test/test_triton_import.py \
+  -q
+
+.venv/bin/lit -sv build/cmake.linux-x86_64-cpython-3.12/test \
+  --filter='buffer_load_store|buffer_load_to_local_to_llvm|amd-optimize-buffer-ops-base-ptr-increment'
+```
+
+Results:
+
+- TokenSpeed import selector tests: `2 passed, 2 skipped`.
+- Focused `tokenspeed_triton` MLIR regression tests: `3 passed`.
+- Frontend smoke from the TokenSpeed venv parsed a Gluon descriptor kernel and
+  found two `validBytes` operands, one for `amdg.buffer_load` and one for
+  `amdg.buffer_load_to_local`.
+
 ## Validation
 
 Focused import tests:
