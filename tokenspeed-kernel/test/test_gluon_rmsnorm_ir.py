@@ -43,6 +43,17 @@ def _parse_aiter_kernel(kernel):
     )
 
 
+def _assert_weight_load_after_rstd(ir: str) -> None:
+    lines = ir.splitlines()
+    load_indices = [i for i, line in enumerate(lines) if "amdg.buffer_load" in line]
+    rstd_index = next(i for i, line in enumerate(lines) if "math.rsqrt" in line)
+
+    assert len(load_indices) == 3
+    assert load_indices[0] < rstd_index
+    assert load_indices[1] < rstd_index
+    assert load_indices[2] > rstd_index
+
+
 def test_block_full_aiter_general_uses_descriptor_bounds_with_load_masks() -> None:
     mod = _parse_aiter_kernel(_rmsnorm_block_full_aiter_kernel)
     ir = mod.str_nodebug()
@@ -55,6 +66,7 @@ def test_block_full_aiter_general_uses_descriptor_bounds_with_load_masks() -> No
     for line in load_lines:
         before_valid_bytes = line.split(" validBytes", maxsplit=1)[0]
         assert ", %" in before_valid_bytes
+    _assert_weight_load_after_rstd(ir)
 
 
 def test_block_full_aiter_aligned_uses_descriptor_bounds_without_load_masks() -> None:
@@ -69,3 +81,4 @@ def test_block_full_aiter_aligned_uses_descriptor_bounds_without_load_masks() ->
     for line in load_lines:
         before_valid_bytes = line.split(" validBytes", maxsplit=1)[0]
         assert ", %" not in before_valid_bytes
+    _assert_weight_load_after_rstd(ir)

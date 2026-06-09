@@ -207,11 +207,12 @@ def _rmsnorm_block_full_aiter_kernel(
             cache=".cs",
         )
 
+    variance = gl.sum(x * x, axis=0) / n_cols
+    rstd = gl.rsqrt(variance + eps)
     weight = gl.amd.cdna4.buffer_load(
         ptr=weight_desc, offsets=weight_offsets, mask=mask, other=0.0
     ).to(gl.float32)
-    variance = gl.sum(x * x, axis=0) / n_cols
-    out = x * gl.rsqrt(variance + eps) * weight
+    out = x * rstd * weight
     gl.amd.cdna4.buffer_store(
         stored_value=out.to(out_ptr.dtype.element_ty),
         ptr=out_ptr,
@@ -269,11 +270,12 @@ def _rmsnorm_block_full_aiter_aligned_kernel(
             cache=".cs",
         )
 
+    variance = gl.sum(x * x, axis=0) / n_cols
+    rstd = gl.rsqrt(variance + eps)
     weight = gl.amd.cdna4.buffer_load(
         ptr=weight_desc, offsets=weight_offsets
     ).to(gl.float32)
-    variance = gl.sum(x * x, axis=0) / n_cols
-    out = x * gl.rsqrt(variance + eps) * weight
+    out = x * rstd * weight
     gl.amd.cdna4.buffer_store(
         stored_value=out.to(out_ptr.dtype.element_ty),
         ptr=out_ptr,
