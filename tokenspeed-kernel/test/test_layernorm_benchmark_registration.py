@@ -56,6 +56,7 @@ def test_layernorm_side_effect_import_registers_rmsnorm_kernels() -> None:
         "gluon_rmsnorm",
         "gluon_rmsnorm_block_full",
         "gluon_rmsnorm_block_full_aiter",
+        "gluon_rmsnorm_block_full_aiter_pipelined",
         "gluon_rmsnorm_streaming_block",
         "gluon_rmsnorm_wave_row",
     }.issubset(names)
@@ -73,6 +74,10 @@ def test_load_builtin_kernels_includes_layernorm() -> None:
     assert KernelRegistry.get().get_by_name("gluon_rmsnorm_block_full") is not None
     assert (
         KernelRegistry.get().get_by_name("gluon_rmsnorm_block_full_aiter")
+        is not None
+    )
+    assert (
+        KernelRegistry.get().get_by_name("gluon_rmsnorm_block_full_aiter_pipelined")
         is not None
     )
     assert (

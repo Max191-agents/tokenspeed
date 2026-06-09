@@ -7,6 +7,7 @@ from tokenspeed_kernel._triton import _import_triton_module
 from tokenspeed_kernel.ops.layernorm.gluon import (
     _rmsnorm_block_full_aiter_aligned_kernel,
     _rmsnorm_block_full_aiter_kernel,
+    _rmsnorm_block_full_aiter_pipelined_aligned_kernel,
 )
 
 
@@ -33,6 +34,34 @@ def _parse_aiter_kernel(kernel):
             1e-6,
             4096,
             True,
+            8,
+            8,
+            8,
+            layout,
+        ),
+        {},
+        target=GPUTarget("hip", "gfx950", 64),
+    )
+
+
+def _parse_pipelined_aiter_kernel(rows_per_cta: int = 4):
+    if not hasattr(gl.amd.cdna4, "make_buffer_descriptor"):
+        pytest.skip("custom tokenspeed_triton descriptor build is not installed")
+
+    layout = gl.BlockedLayout([8], [64], [4], [0])
+    dtype = gl.bfloat16
+    return run_parser(
+        _rmsnorm_block_full_aiter_pipelined_aligned_kernel,
+        (
+            MockTensor(dtype),
+            MockTensor(dtype),
+            MockTensor(dtype),
+            MockTensor(dtype),
+            MockTensor(dtype),
+            2880,
+            1e-6,
+            4096,
+            rows_per_cta,
             8,
             8,
             8,
@@ -84,3 +113,32 @@ def test_block_full_aiter_aligned_uses_descriptor_bounds_without_load_masks() ->
         before_valid_bytes = line.split(" validBytes", maxsplit=1)[0]
         assert ", %" not in before_valid_bytes
     _assert_weight_load_after_rstd(ir)
+
+
+def test_block_full_aiter_pipelined_uses_async_lds_pipeline() -> None:
+    mod = _parse_pipelined_aiter_kernel(rows_per_cta=4)
+    ir = mod.str_nodebug()
+
+    assert "sizePerThread = [8]" in ir
+    assert "ttg.local_alloc" in ir
+    assert "amdg.buffer_load_to_local" in ir
+    assert "ttg.async_commit_group" in ir
+    assert "ttg.async_wait" in ir
+    assert "ttg.local_load" in ir
+    assert "ttg.amdg.syncedViaAsyncWait = true" in ir
+    assert ir.count("amdg.buffer_load_to_local") == 4
+    assert ir.count("amdg.buffer_store") == 4
+    assert ir.count("math.rsqrt") == 4
+
+    lines = ir.splitlines()
+    first_wait = next(i for i, line in enumerate(lines) if "ttg.async_wait" in line)
+    first_weight_load = next(
+        i
+        for i, line in enumerate(lines[:first_wait])
+        if "amdg.buffer_load " in line and "buffer_load_to_local" not in line
+    )
+    prologue_commits = [
+        i for i, line in enumerate(lines[:first_wait]) if "ttg.async_commit_group" in line
+    ]
+    assert len(prologue_commits) == 2
+    assert prologue_commits[-1] < first_weight_load < first_wait

@@ -5,6 +5,7 @@ import torch
 from tokenspeed_kernel.ops.layernorm.gluon import (
     rmsnorm as gluon_rmsnorm,
     rmsnorm_block_full_aiter as gluon_rmsnorm_block_full_aiter,
+    rmsnorm_block_full_aiter_pipelined as gluon_rmsnorm_block_full_aiter_pipelined,
     rmsnorm_block_full as gluon_rmsnorm_block_full,
     rmsnorm_streaming_block as gluon_rmsnorm_streaming_block,
     rmsnorm_wave_row as gluon_rmsnorm_wave_row,
@@ -176,6 +177,27 @@ def test_gluon_rmsnorm_block_full_aiter_shapes(
     result = gluon_rmsnorm_block_full_aiter(x, weight, eps, residual=residual)
 
     _assert_rmsnorm_matches_ref(result, x, weight, eps, residual, dtype)
+
+
+@pytest.mark.skipif(
+    not platform.is_cdna4,
+    reason="Gluon RMSNorm pipelined AITER-style coverage requires AMD CDNA4.",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("weight_dtype_mode", ["float32", "input"])
+def test_gluon_rmsnorm_block_full_aiter_pipelined_large_tile(
+    dtype: torch.dtype,
+    weight_dtype_mode: str,
+    device: str,
+) -> None:
+    eps = 1e-6
+    x = torch.randn(1024, 2880, device=device, dtype=dtype)
+    weight_dtype = torch.float32 if weight_dtype_mode == "float32" else dtype
+    weight = torch.randn(2880, device=device, dtype=weight_dtype)
+
+    result = gluon_rmsnorm_block_full_aiter_pipelined(x, weight, eps)
+
+    _assert_rmsnorm_matches_ref(result, x, weight, eps, None, dtype)
 
 
 @pytest.mark.skipif(

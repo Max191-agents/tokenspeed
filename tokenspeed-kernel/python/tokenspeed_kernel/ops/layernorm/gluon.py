@@ -48,6 +48,13 @@ def _row_alignment_elements(hidden_size: int, tensor: torch.Tensor) -> int:
     return alignment
 
 
+def _select_rows_per_cta(n_rows: int, target_workgroups: int = 512) -> int:
+    if n_rows <= target_workgroups:
+        return 1
+    rows_per_cta = triton.next_power_of_2(triton.cdiv(n_rows, target_workgroups))
+    return min(rows_per_cta, 16)
+
+
 @gluon.jit
 def _rmsnorm_block_full_kernel(
     x_ptr,
@@ -282,6 +289,113 @@ def _rmsnorm_block_full_aiter_aligned_kernel(
         offsets=row_offsets,
         mask=store_mask,
     )
+
+
+@gluon.jit
+def _rmsnorm_block_full_aiter_pipelined_aligned_kernel(
+    x_ptr,
+    residual_ptr,
+    weight_ptr,
+    out_ptr,
+    residual_out_ptr,
+    n_cols: gl.constexpr,
+    eps: gl.constexpr,
+    BLOCK: gl.constexpr,
+    ROWS_PER_CTA: gl.constexpr,
+    ROW_CONTIGUITY: gl.constexpr,
+    WEIGHT_CONTIGUITY: gl.constexpr,
+    ROW_ALIGNMENT: gl.constexpr,
+    layout: gl.constexpr,
+):
+    tile = gl.program_id(0)
+    offsets = gl.arange(0, BLOCK, layout=layout)
+    row_cols = gl.max_contiguous(offsets, ROW_CONTIGUITY)
+    weight_offsets = gl.max_contiguous(offsets + 0, WEIGHT_CONTIGUITY)
+    store_mask = offsets < n_cols
+
+    shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    smem = gl.allocate_shared_memory(
+        x_ptr.dtype.element_ty, [2, BLOCK], shared_layout
+    )
+
+    base_row = tile * ROWS_PER_CTA
+
+    row_start = base_row * n_cols
+    row_start = gl.multiple_of(row_start, ROW_ALIGNMENT)
+    row_ptr = x_ptr + row_start
+    row_desc = gl.amd.cdna4.make_buffer_descriptor(row_ptr, (n_cols,), (1,))
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        smem.index(0), row_desc, row_cols, cache_modifier=".cs"
+    )
+    gl.amd.cdna4.async_copy.commit_group()
+
+    if ROWS_PER_CTA > 1:
+        next_row_start = (base_row + 1) * n_cols
+        next_row_start = gl.multiple_of(next_row_start, ROW_ALIGNMENT)
+        next_row_ptr = x_ptr + next_row_start
+        next_row_desc = gl.amd.cdna4.make_buffer_descriptor(
+            next_row_ptr, (n_cols,), (1,)
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem.index(1), next_row_desc, row_cols, cache_modifier=".cs"
+        )
+        gl.amd.cdna4.async_copy.commit_group()
+
+    weight_desc = gl.amd.cdna4.make_buffer_descriptor(weight_ptr, (n_cols,), (1,))
+    weight = gl.amd.cdna4.buffer_load(
+        ptr=weight_desc, offsets=weight_offsets
+    ).to(gl.float32)
+
+    if ROWS_PER_CTA > 1:
+        gl.amd.cdna4.async_copy.wait_group(1)
+    else:
+        gl.amd.cdna4.async_copy.wait_group(0)
+
+    x = gl.amd.cdna4.async_copy.load_shared_relaxed(smem.index(0), layout).to(
+        gl.float32
+    )
+
+    for row_offset in gl.static_range(0, ROWS_PER_CTA):
+        row = base_row + row_offset
+        prefetch_row = row + 2
+        if row_offset + 2 < ROWS_PER_CTA:
+            prefetch_row_start = prefetch_row * n_cols
+            prefetch_row_start = gl.multiple_of(prefetch_row_start, ROW_ALIGNMENT)
+            prefetch_row_ptr = x_ptr + prefetch_row_start
+            prefetch_row_desc = gl.amd.cdna4.make_buffer_descriptor(
+                prefetch_row_ptr, (n_cols,), (1,)
+            )
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                smem.index(row_offset % 2),
+                prefetch_row_desc,
+                row_cols,
+                cache_modifier=".cs",
+            )
+            gl.amd.cdna4.async_copy.commit_group()
+
+        variance = gl.sum(x * x, axis=0) / n_cols
+        rstd = gl.rsqrt(variance + eps)
+        out = x * rstd * weight
+
+        out_row_start = row * n_cols
+        out_row_start = gl.multiple_of(out_row_start, ROW_ALIGNMENT)
+        out_offsets = out_row_start + row_cols
+        out_offsets = gl.max_contiguous(out_offsets, ROW_CONTIGUITY)
+        gl.amd.cdna4.buffer_store(
+            stored_value=out.to(out_ptr.dtype.element_ty),
+            ptr=out_ptr,
+            offsets=out_offsets,
+            mask=store_mask,
+        )
+
+        if row_offset + 1 < ROWS_PER_CTA:
+            if row_offset + 2 < ROWS_PER_CTA:
+                gl.amd.cdna4.async_copy.wait_group(1)
+            else:
+                gl.amd.cdna4.async_copy.wait_group(0)
+            x = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                smem.index((row_offset + 1) % 2), layout
+            ).to(gl.float32)
 
 
 @gluon.jit
@@ -564,6 +678,92 @@ def _rmsnorm_block_full_aiter(
     return out, residual_out
 
 
+def _rmsnorm_block_full_aiter_pipelined(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    *,
+    num_warps: int = 4,
+    size_per_thread: int = 8,
+    target_workgroups: int = 512,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if x.shape[0] == 0:
+        if residual is None:
+            return x if out is None else out
+        return (x if out is None else out), residual
+    if x.shape[-1] != weight.shape[0]:
+        raise ValueError(
+            f"weight shape {tuple(weight.shape)} does not match hidden size {x.shape[-1]}"
+        )
+    if residual is not None:
+        return _rmsnorm_block_full_aiter(
+            x,
+            weight,
+            eps,
+            residual=residual,
+            out=out,
+            num_warps=num_warps,
+            size_per_thread=size_per_thread,
+        )
+
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+
+    hidden_size = x.shape[-1]
+    x_2d = x.view(-1, hidden_size)
+    out = torch.empty_like(x) if out is None else out
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    out_2d = out.view(-1, hidden_size)
+
+    row_contiguity = _contiguous_elements(x)
+    weight_contiguity = _contiguous_elements(weight)
+    row_alignment = _row_alignment_elements(hidden_size, x)
+    rows_per_cta = _select_rows_per_cta(x_2d.shape[0], target_workgroups)
+
+    if (
+        rows_per_cta == 1
+        or x_2d.shape[0] % rows_per_cta != 0
+        or hidden_size % row_contiguity != 0
+        or hidden_size % weight_contiguity != 0
+    ):
+        return _rmsnorm_block_full_aiter(
+            x,
+            weight,
+            eps,
+            residual=None,
+            out=out,
+            num_warps=num_warps,
+            size_per_thread=size_per_thread,
+        )
+
+    block = triton.next_power_of_2(hidden_size)
+    layout = gl.BlockedLayout([size_per_thread], [64], [num_warps], [0])
+    _rmsnorm_block_full_aiter_pipelined_aligned_kernel[
+        (triton.cdiv(x_2d.shape[0], rows_per_cta),)
+    ](
+        x_2d,
+        x_2d,
+        weight,
+        out_2d,
+        out_2d,
+        hidden_size,
+        eps,
+        BLOCK=block,
+        ROWS_PER_CTA=rows_per_cta,
+        ROW_CONTIGUITY=row_contiguity,
+        WEIGHT_CONTIGUITY=weight_contiguity,
+        ROW_ALIGNMENT=row_alignment,
+        layout=layout,
+        num_warps=num_warps,
+    )
+    return out
+
+
 def _rmsnorm_streaming_block(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -696,6 +896,29 @@ def rmsnorm_block_full_aiter(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     return _rmsnorm_block_full_aiter(x, weight, eps, residual=residual, out=out)
+
+
+@register_kernel(
+    "norm",
+    "rmsnorm",
+    name="gluon_rmsnorm_block_full_aiter_pipelined",
+    solution="gluon",
+    capability=_CDNA4_CAPABILITY,
+    signatures=_RMSNORM_SIGNATURES,
+    traits={},
+    priority=Priority.SPECIALIZED,
+    tags={"latency", "block_full", "aiter", "pipelined"},
+)
+def rmsnorm_block_full_aiter_pipelined(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    return _rmsnorm_block_full_aiter_pipelined(
+        x, weight, eps, residual=residual, out=out
+    )
 
 
 @register_kernel(
