@@ -181,15 +181,22 @@ def _rmsnorm_block_full_aiter_kernel(
     mask = offsets < n_cols
     row_start = row * n_cols
     row_start = gl.multiple_of(row_start, ROW_ALIGNMENT)
+    row_ptr = x_ptr + row_start
+    row_desc = gl.amd.cdna4.make_buffer_descriptor(row_ptr, (n_cols,), (1,))
+    weight_desc = gl.amd.cdna4.make_buffer_descriptor(weight_ptr, (n_cols,), (1,))
     row_offsets = row_start + row_cols
     row_offsets = gl.max_contiguous(row_offsets, ROW_CONTIGUITY)
 
     x = gl.amd.cdna4.buffer_load(
-        ptr=x_ptr, offsets=row_offsets, mask=mask, other=0.0, cache=".cs"
+        ptr=row_desc, offsets=row_cols, mask=mask, other=0.0, cache=".cs"
     ).to(gl.float32)
     if HAS_RESIDUAL:
+        residual_row_ptr = residual_ptr + row_start
+        residual_desc = gl.amd.cdna4.make_buffer_descriptor(
+            residual_row_ptr, (n_cols,), (1,)
+        )
         residual = gl.amd.cdna4.buffer_load(
-            ptr=residual_ptr, offsets=row_offsets, mask=mask, other=0.0, cache=".cs"
+            ptr=residual_desc, offsets=row_cols, mask=mask, other=0.0, cache=".cs"
         ).to(gl.float32)
         x += residual
         gl.amd.cdna4.buffer_store(
@@ -201,7 +208,7 @@ def _rmsnorm_block_full_aiter_kernel(
         )
 
     weight = gl.amd.cdna4.buffer_load(
-        ptr=weight_ptr, offsets=weight_offsets, mask=mask, other=0.0
+        ptr=weight_desc, offsets=weight_offsets, mask=mask, other=0.0
     ).to(gl.float32)
     variance = gl.sum(x * x, axis=0) / n_cols
     out = x * gl.rsqrt(variance + eps) * weight

@@ -148,6 +148,13 @@ The local build produced:
 - Distribution metadata: `tokenspeed-triton==3.7.10.post20260609`
 - Import package: `tokenspeed_triton`
 
+The source branch is committed locally in the custom checkout. Pushing that
+branch to `lightseekorg/triton` failed with a GitHub 403 for
+`agent-commit-access[bot]`, and no `Max191-agents/triton` or similarly named
+agent fork existed on GitHub from this machine. The wheel artifact and local
+commit are usable, but publishing the source branch needs a pushable fork or
+remote.
+
 Install it into the TokenSpeed worktree venv:
 
 ```bash
