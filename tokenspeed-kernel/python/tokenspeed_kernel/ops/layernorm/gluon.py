@@ -221,6 +221,68 @@ def _rmsnorm_block_full_aiter_kernel(
 
 
 @gluon.jit
+def _rmsnorm_block_full_aiter_aligned_kernel(
+    x_ptr,
+    residual_ptr,
+    weight_ptr,
+    out_ptr,
+    residual_out_ptr,
+    n_cols: gl.constexpr,
+    eps: gl.constexpr,
+    BLOCK: gl.constexpr,
+    HAS_RESIDUAL: gl.constexpr,
+    ROW_CONTIGUITY: gl.constexpr,
+    WEIGHT_CONTIGUITY: gl.constexpr,
+    ROW_ALIGNMENT: gl.constexpr,
+    layout: gl.constexpr,
+):
+    row = gl.program_id(0)
+    offsets = gl.arange(0, BLOCK, layout=layout)
+    row_cols = gl.max_contiguous(offsets, ROW_CONTIGUITY)
+    weight_offsets = gl.max_contiguous(offsets + 0, WEIGHT_CONTIGUITY)
+    store_mask = offsets < n_cols
+    row_start = row * n_cols
+    row_start = gl.multiple_of(row_start, ROW_ALIGNMENT)
+    row_ptr = x_ptr + row_start
+    row_desc = gl.amd.cdna4.make_buffer_descriptor(row_ptr, (n_cols,), (1,))
+    weight_desc = gl.amd.cdna4.make_buffer_descriptor(weight_ptr, (n_cols,), (1,))
+    row_offsets = row_start + row_cols
+    row_offsets = gl.max_contiguous(row_offsets, ROW_CONTIGUITY)
+
+    x = gl.amd.cdna4.buffer_load(
+        ptr=row_desc, offsets=row_cols, cache=".cs"
+    ).to(gl.float32)
+    if HAS_RESIDUAL:
+        residual_row_ptr = residual_ptr + row_start
+        residual_desc = gl.amd.cdna4.make_buffer_descriptor(
+            residual_row_ptr, (n_cols,), (1,)
+        )
+        residual = gl.amd.cdna4.buffer_load(
+            ptr=residual_desc, offsets=row_cols, cache=".cs"
+        ).to(gl.float32)
+        x += residual
+        gl.amd.cdna4.buffer_store(
+            stored_value=x.to(residual_out_ptr.dtype.element_ty),
+            ptr=residual_out_ptr,
+            offsets=row_offsets,
+            mask=store_mask,
+            cache=".cs",
+        )
+
+    weight = gl.amd.cdna4.buffer_load(
+        ptr=weight_desc, offsets=weight_offsets
+    ).to(gl.float32)
+    variance = gl.sum(x * x, axis=0) / n_cols
+    out = x * gl.rsqrt(variance + eps) * weight
+    gl.amd.cdna4.buffer_store(
+        stored_value=out.to(out_ptr.dtype.element_ty),
+        ptr=out_ptr,
+        offsets=row_offsets,
+        mask=store_mask,
+    )
+
+
+@gluon.jit
 def _rmsnorm_streaming_block_kernel(
     x_ptr,
     residual_ptr,
@@ -473,7 +535,13 @@ def _rmsnorm_block_full_aiter(
 
     block = triton.next_power_of_2(hidden_size)
     layout = gl.BlockedLayout([size_per_thread], [64], [num_warps], [0])
-    _rmsnorm_block_full_aiter_kernel[(x_2d.shape[0],)](
+    kernel = (
+        _rmsnorm_block_full_aiter_aligned_kernel
+        if hidden_size % row_contiguity == 0
+        and hidden_size % weight_contiguity == 0
+        else _rmsnorm_block_full_aiter_kernel
+    )
+    kernel[(x_2d.shape[0],)](
         x_2d,
         residual_arg,
         weight,

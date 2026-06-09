@@ -154,11 +154,13 @@ def test_gluon_rmsnorm_block_full_shapes(
     [(1, 2880), (32, 2880), (11, 2897)],
 )
 @pytest.mark.parametrize("has_residual", [False, True])
+@pytest.mark.parametrize("weight_dtype_mode", ["float32", "input"])
 def test_gluon_rmsnorm_block_full_aiter_shapes(
     dtype: torch.dtype,
     num_tokens: int,
     hidden_size: int,
     has_residual: bool,
+    weight_dtype_mode: str,
     device: str,
 ) -> None:
     eps = 1e-6
@@ -168,7 +170,8 @@ def test_gluon_rmsnorm_block_full_aiter_shapes(
         if has_residual
         else None
     )
-    weight = torch.randn(hidden_size, device=device, dtype=torch.float32)
+    weight_dtype = torch.float32 if weight_dtype_mode == "float32" else dtype
+    weight = torch.randn(hidden_size, device=device, dtype=weight_dtype)
 
     result = gluon_rmsnorm_block_full_aiter(x, weight, eps, residual=residual)
 

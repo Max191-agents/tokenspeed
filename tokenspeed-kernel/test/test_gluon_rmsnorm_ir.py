@@ -4,7 +4,10 @@ import pytest
 
 from tokenspeed_kernel._triton import gl
 from tokenspeed_kernel._triton import _import_triton_module
-from tokenspeed_kernel.ops.layernorm.gluon import _rmsnorm_block_full_aiter_kernel
+from tokenspeed_kernel.ops.layernorm.gluon import (
+    _rmsnorm_block_full_aiter_aligned_kernel,
+    _rmsnorm_block_full_aiter_kernel,
+)
 
 
 GPUTarget = _import_triton_module("backends.compiler").GPUTarget
@@ -12,14 +15,14 @@ MockTensor = _import_triton_module("runtime.jit").MockTensor
 run_parser = _import_triton_module("_filecheck").run_parser
 
 
-def test_block_full_aiter_uses_descriptor_bounds() -> None:
+def _parse_aiter_kernel(kernel):
     if not hasattr(gl.amd.cdna4, "make_buffer_descriptor"):
         pytest.skip("custom tokenspeed_triton descriptor build is not installed")
 
     layout = gl.BlockedLayout([16], [64], [4], [0])
     dtype = gl.bfloat16
-    mod = run_parser(
-        _rmsnorm_block_full_aiter_kernel,
+    return run_parser(
+        kernel,
         (
             MockTensor(dtype),
             MockTensor(dtype),
@@ -38,8 +41,31 @@ def test_block_full_aiter_uses_descriptor_bounds() -> None:
         {},
         target=GPUTarget("hip", "gfx950", 64),
     )
+
+
+def test_block_full_aiter_general_uses_descriptor_bounds_with_load_masks() -> None:
+    mod = _parse_aiter_kernel(_rmsnorm_block_full_aiter_kernel)
     ir = mod.str_nodebug()
 
     assert ir.count("validBytes =") == 3
     assert "amdg.buffer_load" in ir
     assert "tt.addptr" in ir
+    load_lines = [line for line in ir.splitlines() if "amdg.buffer_load" in line]
+    assert len(load_lines) == 3
+    for line in load_lines:
+        before_valid_bytes = line.split(" validBytes", maxsplit=1)[0]
+        assert ", %" in before_valid_bytes
+
+
+def test_block_full_aiter_aligned_uses_descriptor_bounds_without_load_masks() -> None:
+    mod = _parse_aiter_kernel(_rmsnorm_block_full_aiter_aligned_kernel)
+    ir = mod.str_nodebug()
+
+    assert ir.count("validBytes =") == 3
+    assert "amdg.buffer_load" in ir
+    assert "tt.addptr" in ir
+    load_lines = [line for line in ir.splitlines() if "amdg.buffer_load" in line]
+    assert len(load_lines) == 3
+    for line in load_lines:
+        before_valid_bytes = line.split(" validBytes", maxsplit=1)[0]
+        assert ", %" not in before_valid_bytes
