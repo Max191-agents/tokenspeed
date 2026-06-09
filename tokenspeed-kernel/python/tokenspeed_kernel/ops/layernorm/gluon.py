@@ -32,9 +32,7 @@ _CDNA4_CAPABILITY = CapabilityRequirement(
     max_arch_version=ArchVersion(9, 5),
     vendors=frozenset({"amd"}),
 )
-_RMSNORM_SIGNATURES = format_signatures(
-    "x", "dense", {torch.float16, torch.bfloat16}
-)
+_RMSNORM_SIGNATURES = format_signatures("x", "dense", {torch.float16, torch.bfloat16})
 
 
 def _contiguous_elements(tensor: torch.Tensor) -> int:
@@ -57,6 +55,14 @@ def _select_rows_per_cta(n_rows: int, target_workgroups: int = 512) -> int:
 
 def _select_initial_pipeline_groups(rows_per_cta: int, num_buffers: int) -> int:
     return min(rows_per_cta, num_buffers)
+
+
+def _validate_pipelined_row_mapping(row_mapping: str) -> None:
+    if row_mapping not in {"contiguous", "interleaved"}:
+        raise ValueError(
+            "row_mapping must be either 'contiguous' or 'interleaved', "
+            f"got {row_mapping!r}"
+        )
 
 
 @gluon.jit
@@ -261,9 +267,9 @@ def _rmsnorm_block_full_aiter_aligned_kernel(
     row_offsets = row_start + row_cols
     row_offsets = gl.max_contiguous(row_offsets, ROW_CONTIGUITY)
 
-    x = gl.amd.cdna4.buffer_load(
-        ptr=row_desc, offsets=row_cols, cache=".cs"
-    ).to(gl.float32)
+    x = gl.amd.cdna4.buffer_load(ptr=row_desc, offsets=row_cols, cache=".cs").to(
+        gl.float32
+    )
     if HAS_RESIDUAL:
         residual_row_ptr = residual_ptr + row_start
         residual_desc = gl.amd.cdna4.make_buffer_descriptor(
@@ -283,9 +289,9 @@ def _rmsnorm_block_full_aiter_aligned_kernel(
 
     variance = gl.sum(x * x, axis=0) / n_cols
     rstd = gl.rsqrt(variance + eps)
-    weight = gl.amd.cdna4.buffer_load(
-        ptr=weight_desc, offsets=weight_offsets
-    ).to(gl.float32)
+    weight = gl.amd.cdna4.buffer_load(ptr=weight_desc, offsets=weight_offsets).to(
+        gl.float32
+    )
     out = x * rstd * weight
     gl.amd.cdna4.buffer_store(
         stored_value=out.to(out_ptr.dtype.element_ty),
@@ -305,9 +311,11 @@ def _rmsnorm_block_full_aiter_pipelined_aligned_kernel(
     n_cols: gl.constexpr,
     eps: gl.constexpr,
     BLOCK: gl.constexpr,
+    NUM_TILES: gl.constexpr,
     ROWS_PER_CTA: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     INITIAL_GROUPS: gl.constexpr,
+    INTERLEAVED_ROWS: gl.constexpr,
     ROW_CONTIGUITY: gl.constexpr,
     WEIGHT_CONTIGUITY: gl.constexpr,
     ROW_ALIGNMENT: gl.constexpr,
@@ -328,7 +336,10 @@ def _rmsnorm_block_full_aiter_pipelined_aligned_kernel(
 
     for preload_offset in gl.static_range(0, NUM_BUFFERS):
         if preload_offset < ROWS_PER_CTA:
-            preload_row = base_row + preload_offset
+            if INTERLEAVED_ROWS:
+                preload_row = tile + preload_offset * NUM_TILES
+            else:
+                preload_row = base_row + preload_offset
             preload_row_start = preload_row * n_cols
             preload_row_start = gl.multiple_of(preload_row_start, ROW_ALIGNMENT)
             preload_row_ptr = x_ptr + preload_row_start
@@ -344,9 +355,9 @@ def _rmsnorm_block_full_aiter_pipelined_aligned_kernel(
             gl.amd.cdna4.async_copy.commit_group()
 
     weight_desc = gl.amd.cdna4.make_buffer_descriptor(weight_ptr, (n_cols,), (1,))
-    weight = gl.amd.cdna4.buffer_load(
-        ptr=weight_desc, offsets=weight_offsets
-    ).to(gl.float32)
+    weight = gl.amd.cdna4.buffer_load(ptr=weight_desc, offsets=weight_offsets).to(
+        gl.float32
+    )
 
     gl.amd.cdna4.async_copy.wait_group(INITIAL_GROUPS - 1)
 
@@ -355,8 +366,12 @@ def _rmsnorm_block_full_aiter_pipelined_aligned_kernel(
     )
 
     for row_offset in gl.static_range(0, ROWS_PER_CTA):
-        row = base_row + row_offset
-        prefetch_row = row + NUM_BUFFERS
+        if INTERLEAVED_ROWS:
+            row = tile + row_offset * NUM_TILES
+            prefetch_row = tile + (row_offset + NUM_BUFFERS) * NUM_TILES
+        else:
+            row = base_row + row_offset
+            prefetch_row = row + NUM_BUFFERS
         if row_offset + NUM_BUFFERS < ROWS_PER_CTA:
             prefetch_row_start = prefetch_row * n_cols
             prefetch_row_start = gl.multiple_of(prefetch_row_start, ROW_ALIGNMENT)
@@ -391,9 +406,7 @@ def _rmsnorm_block_full_aiter_pipelined_aligned_kernel(
             if row_offset + NUM_BUFFERS < ROWS_PER_CTA:
                 gl.amd.cdna4.async_copy.wait_group(NUM_BUFFERS - 1)
             else:
-                gl.amd.cdna4.async_copy.wait_group(
-                    ROWS_PER_CTA - row_offset - 2
-                )
+                gl.amd.cdna4.async_copy.wait_group(ROWS_PER_CTA - row_offset - 2)
             x = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 smem.index((row_offset + 1) % NUM_BUFFERS), layout
             ).to(gl.float32)
@@ -654,8 +667,7 @@ def _rmsnorm_block_full_aiter(
     layout = gl.BlockedLayout([size_per_thread], [64], [num_warps], [0])
     kernel = (
         _rmsnorm_block_full_aiter_aligned_kernel
-        if hidden_size % row_contiguity == 0
-        and hidden_size % weight_contiguity == 0
+        if hidden_size % row_contiguity == 0 and hidden_size % weight_contiguity == 0
         else _rmsnorm_block_full_aiter_kernel
     )
     kernel[(x_2d.shape[0],)](
@@ -690,6 +702,7 @@ def _rmsnorm_block_full_aiter_pipelined(
     size_per_thread: int = 8,
     target_workgroups: int = 512,
     num_buffers: int = 2,
+    row_mapping: str = "contiguous",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if x.shape[0] == 0:
         if residual is None:
@@ -701,6 +714,7 @@ def _rmsnorm_block_full_aiter_pipelined(
         )
     if num_buffers <= 0:
         raise ValueError(f"num_buffers must be positive, got {num_buffers}")
+    _validate_pipelined_row_mapping(row_mapping)
     if residual is not None:
         return _rmsnorm_block_full_aiter(
             x,
@@ -748,9 +762,8 @@ def _rmsnorm_block_full_aiter_pipelined(
 
     block = triton.next_power_of_2(hidden_size)
     layout = gl.BlockedLayout([size_per_thread], [64], [num_warps], [0])
-    _rmsnorm_block_full_aiter_pipelined_aligned_kernel[
-        (triton.cdiv(x_2d.shape[0], rows_per_cta),)
-    ](
+    num_tiles = triton.cdiv(x_2d.shape[0], rows_per_cta)
+    _rmsnorm_block_full_aiter_pipelined_aligned_kernel[(num_tiles,)](
         x_2d,
         x_2d,
         weight,
@@ -759,9 +772,11 @@ def _rmsnorm_block_full_aiter_pipelined(
         hidden_size,
         eps,
         BLOCK=block,
+        NUM_TILES=num_tiles,
         ROWS_PER_CTA=rows_per_cta,
         NUM_BUFFERS=num_buffers,
         INITIAL_GROUPS=initial_groups,
+        INTERLEAVED_ROWS=row_mapping == "interleaved",
         ROW_CONTIGUITY=row_contiguity,
         WEIGHT_CONTIGUITY=weight_contiguity,
         ROW_ALIGNMENT=row_alignment,
@@ -925,6 +940,34 @@ def rmsnorm_block_full_aiter_pipelined(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     return _rmsnorm_block_full_aiter_pipelined(
         x, weight, eps, residual=residual, out=out
+    )
+
+
+@register_kernel(
+    "norm",
+    "rmsnorm",
+    name="gluon_rmsnorm_block_full_aiter_pipelined_interleaved",
+    solution="gluon",
+    capability=_CDNA4_CAPABILITY,
+    signatures=_RMSNORM_SIGNATURES,
+    traits={},
+    priority=Priority.SPECIALIZED,
+    tags={"latency", "block_full", "aiter", "pipelined", "interleaved"},
+)
+def rmsnorm_block_full_aiter_pipelined_interleaved(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    return _rmsnorm_block_full_aiter_pipelined(
+        x,
+        weight,
+        eps,
+        residual=residual,
+        out=out,
+        row_mapping="interleaved",
     )
 
 

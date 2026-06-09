@@ -6,6 +6,7 @@ from tokenspeed_kernel.ops.layernorm.gluon import (
     _rmsnorm_block_full_aiter_pipelined,
     rmsnorm as gluon_rmsnorm,
     rmsnorm_block_full_aiter as gluon_rmsnorm_block_full_aiter,
+    rmsnorm_block_full_aiter_pipelined_interleaved as gluon_rmsnorm_block_full_aiter_pipelined_interleaved,
     rmsnorm_block_full_aiter_pipelined as gluon_rmsnorm_block_full_aiter_pipelined,
     rmsnorm_block_full as gluon_rmsnorm_block_full,
     rmsnorm_streaming_block as gluon_rmsnorm_streaming_block,
@@ -203,11 +204,34 @@ def test_gluon_rmsnorm_block_full_aiter_pipelined_large_tile(
 
 @pytest.mark.skipif(
     not platform.is_cdna4,
+    reason="Gluon RMSNorm interleaved pipelined coverage requires AMD CDNA4.",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("weight_dtype_mode", ["float32", "input"])
+def test_gluon_rmsnorm_block_full_aiter_pipelined_interleaved_large_tile(
+    dtype: torch.dtype,
+    weight_dtype_mode: str,
+    device: str,
+) -> None:
+    eps = 1e-6
+    x = torch.randn(4096, 2880, device=device, dtype=dtype)
+    weight_dtype = torch.float32 if weight_dtype_mode == "float32" else dtype
+    weight = torch.randn(2880, device=device, dtype=weight_dtype)
+
+    result = gluon_rmsnorm_block_full_aiter_pipelined_interleaved(x, weight, eps)
+
+    _assert_rmsnorm_matches_ref(result, x, weight, eps, None, dtype)
+
+
+@pytest.mark.skipif(
+    not platform.is_cdna4,
     reason="Gluon RMSNorm pipelined AITER-style coverage requires AMD CDNA4.",
 )
 @pytest.mark.parametrize("num_buffers", [1, 2, 3, 4])
+@pytest.mark.parametrize("row_mapping", ["contiguous", "interleaved"])
 def test_gluon_rmsnorm_block_full_aiter_pipelined_buffer_counts(
     num_buffers: int,
+    row_mapping: str,
     device: str,
 ) -> None:
     eps = 1e-6
@@ -220,6 +244,7 @@ def test_gluon_rmsnorm_block_full_aiter_pipelined_buffer_counts(
         weight,
         eps,
         num_buffers=num_buffers,
+        row_mapping=row_mapping,
     )
 
     _assert_rmsnorm_matches_ref(result, x, weight, eps, None, torch.bfloat16)

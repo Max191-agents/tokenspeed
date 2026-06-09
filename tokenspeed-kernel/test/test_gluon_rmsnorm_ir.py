@@ -44,7 +44,12 @@ def _parse_aiter_kernel(kernel):
     )
 
 
-def _parse_pipelined_aiter_kernel(rows_per_cta: int = 4, num_buffers: int = 2):
+def _parse_pipelined_aiter_kernel(
+    rows_per_cta: int = 4,
+    num_buffers: int = 2,
+    *,
+    interleaved_rows: bool = False,
+):
     if not hasattr(gl.amd.cdna4, "make_buffer_descriptor"):
         pytest.skip("custom tokenspeed_triton descriptor build is not installed")
 
@@ -61,9 +66,11 @@ def _parse_pipelined_aiter_kernel(rows_per_cta: int = 4, num_buffers: int = 2):
             2880,
             1e-6,
             4096,
+            512,
             rows_per_cta,
             num_buffers,
             min(rows_per_cta, num_buffers),
+            interleaved_rows,
             8,
             8,
             8,
@@ -149,7 +156,27 @@ def test_block_full_aiter_pipelined_uses_async_lds_pipeline(
         if "amdg.buffer_load " in line and "buffer_load_to_local" not in line
     )
     prologue_commits = [
-        i for i, line in enumerate(lines[:first_wait]) if "ttg.async_commit_group" in line
+        i
+        for i, line in enumerate(lines[:first_wait])
+        if "ttg.async_commit_group" in line
     ]
     assert len(prologue_commits) == initial_groups
     assert prologue_commits[-1] < first_weight_load < first_wait
+
+
+def test_block_full_aiter_pipelined_interleaved_strides_rows_by_grid() -> None:
+    contiguous_ir = _parse_pipelined_aiter_kernel(
+        rows_per_cta=4,
+        num_buffers=2,
+        interleaved_rows=False,
+    ).str_nodebug()
+    interleaved_ir = _parse_pipelined_aiter_kernel(
+        rows_per_cta=4,
+        num_buffers=2,
+        interleaved_rows=True,
+    ).str_nodebug()
+
+    assert "c512_i32" not in contiguous_ir
+    assert "c512_i32" in interleaved_ir
+    assert "c1024_i32" in interleaved_ir
+    assert "c1536_i32" in interleaved_ir

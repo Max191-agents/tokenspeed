@@ -58,7 +58,7 @@ _TOLERANCE = 2e-2
 class Candidate:
     name: str
     strategy: str
-    params: dict[str, int]
+    params: dict[str, Any]
     launcher: Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]
 
     def run(
@@ -123,6 +123,7 @@ def _make_block_full_aiter_pipelined_launcher(
     size_per_thread: int,
     target_workgroups: int,
     num_buffers: int,
+    row_mapping: str = "contiguous",
 ) -> Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
     def launcher(
         x: torch.Tensor,
@@ -139,6 +140,7 @@ def _make_block_full_aiter_pipelined_launcher(
             size_per_thread=size_per_thread,
             target_workgroups=target_workgroups,
             num_buffers=num_buffers,
+            row_mapping=row_mapping,
         )
 
     return launcher
@@ -262,6 +264,52 @@ def build_default_candidates(
                 ),
             )
         )
+
+    for num_buffers in (2, 3):
+        candidates.append(
+            Candidate(
+                f"block_full_aiter_pipelined_spt8_w4_twg1024_b{num_buffers}",
+                "block_full_aiter_pipelined",
+                {
+                    "num_warps": 4,
+                    "size_per_thread": 8,
+                    "target_workgroups": 1024,
+                    "num_buffers": num_buffers,
+                },
+                _make_block_full_aiter_pipelined_launcher(
+                    num_warps=4,
+                    size_per_thread=8,
+                    target_workgroups=1024,
+                    num_buffers=num_buffers,
+                ),
+            )
+        )
+
+    for target_workgroups in (512, 1024):
+        for num_buffers in (2, 3):
+            candidates.append(
+                Candidate(
+                    (
+                        "block_full_aiter_pipelined_interleaved_"
+                        f"spt8_w4_twg{target_workgroups}_b{num_buffers}"
+                    ),
+                    "block_full_aiter_pipelined_interleaved",
+                    {
+                        "num_warps": 4,
+                        "size_per_thread": 8,
+                        "target_workgroups": target_workgroups,
+                        "num_buffers": num_buffers,
+                        "row_mapping": "interleaved",
+                    },
+                    _make_block_full_aiter_pipelined_launcher(
+                        num_warps=4,
+                        size_per_thread=8,
+                        target_workgroups=target_workgroups,
+                        num_buffers=num_buffers,
+                        row_mapping="interleaved",
+                    ),
+                )
+            )
 
     for size_per_thread in size_per_thread_values:
         for num_warps in (1, 2, 4, 8):
@@ -490,9 +538,7 @@ def _time_candidate(
             candidate.run(**inputs)
     torch.cuda.synchronize()
 
-    start_events = [
-        torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)
-    ]
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)]
     with torch.no_grad():
         for i in range(bench_iters):
@@ -635,7 +681,9 @@ def format_tuning_report(results: list[dict[str, Any]], *, top_k: int = 5) -> st
 
         errors = [item for item in grouped[key] if item["error"]]
         for item in errors[:top_k]:
-            lines.append(f"{item['candidate']},{item['strategy']},ERROR,{item['error']}")
+            lines.append(
+                f"{item['candidate']},{item['strategy']},ERROR,{item['error']}"
+            )
 
     return "\n".join(lines).lstrip()
 
