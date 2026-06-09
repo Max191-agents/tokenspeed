@@ -19,7 +19,7 @@ def _parse_aiter_kernel(kernel):
     if not hasattr(gl.amd.cdna4, "make_buffer_descriptor"):
         pytest.skip("custom tokenspeed_triton descriptor build is not installed")
 
-    layout = gl.BlockedLayout([16], [64], [4], [0])
+    layout = gl.BlockedLayout([8], [64], [4], [0])
     dtype = gl.bfloat16
     return run_parser(
         kernel,
@@ -33,9 +33,9 @@ def _parse_aiter_kernel(kernel):
             1e-6,
             4096,
             True,
-            16,
-            16,
-            16,
+            8,
+            8,
+            8,
             layout,
         ),
         {},
@@ -59,6 +59,7 @@ def test_block_full_aiter_general_uses_descriptor_bounds_with_load_masks() -> No
     ir = mod.str_nodebug()
 
     assert ir.count("validBytes =") == 3
+    assert "sizePerThread = [8]" in ir
     assert "amdg.buffer_load" in ir
     assert "tt.addptr" in ir
     load_lines = [line for line in ir.splitlines() if "amdg.buffer_load" in line]
@@ -74,6 +75,7 @@ def test_block_full_aiter_aligned_uses_descriptor_bounds_without_load_masks() ->
     ir = mod.str_nodebug()
 
     assert ir.count("validBytes =") == 3
+    assert "sizePerThread = [8]" in ir
     assert "amdg.buffer_load" in ir
     assert "tt.addptr" in ir
     load_lines = [line for line in ir.splitlines() if "amdg.buffer_load" in line]

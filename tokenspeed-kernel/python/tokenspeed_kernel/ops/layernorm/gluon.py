@@ -499,7 +499,7 @@ def _rmsnorm_block_full_aiter(
     out: torch.Tensor | None = None,
     *,
     num_warps: int = 4,
-    size_per_thread: int = 16,
+    size_per_thread: int = 8,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if x.shape[0] == 0:
         if residual is None:
