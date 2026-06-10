@@ -387,7 +387,7 @@ def test_rmsnorm_tuning_candidate_names_are_unique():
     names = [candidate.name for candidate in candidates]
 
     assert len(names) == len(set(names))
-    assert len(names) == 98
+    assert len(names) == 118
     assert "triton_rmsnorm" in names
     assert "gluon_rmsnorm" in names
     assert "block_full_aiter_spt16_w4" in names
@@ -406,6 +406,11 @@ def test_rmsnorm_tuning_candidate_names_are_unique():
     assert "block_full_spt4_w4" in names
     assert "block_full_spt8_w4" in names
     assert "block_full_spt16_w4" in names
+    assert "triton_like_w4" in names
+    assert "triton_like_spt2_w4" in names
+    assert "triton_like_spt4_w4" in names
+    assert "triton_like_spt8_w4" in names
+    assert "triton_like_spt16_w4" in names
     assert "wave_row_spt1" in names
     assert "stream_c1024_w4" in names
     assert "stream_c1024_spt2_w4" in names

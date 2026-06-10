@@ -8,6 +8,7 @@ from tokenspeed_kernel.ops.layernorm.gluon import (
     _rmsnorm_block_full_aiter_aligned_kernel,
     _rmsnorm_block_full_aiter_kernel,
     _rmsnorm_block_full_aiter_pipelined_aligned_kernel,
+    _rmsnorm_triton_like_kernel,
 )
 
 
@@ -74,6 +75,28 @@ def _parse_pipelined_aiter_kernel(
             8,
             8,
             8,
+            layout,
+        ),
+        {},
+        target=GPUTarget("hip", "gfx950", 64),
+    )
+
+
+def _parse_triton_like_kernel():
+    layout = gl.BlockedLayout([8], [64], [4], [0])
+    dtype = gl.bfloat16
+    return run_parser(
+        _rmsnorm_triton_like_kernel,
+        (
+            MockTensor(dtype),
+            MockTensor(dtype),
+            MockTensor(dtype),
+            MockTensor(dtype),
+            MockTensor(dtype),
+            2880,
+            1e-6,
+            4096,
+            True,
             layout,
         ),
         {},
@@ -180,3 +203,22 @@ def test_block_full_aiter_pipelined_interleaved_strides_rows_by_grid() -> None:
     assert "c512_i32" in interleaved_ir
     assert "c1024_i32" in interleaved_ir
     assert "c1536_i32" in interleaved_ir
+
+
+def test_triton_like_uses_pointer_loads_without_descriptor_or_async_copy() -> None:
+    mod = _parse_triton_like_kernel()
+    ir = mod.str_nodebug()
+
+    assert "tt.load" in ir
+    assert "tt.store" in ir
+    assert "amdg.buffer_load" not in ir
+    assert "amdg.buffer_load_to_local" not in ir
+    assert "validBytes =" not in ir
+
+    lines = ir.splitlines()
+    load_indices = [i for i, line in enumerate(lines) if "tt.load" in line]
+    rstd_index = next(i for i, line in enumerate(lines) if "math.rsqrt" in line)
+    assert len(load_indices) == 3
+    assert load_indices[0] < rstd_index
+    assert load_indices[1] < rstd_index
+    assert load_indices[2] > rstd_index

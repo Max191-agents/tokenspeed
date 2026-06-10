@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.layernorm.gluon import (
     _rmsnorm_block_full_aiter_pipelined,
     _rmsnorm_block_full,
     _rmsnorm_streaming_block,
+    _rmsnorm_triton_like,
     _rmsnorm_wave_row,
     rmsnorm as gluon_rmsnorm,
 )
@@ -83,6 +84,29 @@ def _make_block_full_launcher(
         residual: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return _rmsnorm_block_full(
+            x,
+            weight,
+            eps,
+            residual=residual,
+            num_warps=num_warps,
+            size_per_thread=size_per_thread,
+        )
+
+    return launcher
+
+
+def _make_triton_like_launcher(
+    *,
+    num_warps: int,
+    size_per_thread: int,
+) -> Callable[..., torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+    def launcher(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return _rmsnorm_triton_like(
             x,
             weight,
             eps,
@@ -196,6 +220,12 @@ def _block_full_candidate_name(num_warps: int, size_per_thread: int) -> str:
     if size_per_thread == 1:
         return f"block_full_w{num_warps}"
     return f"block_full_spt{size_per_thread}_w{num_warps}"
+
+
+def _triton_like_candidate_name(num_warps: int, size_per_thread: int) -> str:
+    if size_per_thread == 1:
+        return f"triton_like_w{num_warps}"
+    return f"triton_like_spt{size_per_thread}_w{num_warps}"
 
 
 def _streaming_block_candidate_name(
@@ -322,6 +352,23 @@ def build_default_candidates(
                         "size_per_thread": size_per_thread,
                     },
                     _make_block_full_launcher(
+                        num_warps=num_warps,
+                        size_per_thread=size_per_thread,
+                    ),
+                )
+            )
+
+    for size_per_thread in size_per_thread_values:
+        for num_warps in (1, 2, 4, 8):
+            candidates.append(
+                Candidate(
+                    _triton_like_candidate_name(num_warps, size_per_thread),
+                    "triton_like",
+                    {
+                        "num_warps": num_warps,
+                        "size_per_thread": size_per_thread,
+                    },
+                    _make_triton_like_launcher(
                         num_warps=num_warps,
                         size_per_thread=size_per_thread,
                     ),

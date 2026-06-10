@@ -10,6 +10,7 @@ from tokenspeed_kernel.ops.layernorm.gluon import (
     rmsnorm_block_full_aiter_pipelined as gluon_rmsnorm_block_full_aiter_pipelined,
     rmsnorm_block_full as gluon_rmsnorm_block_full,
     rmsnorm_streaming_block as gluon_rmsnorm_streaming_block,
+    rmsnorm_triton_like as gluon_rmsnorm_triton_like,
     rmsnorm_wave_row as gluon_rmsnorm_wave_row,
 )
 from tokenspeed_kernel.ops.layernorm.triton import (
@@ -143,6 +144,40 @@ def test_gluon_rmsnorm_block_full_shapes(
     weight = torch.randn(hidden_size, device=device, dtype=torch.float32)
 
     result = gluon_rmsnorm_block_full(x, weight, eps, residual=residual)
+
+    _assert_rmsnorm_matches_ref(result, x, weight, eps, residual, dtype)
+
+
+@pytest.mark.skipif(
+    not platform.is_cdna4,
+    reason="Gluon RMSNorm Triton-like coverage requires AMD CDNA4.",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size",
+    [(1, 2880), (32, 2880), (1024, 2880), (11, 2897)],
+)
+@pytest.mark.parametrize("has_residual", [False, True])
+@pytest.mark.parametrize("weight_dtype_mode", ["float32", "input"])
+def test_gluon_rmsnorm_triton_like_shapes(
+    dtype: torch.dtype,
+    num_tokens: int,
+    hidden_size: int,
+    has_residual: bool,
+    weight_dtype_mode: str,
+    device: str,
+) -> None:
+    eps = 1e-6
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
+    residual = (
+        torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
+        if has_residual
+        else None
+    )
+    weight_dtype = torch.float32 if weight_dtype_mode == "float32" else dtype
+    weight = torch.randn(hidden_size, device=device, dtype=weight_dtype)
+
+    result = gluon_rmsnorm_triton_like(x, weight, eps, residual=residual)
 
     _assert_rmsnorm_matches_ref(result, x, weight, eps, residual, dtype)
 
