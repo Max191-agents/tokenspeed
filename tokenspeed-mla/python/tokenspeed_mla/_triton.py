@@ -20,33 +20,11 @@
 
 """Triton vendor-package indirection used by the standalone MLA package."""
 
-import importlib
-import os
-
-_TRITON_DEFAULT_PACKAGE = "tokenspeed_triton"
-_TRITON_PACKAGE_ENV = "TOKENSPEED_TRITON_PACKAGE"
-_TRITON_DST = os.environ.get(_TRITON_PACKAGE_ENV, _TRITON_DEFAULT_PACKAGE).strip()
-if not _TRITON_DST:
-    _TRITON_DST = _TRITON_DEFAULT_PACKAGE
-
-
-def _import_triton_module(suffix: str = ""):
-    module_name = _TRITON_DST if not suffix else f"{_TRITON_DST}.{suffix}"
-    try:
-        return importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            f"Unable to import Triton package {module_name!r}. "
-            f"Set {_TRITON_PACKAGE_ENV} to the import package that provides the "
-            "Triton API, or install the default tokenspeed_triton package."
-        ) from exc
-
-
-triton = _import_triton_module()
-tl = _import_triton_module("language")
+import tokenspeed_triton as triton
+from tokenspeed_triton import language as tl
 
 try:
-    TensorDescriptor = _import_triton_module("tools.tensor_descriptor").TensorDescriptor
+    from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 except ImportError:
     TensorDescriptor = None
 

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import pytest
 import tokenspeed_kernel.benchmark.cli as benchmark_cli
-import tokenspeed_kernel.benchmark.rmsnorm_tuning as rmsnorm_tuning
 import tokenspeed_kernel.benchmark.runner as benchmark_runner_module
 import tokenspeed_kernel.numerics.gemm  # noqa: F401
 import torch
@@ -351,90 +350,6 @@ def test_rmsnorm_throughput_missing_shape_returns_none():
 
     assert tflops is None
     assert bandwidth is None
-
-
-def test_rmsnorm_tuning_builds_gpt_oss_shapes():
-    shapes = rmsnorm_tuning.build_shapes(
-        [1, 32, 64],
-        2880,
-        include_odd=True,
-        odd_hidden_size=2897,
-    )
-
-    assert {"num_tokens": 1, "hidden_size": 2880, "residual": False} in shapes
-    assert {"num_tokens": 64, "hidden_size": 2880, "residual": True} in shapes
-    assert {"num_tokens": 11, "hidden_size": 2897, "residual": False} in shapes
-    assert {"num_tokens": 11, "hidden_size": 2897, "residual": True} in shapes
-    assert len(shapes) == 8
-
-
-def test_rmsnorm_tuning_make_inputs_uses_weight_dtype():
-    inputs = rmsnorm_tuning._make_inputs(
-        {"num_tokens": 2, "hidden_size": 16, "residual": True},
-        torch.bfloat16,
-        weight_dtype=torch.bfloat16,
-        seed=42,
-        device="cpu",
-    )
-
-    assert inputs["x"].dtype == torch.bfloat16
-    assert inputs["weight"].dtype == torch.bfloat16
-    assert inputs["residual"].dtype == torch.bfloat16
-
-
-def test_rmsnorm_tuning_candidate_names_are_unique():
-    candidates = rmsnorm_tuning.build_default_candidates()
-    names = [candidate.name for candidate in candidates]
-
-    assert len(names) == len(set(names))
-    assert len(names) == 118
-    assert "triton_rmsnorm" in names
-    assert "gluon_rmsnorm" in names
-    assert "block_full_aiter_spt16_w4" in names
-    assert "block_full_aiter_pipelined_spt8_w4_twg512" in names
-    assert "block_full_aiter_pipelined_spt8_w4_twg512_b1" in names
-    assert "block_full_aiter_pipelined_spt8_w4_twg512_b3" in names
-    assert "block_full_aiter_pipelined_spt8_w4_twg512_b4" in names
-    assert "block_full_aiter_pipelined_spt8_w4_twg1024_b2" in names
-    assert "block_full_aiter_pipelined_spt8_w4_twg1024_b3" in names
-    assert "block_full_aiter_pipelined_interleaved_spt8_w4_twg512_b2" in names
-    assert "block_full_aiter_pipelined_interleaved_spt8_w4_twg512_b3" in names
-    assert "block_full_aiter_pipelined_interleaved_spt8_w4_twg1024_b2" in names
-    assert "block_full_aiter_pipelined_interleaved_spt8_w4_twg1024_b3" in names
-    assert "block_full_w4" in names
-    assert "block_full_spt2_w4" in names
-    assert "block_full_spt4_w4" in names
-    assert "block_full_spt8_w4" in names
-    assert "block_full_spt16_w4" in names
-    assert "triton_like_w4" in names
-    assert "triton_like_spt2_w4" in names
-    assert "triton_like_spt4_w4" in names
-    assert "triton_like_spt8_w4" in names
-    assert "triton_like_spt16_w4" in names
-    assert "wave_row_spt1" in names
-    assert "stream_c1024_w4" in names
-    assert "stream_c1024_spt2_w4" in names
-    assert "stream_c1024_spt4_w4" in names
-    assert "stream_c1024_spt8_w4" in names
-    assert "stream_c1024_spt16_w4" in names
-
-
-def test_rmsnorm_tuning_default_spt_values_are_dtype_aware():
-    assert rmsnorm_tuning.default_size_per_thread_values(torch.float32) == (1, 2, 4, 8)
-    assert rmsnorm_tuning.default_size_per_thread_values(torch.float16) == (
-        1,
-        2,
-        4,
-        8,
-        16,
-    )
-    assert rmsnorm_tuning.default_size_per_thread_values(torch.bfloat16) == (
-        1,
-        2,
-        4,
-        8,
-        16,
-    )
 
 
 def test_benchmark_config_rejects_invalid_proton_data():
