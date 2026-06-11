@@ -285,14 +285,15 @@ def shuffle_weight_for_gluon_dot_layout(
             f"be a positive multiple of {_GLUON_DOT_N_LANE} (MFMA "
             f"N_LANE); got {block_n}."
         )
-    # W_VIA_VGPR drops the n-mask, so N must be block_n-aligned. The
-    # combine GEMM pads W + W-scale at the backend before this helper
-    # sees the tensor; we still assert here to catch unaligned callers.
+    # The preshuffled W path uses tile-level predicates instead of a full
+    # per-element N mask, so N must be block_n-aligned. The combine GEMM pads
+    # W + W-scale at the backend before this helper sees the tensor; we still
+    # assert here to catch unaligned callers.
     if N % block_n != 0:
         raise ValueError(
             f"shuffle_weight_for_gluon_dot_layout requires N "
             f"divisible by block_n={block_n} (got N={N}); the kernel's "
-            f"W_VIA_VGPR path assumes block_n-aligned N. Pad the raw W "
+            f"preshuffled W path assumes block_n-aligned N. Pad the raw W "
             f"and its e8m0 W-scale at the backend layer (W with zeros, "
             f"scale with 127 = identity) BEFORE calling "
             f"``swizzle_mxfp4`` and this helper; trim the kernel "
@@ -581,6 +582,7 @@ class MoEConfig:
     DTYPE_W: gl.constexpr
 
     W_TRANSPOSE: gl.constexpr
+    W_PRESHUFFLED: gl.constexpr
     W_VIA_VGPR: gl.constexpr
     W_PREFETCH: gl.constexpr
     NUM_BUFFERS: gl.constexpr
@@ -640,6 +642,7 @@ class MoEConfig:
         EVEN_K=True,
         USE_GATHER=False,
         NUM_WARPS=4,
+        W_PRESHUFFLED=False,
         W_VIA_VGPR=False,
         W_PREFETCH=True,
     ):
@@ -653,6 +656,7 @@ class MoEConfig:
         self.BLOCK_K = gl.constexpr(BLOCK_K)
         self.NUM_BUFFERS = gl.constexpr(NUM_BUFFERS)
         self.W_TRANSPOSE = gl.constexpr(W_TRANSPOSE)
+        self.W_PRESHUFFLED = gl.constexpr(W_PRESHUFFLED)
         self.W_VIA_VGPR = gl.constexpr(W_VIA_VGPR)
         self.W_PREFETCH = gl.constexpr(W_PREFETCH)
         self.WITH_X_MX_SCALE = gl.constexpr(WITH_X_MX_SCALE)
@@ -702,7 +706,7 @@ class MoEConfig:
             self.USE_MFMA_SCALED,
             scale_preshuffle=_scale_via_lds,
             block_m=BLOCK_M,
-            w_via_vgpr=W_VIA_VGPR,
+            w_via_vgpr=W_VIA_VGPR or W_PRESHUFFLED,
         )
 
         DOT_K_WIDTH_X: gl.constexpr = 16 if self.USE_MFMA_SCALED else 8
@@ -758,7 +762,9 @@ class MoEConfig:
                 [BLOCK_M, BLOCK_K_PACKED_X_HOST],
             )
         )
-        if W_TRANSPOSE:
+        if W_PRESHUFFLED:
+            w_shape = [BLOCK_N // 16, BLOCK_K_PACKED_W_HOST * 16]
+        elif W_TRANSPOSE:
             w_shape = [BLOCK_N, BLOCK_K_PACKED_W_HOST]
         else:
             w_shape = [BLOCK_K_PACKED_W_HOST, BLOCK_N]
@@ -771,7 +777,9 @@ class MoEConfig:
             )
         )
 
-        if W_TRANSPOSE:
+        if W_PRESHUFFLED:
+            w_half_shape = [BLOCK_N // 2 // 16, BLOCK_K_PACKED_W_HOST * 16]
+        elif W_TRANSPOSE:
             w_half_shape = [BLOCK_N // 2, BLOCK_K_PACKED_W_HOST]
         else:
             w_half_shape = [BLOCK_K_PACKED_W_HOST, BLOCK_N // 2]
@@ -1148,6 +1156,87 @@ class WVgprDescriptor:
         return gl.convert_layout(tile_t, dot_layout, assert_trivial=True)
 
 
+@gluon.aggregate
+class WPreshuffledLdsDescriptor:
+    cfg: MoEConfig
+    ptr: gl.tensor
+    dtype: gl.constexpr
+    stride_k: gl.tensor  # = N bytes between consecutive K slabs.
+    offsets: gl.tensor  # [LOAD_BN//16, BLOCK_K*16] in preshuffled tile order.
+    pred: gl.tensor
+    BLOCK_K: gl.constexpr
+    LOAD_BN: gl.constexpr
+    load_layout: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(
+        self,
+        cfg: MoEConfig,
+        BLOCK_K,
+        ptr,
+        dtype,
+        stride_k,
+        offsets,
+        pred,
+        load_layout,
+        LOAD_BN=None,
+    ):
+        self.cfg = cfg
+        self.BLOCK_K = gl.constexpr(BLOCK_K)
+        self.LOAD_BN = gl.constexpr(LOAD_BN if LOAD_BN is not None else cfg.BLOCK_N)
+        self.ptr = ptr
+        self.dtype = gl.constexpr(dtype)
+        self.stride_k = stride_k
+        self.offsets = offsets
+        self.pred = pred
+        self.load_layout = gl.constexpr(load_layout)
+
+    @gluon.jit
+    def issue_async_load(
+        self,
+        idx,
+        buffer,
+        pred=1,
+        USE_MASK: gl.constexpr = -1,
+        COMMIT: gl.constexpr = 1,
+    ):
+        NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
+        k_iter_offset = idx * self.BLOCK_K * self.stride_k
+        offsets = self.offsets + k_iter_offset
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            buffer.index(idx % NUM_BUFFERS),
+            self.ptr,
+            offsets,
+            mask=self.pred,
+        )
+        if COMMIT == 1:
+            gl.amd.cdna4.async_copy.commit_group()
+
+    @gluon.jit
+    def issue_local_load(
+        self, idx, buffer, layout: gl.constexpr, do_permute: gl.constexpr = False
+    ):
+        NUM_BUFFERS: gl.constexpr = self.cfg.NUM_BUFFERS
+        BLOCK_K_W: gl.constexpr = self.BLOCK_K
+        LOAD_BN: gl.constexpr = self.LOAD_BN
+        slot = buffer.index(idx % NUM_BUFFERS)
+        tile_flat = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            slot,
+            self.load_layout,
+        )
+        tile_5d = tile_flat.reshape(
+            LOAD_BN // 16,
+            BLOCK_K_W // 64,
+            4,
+            16,
+            16,
+        )
+        tile_perm = tile_5d.permute(0, 3, 1, 2, 4)
+        tile_2d = tile_perm.reshape(LOAD_BN, BLOCK_K_W)
+        tile_t = tile_2d.trans(1, 0)
+        return gl.convert_layout(tile_t, layout, assert_trivial=True)
+
+
 @gluon.jit
 def _load_scale_tile_via_gl_load(desc, mfma_idx):
     EVEN_K: gl.constexpr = desc.cfg.EVEN_K
@@ -1171,7 +1260,7 @@ class MoEPipelinedProgram:
     x_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
     w_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
     x_desc: AsyncCopyDescriptor
-    w_desc: AsyncCopyDescriptor | WVgprDescriptor
+    w_desc: AsyncCopyDescriptor | WVgprDescriptor | WPreshuffledLdsDescriptor
     x_scale_desc: AsyncCopyDescriptor | gl.constexpr
     w_scale_desc: AsyncCopyDescriptor | gl.constexpr
 
@@ -1222,6 +1311,12 @@ class MoEPipelinedProgram:
         # W_VIA_VGPR: skip W's LDS slot; K-loop does HBM->VGPR direct.
         if cfg.W_VIA_VGPR:
             w_buffer = gl.constexpr(0)
+        elif cfg.W_PRESHUFFLED:
+            w_buffer = gl.allocate_shared_memory(
+                w_desc.dtype,
+                shape=[NUM_BUFFERS, cfg.BLOCK_N // 16, BLOCK_K_PACKED_W * 16],
+                layout=cfg.shared_layout_w,
+            )
         else:
             w_buffer = gl.allocate_shared_memory(
                 w_desc.dtype,
@@ -1955,8 +2050,8 @@ class MoESliceNProgram:
     x_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
     w_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
     x_desc: AsyncCopyDescriptor
-    w_desc_top: AsyncCopyDescriptor | WVgprDescriptor
-    w_desc_bot: AsyncCopyDescriptor | WVgprDescriptor
+    w_desc_top: AsyncCopyDescriptor | WVgprDescriptor | WPreshuffledLdsDescriptor
+    w_desc_bot: AsyncCopyDescriptor | WVgprDescriptor | WPreshuffledLdsDescriptor
     x_scale_desc: AsyncCopyDescriptor | gl.constexpr
     w_scale_desc: AsyncCopyDescriptor | gl.constexpr
 
@@ -2017,6 +2112,25 @@ class MoESliceNProgram:
         if cfg.W_VIA_VGPR:
             w_buffer_top = gl.constexpr(0)
             w_buffer_bot = gl.constexpr(0)
+        elif cfg.W_PRESHUFFLED:
+            w_buffer_top = gl.allocate_shared_memory(
+                w_desc_top.dtype,
+                shape=[
+                    NUM_BUFFERS,
+                    cfg.BLOCK_N // 2 // 16,
+                    BLOCK_K_PACKED_W * 16,
+                ],
+                layout=cfg.shared_layout_w_half_n,
+            )
+            w_buffer_bot = gl.allocate_shared_memory(
+                w_desc_bot.dtype,
+                shape=[
+                    NUM_BUFFERS,
+                    cfg.BLOCK_N // 2 // 16,
+                    BLOCK_K_PACKED_W * 16,
+                ],
+                layout=cfg.shared_layout_w_half_n,
+            )
         else:
             w_buffer_top = gl.allocate_shared_memory(
                 w_desc_top.dtype,
@@ -2179,6 +2293,19 @@ class MoESliceNProgram:
             else:
                 w = self.w_desc_bot.issue_global_load_to_vgpr(
                     mfma_idx, cfg.dot_layout_w
+                )
+        elif cfg.W_PRESHUFFLED:
+            if subtile_idx_n == 0:
+                w = self.w_desc_top.issue_local_load(
+                    mfma_idx,
+                    self.w_buffer_top,
+                    cfg.dot_layout_w,
+                )
+            else:
+                w = self.w_desc_bot.issue_local_load(
+                    mfma_idx,
+                    self.w_buffer_bot,
+                    cfg.dot_layout_w,
                 )
         else:
             if subtile_idx_n == 0:
@@ -2379,6 +2506,7 @@ def _pipelined_moe_tile_compute(
     USE_SLICE_MN: gl.constexpr = False,
     USE_SLICE_N: gl.constexpr = False,
     HAS_FP8_QUANT_OUT: gl.constexpr = False,
+    W_PRESHUFFLED: gl.constexpr = False,
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
 ):
@@ -2404,7 +2532,7 @@ def _pipelined_moe_tile_compute(
     ws_base_offset = expert_id * stride_wse
 
     STORE: gl.constexpr = _store_layout(
-        NUM_WARPS, block_m=BLOCK_M, w_via_vgpr=W_VIA_VGPR
+        NUM_WARPS, block_m=BLOCK_M, w_via_vgpr=W_VIA_VGPR or W_PRESHUFFLED
     )
 
     index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
@@ -2425,6 +2553,7 @@ def _pipelined_moe_tile_compute(
         EVEN_K,
         USE_GATHER,
         NUM_WARPS,
+        W_PRESHUFFLED=W_PRESHUFFLED,
         W_VIA_VGPR=W_VIA_VGPR,
         W_PREFETCH=W_PREFETCH,
     )
@@ -2439,12 +2568,16 @@ def _pipelined_moe_tile_compute(
     LOAD_X_LAYOUT: gl.constexpr = _load_layout(
         BLOCK_K_X, BLOCK_M, NUM_WARPS, [1, 0], X_ELEM_BITS
     )
-    if cfg.W_VIA_VGPR:
+    if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
         gl.static_assert(
-            BLOCK_K_W == 128 and (BLOCK_N == 128 or USE_SLICE_N) and NUM_WARPS == 4,
-            "W_VIA_VGPR LinearLayout bases assume BLOCK_K_W=128, "
+            BLOCK_K_W == 128
+            and (BLOCK_N == 128 or USE_SLICE_N)
+            and NUM_WARPS == 4
+            and not USE_SLICE_MN,
+            "preshuffled W layout bases assume BLOCK_K_W=128, "
             "BLOCK_N=128 (or USE_SLICE_N=True for half-tile path), "
-            "NUM_WARPS=4. Re-derive bases for other shapes.",
+            "NUM_WARPS=4, and USE_SLICE_MN=False. Re-derive bases for "
+            "other shapes.",
         )
         BLOCK_N_LAYOUT: gl.constexpr = (BLOCK_N // 2) if USE_SLICE_N else BLOCK_N
         if cfg.SCALE_VIA_LDS:
@@ -2514,7 +2647,7 @@ def _pipelined_moe_tile_compute(
 
     offs_xm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
     offs_xk = gl.arange(0, BLOCK_K_X, layout=gl.SliceLayout(0, LOAD_X_LAYOUT))
-    if cfg.W_VIA_VGPR:
+    if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
         # Virtual (n_block, k_flat); half-tile (BLOCK_N//2//16) under sliceN.
         _BN_W_LAYOUT: gl.constexpr = (BLOCK_N // 2) if USE_SLICE_N else BLOCK_N
         offs_wn = gl.arange(
@@ -2545,8 +2678,9 @@ def _pipelined_moe_tile_compute(
         # bounds during HIP graph warm-up; mask still filters.
         rows_m = gl.where(pre_gather_mask, rows_m, gl.zeros_like(rows_m))
         mask_m = pre_gather_mask
-    if cfg.W_VIA_VGPR:
-        # W_VIA_VGPR skips the n-mask (launcher enforces N aligned).
+    if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
+        # Preshuffled W skips the per-element n-mask; the launcher enforces
+        # 128-wide alignment and SliceN uses a scalar bottom-half predicate.
         # Half-tile width under sliceN so the dummy mask matches the
         # actual offs_wn extent.
         _BN_MASK: gl.constexpr = (BLOCK_N // 2) if USE_SLICE_N else BLOCK_N
@@ -2568,21 +2702,35 @@ def _pipelined_moe_tile_compute(
         mask_m[:, None],
         k_limit_x,
     )
-    if cfg.W_VIA_VGPR:
-        # Host-preshuffled W -> VGPR direct; bypasses LDS staging.
+    if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
+        # Host-preshuffled W uses the dot-tile HBM order. The current
+        # experiment stages that flat tile through LDS unless W_VIA_VGPR
+        # is explicitly enabled.
         TILE_BYTES: gl.constexpr = BLOCK_K_W * BLOCK_N
         offsets_b_vgpr = gl.expand_dims(offs_wk, 0) + gl.expand_dims(offs_wn, 1) * (
             BLOCK_K_W * 16
         )
         base_off_b_vgpr = w_base_offset + pid_n * TILE_BYTES
-        w_desc = WVgprDescriptor(
-            cfg,
-            BLOCK_K_W,
-            w_ptr,
-            gl.to_tensor(N),  # K-iter advance step: idx * BK_W * N
-            offsets_b_vgpr + base_off_b_vgpr,
-            pred=gl.to_tensor(True),  # full-tile path: always in-bounds
-        )
+        if cfg.W_VIA_VGPR:
+            w_desc = WVgprDescriptor(
+                cfg,
+                BLOCK_K_W,
+                w_ptr,
+                gl.to_tensor(N),  # K-iter advance step: idx * BK_W * N
+                offsets_b_vgpr + base_off_b_vgpr,
+                pred=gl.to_tensor(True),  # full-tile path: always in-bounds
+            )
+        else:
+            w_desc = WPreshuffledLdsDescriptor(
+                cfg,
+                BLOCK_K_W,
+                w_ptr,
+                w_ptr.dtype.element_ty,
+                gl.to_tensor(N),
+                offsets_b_vgpr + base_off_b_vgpr,
+                pred=gl.to_tensor(True),
+                load_layout=LOAD_W_LAYOUT,
+            )
     elif W_TRANSPOSE:
         w_desc = AsyncCopyDescriptor.initialize(
             cfg,
@@ -2881,10 +3029,10 @@ def _pipelined_moe_tile_compute(
         acc = slice_mn_pgm.pipeline(K)
     elif USE_SLICE_N:
         SUB_BN: gl.constexpr = BLOCK_N // 2
-        if cfg.W_VIA_VGPR:
+        if cfg.W_PRESHUFFLED or cfg.W_VIA_VGPR:
             gl.static_assert(
                 SUB_BN == 128 and BLOCK_K_W == 128 and NUM_WARPS == 4,
-                "USE_SLICE_N + W_VIA_VGPR requires SUB_BN=BLOCK_K_W=128 "
+                "USE_SLICE_N + preshuffled W requires SUB_BN=BLOCK_K_W=128 "
                 "and NUM_WARPS=4; the half-tile LOAD_W_LAYOUT bases assume "
                 "this shape (re-derive otherwise).",
             )
@@ -2948,24 +3096,48 @@ def _pipelined_moe_tile_compute(
             bot_valid = (2 * pid_n + 1) < n_block_count
             base_off_top = w_base_offset + 2 * pid_n * TILE_BYTES_HALF
             base_off_bot = base_off_top + TILE_BYTES_HALF
-            w_desc_top = WVgprDescriptor(
-                cfg,
-                BLOCK_K_W,
-                w_ptr,
-                gl.to_tensor(N),
-                offsets_h + base_off_top,
-                pred=gl.to_tensor(True),
-                LOAD_BN=SUB_BN,
-            )
-            w_desc_bot = WVgprDescriptor(
-                cfg,
-                BLOCK_K_W,
-                w_ptr,
-                gl.to_tensor(N),
-                offsets_h + base_off_bot,
-                pred=bot_valid,
-                LOAD_BN=SUB_BN,
-            )
+            if cfg.W_VIA_VGPR:
+                w_desc_top = WVgprDescriptor(
+                    cfg,
+                    BLOCK_K_W,
+                    w_ptr,
+                    gl.to_tensor(N),
+                    offsets_h + base_off_top,
+                    pred=gl.to_tensor(True),
+                    LOAD_BN=SUB_BN,
+                )
+                w_desc_bot = WVgprDescriptor(
+                    cfg,
+                    BLOCK_K_W,
+                    w_ptr,
+                    gl.to_tensor(N),
+                    offsets_h + base_off_bot,
+                    pred=bot_valid,
+                    LOAD_BN=SUB_BN,
+                )
+            else:
+                w_desc_top = WPreshuffledLdsDescriptor(
+                    cfg,
+                    BLOCK_K_W,
+                    w_ptr,
+                    w_ptr.dtype.element_ty,
+                    gl.to_tensor(N),
+                    offsets_h + base_off_top,
+                    pred=gl.to_tensor(True),
+                    load_layout=LOAD_W_HALF_LAYOUT,
+                    LOAD_BN=SUB_BN,
+                )
+                w_desc_bot = WPreshuffledLdsDescriptor(
+                    cfg,
+                    BLOCK_K_W,
+                    w_ptr,
+                    w_ptr.dtype.element_ty,
+                    gl.to_tensor(N),
+                    offsets_h + base_off_bot,
+                    pred=bot_valid,
+                    load_layout=LOAD_W_HALF_LAYOUT,
+                    LOAD_BN=SUB_BN,
+                )
         elif W_TRANSPOSE:
             # LDS path, K-contig W tiles.
             LOAD_W_SUB_LAYOUT: gl.constexpr = _load_layout(
@@ -3235,6 +3407,7 @@ def _pipelined_moe_kernel_scaled(
     GRID_N: gl.constexpr = 0,
     GROUP_M: gl.constexpr = 1,
     XCD_SWIZZLE: gl.constexpr = 1,
+    W_PRESHUFFLED: gl.constexpr = False,
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
 ):
@@ -3337,6 +3510,7 @@ def _pipelined_moe_kernel_scaled(
                 USE_SLICE_MN=USE_SLICE_MN,
                 USE_SLICE_N=USE_SLICE_N,
                 HAS_FP8_QUANT_OUT=HAS_FP8_QUANT_OUT,
+                W_PRESHUFFLED=W_PRESHUFFLED,
                 W_VIA_VGPR=W_VIA_VGPR,
                 W_PREFETCH=W_PREFETCH,
             )
@@ -3601,10 +3775,10 @@ def _launch_kernel(
     if w_preshuffle:
         packed_block_n = _preshuffled_layout_block_n(w)
         expected_packed_block_n = block_n // 2 if use_slice_n else block_n
-        assert not use_slice_mn, "preshuffled W_VIA_VGPR does not support USE_SLICE_MN"
-        assert num_warps == 4, "preshuffled W_VIA_VGPR load layout requires NUM_WARPS=4"
+        assert not use_slice_mn, "preshuffled W LDS path does not support USE_SLICE_MN"
+        assert num_warps == 4, "preshuffled W LDS load layout requires NUM_WARPS=4"
         assert packed_block_n == 128, (
-            f"preshuffled W_VIA_VGPR currently supports only block_n=128 "
+            f"preshuffled W LDS path currently supports only block_n=128 "
             f"packed layouts; got block_n={packed_block_n}"
         )
         assert expected_packed_block_n == packed_block_n, (
@@ -3710,11 +3884,11 @@ def _launch_kernel(
     w3 = w if w.ndim == 3 else w.unsqueeze(0)
 
     if w_preshuffle:
-        # Host pre-shuffled into 5-D HBM byte layout (W_VIA_VGPR path);
-        # .contiguous() would clobber it. The descriptor reads N
-        # directly for the K-iter stride, so stride_wn/stride_wk
-        # aren't consulted -- only stride_we matters at launcher level.
-        # ``w_transpose`` is irrelevant on this path.
+        # Host pre-shuffled into 5-D HBM byte layout. The preshuffled
+        # descriptor uses N directly for the K-iter stride and stages the
+        # tile through LDS; .contiguous() would clobber the HBM layout.
+        # stride_wn/stride_wk are not consulted; only stride_we matters.
+        # w_transpose is irrelevant on this path.
         stride_wn, stride_wk = w3.stride(-2), w3.stride(-1)
     elif w_transpose:
         # K-contig W staged as [BN, BK] in LDS; view permuted for dot.
@@ -3862,7 +4036,8 @@ def _launch_kernel(
         USE_SLICE_MN=use_slice_mn,
         USE_SLICE_N=use_slice_n,
         HAS_FP8_QUANT_OUT=has_fp8_quant_out,
-        W_VIA_VGPR=w_preshuffle,
+        W_PRESHUFFLED=w_preshuffle,
+        W_VIA_VGPR=False,
         W_PREFETCH=False,
         GRID_N=grid_n,
         GROUP_M=group_m,
@@ -3946,18 +4121,18 @@ def _autotune_block(
         # fp8 X is 1 byte/elem (lower VGPR pressure); prefill promotes
         # to (128, 256, 256, NW=4) -- sliceMN sweet spot for dispatch.
         if M <= 8192:
-            # combine + W_VIA_VGPR requires NW=4 (LinearLayout bases);
+            # combine + preshuffled W requires NW=4 (LinearLayout bases);
             # dispatch tolerates NW=8 since OUT_BLOCK_N halving sidesteps
             # the BN=256 / SLICE_N constraint at the BN=256 tile.
             bm, bn, bk, nw = (64, 256, 128, 8) if do_swiglu else (64, 256, 128, 4)
         elif do_swiglu:
-            # The preshuffled W_VIA_VGPR path clamps BN to 128 in the
-            # launcher to match the host preshuffle layout.
+            # Preshuffled dispatch may lower BM in the launcher so BN=256 can
+            # use SliceN over two 128-wide packed half-tiles.
             bm, bn, bk, nw = 128, 256, 128, 4
         else:
             # combine path: keep BN=256 throughput but force BM<=64
             # so ``_resolve_use_slice_n`` enables USE_SLICE_N=True
-            # (half-tile path), which the W_VIA_VGPR static_assert
+            # (half-tile path), which the preshuffled-W static_assert
             # explicitly accepts. NW=4 also required.
             bm, bn, bk, nw = 64, 256, 128, 4
     else:
@@ -4133,7 +4308,7 @@ def _align_block_n_to_preshuffled_layout(
 ) -> tuple[int, bool, bool | None]:
     """Constrain the execution tile to the host-preshuffled W layout.
 
-    The current W_VIA_VGPR kernel supports the 128-wide packed layout. A
+    The current preshuffled kernel supports the 128-wide packed layout. A
     256-wide execution tile is still legal by consuming two adjacent 128-wide
     packed half-tiles through USE_SLICE_N.
     """
@@ -4141,10 +4316,10 @@ def _align_block_n_to_preshuffled_layout(
     if packed_block_n != 128:
         raise ValueError(
             f"preshuffled Gluon W layout block_n={packed_block_n} is not "
-            "supported by the current W_VIA_VGPR load layout"
+            "supported by the current preshuffled W load layout"
         )
 
-    # USE_SLICE_MN builds LDS W descriptors and is not wired for W_VIA_VGPR.
+    # USE_SLICE_MN is not wired for the preshuffled W descriptor.
     use_slice_mn = False
 
     if block_n == packed_block_n:
@@ -4224,7 +4399,7 @@ def gluon_mxfp_dispatch_swiglu(
     block_n = block_n or bn
     block_k = block_k or bk
     if w_preshuffle and block_n == 256 and block_m > 64:
-        # W_VIA_VGPR supports BN=256 through USE_SLICE_N's two 128-wide
+        # Preshuffled W supports BN=256 through USE_SLICE_N's two 128-wide
         # packed half-tiles; pick the BM tier that enables that path.
         block_m = 64
     if w_preshuffle:
@@ -4535,7 +4710,7 @@ def _extract_gluon_raw_w(w):
     so we pass it through. If a ``_gluon_shuffled`` attribute is
     attached (set by the backend's preshuffle hook) we return the
     shuffled view instead -- ``is_shuffled_for_gluon_dot=True`` then
-    triggers the kernel's W_VIA_VGPR path.
+    triggers the kernel's preshuffled W path.
     """
     if isinstance(w, torch.Tensor):
         shuffled = getattr(w, "_gluon_shuffled", None)
