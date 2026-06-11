@@ -374,6 +374,8 @@ def shuffle_weight_for_gluon_dot_layout(
     out = out_flat.view(*leading_shape, K_pk_padded, N)
     out.is_shuffled_for_gluon_dot = True
     out.original_k_pk = K_pk
+    out.gluon_dot_block_k_pk = block_k_pk
+    out.gluon_dot_block_n = block_n
     return out
 
 
@@ -3596,6 +3598,22 @@ def _launch_kernel(
         block_k >= _MFMA_SCALED_K
     ), f"scaled MFMA requires BLOCK_K >= {_MFMA_SCALED_K} (got {block_k})"
     assert block_m % _MFMA_M == 0
+    if w_preshuffle:
+        packed_block_n = _preshuffled_layout_block_n(w)
+        expected_packed_block_n = block_n // 2 if use_slice_n else block_n
+        assert not use_slice_mn, "preshuffled W_VIA_VGPR does not support USE_SLICE_MN"
+        assert num_warps == 4, "preshuffled W_VIA_VGPR load layout requires NUM_WARPS=4"
+        assert packed_block_n == 128, (
+            f"preshuffled W_VIA_VGPR currently supports only block_n=128 "
+            f"packed layouts; got block_n={packed_block_n}"
+        )
+        assert expected_packed_block_n == packed_block_n, (
+            f"preshuffled W packed block_n={packed_block_n} is incompatible with "
+            f"execution BLOCK_N={block_n}, USE_SLICE_N={use_slice_n}"
+        )
+        assert N % packed_block_n == 0, (
+            f"preshuffled W N={N} must be divisible by packed block_n={packed_block_n}"
+        )
 
     grid_n = (N + block_n - 1) // block_n
 
@@ -4090,6 +4108,69 @@ def _resolve_use_slice_mn(
     )
 
 
+def _preshuffled_layout_block_n(w: torch.Tensor) -> int:
+    block_n = int(getattr(w, "gluon_dot_block_n", 128))
+    if block_n <= 0 or block_n % _GLUON_DOT_N_LANE != 0:
+        raise ValueError(
+            f"invalid preshuffled Gluon W layout block_n={block_n}; "
+            f"expected a positive multiple of {_GLUON_DOT_N_LANE}"
+        )
+    return block_n
+
+
+def _align_block_n_to_preshuffled_layout(
+    w: torch.Tensor,
+    *,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    scale_load_mode: str,
+    x_format: str,
+    has_x_block_scale: bool,
+    has_w_block_scale: bool,
+    use_slice_mn: bool | None,
+    use_slice_n: bool | None,
+) -> tuple[int, bool, bool | None]:
+    """Constrain the execution tile to the host-preshuffled W layout.
+
+    The current W_VIA_VGPR kernel supports the 128-wide packed layout. A
+    256-wide execution tile is still legal by consuming two adjacent 128-wide
+    packed half-tiles through USE_SLICE_N.
+    """
+    packed_block_n = _preshuffled_layout_block_n(w)
+    if packed_block_n != 128:
+        raise ValueError(
+            f"preshuffled Gluon W layout block_n={packed_block_n} is not "
+            "supported by the current W_VIA_VGPR load layout"
+        )
+
+    # USE_SLICE_MN builds LDS W descriptors and is not wired for W_VIA_VGPR.
+    use_slice_mn = False
+
+    if block_n == packed_block_n:
+        return block_n, use_slice_mn, use_slice_n
+
+    auto_slice_n = (
+        block_n >= 256
+        and block_m <= 64
+        and ((block_n * block_k) // 2) >= _TCP_INFLIGHT_CAP_BYTES
+    )
+    wants_slice_n = use_slice_n is True or (use_slice_n is None and auto_slice_n)
+    can_use_slice_n = wants_slice_n and _can_use_slice_n(
+        block_m,
+        block_n,
+        scale_load_mode=scale_load_mode,
+        x_format=x_format,
+        has_x_block_scale=has_x_block_scale,
+        has_w_block_scale=has_w_block_scale,
+    )
+
+    if block_n == 2 * packed_block_n and can_use_slice_n:
+        return block_n, use_slice_mn, use_slice_n
+
+    return packed_block_n, use_slice_mn, False
+
+
 def gluon_mxfp_dispatch_swiglu(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -4142,9 +4223,26 @@ def gluon_mxfp_dispatch_swiglu(
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
-    if w_preshuffle and block_n > 128:
-        block_n = 128
+    if w_preshuffle and block_n == 256 and block_m > 64:
+        # W_VIA_VGPR supports BN=256 through USE_SLICE_N's two 128-wide
+        # packed half-tiles; pick the BM tier that enables that path.
+        block_m = 64
+    if w_preshuffle:
+        block_n, use_slice_mn, use_slice_n = _align_block_n_to_preshuffled_layout(
+            w,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            scale_load_mode=scale_load_mode,
+            x_format=x_format,
+            has_x_block_scale=x_format == "e2m1",
+            has_w_block_scale=True,
+            use_slice_mn=use_slice_mn,
+            use_slice_n=use_slice_n,
+        )
     num_warps = num_warps or nw
+    if w_preshuffle:
+        num_warps = 4
     num_buffers = (
         num_buffers
         if num_buffers is not None
@@ -4163,27 +4261,53 @@ def gluon_mxfp_dispatch_swiglu(
     use_warp_pipeline = (
         bool(use_warp_pipeline) if use_warp_pipeline is not None else False
     )
-    use_slice_mn = _resolve_use_slice_mn(
-        use_slice_mn,
-        block_m,
-        block_n,
-        num_buffers=num_buffers,
-        scale_load_mode=scale_load_mode,
-        x_format=x_format,
-        has_x_block_scale=x_format == "e2m1",
-        has_w_block_scale=True,
-        bk=block_k,
-    )
-    use_slice_n = _resolve_use_slice_n(
-        use_slice_n,
-        block_m,
-        block_n,
-        scale_load_mode=scale_load_mode,
-        x_format=x_format,
-        has_x_block_scale=x_format == "e2m1",
-        has_w_block_scale=True,
-        bk=block_k,
-    )
+    if w_preshuffle:
+        use_slice_mn = _resolve_use_slice_mn(
+            use_slice_mn,
+            block_m,
+            block_n,
+            num_buffers=num_buffers,
+            scale_load_mode=scale_load_mode,
+            x_format=x_format,
+            has_x_block_scale=x_format == "e2m1",
+            has_w_block_scale=True,
+            bk=block_k,
+        )
+        if use_slice_mn:
+            use_slice_n = False
+        else:
+            use_slice_n = _resolve_use_slice_n(
+                use_slice_n,
+                block_m,
+                block_n,
+                scale_load_mode=scale_load_mode,
+                x_format=x_format,
+                has_x_block_scale=x_format == "e2m1",
+                has_w_block_scale=True,
+                bk=block_k,
+            )
+    else:
+        use_slice_mn = _resolve_use_slice_mn(
+            use_slice_mn,
+            block_m,
+            block_n,
+            num_buffers=num_buffers,
+            scale_load_mode=scale_load_mode,
+            x_format=x_format,
+            has_x_block_scale=x_format == "e2m1",
+            has_w_block_scale=True,
+            bk=block_k,
+        )
+        use_slice_n = _resolve_use_slice_n(
+            use_slice_n,
+            block_m,
+            block_n,
+            scale_load_mode=scale_load_mode,
+            x_format=x_format,
+            has_x_block_scale=x_format == "e2m1",
+            has_w_block_scale=True,
+            bk=block_k,
+        )
     out_block_n = block_n // 2
     y_dtype = torch.float8_e4m3fn if out_quant_scale is not None else out_dtype
     y = torch.empty((M, N // 2), device=x.device, dtype=y_dtype)
@@ -4267,9 +4391,22 @@ def gluon_mxfp_combine(
     block_m = block_m or bm
     block_n = block_n or bn
     block_k = block_k or bk
-    if w_preshuffle and block_n > 128:
-        block_n = 128
+    if w_preshuffle:
+        block_n, use_slice_mn, use_slice_n = _align_block_n_to_preshuffled_layout(
+            w,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            scale_load_mode=scale_load_mode,
+            x_format=x_format,
+            has_x_block_scale=x_format == "e2m1",
+            has_w_block_scale=True,
+            use_slice_mn=use_slice_mn,
+            use_slice_n=use_slice_n,
+        )
     num_warps = num_warps or nw
+    if w_preshuffle:
+        num_warps = 4
     num_buffers = (
         num_buffers
         if num_buffers is not None
@@ -4288,27 +4425,53 @@ def gluon_mxfp_combine(
     use_warp_pipeline = (
         bool(use_warp_pipeline) if use_warp_pipeline is not None else False
     )
-    use_slice_mn = _resolve_use_slice_mn(
-        use_slice_mn,
-        block_m,
-        block_n,
-        num_buffers=num_buffers,
-        scale_load_mode=scale_load_mode,
-        x_format=x_format,
-        has_x_block_scale=x_format == "e2m1",
-        has_w_block_scale=True,
-        bk=block_k,
-    )
-    use_slice_n = _resolve_use_slice_n(
-        use_slice_n,
-        block_m,
-        block_n,
-        scale_load_mode=scale_load_mode,
-        x_format=x_format,
-        has_x_block_scale=x_format == "e2m1",
-        has_w_block_scale=True,
-        bk=block_k,
-    )
+    if w_preshuffle:
+        use_slice_mn = _resolve_use_slice_mn(
+            use_slice_mn,
+            block_m,
+            block_n,
+            num_buffers=num_buffers,
+            scale_load_mode=scale_load_mode,
+            x_format=x_format,
+            has_x_block_scale=x_format == "e2m1",
+            has_w_block_scale=True,
+            bk=block_k,
+        )
+        if use_slice_mn:
+            use_slice_n = False
+        else:
+            use_slice_n = _resolve_use_slice_n(
+                use_slice_n,
+                block_m,
+                block_n,
+                scale_load_mode=scale_load_mode,
+                x_format=x_format,
+                has_x_block_scale=x_format == "e2m1",
+                has_w_block_scale=True,
+                bk=block_k,
+            )
+    else:
+        use_slice_mn = _resolve_use_slice_mn(
+            use_slice_mn,
+            block_m,
+            block_n,
+            num_buffers=num_buffers,
+            scale_load_mode=scale_load_mode,
+            x_format=x_format,
+            has_x_block_scale=x_format == "e2m1",
+            has_w_block_scale=True,
+            bk=block_k,
+        )
+        use_slice_n = _resolve_use_slice_n(
+            use_slice_n,
+            block_m,
+            block_n,
+            scale_load_mode=scale_load_mode,
+            x_format=x_format,
+            has_x_block_scale=x_format == "e2m1",
+            has_w_block_scale=True,
+            bk=block_k,
+        )
     n_act_eff = int(n_expts_act) if n_expts_act is not None else 1
     if n_tokens is None:
         n_rows = M
