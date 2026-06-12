@@ -1504,7 +1504,6 @@ class MoEPipelinedProgram:
     @gluon.jit
     def pipeline(self, loop_k):
         cfg = self.cfg
-        EVEN_K: gl.constexpr = cfg.EVEN_K
         load_idx = 0
         mfma_idx = 0
 
@@ -1513,57 +1512,35 @@ class MoEPipelinedProgram:
         )
         K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
 
-        W_PREFETCH: gl.constexpr = cfg.W_VIA_VGPR and cfg.W_PREFETCH
+        # Three-stage pipeline:
+        #   async_copy(k + NUM_BUFFERS) -> LDS
+        #   local_load(k + 1) -> VGPR
+        #   mfma(k)
+        for _ in gl.static_range(cfg.NUM_BUFFERS):
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
 
-        for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
-            load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
-
-        if W_PREFETCH:
-            w_curr = self._issue_w_vgpr(0)
-
-        # EVEN_K: K_iters - (NUM_BUFFERS-1) all-unmasked main iters.
-        # !EVEN_K: one less unmasked iter; the last is the masked tail below.
-        main_iters = K_iters - (cfg.NUM_BUFFERS - 1 if EVEN_K else cfg.NUM_BUFFERS)
+        main_iters = K_iters - cfg.NUM_BUFFERS
         gl.assume(main_iters >= 0)
 
-        for i in range(0, main_iters):
-            load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
-            self.async_wait(cfg.NUM_BUFFERS - 1)
+        self.async_wait(cfg.NUM_BUFFERS - 1)
+        x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
+        mfma_idx += 1
 
-            if W_PREFETCH:
-                x, scale_x, scale_w = self._load_x_scales(mfma_idx)
-                accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
-                w_curr = self._issue_w_vgpr(mfma_idx + 1)
-            else:
-                x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+        for _ in range(0, main_iters):
+            accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+            self.async_wait(cfg.NUM_BUFFERS - 2)
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
+            x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
             mfma_idx += 1
 
-        if not EVEN_K:
-            # Masked tail iter (one more iter still has W to prefetch).
-            load_idx = self.issue_global_loads(load_idx, USE_MASK=1)
-            self.async_wait(cfg.NUM_BUFFERS - 1)
-            if W_PREFETCH:
-                x, scale_x, scale_w = self._load_x_scales(mfma_idx)
-                accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
-                w_curr = self._issue_w_vgpr(mfma_idx + 1)
-            else:
-                x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
-            mfma_idx += 1
-
-        # Epilogue: drain remaining in-flight buffers; no new global loads.
+        # Drain remaining prefetched K tiles; no new global loads.
         for i in gl.static_range(cfg.NUM_BUFFERS - 1):
+            accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
             self.async_wait(cfg.NUM_BUFFERS - 2 - i)
-            if W_PREFETCH:
-                x, scale_x, scale_w = self._load_x_scales(mfma_idx)
-                accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
-                if i < cfg.NUM_BUFFERS - 2:
-                    w_curr = self._issue_w_vgpr(mfma_idx + 1)
-            else:
-                x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
-                accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+            x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
             mfma_idx += 1
+
+        accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
 
         return accumulator
 
@@ -2373,68 +2350,39 @@ class MoESliceNProgram:
 
         K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
         main_iters = K_iters - NB
-        gl.assume(main_iters >= 2)
+        gl.assume(main_iters >= 0)
 
-        # Drain iter 0's top half so the first ds_read has data.
-        self.async_wait_groups(2 * NB - 1)
+        # Drain iter 0's full tile so both N halves are in registers before
+        # compute. This is the SliceN form of the v5 local-prefetch pipeline.
+        self.async_wait_groups(2 * NB - 2)
         x, sx = self.issue_local_load_x(mfma_idx)
         w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
+        w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
+        mfma_idx += 1
 
-        unroll_pairs = main_iters // 2
-        odd_main = main_iters - unroll_pairs * 2
-        for _ in range(0, unroll_pairs):
-            # iter k regions 0+1.
+        for _ in range(0, main_iters):
             c0 = self.mfma(x, sx, w0, sw0, c0)
-            self.async_wait_groups(2 * NB - 2)
-            w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
-            load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
-
             c1 = self.mfma(x, sx, w1, sw1, c1)
-            mfma_idx += 1
-            self.async_wait_groups(2 * NB - 2)
+            self.async_wait_groups(2 * (NB - 2))
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             x, sx = self.issue_local_load_x(mfma_idx)
             w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
-            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
-
-            # iter k+1 regions 2+3 (LDS slot ping-ponged via mfma_idx parity).
-            c0 = self.mfma(x, sx, w0, sw0, c0)
-            self.async_wait_groups(2 * NB - 2)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
-            load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
-
-            c1 = self.mfma(x, sx, w1, sw1, c1)
             mfma_idx += 1
-            self.async_wait_groups(2 * NB - 2)
-            x, sx = self.issue_local_load_x(mfma_idx)
-            w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
-            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
-
-        # Odd peel; USE_MASK=-1 covers the K-tail iter.
-        if odd_main:
-            c0 = self.mfma(x, sx, w0, sw0, c0)
-            self.async_wait_groups(2 * NB - 2)
-            w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
-            load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
-
-            c1 = self.mfma(x, sx, w1, sw1, c1)
-            mfma_idx += 1
-            self.async_wait_groups(2 * NB - 2)
-            x, sx = self.issue_local_load_x(mfma_idx)
-            w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
-            load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
 
         # Drain + final NB iters of MFMAs (no more async_copy).
-        self.async_wait_groups(0)
-        for i in gl.static_range(NB):
+        for i in gl.static_range(NB - 1):
             c0 = self.mfma(x, sx, w0, sw0, c0)
-            w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
-
             c1 = self.mfma(x, sx, w1, sw1, c1)
+
+            self.async_wait_groups(2 * (NB - 2 - i))
+            x, sx = self.issue_local_load_x(mfma_idx)
+            w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
+            w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
             mfma_idx += 1
 
-            if i < NB - 1:
-                x, sx = self.issue_local_load_x(mfma_idx)
-                w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
+        c0 = self.mfma(x, sx, w0, sw0, c0)
+        c1 = self.mfma(x, sx, w1, sw1, c1)
 
         accumulator = (
             gl.join(c0, c1).permute(0, 2, 1).reshape((cfg.BLOCK_M, cfg.BLOCK_N))
