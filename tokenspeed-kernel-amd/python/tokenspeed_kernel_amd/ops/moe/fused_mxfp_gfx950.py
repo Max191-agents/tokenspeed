@@ -872,10 +872,8 @@ class MoEProgramBase:
         return load_idx + 1
 
     @gluon.jit
-    def async_wait(self, waitcnt, SYNC_AFTER_WAIT: gl.constexpr = False):
+    def async_wait(self, waitcnt):
         gl.amd.cdna4.async_copy.wait_group(waitcnt * self.cfg.NUM_LOADS_IN_BATCH)
-        if SYNC_AFTER_WAIT:
-            gl.barrier()
 
 
 @gluon.constexpr_function
@@ -1504,7 +1502,7 @@ class MoEPipelinedProgram:
         return x, w, scale_x, scale_w
 
     @gluon.jit
-    def pipeline(self, loop_k, SYNC_AFTER_WAIT: gl.constexpr = False):
+    def pipeline(self, loop_k):
         cfg = self.cfg
         EVEN_K: gl.constexpr = cfg.EVEN_K
         load_idx = 0
@@ -1530,7 +1528,7 @@ class MoEPipelinedProgram:
 
         for i in range(0, main_iters):
             load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
-            self.async_wait(cfg.NUM_BUFFERS - 1, SYNC_AFTER_WAIT)
+            self.async_wait(cfg.NUM_BUFFERS - 1)
 
             if W_PREFETCH:
                 x, scale_x, scale_w = self._load_x_scales(mfma_idx)
@@ -1544,7 +1542,7 @@ class MoEPipelinedProgram:
         if not EVEN_K:
             # Masked tail iter (one more iter still has W to prefetch).
             load_idx = self.issue_global_loads(load_idx, USE_MASK=1)
-            self.async_wait(cfg.NUM_BUFFERS - 1, SYNC_AFTER_WAIT)
+            self.async_wait(cfg.NUM_BUFFERS - 1)
             if W_PREFETCH:
                 x, scale_x, scale_w = self._load_x_scales(mfma_idx)
                 accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
@@ -1556,7 +1554,7 @@ class MoEPipelinedProgram:
 
         # Epilogue: drain remaining in-flight buffers; no new global loads.
         for i in gl.static_range(cfg.NUM_BUFFERS - 1):
-            self.async_wait(cfg.NUM_BUFFERS - 2 - i, SYNC_AFTER_WAIT)
+            self.async_wait(cfg.NUM_BUFFERS - 2 - i)
             if W_PREFETCH:
                 x, scale_x, scale_w = self._load_x_scales(mfma_idx)
                 accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
@@ -1570,7 +1568,7 @@ class MoEPipelinedProgram:
         return accumulator
 
     @gluon.jit
-    def warp_pipeline(self, loop_k, SYNC_AFTER_WAIT: gl.constexpr = False):
+    def warp_pipeline(self, loop_k):
         cfg = self.cfg
         gl.static_assert(
             cfg.NUM_BUFFERS >= 3,
@@ -1589,7 +1587,7 @@ class MoEPipelinedProgram:
         gl.assume(main_iters >= 0)
 
         # Drain oldest prologue batch into LDS; rest remain in flight.
-        self.async_wait(cfg.NUM_BUFFERS - 2, SYNC_AFTER_WAIT)
+        self.async_wait(cfg.NUM_BUFFERS - 2)
 
         for _ in range(0, main_iters):
             with gl.amd.warp_pipeline_stage("lds+tdm", priority=1):
@@ -1597,12 +1595,12 @@ class MoEPipelinedProgram:
                 mfma_idx += 1
                 load_idx = self.issue_global_loads(load_idx)
 
-            self.async_wait(cfg.NUM_BUFFERS - 2, SYNC_AFTER_WAIT)
+            self.async_wait(cfg.NUM_BUFFERS - 2)
 
             with gl.amd.warp_pipeline_stage("mfma", priority=0):
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
 
-        self.async_wait(0, SYNC_AFTER_WAIT)
+        self.async_wait(0)
         for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
             x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
             mfma_idx += 1
@@ -2277,16 +2275,12 @@ class MoESliceNProgram:
         return load_idx
 
     @gluon.jit
-    def async_wait(self, waitcnt, SYNC_AFTER_WAIT: gl.constexpr = False):
+    def async_wait(self, waitcnt):
         gl.amd.cdna4.async_copy.wait_group(waitcnt * 2)
-        if SYNC_AFTER_WAIT:
-            gl.barrier()
 
     @gluon.jit
-    def async_wait_groups(self, waitcnt, SYNC_AFTER_WAIT: gl.constexpr = False):
+    def async_wait_groups(self, waitcnt):
         gl.amd.cdna4.async_copy.wait_group(waitcnt)
-        if SYNC_AFTER_WAIT:
-            gl.barrier()
 
     @gluon.jit
     def issue_local_load_w_sub(self, mfma_idx, subtile_idx_n: gl.constexpr):
@@ -2356,7 +2350,7 @@ class MoESliceNProgram:
         return w, scale_w
 
     @gluon.jit
-    def pipeline(self, loop_k, SYNC_AFTER_WAIT: gl.constexpr = False):
+    def pipeline(self, loop_k):
         cfg = self.cfg
         NB: gl.constexpr = cfg.NUM_BUFFERS
         gl.static_assert(
@@ -2382,7 +2376,7 @@ class MoESliceNProgram:
         gl.assume(main_iters >= 2)
 
         # Drain iter 0's top half so the first ds_read has data.
-        self.async_wait_groups(2 * NB - 1, SYNC_AFTER_WAIT)
+        self.async_wait_groups(2 * NB - 1)
         x, sx = self.issue_local_load_x(mfma_idx)
         w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
 
@@ -2391,26 +2385,26 @@ class MoESliceNProgram:
         for _ in range(0, unroll_pairs):
             # iter k regions 0+1.
             c0 = self.mfma(x, sx, w0, sw0, c0)
-            self.async_wait_groups(2 * NB - 2, SYNC_AFTER_WAIT)
+            self.async_wait_groups(2 * NB - 2)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
 
             c1 = self.mfma(x, sx, w1, sw1, c1)
             mfma_idx += 1
-            self.async_wait_groups(2 * NB - 2, SYNC_AFTER_WAIT)
+            self.async_wait_groups(2 * NB - 2)
             x, sx = self.issue_local_load_x(mfma_idx)
             w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
 
             # iter k+1 regions 2+3 (LDS slot ping-ponged via mfma_idx parity).
             c0 = self.mfma(x, sx, w0, sw0, c0)
-            self.async_wait_groups(2 * NB - 2, SYNC_AFTER_WAIT)
+            self.async_wait_groups(2 * NB - 2)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
 
             c1 = self.mfma(x, sx, w1, sw1, c1)
             mfma_idx += 1
-            self.async_wait_groups(2 * NB - 2, SYNC_AFTER_WAIT)
+            self.async_wait_groups(2 * NB - 2)
             x, sx = self.issue_local_load_x(mfma_idx)
             w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
@@ -2418,19 +2412,19 @@ class MoESliceNProgram:
         # Odd peel; USE_MASK=-1 covers the K-tail iter.
         if odd_main:
             c0 = self.mfma(x, sx, w0, sw0, c0)
-            self.async_wait_groups(2 * NB - 2, SYNC_AFTER_WAIT)
+            self.async_wait_groups(2 * NB - 2)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
 
             c1 = self.mfma(x, sx, w1, sw1, c1)
             mfma_idx += 1
-            self.async_wait_groups(2 * NB - 2, SYNC_AFTER_WAIT)
+            self.async_wait_groups(2 * NB - 2)
             x, sx = self.issue_local_load_x(mfma_idx)
             w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
 
         # Drain + final NB iters of MFMAs (no more async_copy).
-        self.async_wait_groups(0, SYNC_AFTER_WAIT)
+        self.async_wait_groups(0)
         for i in gl.static_range(NB):
             c0 = self.mfma(x, sx, w0, sw0, c0)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
@@ -2567,8 +2561,6 @@ def _pipelined_moe_tile_compute(
         W_VIA_VGPR=W_VIA_VGPR,
         W_PREFETCH=W_PREFETCH,
     )
-    sync_preshuffled_lds_w: gl.constexpr = W_PRESHUFFLED and not W_VIA_VGPR
-
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
     BLOCK_K_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
 
@@ -3348,15 +3340,15 @@ def _pipelined_moe_tile_compute(
             x_scale_desc,
             w_scale_desc,
         )
-        acc = pgm.pipeline(K, sync_preshuffled_lds_w)
+        acc = pgm.pipeline(K)
     else:
         pgm = MoEPipelinedProgram.initialize(
             cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
         )
         if USE_WARP_PIPELINE:
-            acc = pgm.warp_pipeline(K, sync_preshuffled_lds_w)
+            acc = pgm.warp_pipeline(K)
         else:
-            acc = pgm.pipeline(K, sync_preshuffled_lds_w)
+            acc = pgm.pipeline(K)
 
     if APPLY_X_GLOBAL_SCALE and not HAS_X_BLOCK_SCALE:
         x_global_scale = gl.load(x_global_scale_ptr)
