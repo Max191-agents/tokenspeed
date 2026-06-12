@@ -1515,10 +1515,11 @@ class MoEPipelinedProgram:
         )
         K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
 
-        # gfx950 tutorial v5 local-prefetch pipeline:
-        #   async_copy(k + 2) -> LDS
-        #   local_load(k + 1) -> VGPR
+        # Two-buffer local-prefetch pipeline:
+        #   async_copy(k + 2) -> freed LDS buffer
         #   mfma(k)
+        #   wait for k + 1, leaving k + 2 in flight
+        #   local_load(k + 1) -> VGPR
         for _ in gl.static_range(cfg.NUM_BUFFERS):
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
 
@@ -1530,9 +1531,12 @@ class MoEPipelinedProgram:
         mfma_idx += 1
 
         for _ in range(0, main_iters):
-            accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
-            self.async_wait(cfg.NUM_BUFFERS - 2)
+            # All waves must finish reading the previous contents before any
+            # wave overwrites this LDS slot with the future async copy.
+            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
+            accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
+            self.async_wait(cfg.NUM_BUFFERS - 1)
             x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
             mfma_idx += 1
 
@@ -2360,7 +2364,9 @@ class MoESliceNProgram:
         gl.assume(main_iters >= 0)
 
         # Drain iter 0's full tile so both N halves are in registers before
-        # compute. This is the SliceN form of the v5 local-prefetch pipeline.
+        # compute. The hot loop issues the future async copy first, computes
+        # the current tile, then waits for the next tile while leaving the
+        # future copy in flight.
         self.async_wait_groups(2 * NB - 2)
         x, sx = self.issue_local_load_x(mfma_idx)
         w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
@@ -2368,10 +2374,13 @@ class MoESliceNProgram:
         mfma_idx += 1
 
         for _ in range(0, main_iters):
+            # The future copy reuses the slot just local-loaded into VGPRs.
+            # Synchronize the CTA before any producer wave overwrites it.
+            gl.barrier()
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x, sx, w0, sw0, c0)
             c1 = self.mfma(x, sx, w1, sw1, c1)
-            self.async_wait_groups(2 * (NB - 2))
-            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
+            self.async_wait_groups(2 * (NB - 1))
             x, sx = self.issue_local_load_x(mfma_idx)
             w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
