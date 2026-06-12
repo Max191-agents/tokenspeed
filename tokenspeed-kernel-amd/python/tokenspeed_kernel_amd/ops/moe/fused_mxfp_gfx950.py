@@ -233,23 +233,22 @@ def _default_num_buffers(
     has_w_block_scale: bool = True,
     scale_load_mode: str = "transpose",
 ) -> int:
-    K_iters = max(1, (K + block_k - 1) // block_k)
-    nb = 3 if K_iters >= 3 else 2
-    if block_m is not None and block_n is not None:
-        per_buf = _estimate_pipeline_lds_per_buffer(
-            block_m=block_m,
-            block_n=block_n,
-            block_k=block_k,
-            x_format=x_format,
-            w_format=w_format,
-            has_x_block_scale=has_x_block_scale,
-            has_w_block_scale=has_w_block_scale,
-            scale_load_mode=scale_load_mode,
-        )
-        if per_buf > 0:
-            max_nb = max(1, 160 * 1024 // per_buf)
-            nb = min(nb, max_nb)
-    return nb
+    del (
+        K,
+        block_k,
+        block_m,
+        block_n,
+        x_format,
+        w_format,
+        has_x_block_scale,
+        has_w_block_scale,
+        scale_load_mode,
+    )
+    # Match the gfx950 Gluon tutorial v5 local-prefetch pipeline: the
+    # three stages are global->LDS, LDS->VGPR, and MFMA, but only two
+    # physical LDS buffers are needed because MFMA consumes values that
+    # were already prefetched into registers.
+    return 2
 
 
 _CDNA4_NUM_CUS = 256
@@ -1504,6 +1503,10 @@ class MoEPipelinedProgram:
     @gluon.jit
     def pipeline(self, loop_k):
         cfg = self.cfg
+        gl.static_assert(
+            cfg.NUM_BUFFERS == 2,
+            "v5 local-prefetch pipeline requires exactly two LDS buffers",
+        )
         load_idx = 0
         mfma_idx = 0
 
@@ -1512,8 +1515,8 @@ class MoEPipelinedProgram:
         )
         K_iters = gl.cdiv(loop_k, cfg.BLOCK_K)
 
-        # Three-stage pipeline:
-        #   async_copy(k + NUM_BUFFERS) -> LDS
+        # gfx950 tutorial v5 local-prefetch pipeline:
+        #   async_copy(k + 2) -> LDS
         #   local_load(k + 1) -> VGPR
         #   mfma(k)
         for _ in gl.static_range(cfg.NUM_BUFFERS):
@@ -2335,6 +2338,10 @@ class MoESliceNProgram:
             and (cfg.NUM_SUBTILES[1] == 2)
             and (cfg.NUM_SUBTILES[2] == 1),
             "MoESliceNProgram requires NUM_SUBTILES=(1,2,1)",
+        )
+        gl.static_assert(
+            NB == 2,
+            "v5 local-prefetch SliceN pipeline requires exactly two LDS buffers",
         )
 
         SUBTILE_N: gl.constexpr = cfg.BLOCK_N // 2
