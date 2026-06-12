@@ -57,19 +57,17 @@ def test_preshuffled_layout_selection_clamps_block_n_256_without_slicen() -> Non
     w = torch.empty((128, 128), dtype=torch.uint8)
     w.gluon_dot_block_n = 128
 
-    block_n, use_slice_mn, use_slice_n = (
-        gluon_moe._align_block_n_to_preshuffled_layout(
-            w,
-            block_m=128,
-            block_n=256,
-            block_k=256,
-            scale_load_mode="swizzle",
-            x_format="e4m3",
-            has_x_block_scale=False,
-            has_w_block_scale=True,
-            use_slice_mn=None,
-            use_slice_n=None,
-        )
+    block_n, use_slice_mn, use_slice_n = gluon_moe._align_block_n_to_preshuffled_layout(
+        w,
+        block_m=128,
+        block_n=256,
+        block_k=256,
+        scale_load_mode="swizzle",
+        x_format="e4m3",
+        has_x_block_scale=False,
+        has_w_block_scale=True,
+        use_slice_mn=None,
+        use_slice_n=None,
     )
 
     assert block_n == 128
@@ -83,19 +81,17 @@ def test_preshuffled_layout_selection_keeps_block_n_256_for_slicen() -> None:
     w = torch.empty((128, 128), dtype=torch.uint8)
     w.gluon_dot_block_n = 128
 
-    block_n, use_slice_mn, use_slice_n = (
-        gluon_moe._align_block_n_to_preshuffled_layout(
-            w,
-            block_m=64,
-            block_n=256,
-            block_k=256,
-            scale_load_mode="swizzle",
-            x_format="e4m3",
-            has_x_block_scale=False,
-            has_w_block_scale=True,
-            use_slice_mn=None,
-            use_slice_n=None,
-        )
+    block_n, use_slice_mn, use_slice_n = gluon_moe._align_block_n_to_preshuffled_layout(
+        w,
+        block_m=64,
+        block_n=256,
+        block_k=256,
+        scale_load_mode="swizzle",
+        x_format="e4m3",
+        has_x_block_scale=False,
+        has_w_block_scale=True,
+        use_slice_mn=None,
+        use_slice_n=None,
     )
 
     assert block_n == 256
@@ -109,19 +105,17 @@ def test_preshuffled_layout_selection_clamps_when_slicen_is_incompatible() -> No
     w = torch.empty((128, 128), dtype=torch.uint8)
     w.gluon_dot_block_n = 128
 
-    block_n, use_slice_mn, use_slice_n = (
-        gluon_moe._align_block_n_to_preshuffled_layout(
-            w,
-            block_m=128,
-            block_n=256,
-            block_k=256,
-            scale_load_mode="transpose",
-            x_format="e4m3",
-            has_x_block_scale=False,
-            has_w_block_scale=True,
-            use_slice_mn=None,
-            use_slice_n=None,
-        )
+    block_n, use_slice_mn, use_slice_n = gluon_moe._align_block_n_to_preshuffled_layout(
+        w,
+        block_m=128,
+        block_n=256,
+        block_k=256,
+        scale_load_mode="transpose",
+        x_format="e4m3",
+        has_x_block_scale=False,
+        has_w_block_scale=True,
+        use_slice_mn=None,
+        use_slice_n=None,
     )
 
     assert block_n == 128

@@ -872,8 +872,10 @@ class MoEProgramBase:
         return load_idx + 1
 
     @gluon.jit
-    def async_wait(self, waitcnt):
+    def async_wait(self, waitcnt, SYNC_AFTER_WAIT: gl.constexpr = False):
         gl.amd.cdna4.async_copy.wait_group(waitcnt * self.cfg.NUM_LOADS_IN_BATCH)
+        if SYNC_AFTER_WAIT:
+            gl.barrier()
 
 
 @gluon.constexpr_function
@@ -1502,7 +1504,7 @@ class MoEPipelinedProgram:
         return x, w, scale_x, scale_w
 
     @gluon.jit
-    def pipeline(self, loop_k):
+    def pipeline(self, loop_k, SYNC_AFTER_WAIT: gl.constexpr = False):
         cfg = self.cfg
         EVEN_K: gl.constexpr = cfg.EVEN_K
         load_idx = 0
@@ -1528,7 +1530,7 @@ class MoEPipelinedProgram:
 
         for i in range(0, main_iters):
             load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
-            self.async_wait(cfg.NUM_BUFFERS - 1)
+            self.async_wait(cfg.NUM_BUFFERS - 1, SYNC_AFTER_WAIT)
 
             if W_PREFETCH:
                 x, scale_x, scale_w = self._load_x_scales(mfma_idx)
@@ -1542,7 +1544,7 @@ class MoEPipelinedProgram:
         if not EVEN_K:
             # Masked tail iter (one more iter still has W to prefetch).
             load_idx = self.issue_global_loads(load_idx, USE_MASK=1)
-            self.async_wait(cfg.NUM_BUFFERS - 1)
+            self.async_wait(cfg.NUM_BUFFERS - 1, SYNC_AFTER_WAIT)
             if W_PREFETCH:
                 x, scale_x, scale_w = self._load_x_scales(mfma_idx)
                 accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
@@ -1554,7 +1556,7 @@ class MoEPipelinedProgram:
 
         # Epilogue: drain remaining in-flight buffers; no new global loads.
         for i in gl.static_range(cfg.NUM_BUFFERS - 1):
-            self.async_wait(cfg.NUM_BUFFERS - 2 - i)
+            self.async_wait(cfg.NUM_BUFFERS - 2 - i, SYNC_AFTER_WAIT)
             if W_PREFETCH:
                 x, scale_x, scale_w = self._load_x_scales(mfma_idx)
                 accumulator = self.mfma(x, scale_x, w_curr, scale_w, accumulator)
@@ -1568,7 +1570,7 @@ class MoEPipelinedProgram:
         return accumulator
 
     @gluon.jit
-    def warp_pipeline(self, loop_k):
+    def warp_pipeline(self, loop_k, SYNC_AFTER_WAIT: gl.constexpr = False):
         cfg = self.cfg
         gl.static_assert(
             cfg.NUM_BUFFERS >= 3,
@@ -1587,7 +1589,7 @@ class MoEPipelinedProgram:
         gl.assume(main_iters >= 0)
 
         # Drain oldest prologue batch into LDS; rest remain in flight.
-        self.async_wait(cfg.NUM_BUFFERS - 2)
+        self.async_wait(cfg.NUM_BUFFERS - 2, SYNC_AFTER_WAIT)
 
         for _ in range(0, main_iters):
             with gl.amd.warp_pipeline_stage("lds+tdm", priority=1):
@@ -1595,12 +1597,12 @@ class MoEPipelinedProgram:
                 mfma_idx += 1
                 load_idx = self.issue_global_loads(load_idx)
 
-            self.async_wait(cfg.NUM_BUFFERS - 2)
+            self.async_wait(cfg.NUM_BUFFERS - 2, SYNC_AFTER_WAIT)
 
             with gl.amd.warp_pipeline_stage("mfma", priority=0):
                 accumulator = self.mfma(x, scale_x, w, scale_w, accumulator)
 
-        self.async_wait(0)
+        self.async_wait(0, SYNC_AFTER_WAIT)
         for _ in gl.static_range(cfg.NUM_BUFFERS - 1):
             x, w, scale_x, scale_w = self.issue_local_loads(mfma_idx)
             mfma_idx += 1
@@ -2275,8 +2277,16 @@ class MoESliceNProgram:
         return load_idx
 
     @gluon.jit
-    def async_wait(self, waitcnt):
+    def async_wait(self, waitcnt, SYNC_AFTER_WAIT: gl.constexpr = False):
         gl.amd.cdna4.async_copy.wait_group(waitcnt * 2)
+        if SYNC_AFTER_WAIT:
+            gl.barrier()
+
+    @gluon.jit
+    def async_wait_groups(self, waitcnt, SYNC_AFTER_WAIT: gl.constexpr = False):
+        gl.amd.cdna4.async_copy.wait_group(waitcnt)
+        if SYNC_AFTER_WAIT:
+            gl.barrier()
 
     @gluon.jit
     def issue_local_load_w_sub(self, mfma_idx, subtile_idx_n: gl.constexpr):
@@ -2346,7 +2356,7 @@ class MoESliceNProgram:
         return w, scale_w
 
     @gluon.jit
-    def pipeline(self, loop_k):
+    def pipeline(self, loop_k, SYNC_AFTER_WAIT: gl.constexpr = False):
         cfg = self.cfg
         NB: gl.constexpr = cfg.NUM_BUFFERS
         gl.static_assert(
@@ -2372,7 +2382,7 @@ class MoESliceNProgram:
         gl.assume(main_iters >= 2)
 
         # Drain iter 0's top half so the first ds_read has data.
-        gl.amd.cdna4.async_copy.wait_group(2 * NB - 1)
+        self.async_wait_groups(2 * NB - 1, SYNC_AFTER_WAIT)
         x, sx = self.issue_local_load_x(mfma_idx)
         w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
 
@@ -2381,26 +2391,26 @@ class MoESliceNProgram:
         for _ in range(0, unroll_pairs):
             # iter k regions 0+1.
             c0 = self.mfma(x, sx, w0, sw0, c0)
-            gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
+            self.async_wait_groups(2 * NB - 2, SYNC_AFTER_WAIT)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
 
             c1 = self.mfma(x, sx, w1, sw1, c1)
             mfma_idx += 1
-            gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
+            self.async_wait_groups(2 * NB - 2, SYNC_AFTER_WAIT)
             x, sx = self.issue_local_load_x(mfma_idx)
             w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
 
             # iter k+1 regions 2+3 (LDS slot ping-ponged via mfma_idx parity).
             c0 = self.mfma(x, sx, w0, sw0, c0)
-            gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
+            self.async_wait_groups(2 * NB - 2, SYNC_AFTER_WAIT)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
 
             c1 = self.mfma(x, sx, w1, sw1, c1)
             mfma_idx += 1
-            gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
+            self.async_wait_groups(2 * NB - 2, SYNC_AFTER_WAIT)
             x, sx = self.issue_local_load_x(mfma_idx)
             w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
@@ -2408,19 +2418,19 @@ class MoESliceNProgram:
         # Odd peel; USE_MASK=-1 covers the K-tail iter.
         if odd_main:
             c0 = self.mfma(x, sx, w0, sw0, c0)
-            gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
+            self.async_wait_groups(2 * NB - 2, SYNC_AFTER_WAIT)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
 
             c1 = self.mfma(x, sx, w1, sw1, c1)
             mfma_idx += 1
-            gl.amd.cdna4.async_copy.wait_group(2 * NB - 2)
+            self.async_wait_groups(2 * NB - 2, SYNC_AFTER_WAIT)
             x, sx = self.issue_local_load_x(mfma_idx)
             w0, sw0 = self.issue_local_load_w_sub(mfma_idx, 0)
             load_idx = self.issue_global_load_bot(load_idx, USE_MASK=-1)
 
         # Drain + final NB iters of MFMAs (no more async_copy).
-        gl.amd.cdna4.async_copy.wait_group(0)
+        self.async_wait_groups(0, SYNC_AFTER_WAIT)
         for i in gl.static_range(NB):
             c0 = self.mfma(x, sx, w0, sw0, c0)
             w1, sw1 = self.issue_local_load_w_sub(mfma_idx, 1)
@@ -2557,6 +2567,7 @@ def _pipelined_moe_tile_compute(
         W_VIA_VGPR=W_VIA_VGPR,
         W_PREFETCH=W_PREFETCH,
     )
+    sync_preshuffled_lds_w: gl.constexpr = W_PRESHUFFLED and not W_VIA_VGPR
 
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
     BLOCK_K_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
@@ -2607,6 +2618,36 @@ def _pipelined_moe_tile_compute(
                 block_bases=[],
                 shape=[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16],
             )
+            if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR:
+                # Use all four waves as unique async-copy producers.  The
+                # local LDS load still uses LOAD_W_LAYOUT above because it is
+                # matched to the W dot operand layout.
+                LOAD_W_COPY_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+                    reg_bases=[
+                        [0, 1],
+                        [0, 2],
+                        [0, 4],
+                        [0, 8],
+                        [0, 1024],
+                        [1, 0],
+                    ],
+                    lane_bases=[
+                        [0, 16],
+                        [0, 32],
+                        [0, 64],
+                        [0, 128],
+                        [0, 256],
+                        [0, 512],
+                    ],
+                    warp_bases=[
+                        [2, 0],
+                        [4, 0],
+                    ],
+                    block_bases=[],
+                    shape=[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16],
+                )
+            else:
+                LOAD_W_COPY_LAYOUT: gl.constexpr = LOAD_W_LAYOUT
         else:
             # tpw=[1,1]
             LOAD_W_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
@@ -2634,6 +2675,35 @@ def _pipelined_moe_tile_compute(
                 block_bases=[],
                 shape=[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16],
             )
+            if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR:
+                # See the SCALE_VIA_LDS branch: copy with unique producer
+                # waves, then read from LDS with the dot-compatible layout.
+                LOAD_W_COPY_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+                    reg_bases=[
+                        [0, 1],
+                        [0, 2],
+                        [0, 4],
+                        [0, 8],
+                        [0, 1024],
+                        [2, 0],
+                    ],
+                    lane_bases=[
+                        [0, 16],
+                        [0, 32],
+                        [0, 64],
+                        [0, 128],
+                        [0, 256],
+                        [0, 512],
+                    ],
+                    warp_bases=[
+                        [1, 0],
+                        [4, 0],
+                    ],
+                    block_bases=[],
+                    shape=[BLOCK_N_LAYOUT // 16, BLOCK_K_W * 16],
+                )
+            else:
+                LOAD_W_COPY_LAYOUT: gl.constexpr = LOAD_W_LAYOUT
     elif W_TRANSPOSE:
         # LDS path, K-contig: offsets shape (BLOCK_NONK, BLOCK_K).
         LOAD_W_LAYOUT: gl.constexpr = _load_layout(
@@ -2651,9 +2721,11 @@ def _pipelined_moe_tile_compute(
         # Virtual (n_block, k_flat); half-tile (BLOCK_N//2//16) under sliceN.
         _BN_W_LAYOUT: gl.constexpr = (BLOCK_N // 2) if USE_SLICE_N else BLOCK_N
         offs_wn = gl.arange(
-            0, _BN_W_LAYOUT // 16, layout=gl.SliceLayout(1, LOAD_W_LAYOUT)
+            0, _BN_W_LAYOUT // 16, layout=gl.SliceLayout(1, LOAD_W_COPY_LAYOUT)
         )
-        offs_wk = gl.arange(0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
+        offs_wk = gl.arange(
+            0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_COPY_LAYOUT)
+        )
     elif W_TRANSPOSE:
         offs_wn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, LOAD_W_LAYOUT))
         offs_wk = gl.arange(0, BLOCK_K_W, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))
@@ -3059,6 +3131,30 @@ def _pipelined_moe_tile_compute(
                     block_bases=[],
                     shape=[SUB_BN // 16, BLOCK_K_W * 16],
                 )
+                if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR:
+                    LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+                        reg_bases=[
+                            [0, 1],
+                            [0, 2],
+                            [0, 4],
+                            [0, 8],
+                            [0, 1024],
+                            [1, 0],
+                        ],
+                        lane_bases=[
+                            [0, 16],
+                            [0, 32],
+                            [0, 64],
+                            [0, 128],
+                            [0, 256],
+                            [0, 512],
+                        ],
+                        warp_bases=[[2, 0], [4, 0]],
+                        block_bases=[],
+                        shape=[SUB_BN // 16, BLOCK_K_W * 16],
+                    )
+                else:
+                    LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = LOAD_W_HALF_LAYOUT
             else:
                 LOAD_W_HALF_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
                     reg_bases=[
@@ -3082,11 +3178,35 @@ def _pipelined_moe_tile_compute(
                     block_bases=[],
                     shape=[SUB_BN // 16, BLOCK_K_W * 16],
                 )
+                if cfg.W_PRESHUFFLED and not cfg.W_VIA_VGPR:
+                    LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
+                        reg_bases=[
+                            [0, 1],
+                            [0, 2],
+                            [0, 4],
+                            [0, 8],
+                            [0, 1024],
+                            [2, 0],
+                        ],
+                        lane_bases=[
+                            [0, 16],
+                            [0, 32],
+                            [0, 64],
+                            [0, 128],
+                            [0, 256],
+                            [0, 512],
+                        ],
+                        warp_bases=[[1, 0], [4, 0]],
+                        block_bases=[],
+                        shape=[SUB_BN // 16, BLOCK_K_W * 16],
+                    )
+                else:
+                    LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = LOAD_W_HALF_LAYOUT
             offs_wn_h = gl.arange(
-                0, SUB_BN // 16, layout=gl.SliceLayout(1, LOAD_W_HALF_LAYOUT)
+                0, SUB_BN // 16, layout=gl.SliceLayout(1, LOAD_W_HALF_COPY_LAYOUT)
             )
             offs_wk_h = gl.arange(
-                0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_HALF_LAYOUT)
+                0, BLOCK_K_W * 16, layout=gl.SliceLayout(0, LOAD_W_HALF_COPY_LAYOUT)
             )
             offsets_h = gl.expand_dims(offs_wk_h, 0) + gl.expand_dims(offs_wn_h, 1) * (
                 BLOCK_K_W * 16
@@ -3228,15 +3348,15 @@ def _pipelined_moe_tile_compute(
             x_scale_desc,
             w_scale_desc,
         )
-        acc = pgm.pipeline(K)
+        acc = pgm.pipeline(K, sync_preshuffled_lds_w)
     else:
         pgm = MoEPipelinedProgram.initialize(
             cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
         )
         if USE_WARP_PIPELINE:
-            acc = pgm.warp_pipeline(K)
+            acc = pgm.warp_pipeline(K, sync_preshuffled_lds_w)
         else:
-            acc = pgm.pipeline(K)
+            acc = pgm.pipeline(K, sync_preshuffled_lds_w)
 
     if APPLY_X_GLOBAL_SCALE and not HAS_X_BLOCK_SCALE:
         x_global_scale = gl.load(x_global_scale_ptr)
@@ -3785,9 +3905,9 @@ def _launch_kernel(
             f"preshuffled W packed block_n={packed_block_n} is incompatible with "
             f"execution BLOCK_N={block_n}, USE_SLICE_N={use_slice_n}"
         )
-        assert N % packed_block_n == 0, (
-            f"preshuffled W N={N} must be divisible by packed block_n={packed_block_n}"
-        )
+        assert (
+            N % packed_block_n == 0
+        ), f"preshuffled W N={N} must be divisible by packed block_n={packed_block_n}"
 
     grid_n = (N + block_n - 1) // block_n
 
