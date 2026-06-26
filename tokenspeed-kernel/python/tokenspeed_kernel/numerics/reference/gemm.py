@@ -68,11 +68,13 @@ def torch_mm_fp8_blockscale(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    C: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    del C
     assert block_size is not None, "block_size is required for mxfp8 reference"
-    assert (
-        A_scales is not None and B_scales is not None
-    ), "A_scales and B_scales are required for mxfp8 reference"
+    assert A_scales is not None and B_scales is not None, (
+        "A_scales and B_scales are required for mxfp8 reference"
+    )
     assert A.ndim == 2 and B.ndim == 2, f"Expected 2D inputs, got {A.ndim=} {B.ndim=}"
 
     M, K = A.shape
@@ -83,8 +85,7 @@ def torch_mm_fp8_blockscale(
     k_tiles = math.ceil(K / block_k)
     n_tiles = math.ceil(N / block_n)
     assert A_scales.shape == (M, k_tiles), (
-        f"A_scales shape mismatch: expected {(M, k_tiles)}, "
-        f"got {tuple(A_scales.shape)}"
+        f"A_scales shape mismatch: expected {(M, k_tiles)}, got {tuple(A_scales.shape)}"
     )
     assert B_scales.shape == (n_tiles, k_tiles), (
         f"B_scales shape mismatch: expected {(n_tiles, k_tiles)}, "
@@ -125,17 +126,19 @@ def torch_mm_fp8_scaled_mnk(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    C: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    del C
     assert block_size is None, "block_size is not supported for fp8 scaled reference"
-    assert (
-        A_scales is not None and B_scales is not None
-    ), "A_scales and B_scales are required for fp8 scaled reference"
+    assert A_scales is not None and B_scales is not None, (
+        "A_scales and B_scales are required for fp8 scaled reference"
+    )
     assert A_scales.shape == (1,), "A_scales must have shape (1,)"
     assert B_scales.shape == (1,), "B_scales must have shape (1,)"
 
-    assert (
-        A.shape[1] == B.shape[1]
-    ), f"Expected A and B to have the same K dimension, got {tuple(A.shape)} and {tuple(B.shape)}"
+    assert A.shape[1] == B.shape[1], (
+        f"Expected A and B to have the same K dimension, got {tuple(A.shape)} and {tuple(B.shape)}"
+    )
 
     A_scales = float(A_scales.item())
     B_scales = float(B_scales.item())
@@ -167,17 +170,19 @@ def torch_mm_fp8_scaled_nkm(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    C: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    del C
     assert block_size is None, "block_size is not supported for fp8 scaled reference"
-    assert (
-        A_scales is not None and B_scales is not None
-    ), "A_scales and B_scales are required for fp8 scaled reference"
+    assert A_scales is not None and B_scales is not None, (
+        "A_scales and B_scales are required for fp8 scaled reference"
+    )
     assert A_scales.shape == (1,), "A_scales must have shape (1,)"
     assert B_scales.shape == (1,), "B_scales must have shape (1,)"
 
-    assert (
-        A.shape[1] == B.shape[0]
-    ), f"Expected A and B to have the same K dimension, got {tuple(A.shape)} and {tuple(B.shape)}"
+    assert A.shape[1] == B.shape[0], (
+        f"Expected A and B to have the same K dimension, got {tuple(A.shape)} and {tuple(B.shape)}"
+    )
 
     output = (A.float() * float(A_scales.item())) @ (B.float() * float(B_scales.item()))
 
@@ -206,7 +211,9 @@ def torch_mm(
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
     bias: torch.Tensor | None = None,
+    C: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    del C
     if alpha is None:
         # F.linear fuses the bias add inside the GEMM epilogue.
         output = F.linear(A, B, bias)

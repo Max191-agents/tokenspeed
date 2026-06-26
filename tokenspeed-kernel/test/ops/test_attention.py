@@ -72,11 +72,11 @@ def test_mha_prefill(
 
     seqlens_list = [851, 914, 1053]
     max_seqlen = max(seqlens_list)
-    cu_seqlens_cpu = [0]
+    cu_seqlens_q_cpu = [0]
     for seqlen in seqlens_list:
-        cu_seqlens_cpu.append(cu_seqlens_cpu[-1] + seqlen)
+        cu_seqlens_q_cpu.append(cu_seqlens_q_cpu[-1] + seqlen)
     seqlens = torch.tensor(seqlens_list, device=device, dtype=torch.int32)
-    cu_seqlens = torch.tensor(cu_seqlens_cpu, device=device, dtype=torch.int32)
+    cu_seqlens_q = torch.tensor(cu_seqlens_q_cpu, device=device, dtype=torch.int32)
     total_tokens = int(seqlens.sum().item())
 
     q = _randn((total_tokens, num_q_heads, head_dim), device=device, dtype=dtype)
@@ -89,8 +89,8 @@ def test_mha_prefill(
         q=q,
         k=k,
         v=v,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=cu_seqlens_cpu,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_q_cpu=cu_seqlens_q_cpu,
         max_seqlen=max_seqlen,
         window_left=window_left,
         sinks=sinks,

@@ -24,6 +24,7 @@ import math
 from typing import Any
 
 import torch
+from tokenspeed_kernel.numerics.input_generators import GemmInputs, ScaledGemmInputs
 from tokenspeed_kernel.numerics.inputs import (
     InputGenerator,
     set_benchmark_shapes,
@@ -102,28 +103,18 @@ set_family_tolerance("gemm", tolerance)
 
 
 class GemmInputGenerator(InputGenerator):
-    def _generate_value(self, shape: tuple[int, ...], dtype) -> torch.Tensor:
-        values = torch.randn(
-            *shape,
-            dtype=torch.float32,
-            device=self.device,
-            generator=self.rng,
-        )
-        return values.to(dtype)
-
-    def _generate_scales(self, shape: tuple[int, ...], dtype) -> torch.Tensor:
-        scales = torch.rand(
-            *shape,
-            dtype=torch.float32,
-            device=self.device,
-            generator=self.rng,
-        )
-        return scales.to(dtype)
-
     def _format(self, role: str) -> TensorFormat | None:
         if self.format_signature is None:
             return None
         return self.format_signature.format_for(role)
+
+    def _layout(self, role: str) -> str:
+        layout = self.traits.get(f"{role}_layout")
+        if role == "a" and layout == {"KM"}:
+            return "KM"
+        if role == "b" and layout == {"KN"}:
+            return "KN"
+        return "MK" if role == "a" else "NK"
 
     def _block_size(
         self,
@@ -135,89 +126,67 @@ class GemmInputGenerator(InputGenerator):
                 return list(scale.block_shape)
         return None
 
-    def _scale_for_format(
-        self,
-        tensor_format: TensorFormat | None,
-        role: str,
-        *,
-        M: int,
-        N: int,
-        K: int,
-        block_size: list[int] | None,
-    ) -> torch.Tensor | None:
-        scale = tensor_format.scale if tensor_format is not None else None
-        if scale is None:
-            return None
-
-        if scale.granularity == "block" and tensor_format.format == "mxfp8":
-            if block_size is None:
-                raise ValueError(
-                    "mxfp8 block scale format requires concrete block_shape"
-                )
-            block_n, block_k = block_size
-            k_tiles = math.ceil(K / block_k)
-            if role == "a":
-                return self._generate_scales((M, k_tiles), scale.storage_dtype)
-            if role == "b":
-                n_tiles = math.ceil(N / block_n)
-                return self._generate_scales((n_tiles, k_tiles), scale.storage_dtype)
-
-        if scale.granularity == "channel":
-            return self._generate_scales(
-                (M,) if role == "a" else (N,),
-                scale.storage_dtype,
-            )
-
-        return self._generate_scales((1,), scale.storage_dtype)
-
     def generate(
         self,
         M: int,
         N: int,
         K: int,
     ) -> dict[str, Any]:
-        a_layout = self.traits.get("a_layout")
-        b_layout = self.traits.get("b_layout")
-        a_format = self._format("a")
-        b_format = self._format("b")
-        a_dtype = a_format.storage_dtype if a_format is not None else self.dtype
-        b_dtype = b_format.storage_dtype if b_format is not None else self.dtype
-
-        A = (
-            self._generate_value((K, M), a_dtype)
-            if a_layout == {"KM"}
-            else self._generate_value((M, K), a_dtype)
+        a_tensor_format = self._format("a")
+        b_tensor_format = self._format("b")
+        a_dtype = (
+            a_tensor_format.storage_dtype if a_tensor_format is not None else self.dtype
         )
-        B = (
-            self._generate_value((K, N), b_dtype)
-            if b_layout == {"KN"}
-            else self._generate_value((N, K), b_dtype)
+        b_dtype = (
+            b_tensor_format.storage_dtype if b_tensor_format is not None else self.dtype
         )
 
-        block_size = self._block_size(a_format, b_format)
-        A_scales = self._scale_for_format(
-            a_format,
-            "a",
-            M=M,
-            N=N,
-            K=K,
-            block_size=block_size,
-        )
-        B_scales = self._scale_for_format(
-            b_format,
-            "b",
-            M=M,
-            N=N,
-            K=K,
-            block_size=block_size,
-        )
-
+        block_size = self._block_size(a_tensor_format, b_tensor_format)
+        a_layout = self._layout("a")
+        b_layout = self._layout("b")
         out_dtype = torch.bfloat16
+
+        if (a_tensor_format is not None and a_tensor_format.scale is not None) or (
+            b_tensor_format is not None and b_tensor_format.scale is not None
+        ):
+            scaled_inputs = ScaledGemmInputs.from_formats(
+                M=M,
+                N=N,
+                K=K,
+                a_tensor_format=a_tensor_format or TensorFormat(storage_dtype=a_dtype),
+                b_tensor_format=b_tensor_format or TensorFormat(storage_dtype=b_dtype),
+                c_dtype=out_dtype,
+                a_layout=a_layout,
+                b_layout=b_layout,
+            ).generate(seed=self.seed, device=self.device)
+            A = scaled_inputs.A.values if scaled_inputs.A is not None else None
+            B = scaled_inputs.B.values if scaled_inputs.B is not None else None
+            A_scales = scaled_inputs.A.scales if scaled_inputs.A is not None else None
+            B_scales = scaled_inputs.B.scales if scaled_inputs.B is not None else None
+            C = scaled_inputs.C
+        else:
+            gemm_inputs = GemmInputs(
+                M=M,
+                N=N,
+                K=K,
+                a_dtype=a_dtype,
+                b_dtype=b_dtype,
+                c_dtype=out_dtype,
+                a_layout=a_layout,
+                b_layout=b_layout,
+            ).generate(seed=self.seed, device=self.device)
+            A = gemm_inputs.A
+            B = gemm_inputs.B
+            A_scales = None
+            B_scales = None
+            C = gemm_inputs.C
+
         alpha = None
 
         return {
             "A": A,
             "B": B,
+            "C": C,
             "A_scales": A_scales,
             "B_scales": B_scales,
             "out_dtype": out_dtype,

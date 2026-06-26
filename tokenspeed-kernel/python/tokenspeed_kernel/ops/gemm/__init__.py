@@ -236,6 +236,7 @@ def mm(
     A_scales: torch.Tensor | None = None,
     B_scales: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    C: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
@@ -260,6 +261,7 @@ def mm(
             output.  When the selected kernel supports a fused bias
             epilogue (see ``_KERNELS_WITH_FUSED_BIAS``) it is passed
             into the kernel; otherwise it is added after the GEMM.
+        C: Optional caller-provided output buffer for kernels that support one.
         out_dtype: Output dtype (defaults to ``A.dtype``).
         alpha: Global scaling factor (nvfp4 only).
         block_size: Block size for block-wise quantization, e.g.
@@ -305,13 +307,17 @@ def mm(
 
     # Online activation quantization
     if quant == "mxfp8" and A_scales is None:
-        assert (
-            block_size is not None
-        ), "block_size is required for online activation quantization"
+        assert block_size is not None, (
+            "block_size is required for online activation quantization"
+        )
         A, A_scales = _online_quantize_mxfp8(A, block_size, kernel.name)
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
-    kernel_kwargs: dict[str, object] = {"alpha": alpha, "block_size": block_size}
+    kernel_kwargs: dict[str, object] = {
+        "alpha": alpha,
+        "block_size": block_size,
+        "C": C,
+    }
 
     fused_bias = bias is not None and kernel.name in _KERNELS_WITH_FUSED_BIAS
     if fused_bias:

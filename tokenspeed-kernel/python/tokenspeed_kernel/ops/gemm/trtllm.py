@@ -97,7 +97,9 @@ def cublaslt_mm_nvfp4(
     *,
     alpha: torch.Tensor,
     block_size: list[int] | None = None,
+    C: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    del C
     runner = _get_runner(out_dtype)
     return runner.run_gemm(
         A,

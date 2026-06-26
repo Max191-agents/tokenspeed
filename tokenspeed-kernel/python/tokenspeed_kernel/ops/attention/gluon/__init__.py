@@ -89,5 +89,27 @@ if current_platform().is_amd:
             "return_lse": frozenset({False, True}),
         },
     )
-    def gluon_mha_prefill_fp16_gfx950(*args, **kwargs):
-        return _prefill_impl(*args, **kwargs)
+    def gluon_mha_prefill_fp16_gfx950(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_q_cpu: list[int],
+        max_seqlen: int,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = False,
+    ):
+        return _prefill_impl(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens=cu_seqlens_q,
+            cu_seqlens_cpu=cu_seqlens_q_cpu,
+            max_seqlen=max_seqlen,
+            window_left=window_left,
+            logit_cap=logit_cap,
+            sinks=sinks,
+            return_lse=return_lse,
+        )

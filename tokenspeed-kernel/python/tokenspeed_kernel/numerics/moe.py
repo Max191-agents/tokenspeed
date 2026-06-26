@@ -67,10 +67,12 @@ class MoeAlignBlockSizeInputGenerator(InputGenerator):
         num_experts: int,
         block_size: int,
     ) -> dict[str, Any]:
+        if num_experts <= 0:
+            raise ValueError("num_experts must be positive")
         topk_ids = torch.randint(
-            low=0,
-            high=num_experts,
-            size=(total_tokens, top_k),
+            0,
+            num_experts,
+            (total_tokens, top_k),
             device=self.device,
             dtype=torch.int32,
             generator=self.rng,

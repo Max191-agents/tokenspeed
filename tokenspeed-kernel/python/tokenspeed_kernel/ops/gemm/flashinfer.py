@@ -75,14 +75,10 @@ _NVFP4_FORMAT_SIGNATURES = frozenset(
 # ---- FlashInfer block-scaled FP8 ----------------------------------------
 
 gemm_fp8_nt_groupwise = error_fn
-tinygemm_bf16 = error_fn
 
 if platform.is_hopper_plus:
     try:
-        from flashinfer.gemm import (
-            gemm_fp8_nt_groupwise,
-            tinygemm_bf16,
-        )
+        from flashinfer.gemm import gemm_fp8_nt_groupwise
     except ImportError:
         pass
 
@@ -114,10 +110,12 @@ if gemm_fp8_nt_groupwise is not error_fn:
         *,
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
+        C: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert (
-            A_scales is not None
-        ), "A_scales is required; online quantization should be done by the caller"
+        del C
+        assert A_scales is not None, (
+            "A_scales is required; online quantization should be done by the caller"
+        )
         assert B_scales is not None, "B_scales is required for FP8 blockscale GEMM"
         orig_m = A.shape[0]
         scale_m = A_scales.shape[0]
@@ -178,7 +176,9 @@ if mm_fp4 is not error_fn:
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
         enable_pdl: bool = False,
+        C: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del C
         # backend="cutlass" (not "auto") to skip flashinfer's cuDNN-graph plan compile.
         return mm_fp4(
             A,

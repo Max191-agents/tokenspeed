@@ -67,8 +67,8 @@ def mha_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_cpu: list[int],
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_q_cpu: list[int],
     max_seqlen: int,
     # attention options
     window_left: int = -1,
@@ -85,10 +85,11 @@ def mha_prefill(
         q: Query tensor with shape [total_q, num_q_heads, head_dim].
         k: Key tensor with shape [total_kv, num_kv_heads, head_dim].
         v: Value tensor with shape [total_kv, num_kv_heads, head_dim].
-        cu_seqlens: Cumulative sequence lengths with shape [batch + 1].
+        cu_seqlens_q: Query cumulative sequence lengths with shape [batch + 1].
             KV cumulative sequence lengths are assumed to be identical.
-        cu_seqlens_cpu: Host-side cumulative sequence lengths as a strict
-            list[int]. Used for host-side launch metadata; must match cu_seqlens.
+        cu_seqlens_q_cpu: Host-side query cumulative sequence lengths as a
+            strict list[int]. Used for host-side launch metadata; must match
+            cu_seqlens_q.
         max_seqlen: Maximum sequence length.
         window_left: Inclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
@@ -100,7 +101,7 @@ def mha_prefill(
 
     Standard full-sequence prefill assumes query and KV sequence boundaries match.
     """
-    batch_size = cu_seqlens.shape[0] - 1
+    batch_size = cu_seqlens_q.shape[0] - 1
 
     # Select kernel
     traits = {
@@ -150,8 +151,8 @@ def mha_prefill(
             q=q,
             k=k,
             v=v,
-            cu_seqlens=cu_seqlens,
-            cu_seqlens_cpu=cu_seqlens_cpu,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             max_seqlen=max_seqlen,
             window_left=window_left,
             logit_cap=logit_cap,

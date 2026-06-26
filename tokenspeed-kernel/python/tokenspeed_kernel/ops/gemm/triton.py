@@ -83,9 +83,9 @@ def prepare_block_fp8_matmul_inputs(
     if As.dtype == torch.float:
         assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     elif As.dtype == torch.int:
-        assert (
-            triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
-        ), f"{A.shape=} {As.shape=} {block_size=}"
+        assert triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1], (
+            f"{A.shape=} {As.shape=} {block_size=}"
+        )
     else:
         raise NotImplementedError
 
@@ -101,9 +101,9 @@ def prepare_block_fp8_matmul_inputs(
         assert triton.cdiv(K, block_k) == Bs.shape[1]
     elif Bs.dtype == torch.int:
         assert N == Bs.shape[0], f"{B.shape=} {Bs.shape=} {block_size=}"
-        assert (
-            triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
-        ), f"{B.shape=} {Bs.shape=} {block_size=}"
+        assert triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1], (
+            f"{B.shape=} {Bs.shape=} {block_size=}"
+        )
     else:
         raise NotImplementedError
 
@@ -657,13 +657,15 @@ def triton_scaled_mm(
     assert is_weak_contiguous(input)
     assert is_weak_contiguous(weight)
 
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
 
     result = torch.empty((M, N), dtype=out_dtype, device=input.device)
 
-    has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
+    def has_scalar(x):
+        return x.shape[0] == 1 and x.shape[1] == 1
 
     if use_heuristic:
         is_small_N = N < 8192
@@ -739,11 +741,13 @@ def triton_mm_fp8_blockscale(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    C: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    del C
     assert block_size is not None, "block_size is required for triton_mm_fp8_blockscale"
-    assert (
-        A_scales is not None
-    ), "A_scales is required; online quantization should be done by the caller"
+    assert A_scales is not None, (
+        "A_scales is required; online quantization should be done by the caller"
+    )
     return w8a8_block_fp8_matmul_triton(
         A,
         B,
@@ -846,6 +850,7 @@ def triton_mm_mxfp4(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    C: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del alpha, block_size
     if A.dtype != torch.uint8 or B.dtype != torch.uint8:
@@ -859,7 +864,16 @@ def triton_mm_mxfp4(
     N = B.shape[0]
     if K % 32 != 0:
         raise ValueError("MXFP4 GEMM requires K divisible by 32")
-    C = torch.empty(M, N, device=A.device, dtype=out_dtype)
+    if C is None:
+        C = torch.empty(M, N, device=A.device, dtype=out_dtype)
+    elif C.shape != (M, N):
+        raise ValueError(
+            f"MXFP4 GEMM C shape mismatch: expected {(M, N)}, got {C.shape}"
+        )
+    elif C.dtype != out_dtype:
+        raise ValueError(
+            f"MXFP4 GEMM C dtype mismatch: expected {out_dtype}, got {C.dtype}"
+        )
     grid = (triton.cdiv(M, 16), triton.cdiv(N, 32))
     _mxfp4_mm_kernel[grid](
         A,
@@ -917,7 +931,9 @@ def triton_mm_fp8_scaled(
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
     bias: torch.Tensor | None = None,
+    C: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    del C
     return triton_scaled_mm(
         A,
         B,
