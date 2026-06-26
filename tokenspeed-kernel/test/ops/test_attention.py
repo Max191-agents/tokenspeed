@@ -150,17 +150,14 @@ def test_mha_extend_with_kvcache(
             device=device,
             dtype=torch.int32,
         )
-        triton_out, triton_lse = mha_extend_with_kvcache(
-            q=kwargs["q"],
-            cu_seqlens_q=kwargs["cu_seqlens_q"],
-            cu_seqlens_kv=kwargs["cu_seqlens_kv"],
-            k_cache=kwargs["k_cache"],
-            v_cache=kwargs["v_cache"],
-            page_table=kwargs["page_table"],
+        triton_kwargs = dict(kwargs)
+        triton_kwargs.update(
             cache_seqlens=prefix_seqlens,
-            max_seqlen_q=kwargs["max_seqlen_q"],
             max_seqlen_k=int(prefix_seqlens.max().item()),
             return_lse=True,
+        )
+        triton_out, triton_lse = mha_extend_with_kvcache(
+            **triton_kwargs,
             solution=solution,
         )
 
