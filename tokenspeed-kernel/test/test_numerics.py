@@ -38,6 +38,7 @@ from tokenspeed_kernel.numerics.input_generators import (
     ScaledTensorInput,
     TensorInputConfig,
     TensorInput,
+    gemm_scale_shape,
 )
 from tokenspeed_kernel.numerics.inputs import get_input_generator
 from tokenspeed_kernel.numerics.tolerance import Tolerance
@@ -404,14 +405,17 @@ def test_gemm_inputs_support_custom_mxfp4_dtype() -> None:
 
 
 def test_scaled_gemm_inputs_generate_scaled_operands() -> None:
-    scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
-    inputs = ScaledGemmInputs.from_formats(
+    inputs = ScaledGemmInputs(
         M=4,
         N=6,
         K=8,
-        a_tensor_format=tensor_format("scaled-fp8", _fp8_dtype, scale=scale),
-        b_tensor_format=tensor_format("scaled-fp8", _fp8_dtype, scale=scale),
+        a_dtype=_fp8_dtype,
+        b_dtype=_fp8_dtype,
+        a_scale_dtype=torch.float32,
+        b_scale_dtype=torch.float32,
         c_dtype=torch.float32,
+        a_scale_shape=gemm_scale_shape("channel", "a", M=4, N=6, K=8),
+        b_scale_shape=gemm_scale_shape("channel", "b", M=4, N=6, K=8),
     ).generate(seed=17, device="cpu")
 
     assert inputs.A is not None
@@ -431,14 +435,17 @@ def test_scaled_gemm_inputs_generate_scaled_operands() -> None:
 
 
 def test_scaled_gemm_inputs_use_mutable_config_fields() -> None:
-    scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
-    inputs = ScaledGemmInputs.from_formats(
+    inputs = ScaledGemmInputs(
         M=4,
         N=6,
         K=8,
-        a_tensor_format=tensor_format("scaled-fp8", _fp8_dtype, scale=scale),
-        b_tensor_format=tensor_format("scaled-fp8", _fp8_dtype, scale=scale),
+        a_dtype=_fp8_dtype,
+        b_dtype=_fp8_dtype,
+        a_scale_dtype=torch.float32,
+        b_scale_dtype=torch.float32,
         c_dtype=torch.float32,
+        a_scale_shape=gemm_scale_shape("channel", "a", M=4, N=6, K=8),
+        b_scale_shape=gemm_scale_shape("channel", "b", M=4, N=6, K=8),
     )
 
     inputs.config.a_scale_dtype = torch.float64

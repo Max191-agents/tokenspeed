@@ -39,7 +39,6 @@ from tokenspeed_kernel.numerics.input_generators.core import (
     _normalize_shape,
     _packed_mxfp4_shape,
 )
-from tokenspeed_kernel.signature import ScaleFormat, TensorFormat
 
 __all__ = [
     "GemmInputs",
@@ -52,6 +51,7 @@ __all__ = [
 ]
 
 GemmLayout = Literal["MK", "KM", "NK", "KN"]
+ScaleGranularity = Literal["tensor", "channel", "block"]
 
 _DEFAULT_MXFP4_BLOCK_SIZE = 32
 
@@ -81,55 +81,50 @@ def _gemm_value_shape(
 
 
 def gemm_scale_shape(
-    scale_format: ScaleFormat | None,
+    granularity: ScaleGranularity | str | None,
     role: Literal["a", "b"],
     *,
     M: int,
     N: int,
     K: int,
     batch_shape: tuple[int, ...] = (),
+    block_shape: tuple[int, ...] | None = None,
 ) -> tuple[int, ...] | None:
     """Return the physical scale shape for a GEMM operand role."""
 
-    if scale_format is None:
+    if granularity is None:
         return None
 
-    if scale_format.granularity == "tensor":
+    if granularity == "tensor":
         return (1,)
 
-    if scale_format.granularity == "channel":
+    if granularity == "channel":
         return batch_shape + ((M,) if role == "a" else (N,))
 
-    if scale_format.granularity != "block":
-        return (1,)
-
-    if scale_format.block_shape is None:
+    if granularity != "block":
+        raise ValueError(f"unsupported GEMM scale granularity {granularity!r}")
+    if block_shape is None:
         raise ValueError("block scale format requires concrete block_shape")
 
-    if len(scale_format.block_shape) == 1:
-        block_k = scale_format.block_shape[0]
+    block_shape = tuple(block_shape)
+    if not block_shape or any(dim <= 0 for dim in block_shape):
+        raise ValueError("block_shape must contain positive dimensions")
+
+    if len(block_shape) == 1:
+        block_k = block_shape[0]
         return batch_shape + (
             (M, math.ceil(K / block_k)) if role == "a" else (N, math.ceil(K / block_k))
         )
 
-    if len(scale_format.block_shape) == 2:
-        block_n, block_k = scale_format.block_shape
+    if len(block_shape) == 2:
+        block_n, block_k = block_shape
         if role == "a":
             return batch_shape + (M, math.ceil(K / block_k))
         return batch_shape + (math.ceil(N / block_n), math.ceil(K / block_k))
 
     raise ValueError(
-        f"GEMM scale format supports 1D or 2D block shapes, got "
-        f"{scale_format.block_shape}"
+        f"GEMM scale format supports 1D or 2D block shapes, got {block_shape}"
     )
-
-
-def _input_dtype_from_format(tensor_format: TensorFormat) -> InputDType:
-    if tensor_format.format == "mxfp4":
-        if tensor_format.storage_dtype != torch.uint8:
-            raise ValueError("mxfp4 values must use torch.uint8 storage")
-        return CustomDType.MXFP4
-    return tensor_format.storage_dtype
 
 
 def _generate_tensor(
@@ -448,62 +443,6 @@ class ScaledGemmInputs(NumericsInputGenerator):
             self.config.b_scale_shape = _normalize_shape(self.config.b_scale_shape)
 
     @classmethod
-    def from_formats(
-        cls,
-        *,
-        M: int,
-        N: int,
-        K: int,
-        a_tensor_format: TensorFormat,
-        b_tensor_format: TensorFormat,
-        c_dtype: torch.dtype,
-        a_layout: GemmLayout = "MK",
-        b_layout: GemmLayout = "NK",
-        batch_shape: tuple[int, ...] = (),
-    ) -> Self:
-        """Build a scaled GEMM generator from signature metadata."""
-
-        a_scale_shape = gemm_scale_shape(
-            a_tensor_format.scale,
-            "a",
-            M=M,
-            N=N,
-            K=K,
-            batch_shape=batch_shape,
-        )
-        b_scale_shape = gemm_scale_shape(
-            b_tensor_format.scale,
-            "b",
-            M=M,
-            N=N,
-            K=K,
-            batch_shape=batch_shape,
-        )
-        return cls(
-            M=M,
-            N=N,
-            K=K,
-            a_dtype=_input_dtype_from_format(a_tensor_format),
-            b_dtype=_input_dtype_from_format(b_tensor_format),
-            a_scale_dtype=(
-                None
-                if a_tensor_format.scale is None
-                else a_tensor_format.scale.storage_dtype
-            ),
-            b_scale_dtype=(
-                None
-                if b_tensor_format.scale is None
-                else b_tensor_format.scale.storage_dtype
-            ),
-            c_dtype=c_dtype,
-            a_layout=a_layout,
-            b_layout=b_layout,
-            batch_shape=batch_shape,
-            a_scale_shape=a_scale_shape,
-            b_scale_shape=b_scale_shape,
-        )
-
-    @classmethod
     def mxfp4(
         cls,
         *,
@@ -521,11 +460,6 @@ class ScaledGemmInputs(NumericsInputGenerator):
     ) -> Self:
         """Build an mxfp4 scaled GEMM generator with fp8-compatible scales."""
 
-        scale = ScaleFormat(
-            storage_dtype=scale_dtype,
-            granularity="block",
-            block_shape=(block_size,),
-        )
         return cls(
             M=M,
             N=N,
@@ -542,24 +476,26 @@ class ScaledGemmInputs(NumericsInputGenerator):
                 None
                 if a_dtype is None
                 else gemm_scale_shape(
-                    scale,
+                    "block",
                     "a",
                     M=M,
                     N=N,
                     K=K,
                     batch_shape=batch_shape,
+                    block_shape=(block_size,),
                 )
             ),
             b_scale_shape=(
                 None
                 if b_dtype is None
                 else gemm_scale_shape(
-                    scale,
+                    "block",
                     "b",
                     M=M,
                     N=N,
                     K=K,
                     batch_shape=batch_shape,
+                    block_shape=(block_size,),
                 )
             ),
         )

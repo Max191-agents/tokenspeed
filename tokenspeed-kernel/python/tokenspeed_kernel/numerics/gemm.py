@@ -21,10 +21,16 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Literal
 
 import torch
-from tokenspeed_kernel.numerics.input_generators import GemmInputs, ScaledGemmInputs
+from tokenspeed_kernel.numerics.input_generators import (
+    CustomDType,
+    GemmInputs,
+    InputDType,
+    ScaledGemmInputs,
+    gemm_scale_shape,
+)
 from tokenspeed_kernel.numerics.inputs import (
     InputGenerator,
     set_benchmark_shapes,
@@ -32,7 +38,6 @@ from tokenspeed_kernel.numerics.inputs import (
     set_standard_shapes,
 )
 from tokenspeed_kernel.numerics.tolerance import Tolerance, set_family_tolerance
-from tokenspeed_kernel.signature import TensorFormat
 
 # ---------------------------------------------------------------------------
 # Tolerance
@@ -103,7 +108,7 @@ set_family_tolerance("gemm", tolerance)
 
 
 class GemmInputGenerator(InputGenerator):
-    def _format(self, role: str) -> TensorFormat | None:
+    def _format(self, role: str) -> Any | None:
         if self.format_signature is None:
             return None
         return self.format_signature.format_for(role)
@@ -116,15 +121,46 @@ class GemmInputGenerator(InputGenerator):
             return "KN"
         return "MK" if role == "a" else "NK"
 
-    def _block_size(
-        self,
-        *formats: TensorFormat | None,
-    ) -> list[int] | None:
+    def _block_size(self, *formats: Any | None) -> list[int] | None:
         for tensor_format in formats:
             scale = tensor_format.scale if tensor_format is not None else None
             if scale is not None and scale.block_shape is not None:
                 return list(scale.block_shape)
         return None
+
+    def _input_dtype(self, tensor_format: Any | None) -> InputDType:
+        if tensor_format is None:
+            return self.dtype
+        if tensor_format.format == "mxfp4":
+            if tensor_format.storage_dtype != torch.uint8:
+                raise ValueError("mxfp4 values must use torch.uint8 storage")
+            return CustomDType.MXFP4
+        return tensor_format.storage_dtype
+
+    def _scale_dtype(self, tensor_format: Any | None) -> torch.dtype | None:
+        scale = tensor_format.scale if tensor_format is not None else None
+        return None if scale is None else scale.storage_dtype
+
+    def _scale_shape(
+        self,
+        tensor_format: Any | None,
+        role: Literal["a", "b"],
+        *,
+        M: int,
+        N: int,
+        K: int,
+    ) -> tuple[int, ...] | None:
+        scale = tensor_format.scale if tensor_format is not None else None
+        if scale is None:
+            return None
+        return gemm_scale_shape(
+            scale.granularity,
+            role,
+            M=M,
+            N=N,
+            K=K,
+            block_shape=scale.block_shape,
+        )
 
     def generate(
         self,
@@ -134,12 +170,8 @@ class GemmInputGenerator(InputGenerator):
     ) -> dict[str, Any]:
         a_tensor_format = self._format("a")
         b_tensor_format = self._format("b")
-        a_dtype = (
-            a_tensor_format.storage_dtype if a_tensor_format is not None else self.dtype
-        )
-        b_dtype = (
-            b_tensor_format.storage_dtype if b_tensor_format is not None else self.dtype
-        )
+        a_dtype = self._input_dtype(a_tensor_format)
+        b_dtype = self._input_dtype(b_tensor_format)
 
         block_size = self._block_size(a_tensor_format, b_tensor_format)
         a_layout = self._layout("a")
@@ -149,15 +181,19 @@ class GemmInputGenerator(InputGenerator):
         if (a_tensor_format is not None and a_tensor_format.scale is not None) or (
             b_tensor_format is not None and b_tensor_format.scale is not None
         ):
-            scaled_inputs = ScaledGemmInputs.from_formats(
+            scaled_inputs = ScaledGemmInputs(
                 M=M,
                 N=N,
                 K=K,
-                a_tensor_format=a_tensor_format or TensorFormat(storage_dtype=a_dtype),
-                b_tensor_format=b_tensor_format or TensorFormat(storage_dtype=b_dtype),
+                a_dtype=a_dtype,
+                b_dtype=b_dtype,
+                a_scale_dtype=self._scale_dtype(a_tensor_format),
+                b_scale_dtype=self._scale_dtype(b_tensor_format),
                 c_dtype=out_dtype,
                 a_layout=a_layout,
                 b_layout=b_layout,
+                a_scale_shape=self._scale_shape(a_tensor_format, "a", M=M, N=N, K=K),
+                b_scale_shape=self._scale_shape(b_tensor_format, "b", M=M, N=N, K=K),
             ).generate(seed=self.seed, device=self.device)
             A = scaled_inputs.A.values if scaled_inputs.A is not None else None
             B = scaled_inputs.B.values if scaled_inputs.B is not None else None
