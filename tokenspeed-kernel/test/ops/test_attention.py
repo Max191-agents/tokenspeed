@@ -32,7 +32,14 @@ from tokenspeed_kernel import (
     mla_decode_with_kvcache,
     mla_prefill,
 )
-from tokenspeed_kernel.numerics.input_generators import MHAInputs
+from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
+    mha_decode_with_kvcache_kwargs,
+    mha_extend_with_kvcache_kwargs,
+    mha_prefill_kwargs,
+)
+from tokenspeed_kernel.numerics.input_generators import (
+    MHAInputs,
+)
 from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
@@ -86,7 +93,7 @@ def test_mha_prefill(
     window_left = 127 if is_sliding else -1
 
     out = mha_prefill(
-        **inputs.as_mha_prefill_kwargs(window_left=window_left),
+        **mha_prefill_kwargs(inputs, window_left=window_left),
         solution=solution,
     )
 
@@ -134,7 +141,7 @@ def test_mha_extend_with_kvcache(
         max_new_q_tokens_per_request=4,
         kv_cache_dtype=dtype,
     ).generate(metadata_seed=32, value_seed=42, device=device)
-    kwargs = inputs.as_mha_extend_with_kvcache_kwargs()
+    kwargs = mha_extend_with_kvcache_kwargs(inputs)
 
     out = mha_extend_with_kvcache(
         **kwargs,
@@ -207,7 +214,7 @@ def test_mha_decode_with_kvcache(
     ).generate(metadata_seed=33 + seqlen_q, value_seed=43, device=device)
 
     out = mha_decode_with_kvcache(
-        **inputs.as_mha_decode_with_kvcache_kwargs(),
+        **mha_decode_with_kvcache_kwargs(inputs),
         solution=solution,
     )
 

@@ -27,6 +27,11 @@ from tokenspeed_kernel import (
     mha_extend_with_kvcache,
     mha_prefill,
 )
+from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
+    mha_decode_with_kvcache_kwargs,
+    mha_extend_with_kvcache_kwargs,
+    mha_prefill_kwargs,
+)
 from tokenspeed_kernel.numerics.input_generators import (
     KVCacheInput,
     KVCacheInputConfig,
@@ -562,7 +567,7 @@ def test_mha_prefill_generator_runs_attention_kernel(
         include_sinks=True,
     ).generate(metadata_seed=101, value_seed=201, device=device)
 
-    out = mha_prefill(**inputs.as_mha_prefill_kwargs(), solution=solution)
+    out = mha_prefill(**mha_prefill_kwargs(inputs), solution=solution)
 
     assert inputs.q is not None
     assert out.shape == inputs.q.shape
@@ -593,7 +598,7 @@ def test_mha_paged_extend_generator_runs_triton_attention_kernel(
     ).generate(metadata_seed=102, value_seed=202, device=device)
 
     out = mha_extend_with_kvcache(
-        **inputs.as_mha_extend_with_kvcache_kwargs(),
+        **mha_extend_with_kvcache_kwargs(inputs),
         solution=solution,
     )
 
@@ -627,7 +632,7 @@ def test_mha_paged_decode_generator_runs_attention_kernel(
     ).generate(metadata_seed=103, value_seed=203, device=device)
 
     out = mha_decode_with_kvcache(
-        **inputs.as_mha_decode_with_kvcache_kwargs(),
+        **mha_decode_with_kvcache_kwargs(inputs),
         solution=solution,
     )
 

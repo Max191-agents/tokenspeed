@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 from tokenspeed_kernel.numerics.input_generators.attention_cache import (
@@ -104,110 +103,6 @@ class MHAInputValues:
     v: torch.Tensor | None
     sinks: torch.Tensor | None
     cache: KVCacheValues | None = None
-
-    def as_mha_prefill_kwargs(
-        self,
-        *,
-        window_left: int = -1,
-        logit_cap: float = 0.0,
-    ) -> dict[str, Any]:
-        """Return keyword args for ``tokenspeed_kernel.mha_prefill``."""
-
-        if self.cache is not None:
-            raise ValueError("mha_prefill kwargs require non-cached values")
-        if self.metadata.new_q_lens_cpu != self.metadata.new_kv_lens_cpu:
-            raise ValueError("mha_prefill requires matching Q and KV lengths")
-        if (
-            self.q is None
-            or self.k is None
-            or self.v is None
-            or self.metadata.cu_seqlens_q is None
-            or self.metadata.cu_seqlens_q_cpu is None
-        ):
-            raise ValueError("generated values are incomplete")
-        return {
-            "q": self.q,
-            "k": self.k,
-            "v": self.v,
-            "cu_seqlens_q": self.metadata.cu_seqlens_q,
-            "cu_seqlens_q_cpu": self.metadata.cu_seqlens_q_cpu,
-            "max_seqlen": self.metadata.max_seqlen_q,
-            "window_left": window_left,
-            "logit_cap": logit_cap,
-            "sinks": self.sinks,
-        }
-
-    def as_mha_extend_with_kvcache_kwargs(
-        self,
-        *,
-        is_causal: bool = True,
-        window_left: int = -1,
-        logit_cap: float = 0.0,
-    ) -> dict[str, Any]:
-        """Return keyword args for ``tokenspeed_kernel.mha_extend_with_kvcache``."""
-
-        cache = self.cache
-        if (
-            self.q is None
-            or cache is None
-            or cache.k_cache is None
-            or cache.v_cache is None
-            or cache.page_table is None
-            or self.metadata.cache_seqlens is None
-            or self.metadata.cu_seqlens_q is None
-            or self.metadata.cu_seqlens_kv is None
-        ):
-            raise ValueError("paged extend generated values are incomplete")
-        return {
-            "q": self.q,
-            "cu_seqlens_q": self.metadata.cu_seqlens_q,
-            "cu_seqlens_kv": self.metadata.cu_seqlens_kv,
-            "k_cache": cache.k_cache,
-            "v_cache": cache.v_cache,
-            "page_table": cache.page_table,
-            "cache_seqlens": self.metadata.cache_seqlens,
-            "max_seqlen_q": self.metadata.max_seqlen_q,
-            "max_seqlen_k": self.metadata.resolved_max_seqlen_k,
-            "is_causal": is_causal,
-            "window_left": window_left,
-            "logit_cap": logit_cap,
-            "sinks": self.sinks,
-        }
-
-    def as_mha_decode_with_kvcache_kwargs(
-        self,
-        *,
-        window_left: int = -1,
-        logit_cap: float = 0.0,
-    ) -> dict[str, Any]:
-        """Return keyword args for ``tokenspeed_kernel.mha_decode_with_kvcache``."""
-
-        if len(set(self.metadata.new_q_lens_cpu)) != 1:
-            raise ValueError(
-                "mha_decode_with_kvcache requires a fixed query length per request"
-            )
-        cache = self.cache
-        if (
-            self.q is None
-            or cache is None
-            or cache.k_cache is None
-            or cache.v_cache is None
-            or cache.page_table is None
-            or self.metadata.cache_seqlens is None
-        ):
-            raise ValueError("paged decode generated values are incomplete")
-        return {
-            "q": self.q,
-            "k_cache": cache.k_cache,
-            "v_cache": cache.v_cache,
-            "page_table": cache.page_table,
-            "cache_seqlens": self.metadata.cache_seqlens,
-            "max_seqlen_k": self.metadata.resolved_max_seqlen_k,
-            "max_seqlen_q": self.metadata.max_seqlen_q,
-            "window_left": window_left,
-            "logit_cap": logit_cap,
-            "sinks": self.sinks,
-        }
 
     def dense_qkv(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return regular batch-major Q/K/V views for dense non-cached tests."""
