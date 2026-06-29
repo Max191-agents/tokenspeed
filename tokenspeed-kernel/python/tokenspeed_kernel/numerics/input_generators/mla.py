@@ -497,9 +497,18 @@ class MLAInputs(NumericsInputGenerator):
                 self.config.num_kv_heads,
                 self.config.v_head_dim,
             )
-            q = self.q_input.generate(seed=_child_seed(value_seed, 1), device=device)
-            k = self.k_input.generate(seed=_child_seed(value_seed, 2), device=device)
-            v = self.v_input.generate(seed=_child_seed(value_seed, 3), device=device)
+            q = self.q_input.generate(
+                seed=_child_seed(value_seed, 1),
+                device=device,
+            ).values
+            k = self.k_input.generate(
+                seed=_child_seed(value_seed, 2),
+                device=device,
+            ).values
+            v = self.v_input.generate(
+                seed=_child_seed(value_seed, 3),
+                device=device,
+            ).values
             return self._make_values(metadata=metadata, q=q, k=k, v=v, cache=None)
 
         if len(set(metadata.new_q_lens_cpu)) != 1:
@@ -515,7 +524,7 @@ class MLAInputs(NumericsInputGenerator):
             self.config.num_q_heads,
             self._decode_qk_head_dim(),
         )
-        q = self.q_input.generate(seed=_child_seed(value_seed, 1), device=device)
+        q = self.q_input.generate(seed=_child_seed(value_seed, 1), device=device).values
         cache = self._generate_cache(
             metadata=metadata,
             value_seed=_child_seed(value_seed, 4),

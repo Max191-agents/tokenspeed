@@ -429,11 +429,11 @@ class KVCacheInput(AttentionCacheInput):
         k_cache = self.k_cache_input.generate(
             seed=_child_seed(seed, 1),
             device=target_device,
-        )
+        ).values
         v_cache = self.v_cache_input.generate(
             seed=_child_seed(seed, 2),
             device=target_device,
-        )
+        ).values
         return KVCacheValues(
             k_cache=k_cache,
             v_cache=v_cache,
@@ -584,7 +584,7 @@ class MLAKVCacheInput(AttentionCacheInput):
         kv_cache = self.kv_cache_input.generate(
             seed=_child_seed(seed, 1),
             device=target_device,
-        )
+        ).values
         if kv_cache is None:
             raise ValueError("MLAKVCacheInput dtype must generate a tensor")
         return MLAKVCacheValues(

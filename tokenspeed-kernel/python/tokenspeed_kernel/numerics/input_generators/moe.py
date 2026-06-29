@@ -305,11 +305,11 @@ class MoeInputs(NumericsInputGenerator):
         hidden_states = self.hidden_states_input.generate(
             seed=_child_seed(seed, 1),
             device=default_device,
-        )
+        ).values
         router_logits = self.router_logits_input.generate(
             seed=_child_seed(seed, 2),
             device=default_device,
-        )
+        ).values
         rng_device = "cuda" if default_device.type == "cuda" else "cpu"
         topk_generator = torch.Generator(device=rng_device).manual_seed(
             _child_seed(seed, 3)
@@ -329,11 +329,11 @@ class MoeInputs(NumericsInputGenerator):
         w13_bias = self.w13_bias_input.generate(
             seed=_child_seed(seed, 6),
             device=default_device,
-        )
+        ).values
         w2_bias = self.w2_bias_input.generate(
             seed=_child_seed(seed, 7),
             device=default_device,
-        )
+        ).values
         return MoeInputValues(
             hidden_states=hidden_states,
             router_logits=router_logits,

@@ -34,8 +34,6 @@ from tokenspeed_kernel.numerics.input_generators import (
     ScaledGemmInputConfig,
     ScaledGemmInputValues,
     ScaledGemmInputs,
-    ScaledTensorInputConfig,
-    ScaledTensorInput,
     TensorInput,
     gemm_scale_shape,
     mxfp4_scaled_gemm_input_config,
@@ -199,17 +197,20 @@ def test_tensor_input_generates_standard_fp_dtypes(dtype: torch.dtype) -> None:
     first = TensorInput((2, 3), dtype).generate(seed=123, device="cpu")
     second = TensorInput((2, 3), dtype).generate(seed=123, device="cpu")
 
-    assert first is not None
-    assert second is not None
-    assert first.shape == (2, 3)
-    assert first.dtype == dtype
-    assert torch.equal(first, second)
+    assert first.values is not None
+    assert second.values is not None
+    assert first.scales is None
+    assert second.scales is None
+    assert first.values.shape == (2, 3)
+    assert first.values.dtype == dtype
+    assert torch.equal(first.values, second.values)
 
 
 def test_tensor_input_dtype_none_skips_generation() -> None:
     tensor = TensorInput((2, 3), None).generate(seed=123, device="cpu")
 
-    assert tensor is None
+    assert tensor.values is None
+    assert tensor.scales is None
 
 
 def test_tensor_input_rejects_non_floating_torch_dtype() -> None:
@@ -223,34 +224,18 @@ def test_tensor_input_uses_named_arguments() -> None:
     values = tensor.generate(seed=123, device="cpu")
 
     assert values is not None
-    assert values.shape == (2, 3)
-    assert values.dtype == torch.float32
+    assert values.values is not None
+    assert values.scales is None
+    assert values.values.shape == (2, 3)
+    assert values.values.dtype == torch.float32
 
 
-def test_scaled_tensor_inputs_accept_config_objects() -> None:
-    scaled_config = ScaledTensorInputConfig(
-        value_shape=(2, 4),
-        value_dtype=torch.float16,
-        scale_shape=(2, 1),
+def test_tensor_input_generates_torch_values_and_scales() -> None:
+    tensor = TensorInput(
+        (4, 5),
+        torch.float16,
+        scale_shape=(4, 1),
         scale_dtype=torch.float32,
-    )
-    scaled = ScaledTensorInput(scaled_config)
-    scaled_values = scaled.generate(seed=124, device="cpu")
-
-    assert scaled.config is scaled_config
-    assert scaled.values_input is not None
-    assert scaled_values.values is not None
-    assert scaled_values.values.dtype == torch.float16
-
-
-def test_scaled_tensor_input_generates_torch_values_and_scales() -> None:
-    tensor = ScaledTensorInput(
-        ScaledTensorInputConfig(
-            value_shape=(4, 5),
-            value_dtype=torch.float16,
-            scale_shape=(4, 1),
-            scale_dtype=torch.float32,
-        )
     ).generate(seed=125, device="cpu")
 
     assert tensor.values is not None
@@ -264,34 +249,27 @@ def test_scaled_tensor_input_generates_torch_values_and_scales() -> None:
     assert torch.all(tensor.scales <= 1.0)
 
 
-def test_scaled_tensor_input_reuses_mutable_value_generator_dtype() -> None:
-    tensor = ScaledTensorInput(
-        ScaledTensorInputConfig(
-            value_shape=(4, 5),
-            value_dtype=torch.float16,
-            scale_shape=(4, 1),
-            scale_dtype=torch.float32,
-        )
+def test_tensor_input_reuses_mutable_dtype() -> None:
+    tensor = TensorInput(
+        (4, 5),
+        torch.float16,
+        scale_shape=(4, 1),
+        scale_dtype=torch.float32,
     )
-    assert tensor.values_input is not None
-    values_input = tensor.values_input
-    values_input.dtype = torch.float64
+    tensor.dtype = torch.float64
 
     values = tensor.generate(seed=125, device="cpu")
 
-    assert tensor.values_input is values_input
     assert values.values is not None
     assert values.values.dtype == torch.float64
 
 
-def test_scaled_tensor_input_generates_mxfp4_values_and_scales() -> None:
-    tensor = ScaledTensorInput(
-        ScaledTensorInputConfig(
-            value_shape=(4, 8),
-            value_dtype=CustomDType.MXFP4,
-            scale_shape=(4, 1),
-            scale_dtype=torch.float32,
-        )
+def test_tensor_input_generates_mxfp4_values_and_scales() -> None:
+    tensor = TensorInput(
+        (4, 8),
+        CustomDType.MXFP4,
+        scale_shape=(4, 1),
+        scale_dtype=torch.float32,
     ).generate(seed=126, device="cpu")
 
     assert tensor.values is not None
@@ -301,6 +279,23 @@ def test_scaled_tensor_input_generates_mxfp4_values_and_scales() -> None:
     assert tensor.scales.dtype == torch.float32
     assert torch.all(tensor.scales > 0.0)
     assert torch.all(tensor.scales <= 0.125)
+
+
+def test_tensor_input_requires_scale_shape_and_dtype_together() -> None:
+    with pytest.raises(ValueError, match="scale_shape and scale_dtype"):
+        TensorInput((4, 5), torch.float16, scale_shape=(4, 1))
+    with pytest.raises(ValueError, match="scale_shape and scale_dtype"):
+        TensorInput((4, 5), torch.float16, scale_dtype=torch.float32)
+
+
+def test_tensor_input_rejects_incompatible_scale_shape() -> None:
+    with pytest.raises(ValueError, match="scale_shape must be prefix-compatible"):
+        TensorInput(
+            (4, 5),
+            torch.float16,
+            scale_shape=(4, 6),
+            scale_dtype=torch.float32,
+        )
 
 
 def test_gemm_inputs_generate_operands_and_layouts() -> None:

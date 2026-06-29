@@ -54,10 +54,8 @@ from tokenspeed_kernel.numerics.input_generators.core import (
     DeviceLike,
     InputDType,
     NumericsInputGenerator,
-    ScaledTensorInputConfig,
-    ScaledTensorInput,
-    ScaledTensorValues,
     TensorInput,
+    TensorValues,
 )
 from tokenspeed_kernel.numerics.input_generators.gemm import (
     GemmInputConfig,
@@ -114,10 +112,8 @@ __all__ = [
     "ScaledGemmInputConfig",
     "ScaledGemmInputValues",
     "ScaledGemmInputs",
-    "ScaledTensorInputConfig",
-    "ScaledTensorInput",
-    "ScaledTensorValues",
     "TensorInput",
+    "TensorValues",
     "gemm_scale_shape",
     "mxfp4_scaled_gemm_input_config",
 ]

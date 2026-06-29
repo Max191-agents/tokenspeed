@@ -32,10 +32,8 @@ from tokenspeed_kernel.numerics.input_generators.core import (
     DeviceLike,
     InputDType,
     NumericsInputGenerator,
-    ScaledTensorInput,
-    ScaledTensorInputConfig,
-    ScaledTensorValues,
     TensorInput,
+    TensorValues,
     _child_seed,
     _normalize_shape,
     _packed_mxfp4_shape,
@@ -139,24 +137,23 @@ def _generate_tensor(
 ) -> torch.Tensor | None:
     if isinstance(dtype, CustomDType):
         return (
-            ScaledTensorInput(
-                ScaledTensorInputConfig(
-                    value_shape=shape,
-                    value_dtype=dtype,
-                    scale_shape=None,
-                    scale_dtype=None,
-                    value_device=configured_device,
-                )
+            TensorInput(shape, dtype, device=configured_device)
+            .generate(
+                seed=seed,
+                device=device,
+            )
+            .values
+        )
+    if dtype is None or isinstance(dtype, torch.dtype):
+        return (
+            TensorInput(
+                shape,
+                dtype,
+                device=configured_device,
             )
             .generate(seed=seed, device=device)
             .values
         )
-    if dtype is None or isinstance(dtype, torch.dtype):
-        return TensorInput(
-            shape,
-            dtype,
-            device=configured_device,
-        ).generate(seed=seed, device=device)
     raise TypeError(f"unsupported GEMM dtype={dtype!r}")
 
 
@@ -173,8 +170,8 @@ class GemmInputValues:
 class ScaledGemmInputValues:
     """Generated values for ``ScaledGemmInputs``."""
 
-    A: ScaledTensorValues
-    B: ScaledTensorValues
+    A: TensorValues
+    B: TensorValues
     C: torch.Tensor
 
 
@@ -526,23 +523,21 @@ class ScaledGemmInputs(NumericsInputGenerator):
         *,
         seed: int,
         device: DeviceLike,
-    ) -> ScaledTensorValues:
+    ) -> TensorValues:
         is_a = role == "a"
-        return ScaledTensorInput(
-            ScaledTensorInputConfig(
-                value_shape=self._scaled_value_shape(role),
-                value_dtype=self.config.a_dtype if is_a else self.config.b_dtype,
-                scale_shape=self.config.a_scale_shape
-                if is_a
-                else self.config.b_scale_shape,
-                scale_dtype=self.config.a_scale_dtype
-                if is_a
-                else self.config.b_scale_dtype,
-                value_device=self.config.a_device if is_a else self.config.b_device,
-                scale_device=self.config.a_scale_device
-                if is_a
-                else self.config.b_scale_device,
-            )
+        return TensorInput(
+            self._scaled_value_shape(role),
+            self.config.a_dtype if is_a else self.config.b_dtype,
+            scale_shape=self.config.a_scale_shape
+            if is_a
+            else self.config.b_scale_shape,
+            scale_dtype=self.config.a_scale_dtype
+            if is_a
+            else self.config.b_scale_dtype,
+            device=self.config.a_device if is_a else self.config.b_device,
+            scale_device=self.config.a_scale_device
+            if is_a
+            else self.config.b_scale_device,
         ).generate(seed=seed, device=device)
 
     def generate(

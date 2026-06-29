@@ -503,13 +503,13 @@ class MHAInputs(NumericsInputGenerator):
             self.config.sink_dtype if self.config.include_sinks else None
         )
 
-        q = self.q_input.generate(seed=_child_seed(value_seed, 1), device=device)
-        k = self.k_input.generate(seed=_child_seed(value_seed, 2), device=device)
-        v = self.v_input.generate(seed=_child_seed(value_seed, 3), device=device)
+        q = self.q_input.generate(seed=_child_seed(value_seed, 1), device=device).values
+        k = self.k_input.generate(seed=_child_seed(value_seed, 2), device=device).values
+        v = self.v_input.generate(seed=_child_seed(value_seed, 3), device=device).values
         sinks = self.sinks_input.generate(
             seed=_child_seed(value_seed, 4),
             device=device,
-        )
+        ).values
 
         if self.config.cache_layout == "none":
             self.cache_input = None
