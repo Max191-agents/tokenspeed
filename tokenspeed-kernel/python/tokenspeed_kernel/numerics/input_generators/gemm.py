@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal, Self
+from typing import Literal
 
 import torch
 from tokenspeed_kernel.numerics.input_generators.core import (
@@ -33,6 +33,7 @@ from tokenspeed_kernel.numerics.input_generators.core import (
     InputDType,
     NumericsInputGenerator,
     ScaledTensorInput,
+    ScaledTensorInputConfig,
     ScaledTensorValues,
     TensorInput,
     _child_seed,
@@ -48,6 +49,7 @@ __all__ = [
     "ScaledGemmInputConfig",
     "ScaledGemmInputValues",
     "gemm_scale_shape",
+    "mxfp4_scaled_gemm_input_config",
 ]
 
 GemmLayout = Literal["MK", "KM", "NK", "KN"]
@@ -138,11 +140,13 @@ def _generate_tensor(
     if isinstance(dtype, CustomDType):
         return (
             ScaledTensorInput(
-                value_shape=shape,
-                value_dtype=dtype,
-                scale_shape=None,
-                scale_dtype=None,
-                value_device=configured_device,
+                ScaledTensorInputConfig(
+                    value_shape=shape,
+                    value_dtype=dtype,
+                    scale_shape=None,
+                    scale_dtype=None,
+                    value_device=configured_device,
+                )
             )
             .generate(seed=seed, device=device)
             .values
@@ -247,13 +251,9 @@ class GemmInputs(NumericsInputGenerator):
 
     def __init__(
         self,
-        config: GemmInputConfig | None = None,
-        **kwargs: object,
+        config: GemmInputConfig,
     ) -> None:
-        if config is not None and kwargs:
-            raise TypeError("pass either config or keyword parameters, not both")
-
-        self.config = config or GemmInputConfig(**kwargs)  # type: ignore[arg-type]
+        self.config = config
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -400,6 +400,63 @@ class ScaledGemmInputConfig:
     c_device: DeviceLike = None
 
 
+def mxfp4_scaled_gemm_input_config(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    c_dtype: torch.dtype,
+    scale_dtype: torch.dtype = torch.float8_e4m3fn,
+    a_dtype: InputDType = CustomDType.MXFP4,
+    b_dtype: InputDType = CustomDType.MXFP4,
+    a_layout: GemmLayout = "MK",
+    b_layout: GemmLayout = "NK",
+    batch_shape: tuple[int, ...] = (),
+    block_size: int = _DEFAULT_MXFP4_BLOCK_SIZE,
+) -> ScaledGemmInputConfig:
+    """Build a scaled GEMM config for mxfp4 values with fp8-compatible scales."""
+
+    return ScaledGemmInputConfig(
+        M=M,
+        N=N,
+        K=K,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        a_scale_dtype=None if a_dtype is None else scale_dtype,
+        b_scale_dtype=None if b_dtype is None else scale_dtype,
+        c_dtype=c_dtype,
+        a_layout=a_layout,
+        b_layout=b_layout,
+        batch_shape=batch_shape,
+        a_scale_shape=(
+            None
+            if a_dtype is None
+            else gemm_scale_shape(
+                "block",
+                "a",
+                M=M,
+                N=N,
+                K=K,
+                batch_shape=batch_shape,
+                block_shape=(block_size,),
+            )
+        ),
+        b_scale_shape=(
+            None
+            if b_dtype is None
+            else gemm_scale_shape(
+                "block",
+                "b",
+                M=M,
+                N=N,
+                K=K,
+                batch_shape=batch_shape,
+                block_shape=(block_size,),
+            )
+        ),
+    )
+
+
 @dataclass(init=False)
 class ScaledGemmInputs(NumericsInputGenerator):
     """Typed input generator for GEMM with scaled ``A`` and ``B`` operands.
@@ -417,13 +474,9 @@ class ScaledGemmInputs(NumericsInputGenerator):
 
     def __init__(
         self,
-        config: ScaledGemmInputConfig | None = None,
-        **kwargs: object,
+        config: ScaledGemmInputConfig,
     ) -> None:
-        if config is not None and kwargs:
-            raise TypeError("pass either config or keyword parameters, not both")
-
-        self.config = config or ScaledGemmInputConfig(**kwargs)  # type: ignore[arg-type]
+        self.config = config
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -441,64 +494,6 @@ class ScaledGemmInputs(NumericsInputGenerator):
             self.config.a_scale_shape = _normalize_shape(self.config.a_scale_shape)
         if self.config.b_scale_shape is not None:
             self.config.b_scale_shape = _normalize_shape(self.config.b_scale_shape)
-
-    @classmethod
-    def mxfp4(
-        cls,
-        *,
-        M: int,
-        N: int,
-        K: int,
-        c_dtype: torch.dtype,
-        scale_dtype: torch.dtype = torch.float8_e4m3fn,
-        a_dtype: InputDType = CustomDType.MXFP4,
-        b_dtype: InputDType = CustomDType.MXFP4,
-        a_layout: GemmLayout = "MK",
-        b_layout: GemmLayout = "NK",
-        batch_shape: tuple[int, ...] = (),
-        block_size: int = _DEFAULT_MXFP4_BLOCK_SIZE,
-    ) -> Self:
-        """Build an mxfp4 scaled GEMM generator with fp8-compatible scales."""
-
-        return cls(
-            M=M,
-            N=N,
-            K=K,
-            a_dtype=a_dtype,
-            b_dtype=b_dtype,
-            a_scale_dtype=None if a_dtype is None else scale_dtype,
-            b_scale_dtype=None if b_dtype is None else scale_dtype,
-            c_dtype=c_dtype,
-            a_layout=a_layout,
-            b_layout=b_layout,
-            batch_shape=batch_shape,
-            a_scale_shape=(
-                None
-                if a_dtype is None
-                else gemm_scale_shape(
-                    "block",
-                    "a",
-                    M=M,
-                    N=N,
-                    K=K,
-                    batch_shape=batch_shape,
-                    block_shape=(block_size,),
-                )
-            ),
-            b_scale_shape=(
-                None
-                if b_dtype is None
-                else gemm_scale_shape(
-                    "block",
-                    "b",
-                    M=M,
-                    N=N,
-                    K=K,
-                    batch_shape=batch_shape,
-                    block_shape=(block_size,),
-                )
-            ),
-        )
 
     def _scaled_value_shape(
         self,
@@ -534,18 +529,20 @@ class ScaledGemmInputs(NumericsInputGenerator):
     ) -> ScaledTensorValues:
         is_a = role == "a"
         return ScaledTensorInput(
-            value_shape=self._scaled_value_shape(role),
-            value_dtype=self.config.a_dtype if is_a else self.config.b_dtype,
-            scale_shape=self.config.a_scale_shape
-            if is_a
-            else self.config.b_scale_shape,
-            scale_dtype=self.config.a_scale_dtype
-            if is_a
-            else self.config.b_scale_dtype,
-            value_device=self.config.a_device if is_a else self.config.b_device,
-            scale_device=self.config.a_scale_device
-            if is_a
-            else self.config.b_scale_device,
+            ScaledTensorInputConfig(
+                value_shape=self._scaled_value_shape(role),
+                value_dtype=self.config.a_dtype if is_a else self.config.b_dtype,
+                scale_shape=self.config.a_scale_shape
+                if is_a
+                else self.config.b_scale_shape,
+                scale_dtype=self.config.a_scale_dtype
+                if is_a
+                else self.config.b_scale_dtype,
+                value_device=self.config.a_device if is_a else self.config.b_device,
+                scale_device=self.config.a_scale_device
+                if is_a
+                else self.config.b_scale_device,
+            )
         ).generate(seed=seed, device=device)
 
     def generate(

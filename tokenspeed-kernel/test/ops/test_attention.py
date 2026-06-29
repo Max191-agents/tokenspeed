@@ -38,7 +38,9 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mha_prefill_kwargs,
 )
 from tokenspeed_kernel.numerics.input_generators import (
+    MHAInputConfig,
     MHAInputs,
+    MHARequestMetadataInputConfig,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -46,6 +48,43 @@ platform = current_platform()
 torch.manual_seed(42)
 
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
+
+
+def _mha_config(
+    *,
+    batch_size: int,
+    total_cached_tokens: int,
+    total_new_q_tokens: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    q_dtype: torch.dtype,
+    cache_layout: str = "none",
+    page_size: int | None = None,
+    indexing: str | None = None,
+    include_sinks: bool = False,
+    metadata_kwargs: dict[str, object] | None = None,
+) -> MHAInputConfig:
+    return MHAInputConfig(
+        batch_size=batch_size,
+        total_cached_tokens=total_cached_tokens,
+        total_new_q_tokens=total_new_q_tokens,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_dtype=q_dtype,
+        cache_layout=cache_layout,  # type: ignore[arg-type]
+        page_size=page_size,
+        indexing=indexing,  # type: ignore[arg-type]
+        include_sinks=include_sinks,
+        metadata_input=MHARequestMetadataInputConfig(
+            batch_size=batch_size,
+            total_cached_tokens=total_cached_tokens,
+            total_new_q_tokens=total_new_q_tokens,
+            cache_layout=cache_layout,  # type: ignore[arg-type]
+            **(metadata_kwargs or {}),
+        ),
+    )
 
 
 def _randn(shape: tuple[int, ...], *, device: str, dtype: torch.dtype) -> torch.Tensor:
@@ -79,16 +118,20 @@ def test_mha_prefill(
         pytest.skip("FA4 MHA prefill does not support sinks or sliding window")
 
     inputs = MHAInputs(
-        batch_size=3,
-        total_cached_tokens=0,
-        total_new_q_tokens=2818,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        q_dtype=dtype,
-        include_sinks=has_sink,
-        new_q_length_mode="ragged",
-        max_new_q_tokens_per_request=1100,
+        _mha_config(
+            batch_size=3,
+            total_cached_tokens=0,
+            total_new_q_tokens=2818,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_dtype=dtype,
+            include_sinks=has_sink,
+            metadata_kwargs={
+                "new_q_length_mode": "ragged",
+                "max_new_q_tokens_per_request": 1100,
+            },
+        )
     ).generate(metadata_seed=31, value_seed=41, device=device)
     window_left = 127 if is_sliding else -1
 
@@ -124,22 +167,25 @@ def test_mha_extend_with_kvcache(
     page_size = 64
     max_cache_seqlen = 256
     inputs = MHAInputs(
-        batch_size=4,
-        total_cached_tokens=208,
-        total_new_q_tokens=10,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        q_dtype=dtype,
-        cache_layout="paged",
-        page_size=page_size,
-        indexing="identity",
-        max_seqlen_k=max_cache_seqlen,
-        cached_length_mode="ragged",
-        max_cached_tokens_per_request=128,
-        new_q_length_mode="ragged",
-        max_new_q_tokens_per_request=4,
-        kv_cache_dtype=dtype,
+        _mha_config(
+            batch_size=4,
+            total_cached_tokens=208,
+            total_new_q_tokens=10,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_dtype=dtype,
+            cache_layout="paged",
+            page_size=page_size,
+            indexing="identity",
+            metadata_kwargs={
+                "max_seqlen_k": max_cache_seqlen,
+                "cached_length_mode": "ragged",
+                "max_cached_tokens_per_request": 128,
+                "new_q_length_mode": "ragged",
+                "max_new_q_tokens_per_request": 4,
+            },
+        )
     ).generate(metadata_seed=32, value_seed=42, device=device)
     kwargs = mha_extend_with_kvcache_kwargs(inputs)
 
@@ -196,21 +242,24 @@ def test_mha_decode_with_kvcache(
     page_size = 64
     max_cache_seqlen = 256
     inputs = MHAInputs(
-        batch_size=4,
-        total_cached_tokens=400,
-        total_new_q_tokens=4 * seqlen_q,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        q_dtype=dtype,
-        cache_layout="paged",
-        page_size=page_size,
-        indexing="identity",
-        max_seqlen_k=max_cache_seqlen,
-        cached_length_mode="ragged",
-        max_cached_tokens_per_request=max_cache_seqlen - seqlen_q,
-        new_q_length_mode="fixed_per_request",
-        kv_cache_dtype=dtype,
+        _mha_config(
+            batch_size=4,
+            total_cached_tokens=400,
+            total_new_q_tokens=4 * seqlen_q,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_dtype=dtype,
+            cache_layout="paged",
+            page_size=page_size,
+            indexing="identity",
+            metadata_kwargs={
+                "max_seqlen_k": max_cache_seqlen,
+                "cached_length_mode": "ragged",
+                "max_cached_tokens_per_request": max_cache_seqlen - seqlen_q,
+                "new_q_length_mode": "fixed_per_request",
+            },
+        )
     ).generate(metadata_seed=33 + seqlen_q, value_seed=43, device=device)
 
     out = mha_decode_with_kvcache(

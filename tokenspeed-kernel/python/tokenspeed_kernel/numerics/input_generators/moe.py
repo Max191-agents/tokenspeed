@@ -33,6 +33,7 @@ from tokenspeed_kernel.numerics.input_generators.core import (
     TensorInput,
     _child_seed,
     _resolve_device,
+    _tensor_input_from_config,
 )
 from tokenspeed_kernel.numerics.input_generators.gemm import (
     GemmInputConfig,
@@ -41,6 +42,7 @@ from tokenspeed_kernel.numerics.input_generators.gemm import (
     ScaledGemmInputConfig,
     ScaledGemmInputValues,
     ScaledGemmInputs,
+    mxfp4_scaled_gemm_input_config,
 )
 
 __all__ = ["MoeInputConfig", "MoeInputValues", "MoeInputs"]
@@ -165,50 +167,15 @@ class MoeInputs(NumericsInputGenerator):
 
     def __init__(
         self,
-        config: MoeInputConfig | None = None,
-        **kwargs: object,
+        config: MoeInputConfig,
     ) -> None:
-        if config is not None and kwargs:
-            raise TypeError("pass either config or keyword parameters, not both")
-
-        hidden_states_input = kwargs.get("hidden_states_input")
-        router_logits_input = kwargs.get("router_logits_input")
-        w13 = kwargs.get("w13")
-        w2 = kwargs.get("w2")
-        w13_bias_input = kwargs.get("w13_bias_input")
-        w2_bias_input = kwargs.get("w2_bias_input")
-        if isinstance(hidden_states_input, TensorInput):
-            kwargs["hidden_states_input"] = hidden_states_input.config
-        if isinstance(router_logits_input, TensorInput):
-            kwargs["router_logits_input"] = router_logits_input.config
-        if isinstance(w13, (GemmInputs, ScaledGemmInputs)):
-            kwargs["w13"] = w13.config
-        if isinstance(w2, (GemmInputs, ScaledGemmInputs)):
-            kwargs["w2"] = w2.config
-        if isinstance(w13_bias_input, TensorInput):
-            kwargs["w13_bias_input"] = w13_bias_input.config
-        if isinstance(w2_bias_input, TensorInput):
-            kwargs["w2_bias_input"] = w2_bias_input.config
-
-        self.config = config or MoeInputConfig(**kwargs)  # type: ignore[arg-type]
-        self.hidden_states_input = (
-            hidden_states_input
-            if isinstance(hidden_states_input, TensorInput)
-            else None
-        )
-        self.router_logits_input = (
-            router_logits_input
-            if isinstance(router_logits_input, TensorInput)
-            else None
-        )
-        self.w13 = w13 if isinstance(w13, (GemmInputs, ScaledGemmInputs)) else None
-        self.w2 = w2 if isinstance(w2, (GemmInputs, ScaledGemmInputs)) else None
-        self.w13_bias_input = (
-            w13_bias_input if isinstance(w13_bias_input, TensorInput) else None
-        )
-        self.w2_bias_input = (
-            w2_bias_input if isinstance(w2_bias_input, TensorInput) else None
-        )
+        self.config = config
+        self.hidden_states_input = None
+        self.router_logits_input = None
+        self.w13 = None
+        self.w2 = None
+        self.w13_bias_input = None
+        self.w2_bias_input = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -241,23 +208,19 @@ class MoeInputs(NumericsInputGenerator):
         ):
             self.config.weight_scale_dtype = torch.float8_e4m3fn
         if self.hidden_states_input is None:
-            self.hidden_states_input = TensorInput(
-                self.config.hidden_states_input
-                or TensorInputConfig(
-                    (self.config.num_tokens, self.config.hidden_size),
-                    self.config.hidden_dtype,
-                    device=self.config.device,
-                )
+            hidden_config = self.config.hidden_states_input or TensorInputConfig(
+                (self.config.num_tokens, self.config.hidden_size),
+                self.config.hidden_dtype,
+                device=self.config.device,
             )
+            self.hidden_states_input = _tensor_input_from_config(hidden_config)
         if self.router_logits_input is None:
-            self.router_logits_input = TensorInput(
-                self.config.router_logits_input
-                or TensorInputConfig(
-                    (self.config.num_tokens, self.config.num_experts),
-                    self.config.router_dtype,
-                    device=self.config.device,
-                )
+            router_config = self.config.router_logits_input or TensorInputConfig(
+                (self.config.num_tokens, self.config.num_experts),
+                self.config.router_dtype,
+                device=self.config.device,
             )
+            self.router_logits_input = _tensor_input_from_config(router_config)
         if self.w13 is None:
             self.w13 = self._make_weight_gemm(
                 self.config.w13
@@ -275,23 +238,19 @@ class MoeInputs(NumericsInputGenerator):
                 )
             )
         if self.w13_bias_input is None:
-            self.w13_bias_input = TensorInput(
-                self.config.w13_bias_input
-                or TensorInputConfig(
-                    (self.config.num_experts, 2 * self.config.intermediate_size),
-                    self.config.bias_dtype,
-                    device=self.config.device,
-                )
+            w13_bias_config = self.config.w13_bias_input or TensorInputConfig(
+                (self.config.num_experts, 2 * self.config.intermediate_size),
+                self.config.bias_dtype,
+                device=self.config.device,
             )
+            self.w13_bias_input = _tensor_input_from_config(w13_bias_config)
         if self.w2_bias_input is None:
-            self.w2_bias_input = TensorInput(
-                self.config.w2_bias_input
-                or TensorInputConfig(
-                    (self.config.num_experts, self.config.hidden_size),
-                    self.config.bias_dtype,
-                    device=self.config.device,
-                )
+            w2_bias_config = self.config.w2_bias_input or TensorInputConfig(
+                (self.config.num_experts, self.config.hidden_size),
+                self.config.bias_dtype,
+                device=self.config.device,
             )
+            self.w2_bias_input = _tensor_input_from_config(w2_bias_config)
         self.config.hidden_states_input = self.hidden_states_input.config
         self.config.router_logits_input = self.router_logits_input.config
         self.config.w13 = self.w13.config
@@ -328,7 +287,7 @@ class MoeInputs(NumericsInputGenerator):
             )
 
         if self.config.weight_format == "mxfp4":
-            return ScaledGemmInputs.mxfp4(
+            return mxfp4_scaled_gemm_input_config(
                 M=self.config.num_tokens,
                 N=N,
                 K=K,
@@ -337,7 +296,7 @@ class MoeInputs(NumericsInputGenerator):
                 scale_dtype=self.config.weight_scale_dtype or torch.float8_e4m3fn,
                 c_dtype=c_dtype,
                 batch_shape=(self.config.num_experts,),
-            ).config
+            )
 
         return ScaledGemmInputConfig(
             M=self.config.num_tokens,

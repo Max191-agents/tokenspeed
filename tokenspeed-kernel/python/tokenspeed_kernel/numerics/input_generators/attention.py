@@ -45,6 +45,7 @@ from tokenspeed_kernel.numerics.input_generators.core import (
     TensorInput,
     _child_seed,
     _resolve_device,
+    _tensor_input_from_config,
 )
 
 __all__ = ["MHAInputConfig", "MHAInputValues", "MHAInputs"]
@@ -246,149 +247,15 @@ class MHAInputs(NumericsInputGenerator):
 
     def __init__(
         self,
-        config: MHAInputConfig | None = None,
-        **kwargs: object,
+        config: MHAInputConfig,
     ) -> None:
-        if config is not None and kwargs:
-            raise TypeError("pass either config or keyword parameters, not both")
-
-        page_table_indexing = kwargs.pop("page_table_indexing", None)
-        if page_table_indexing is not None:
-            if "indexing" in kwargs and kwargs["indexing"] != page_table_indexing:
-                raise ValueError(
-                    "pass either indexing or page_table_indexing, not both"
-                )
-            kwargs["indexing"] = page_table_indexing
-        metadata_keys = {
-            "total_new_kv_tokens",
-            "cached_length_mode",
-            "max_cached_tokens_per_request",
-            "new_q_length_mode",
-            "max_new_q_tokens_per_request",
-            "new_kv_length_mode",
-            "max_new_kv_tokens_per_request",
-            "tie_new_kv_to_query",
-            "max_seqlen_k",
-        }
-        metadata_kwargs = {
-            key: kwargs.pop(key) for key in list(kwargs) if key in metadata_keys
-        }
-        kv_cache_dtype = kwargs.pop("kv_cache_dtype", None)
-
-        metadata_input = kwargs.get("metadata_input")
-        q_input = kwargs.get("q_input")
-        k_input = kwargs.get("k_input")
-        v_input = kwargs.get("v_input")
-        cache_input = kwargs.get("cache_input")
-        sinks_input = kwargs.get("sinks_input")
-        cache_input_obj = cache_input if isinstance(cache_input, KVCacheInput) else None
-        if isinstance(metadata_input, MHARequestMetadataInput):
-            kwargs["metadata_input"] = metadata_input.config
-            metadata_config = metadata_input.config
-        else:
-            metadata_config = metadata_input
-        if metadata_config is not None:
-            kwargs.setdefault("batch_size", metadata_config.batch_size)
-            kwargs.setdefault(
-                "total_cached_tokens", metadata_config.total_cached_tokens
-            )
-            kwargs.setdefault("total_new_q_tokens", metadata_config.total_new_q_tokens)
-            kwargs.setdefault("cache_layout", metadata_config.cache_layout)
-        if metadata_kwargs:
-            if metadata_config is not None:
-                raise ValueError(
-                    "MHA metadata parameters must be provided either as "
-                    "metadata_input or as flat legacy keyword arguments, not both"
-                )
-            metadata_config = MHARequestMetadataInputConfig(
-                batch_size=int(kwargs["batch_size"]),
-                total_cached_tokens=int(kwargs["total_cached_tokens"]),
-                total_new_q_tokens=int(kwargs["total_new_q_tokens"]),
-                total_new_kv_tokens=metadata_kwargs.pop("total_new_kv_tokens", None),
-                cache_layout=kwargs.get("cache_layout", "none"),
-                cached_length_mode=metadata_kwargs.pop(
-                    "cached_length_mode",
-                    "ragged",
-                ),
-                max_cached_tokens_per_request=metadata_kwargs.pop(
-                    "max_cached_tokens_per_request",
-                    None,
-                ),
-                new_q_length_mode=metadata_kwargs.pop("new_q_length_mode", "ragged"),
-                max_new_q_tokens_per_request=metadata_kwargs.pop(
-                    "max_new_q_tokens_per_request",
-                    None,
-                ),
-                new_kv_length_mode=metadata_kwargs.pop("new_kv_length_mode", None),
-                max_new_kv_tokens_per_request=metadata_kwargs.pop(
-                    "max_new_kv_tokens_per_request",
-                    None,
-                ),
-                tie_new_kv_to_query=metadata_kwargs.pop("tie_new_kv_to_query", True),
-                max_seqlen_k=metadata_kwargs.pop("max_seqlen_k", None),
-                device=kwargs.get("device"),
-            )
-            kwargs["metadata_input"] = metadata_config
-        if isinstance(q_input, TensorInput):
-            kwargs["q_input"] = q_input.config
-        if isinstance(k_input, TensorInput):
-            kwargs["k_input"] = k_input.config
-        if isinstance(v_input, TensorInput):
-            kwargs["v_input"] = v_input.config
-        if isinstance(cache_input, KVCacheInput):
-            kwargs["cache_input"] = cache_input.config
-        cache_input_config = kwargs.get("cache_input")
-        if isinstance(sinks_input, TensorInput):
-            kwargs["sinks_input"] = sinks_input.config
-
-        if cache_input_config is not None:
-            kwargs.setdefault("cache_layout", cache_input_config.cache_layout)
-
-        if kv_cache_dtype is not None:
-            if cache_input_config is not None:
-                raise ValueError(
-                    "MHA cache parameters must be provided either as cache_input or "
-                    "as flat legacy keyword arguments, not both"
-                )
-            cache_layout = kwargs.get("cache_layout", "none")
-            if cache_layout != "none":
-                cache_input_config = KVCacheInputConfig(
-                    cache_layout=cache_layout,
-                    batch_size=int(kwargs["batch_size"]),
-                    max_seqlen_k=(
-                        metadata_config.max_seqlen_k
-                        if metadata_config is not None
-                        and metadata_config.max_seqlen_k is not None
-                        else 0
-                    ),
-                    num_kv_heads=int(kwargs["num_kv_heads"]),
-                    head_dim=int(kwargs["head_dim"]),
-                    dtype=kv_cache_dtype,
-                    page_size=kwargs.get("page_size"),
-                    device=kwargs.get("device"),
-                )
-                if kwargs.get("indexing") is not None:
-                    cache_input_config.page_table_input = PageTableInputConfig(
-                        batch_size=cache_input_config.batch_size,
-                        max_pages_per_request=1,
-                        indexing=kwargs["indexing"],
-                        device=cache_input_config.device,
-                    )
-                kwargs["cache_input"] = cache_input_config
-            else:
-                raise ValueError("kv_cache_dtype requires cache_layout != 'none'")
-
-        self.config = config or MHAInputConfig(**kwargs)  # type: ignore[arg-type]
-        self.metadata_input = (
-            metadata_input
-            if isinstance(metadata_input, MHARequestMetadataInput)
-            else None
-        )
-        self.q_input = q_input if isinstance(q_input, TensorInput) else None
-        self.k_input = k_input if isinstance(k_input, TensorInput) else None
-        self.v_input = v_input if isinstance(v_input, TensorInput) else None
-        self.cache_input = cache_input_obj
-        self.sinks_input = sinks_input if isinstance(sinks_input, TensorInput) else None
+        self.config = config
+        self.metadata_input = None
+        self.q_input = None
+        self.k_input = None
+        self.v_input = None
+        self.cache_input = None
+        self.sinks_input = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -435,38 +302,30 @@ class MHAInputs(NumericsInputGenerator):
         if self.cache_input is not None:
             self._verify_cache_config_matches_parent()
 
-        self.q_input = self.q_input or TensorInput(
-            self.config.q_input
-            or TensorInputConfig(
-                (0, self.config.num_q_heads, self.config.head_dim),
-                self.config.q_dtype,
-                device=self.config.device,
-            )
+        q_config = self.config.q_input or TensorInputConfig(
+            (0, self.config.num_q_heads, self.config.head_dim),
+            self.config.q_dtype,
+            device=self.config.device,
         )
-        self.k_input = self.k_input or TensorInput(
-            self.config.k_input
-            or TensorInputConfig(
-                (0, self.config.num_kv_heads, self.config.head_dim),
-                self.config.k_dtype,
-                device=self.config.device,
-            )
+        k_config = self.config.k_input or TensorInputConfig(
+            (0, self.config.num_kv_heads, self.config.head_dim),
+            self.config.k_dtype,
+            device=self.config.device,
         )
-        self.v_input = self.v_input or TensorInput(
-            self.config.v_input
-            or TensorInputConfig(
-                (0, self.config.num_kv_heads, self.config.head_dim),
-                self.config.v_dtype,
-                device=self.config.device,
-            )
+        v_config = self.config.v_input or TensorInputConfig(
+            (0, self.config.num_kv_heads, self.config.head_dim),
+            self.config.v_dtype,
+            device=self.config.device,
         )
-        self.sinks_input = self.sinks_input or TensorInput(
-            self.config.sinks_input
-            or TensorInputConfig(
-                (self.config.num_q_heads,),
-                self.config.sink_dtype if self.config.include_sinks else None,
-                device=self.config.device,
-            )
+        sinks_config = self.config.sinks_input or TensorInputConfig(
+            (self.config.num_q_heads,),
+            self.config.sink_dtype if self.config.include_sinks else None,
+            device=self.config.device,
         )
+        self.q_input = self.q_input or _tensor_input_from_config(q_config)
+        self.k_input = self.k_input or _tensor_input_from_config(k_config)
+        self.v_input = self.v_input or _tensor_input_from_config(v_config)
+        self.sinks_input = self.sinks_input or _tensor_input_from_config(sinks_config)
         self.config.q_input = self.q_input.config
         self.config.k_input = self.k_input.config
         self.config.v_input = self.v_input.config

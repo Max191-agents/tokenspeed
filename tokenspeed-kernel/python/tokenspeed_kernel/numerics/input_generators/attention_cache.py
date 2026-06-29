@@ -37,6 +37,7 @@ from tokenspeed_kernel.numerics.input_generators.core import (
     TensorInput,
     _child_seed,
     _resolve_device,
+    _tensor_input_from_config,
 )
 
 __all__ = [
@@ -138,12 +139,9 @@ class PageTableInput(NumericsInputGenerator):
 
     def __init__(
         self,
-        config: PageTableInputConfig | None = None,
-        **kwargs: object,
+        config: PageTableInputConfig,
     ) -> None:
-        if config is not None and kwargs:
-            raise TypeError("pass either config or keyword parameters, not both")
-        self.config = config or PageTableInputConfig(**kwargs)  # type: ignore[arg-type]
+        self.config = config
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -211,33 +209,6 @@ class AttentionCacheInput(NumericsInputGenerator):
     """
 
     page_table_input: PageTableInput | None
-
-    def _coerce_page_table_input_kwargs(
-        self,
-        kwargs: dict[str, object],
-    ) -> PageTableInput | None:
-        page_table_indexing = kwargs.pop("page_table_indexing", None)
-        page_table_input = kwargs.get("page_table_input")
-        page_table_input_obj = (
-            page_table_input if isinstance(page_table_input, PageTableInput) else None
-        )
-        if isinstance(page_table_input, PageTableInput):
-            kwargs["page_table_input"] = page_table_input.config
-        page_table_config = kwargs.get("page_table_input")
-        if page_table_indexing is not None:
-            if page_table_config is None:
-                page_table_config = PageTableInputConfig(
-                    batch_size=int(kwargs["batch_size"]),
-                    max_pages_per_request=1,
-                    indexing=_check_page_table_indexing(str(page_table_indexing)),
-                    device=kwargs.get("device"),
-                )
-                kwargs["page_table_input"] = page_table_config
-            else:
-                page_table_config.indexing = _check_page_table_indexing(
-                    str(page_table_indexing)
-                )
-        return page_table_input_obj
 
     def _normalize_common_config(self) -> None:
         self.config.cache_layout = _check_cache_layout(self.config.cache_layout)
@@ -408,47 +379,31 @@ class KVCacheInput(AttentionCacheInput):
 
     def __init__(
         self,
-        config: KVCacheInputConfig | None = None,
-        **kwargs: object,
+        config: KVCacheInputConfig,
     ) -> None:
-        if config is not None and kwargs:
-            raise TypeError("pass either config or keyword parameters, not both")
-
-        k_cache_input = kwargs.get("k_cache_input")
-        v_cache_input = kwargs.get("v_cache_input")
-        if isinstance(k_cache_input, TensorInput):
-            kwargs["k_cache_input"] = k_cache_input.config
-        if isinstance(v_cache_input, TensorInput):
-            kwargs["v_cache_input"] = v_cache_input.config
-        page_table_input_obj = self._coerce_page_table_input_kwargs(kwargs)
-
-        self.config = config or KVCacheInputConfig(**kwargs)  # type: ignore[arg-type]
-        self.k_cache_input = (
-            k_cache_input if isinstance(k_cache_input, TensorInput) else None
-        )
-        self.v_cache_input = (
-            v_cache_input if isinstance(v_cache_input, TensorInput) else None
-        )
-        self.page_table_input = page_table_input_obj
+        self.config = config
+        self.k_cache_input = None
+        self.v_cache_input = None
+        self.page_table_input = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
         self._normalize_config()
-        self.k_cache_input = self.k_cache_input or TensorInput(
-            self.config.k_cache_input
-            or TensorInputConfig(
-                (0, self.config.num_kv_heads, self.config.head_dim),
-                self.config.dtype,
-                device=self.config.device,
-            )
+        k_cache_config = self.config.k_cache_input or TensorInputConfig(
+            (0, self.config.num_kv_heads, self.config.head_dim),
+            self.config.dtype,
+            device=self.config.device,
         )
-        self.v_cache_input = self.v_cache_input or TensorInput(
-            self.config.v_cache_input
-            or TensorInputConfig(
-                (0, self.config.num_kv_heads, self.config.head_dim),
-                self.config.dtype,
-                device=self.config.device,
-            )
+        v_cache_config = self.config.v_cache_input or TensorInputConfig(
+            (0, self.config.num_kv_heads, self.config.head_dim),
+            self.config.dtype,
+            device=self.config.device,
+        )
+        self.k_cache_input = self.k_cache_input or _tensor_input_from_config(
+            k_cache_config
+        )
+        self.v_cache_input = self.v_cache_input or _tensor_input_from_config(
+            v_cache_config
         )
         if self.config.cache_layout == "paged" and self.page_table_input is None:
             self.page_table_input = PageTableInput(
@@ -596,33 +551,22 @@ class MLAKVCacheInput(AttentionCacheInput):
 
     def __init__(
         self,
-        config: MLAKVCacheInputConfig | None = None,
-        **kwargs: object,
+        config: MLAKVCacheInputConfig,
     ) -> None:
-        if config is not None and kwargs:
-            raise TypeError("pass either config or keyword parameters, not both")
-
-        kv_cache_input = kwargs.get("kv_cache_input")
-        if isinstance(kv_cache_input, TensorInput):
-            kwargs["kv_cache_input"] = kv_cache_input.config
-        page_table_input_obj = self._coerce_page_table_input_kwargs(kwargs)
-
-        self.config = config or MLAKVCacheInputConfig(**kwargs)  # type: ignore[arg-type]
-        self.kv_cache_input = (
-            kv_cache_input if isinstance(kv_cache_input, TensorInput) else None
-        )
-        self.page_table_input = page_table_input_obj
+        self.config = config
+        self.kv_cache_input = None
+        self.page_table_input = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
         self._normalize_config()
-        self.kv_cache_input = self.kv_cache_input or TensorInput(
-            self.config.kv_cache_input
-            or TensorInputConfig(
-                (0, 1, self._cache_head_dim()),
-                self.config.dtype,
-                device=self.config.device,
-            )
+        kv_cache_config = self.config.kv_cache_input or TensorInputConfig(
+            (0, 1, self._cache_head_dim()),
+            self.config.dtype,
+            device=self.config.device,
+        )
+        self.kv_cache_input = self.kv_cache_input or _tensor_input_from_config(
+            kv_cache_config
         )
         if self.config.cache_layout == "paged" and self.page_table_input is None:
             self.page_table_input = PageTableInput(

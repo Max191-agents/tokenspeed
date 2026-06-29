@@ -68,6 +68,7 @@ from tokenspeed_kernel.numerics.input_generators.gemm import (
     ScaledGemmInputValues,
     ScaledGemmInputs,
     gemm_scale_shape,
+    mxfp4_scaled_gemm_input_config,
 )
 from tokenspeed_kernel.numerics.input_generators.moe import (
     MoeInputConfig,
@@ -120,4 +121,5 @@ __all__ = [
     "TensorInputConfig",
     "TensorInput",
     "gemm_scale_shape",
+    "mxfp4_scaled_gemm_input_config",
 ]

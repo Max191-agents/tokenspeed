@@ -39,6 +39,7 @@ from tokenspeed_kernel.numerics.input_generators import (
     TensorInputConfig,
     TensorInput,
     gemm_scale_shape,
+    mxfp4_scaled_gemm_input_config,
 )
 from tokenspeed_kernel.numerics.inputs import get_input_generator
 from tokenspeed_kernel.numerics.tolerance import Tolerance
@@ -217,17 +218,17 @@ def test_tensor_input_rejects_non_floating_torch_dtype() -> None:
         TensorInput((2, 3), torch.int32).generate(seed=123, device="cpu")
 
 
-def test_tensor_inputs_accept_config_objects() -> None:
-    tensor_config = TensorInputConfig((2, 3), torch.float32)
-    tensor = TensorInput(tensor_config)
+def test_tensor_input_uses_named_arguments() -> None:
+    tensor = TensorInput((2, 3), torch.float32)
 
     values = tensor.generate(seed=123, device="cpu")
 
-    assert tensor.config is tensor_config
     assert values is not None
     assert values.shape == (2, 3)
     assert values.dtype == torch.float32
 
+
+def test_scaled_tensor_inputs_accept_config_objects() -> None:
     scaled_config = ScaledTensorInputConfig(
         value_shape=(2, 4),
         value_dtype=torch.float16,
@@ -247,10 +248,12 @@ def test_tensor_inputs_accept_config_objects() -> None:
 
 def test_scaled_tensor_input_generates_torch_values_and_scales() -> None:
     tensor = ScaledTensorInput(
-        value_shape=(4, 5),
-        value_dtype=torch.float16,
-        scale_shape=(4, 1),
-        scale_dtype=torch.float32,
+        ScaledTensorInputConfig(
+            value_shape=(4, 5),
+            value_dtype=torch.float16,
+            scale_shape=(4, 1),
+            scale_dtype=torch.float32,
+        )
     ).generate(seed=125, device="cpu")
 
     assert tensor.values is not None
@@ -266,10 +269,12 @@ def test_scaled_tensor_input_generates_torch_values_and_scales() -> None:
 
 def test_scaled_tensor_input_reuses_mutable_value_generator_dtype() -> None:
     tensor = ScaledTensorInput(
-        value_shape=(4, 5),
-        value_dtype=torch.float16,
-        scale_shape=(4, 1),
-        scale_dtype=torch.float32,
+        ScaledTensorInputConfig(
+            value_shape=(4, 5),
+            value_dtype=torch.float16,
+            scale_shape=(4, 1),
+            scale_dtype=torch.float32,
+        )
     )
     assert tensor.values_input is not None
     values_input = tensor.values_input
@@ -284,10 +289,12 @@ def test_scaled_tensor_input_reuses_mutable_value_generator_dtype() -> None:
 
 def test_scaled_tensor_input_generates_mxfp4_values_and_scales() -> None:
     tensor = ScaledTensorInput(
-        value_shape=(4, 8),
-        value_dtype=CustomDType.MXFP4,
-        scale_shape=(4, 1),
-        scale_dtype=torch.float32,
+        ScaledTensorInputConfig(
+            value_shape=(4, 8),
+            value_dtype=CustomDType.MXFP4,
+            scale_shape=(4, 1),
+            scale_dtype=torch.float32,
+        )
     ).generate(seed=126, device="cpu")
 
     assert tensor.values is not None
@@ -301,14 +308,16 @@ def test_scaled_tensor_input_generates_mxfp4_values_and_scales() -> None:
 
 def test_gemm_inputs_generate_operands_and_layouts() -> None:
     inputs = GemmInputs(
-        M=2,
-        N=3,
-        K=4,
-        a_dtype=torch.float16,
-        b_dtype=torch.float32,
-        c_dtype=torch.float64,
-        a_layout="KM",
-        b_layout="KN",
+        GemmInputConfig(
+            M=2,
+            N=3,
+            K=4,
+            a_dtype=torch.float16,
+            b_dtype=torch.float32,
+            c_dtype=torch.float64,
+            a_layout="KM",
+            b_layout="KN",
+        )
     ).generate(seed=5, device="cpu")
 
     assert inputs.A is not None
@@ -324,12 +333,14 @@ def test_gemm_inputs_generate_operands_and_layouts() -> None:
 
 def test_gemm_inputs_use_mutable_config_fields() -> None:
     inputs = GemmInputs(
-        M=2,
-        N=3,
-        K=4,
-        a_dtype=torch.float16,
-        b_dtype=torch.float32,
-        c_dtype=torch.float32,
+        GemmInputConfig(
+            M=2,
+            N=3,
+            K=4,
+            a_dtype=torch.float16,
+            b_dtype=torch.float32,
+            c_dtype=torch.float32,
+        )
     )
 
     inputs.config.b_dtype = torch.float64
@@ -362,7 +373,7 @@ def test_gemm_inputs_accept_config_objects() -> None:
 
 def test_gemm_inputs_require_c_dtype() -> None:
     with pytest.raises(TypeError, match="c_dtype"):
-        GemmInputs(
+        GemmInputConfig(
             M=2,
             N=3,
             K=4,
@@ -371,12 +382,14 @@ def test_gemm_inputs_require_c_dtype() -> None:
         )
 
     inputs = GemmInputs(
-        M=2,
-        N=3,
-        K=4,
-        a_dtype=torch.float16,
-        b_dtype=torch.float32,
-        c_dtype=torch.float32,
+        GemmInputConfig(
+            M=2,
+            N=3,
+            K=4,
+            a_dtype=torch.float16,
+            b_dtype=torch.float32,
+            c_dtype=torch.float32,
+        )
     )
     inputs.config.c_dtype = None  # type: ignore[assignment]
 
@@ -386,12 +399,14 @@ def test_gemm_inputs_require_c_dtype() -> None:
 
 def test_gemm_inputs_support_custom_mxfp4_dtype() -> None:
     values = GemmInputs(
-        M=4,
-        N=8,
-        K=64,
-        a_dtype=CustomDType.MXFP4,
-        b_dtype=CustomDType.MXFP4,
-        c_dtype=torch.float32,
+        GemmInputConfig(
+            M=4,
+            N=8,
+            K=64,
+            a_dtype=CustomDType.MXFP4,
+            b_dtype=CustomDType.MXFP4,
+            c_dtype=torch.float32,
+        )
     ).generate(seed=9, device="cpu")
 
     assert values.A is not None
@@ -406,16 +421,18 @@ def test_gemm_inputs_support_custom_mxfp4_dtype() -> None:
 
 def test_scaled_gemm_inputs_generate_scaled_operands() -> None:
     inputs = ScaledGemmInputs(
-        M=4,
-        N=6,
-        K=8,
-        a_dtype=_fp8_dtype,
-        b_dtype=_fp8_dtype,
-        a_scale_dtype=torch.float32,
-        b_scale_dtype=torch.float32,
-        c_dtype=torch.float32,
-        a_scale_shape=gemm_scale_shape("channel", "a", M=4, N=6, K=8),
-        b_scale_shape=gemm_scale_shape("channel", "b", M=4, N=6, K=8),
+        ScaledGemmInputConfig(
+            M=4,
+            N=6,
+            K=8,
+            a_dtype=_fp8_dtype,
+            b_dtype=_fp8_dtype,
+            a_scale_dtype=torch.float32,
+            b_scale_dtype=torch.float32,
+            c_dtype=torch.float32,
+            a_scale_shape=gemm_scale_shape("channel", "a", M=4, N=6, K=8),
+            b_scale_shape=gemm_scale_shape("channel", "b", M=4, N=6, K=8),
+        )
     ).generate(seed=17, device="cpu")
 
     assert inputs.A is not None
@@ -436,16 +453,18 @@ def test_scaled_gemm_inputs_generate_scaled_operands() -> None:
 
 def test_scaled_gemm_inputs_use_mutable_config_fields() -> None:
     inputs = ScaledGemmInputs(
-        M=4,
-        N=6,
-        K=8,
-        a_dtype=_fp8_dtype,
-        b_dtype=_fp8_dtype,
-        a_scale_dtype=torch.float32,
-        b_scale_dtype=torch.float32,
-        c_dtype=torch.float32,
-        a_scale_shape=gemm_scale_shape("channel", "a", M=4, N=6, K=8),
-        b_scale_shape=gemm_scale_shape("channel", "b", M=4, N=6, K=8),
+        ScaledGemmInputConfig(
+            M=4,
+            N=6,
+            K=8,
+            a_dtype=_fp8_dtype,
+            b_dtype=_fp8_dtype,
+            a_scale_dtype=torch.float32,
+            b_scale_dtype=torch.float32,
+            c_dtype=torch.float32,
+            a_scale_shape=gemm_scale_shape("channel", "a", M=4, N=6, K=8),
+            b_scale_shape=gemm_scale_shape("channel", "b", M=4, N=6, K=8),
+        )
     )
 
     inputs.config.a_scale_dtype = torch.float64
@@ -484,12 +503,14 @@ def test_scaled_gemm_inputs_accept_config_objects() -> None:
 
 
 def test_scaled_gemm_inputs_support_mxfp4_fp8_scales() -> None:
-    inputs = ScaledGemmInputs.mxfp4(
-        M=4,
-        N=8,
-        K=64,
-        scale_dtype=_fp8_dtype,
-        c_dtype=torch.float32,
+    inputs = ScaledGemmInputs(
+        mxfp4_scaled_gemm_input_config(
+            M=4,
+            N=8,
+            K=64,
+            scale_dtype=_fp8_dtype,
+            c_dtype=torch.float32,
+        )
     ).generate(seed=19, device="cpu")
 
     assert inputs.A is not None
@@ -512,12 +533,14 @@ def test_scaled_gemm_inputs_support_mxfp4_fp8_scales() -> None:
 
 def test_moe_inputs_compose_dense_weight_gemms() -> None:
     inputs = MoeInputs(
-        num_tokens=5,
-        hidden_size=16,
-        intermediate_size=32,
-        num_experts=4,
-        top_k=2,
-        hidden_dtype=torch.float16,
+        MoeInputConfig(
+            num_tokens=5,
+            hidden_size=16,
+            intermediate_size=32,
+            num_experts=4,
+            top_k=2,
+            hidden_dtype=torch.float16,
+        )
     ).generate(seed=23, device="cpu")
 
     assert inputs.hidden_states is not None
@@ -549,12 +572,14 @@ def test_moe_inputs_compose_dense_weight_gemms() -> None:
 
 def test_moe_inputs_reuse_mutable_child_generators() -> None:
     inputs = MoeInputs(
-        num_tokens=5,
-        hidden_size=16,
-        intermediate_size=32,
-        num_experts=4,
-        top_k=2,
-        hidden_dtype=torch.float16,
+        MoeInputConfig(
+            num_tokens=5,
+            hidden_size=16,
+            intermediate_size=32,
+            num_experts=4,
+            top_k=2,
+            hidden_dtype=torch.float16,
+        )
     )
 
     assert inputs.hidden_states_input is not None
@@ -607,14 +632,16 @@ def test_moe_inputs_accept_config_objects() -> None:
 
 def test_moe_inputs_compose_mxfp4_scaled_weight_gemms() -> None:
     inputs = MoeInputs(
-        num_tokens=5,
-        hidden_size=64,
-        intermediate_size=32,
-        num_experts=4,
-        top_k=2,
-        hidden_dtype=torch.float16,
-        weight_format="mxfp4",
-        weight_scale_dtype=_fp8_dtype,
+        MoeInputConfig(
+            num_tokens=5,
+            hidden_size=64,
+            intermediate_size=32,
+            num_experts=4,
+            top_k=2,
+            hidden_dtype=torch.float16,
+            weight_format="mxfp4",
+            weight_scale_dtype=_fp8_dtype,
+        )
     ).generate(seed=29, device="cpu")
 
     assert isinstance(inputs.w13, ScaledGemmInputValues)

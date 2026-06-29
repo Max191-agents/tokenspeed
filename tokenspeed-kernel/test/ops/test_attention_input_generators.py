@@ -42,8 +42,10 @@ from tokenspeed_kernel.numerics.input_generators import (
     MHAInputConfig,
     MHAInputValues,
     MHAInputs,
+    MLAInputConfig,
     MLAInputs,
     MLAKVCacheInput,
+    MLAKVCacheInputConfig,
     MHARequestMetadataInputConfig,
     PageTableInput,
     PageTableInputConfig,
@@ -57,15 +59,104 @@ def _page_ids(inputs: MHAInputValues) -> list[int]:
     return [page_id for row in inputs.cache.page_table_cpu for page_id in row]
 
 
+def _mha_config(
+    *,
+    batch_size: int,
+    total_cached_tokens: int,
+    total_new_q_tokens: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    q_dtype: torch.dtype,
+    cache_layout: str = "none",
+    page_size: int | None = None,
+    indexing: str | None = None,
+    include_sinks: bool = False,
+    metadata_kwargs: dict[str, object] | None = None,
+) -> MHAInputConfig:
+    return MHAInputConfig(
+        batch_size=batch_size,
+        total_cached_tokens=total_cached_tokens,
+        total_new_q_tokens=total_new_q_tokens,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_dtype=q_dtype,
+        cache_layout=cache_layout,  # type: ignore[arg-type]
+        page_size=page_size,
+        indexing=indexing,  # type: ignore[arg-type]
+        include_sinks=include_sinks,
+        metadata_input=MHARequestMetadataInputConfig(
+            batch_size=batch_size,
+            total_cached_tokens=total_cached_tokens,
+            total_new_q_tokens=total_new_q_tokens,
+            cache_layout=cache_layout,  # type: ignore[arg-type]
+            **(metadata_kwargs or {}),
+        ),
+    )
+
+
+def _mla_config(
+    *,
+    batch_size: int,
+    total_cached_tokens: int,
+    total_new_q_tokens: int,
+    num_q_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    v_head_dim: int,
+    q_dtype: torch.dtype,
+    cache_layout: str = "none",
+    page_size: int | None = None,
+    indexing: str | None = None,
+    num_kv_heads: int | None = None,
+    metadata_kwargs: dict[str, object] | None = None,
+) -> MLAInputConfig:
+    metadata_fields = {
+        "allow_untied_non_cached_kv": True,
+        "new_q_length_mode": (
+            "fixed_per_request" if cache_layout != "none" else "ragged"
+        ),
+        **(metadata_kwargs or {}),
+    }
+    return MLAInputConfig(
+        batch_size=batch_size,
+        total_cached_tokens=total_cached_tokens,
+        total_new_q_tokens=total_new_q_tokens,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        v_head_dim=v_head_dim,
+        q_dtype=q_dtype,
+        cache_layout=cache_layout,  # type: ignore[arg-type]
+        page_size=page_size,
+        indexing=indexing,  # type: ignore[arg-type]
+        metadata_input=MHARequestMetadataInputConfig(
+            batch_size=batch_size,
+            total_cached_tokens=total_cached_tokens,
+            total_new_q_tokens=total_new_q_tokens,
+            cache_layout=cache_layout,  # type: ignore[arg-type]
+            **metadata_fields,
+        ),
+    )
+
+
 def test_page_table_input_generates_identity_and_random_indexing() -> None:
     identity = PageTableInput(
-        batch_size=3,
-        max_pages_per_request=5,
-        indexing="identity",
+        PageTableInputConfig(
+            batch_size=3,
+            max_pages_per_request=5,
+            indexing="identity",
+        )
     ).generate(seed=1, device="cpu")
     random = PageTableInput(
-        batch_size=3,
-        max_pages_per_request=5,
+        PageTableInputConfig(
+            batch_size=3,
+            max_pages_per_request=5,
+        )
     ).generate(seed=1, device="cpu")
 
     expected_pages = list(range(15))
@@ -78,12 +169,14 @@ def test_page_table_input_generates_identity_and_random_indexing() -> None:
 
 def test_kv_cache_input_generates_dense_cache() -> None:
     cache = KVCacheInput(
-        cache_layout="dense",
-        batch_size=3,
-        max_seqlen_k=17,
-        num_kv_heads=2,
-        head_dim=8,
-        dtype=torch.float32,
+        KVCacheInputConfig(
+            cache_layout="dense",
+            batch_size=3,
+            max_seqlen_k=17,
+            num_kv_heads=2,
+            head_dim=8,
+            dtype=torch.float32,
+        )
     ).generate(seed=1, device="cpu")
 
     assert cache.k_cache is not None
@@ -98,25 +191,33 @@ def test_kv_cache_input_generates_dense_cache() -> None:
 def test_kv_cache_input_requires_real_cache_layout() -> None:
     with pytest.raises(ValueError, match="cache_layout must be 'dense' or 'paged'"):
         KVCacheInput(
-            cache_layout="none",
-            batch_size=3,
-            max_seqlen_k=17,
-            num_kv_heads=2,
-            head_dim=8,
-            dtype=torch.float32,
+            KVCacheInputConfig(
+                cache_layout="none",
+                batch_size=3,
+                max_seqlen_k=17,
+                num_kv_heads=2,
+                head_dim=8,
+                dtype=torch.float32,
+            )
         )
 
 
 def test_kv_cache_input_generates_paged_cache_with_nested_page_table() -> None:
     cache_input = KVCacheInput(
-        cache_layout="paged",
-        batch_size=3,
-        max_seqlen_k=17,
-        num_kv_heads=2,
-        head_dim=8,
-        dtype=torch.float32,
-        page_size=4,
-        page_table_indexing="identity",
+        KVCacheInputConfig(
+            cache_layout="paged",
+            batch_size=3,
+            max_seqlen_k=17,
+            num_kv_heads=2,
+            head_dim=8,
+            dtype=torch.float32,
+            page_size=4,
+            page_table_input=PageTableInputConfig(
+                batch_size=3,
+                max_pages_per_request=1,
+                indexing="identity",
+            ),
+        )
     )
     assert cache_input.page_table_input is not None
     cache_input.page_table_input.config.indexing = "random"
@@ -134,24 +235,27 @@ def test_kv_cache_input_generates_paged_cache_with_nested_page_table() -> None:
     assert cache.page_table_values.page_ids() != list(range(15))
 
 
-def test_kv_cache_input_preserves_nested_page_table_generator_object() -> None:
-    page_table_input = PageTableInput(
+def test_kv_cache_input_uses_nested_page_table_config() -> None:
+    page_table_config = PageTableInputConfig(
         batch_size=1,
         max_pages_per_request=1,
         indexing="identity",
     )
     cache_input = KVCacheInput(
-        cache_layout="paged",
-        batch_size=3,
-        max_seqlen_k=17,
-        num_kv_heads=2,
-        head_dim=8,
-        dtype=torch.float32,
-        page_size=4,
-        page_table_input=page_table_input,
+        KVCacheInputConfig(
+            cache_layout="paged",
+            batch_size=3,
+            max_seqlen_k=17,
+            num_kv_heads=2,
+            head_dim=8,
+            dtype=torch.float32,
+            page_size=4,
+            page_table_input=page_table_config,
+        )
     )
 
-    assert cache_input.page_table_input is page_table_input
+    assert cache_input.page_table_input is not None
+    assert cache_input.page_table_input.config is page_table_config
 
     cache = cache_input.generate(seed=1, device="cpu")
 
@@ -161,14 +265,20 @@ def test_kv_cache_input_preserves_nested_page_table_generator_object() -> None:
 
 def test_mla_kv_cache_input_generates_paged_compressed_cache() -> None:
     cache = MLAKVCacheInput(
-        cache_layout="paged",
-        batch_size=2,
-        max_seqlen_k=9,
-        kv_lora_rank=16,
-        qk_rope_head_dim=4,
-        dtype=torch.float32,
-        page_size=4,
-        page_table_indexing="identity",
+        MLAKVCacheInputConfig(
+            cache_layout="paged",
+            batch_size=2,
+            max_seqlen_k=9,
+            kv_lora_rank=16,
+            qk_rope_head_dim=4,
+            dtype=torch.float32,
+            page_size=4,
+            page_table_input=PageTableInputConfig(
+                batch_size=2,
+                max_pages_per_request=1,
+                indexing="identity",
+            ),
+        )
     ).generate(seed=1, device="cpu")
 
     assert cache.page_table is not None
@@ -180,15 +290,17 @@ def test_mla_kv_cache_input_generates_paged_compressed_cache() -> None:
 
 def test_mha_inputs_without_cache_leaves_cache_input_none() -> None:
     generator = MHAInputs(
-        batch_size=3,
-        total_cached_tokens=0,
-        total_new_q_tokens=12,
-        num_q_heads=4,
-        num_kv_heads=2,
-        head_dim=8,
-        q_dtype=torch.float32,
-        cache_layout="none",
-        new_q_length_mode="fixed_per_request",
+        _mha_config(
+            batch_size=3,
+            total_cached_tokens=0,
+            total_new_q_tokens=12,
+            num_q_heads=4,
+            num_kv_heads=2,
+            head_dim=8,
+            q_dtype=torch.float32,
+            cache_layout="none",
+            metadata_kwargs={"new_q_length_mode": "fixed_per_request"},
+        )
     )
     assert generator.cache_input is None
 
@@ -200,26 +312,30 @@ def test_mha_inputs_without_cache_leaves_cache_input_none() -> None:
 
 def test_mha_inputs_keep_metadata_seed_independent_from_values() -> None:
     first = MHAInputs(
-        batch_size=4,
-        total_cached_tokens=31,
-        total_new_q_tokens=9,
-        num_q_heads=4,
-        num_kv_heads=2,
-        head_dim=16,
-        q_dtype=torch.float32,
-        cache_layout="paged",
-        page_size=8,
+        _mha_config(
+            batch_size=4,
+            total_cached_tokens=31,
+            total_new_q_tokens=9,
+            num_q_heads=4,
+            num_kv_heads=2,
+            head_dim=16,
+            q_dtype=torch.float32,
+            cache_layout="paged",
+            page_size=8,
+        )
     ).generate(metadata_seed=11, value_seed=21, device="cpu")
     second = MHAInputs(
-        batch_size=4,
-        total_cached_tokens=31,
-        total_new_q_tokens=9,
-        num_q_heads=4,
-        num_kv_heads=2,
-        head_dim=16,
-        q_dtype=torch.float32,
-        cache_layout="paged",
-        page_size=8,
+        _mha_config(
+            batch_size=4,
+            total_cached_tokens=31,
+            total_new_q_tokens=9,
+            num_q_heads=4,
+            num_kv_heads=2,
+            head_dim=16,
+            q_dtype=torch.float32,
+            cache_layout="paged",
+            page_size=8,
+        )
     ).generate(metadata_seed=11, value_seed=22, device="cpu")
 
     assert first.cache is not None
@@ -236,15 +352,17 @@ def test_mha_inputs_keep_metadata_seed_independent_from_values() -> None:
 
 def test_mha_inputs_generate_dense_qkv_view() -> None:
     inputs = MHAInputs(
-        batch_size=3,
-        total_cached_tokens=0,
-        total_new_q_tokens=12,
-        num_q_heads=4,
-        num_kv_heads=2,
-        head_dim=8,
-        q_dtype=torch.float32,
-        cache_layout="none",
-        new_q_length_mode="fixed_per_request",
+        _mha_config(
+            batch_size=3,
+            total_cached_tokens=0,
+            total_new_q_tokens=12,
+            num_q_heads=4,
+            num_kv_heads=2,
+            head_dim=8,
+            q_dtype=torch.float32,
+            cache_layout="none",
+            metadata_kwargs={"new_q_length_mode": "fixed_per_request"},
+        )
     ).generate(metadata_seed=31, value_seed=41, device="cpu")
 
     q, k, v = inputs.dense_qkv()
@@ -257,17 +375,21 @@ def test_mha_inputs_generate_dense_qkv_view() -> None:
 
 def test_mha_inputs_generate_bounded_ragged_request_lengths() -> None:
     inputs = MHAInputs(
-        batch_size=5,
-        total_cached_tokens=27,
-        total_new_q_tokens=23,
-        max_cached_tokens_per_request=9,
-        max_new_q_tokens_per_request=8,
-        num_q_heads=4,
-        num_kv_heads=2,
-        head_dim=16,
-        q_dtype=torch.float32,
-        cache_layout="paged",
-        page_size=8,
+        _mha_config(
+            batch_size=5,
+            total_cached_tokens=27,
+            total_new_q_tokens=23,
+            num_q_heads=4,
+            num_kv_heads=2,
+            head_dim=16,
+            q_dtype=torch.float32,
+            cache_layout="paged",
+            page_size=8,
+            metadata_kwargs={
+                "max_cached_tokens_per_request": 9,
+                "max_new_q_tokens_per_request": 8,
+            },
+        )
     ).generate(metadata_seed=1, value_seed=99, device="cpu")
 
     assert sum(inputs.metadata.cached_lens_cpu) == 27
@@ -280,18 +402,22 @@ def test_mha_inputs_generate_bounded_ragged_request_lengths() -> None:
 
 def test_mha_inputs_generate_identity_page_table_indexing() -> None:
     inputs = MHAInputs(
-        batch_size=3,
-        total_cached_tokens=36,
-        total_new_q_tokens=12,
-        num_q_heads=4,
-        num_kv_heads=2,
-        head_dim=16,
-        q_dtype=torch.float32,
-        cache_layout="paged",
-        cached_length_mode="regular",
-        new_q_length_mode="fixed_per_request",
-        page_size=4,
-        page_table_indexing="identity",
+        _mha_config(
+            batch_size=3,
+            total_cached_tokens=36,
+            total_new_q_tokens=12,
+            num_q_heads=4,
+            num_kv_heads=2,
+            head_dim=16,
+            q_dtype=torch.float32,
+            cache_layout="paged",
+            page_size=4,
+            indexing="identity",
+            metadata_kwargs={
+                "cached_length_mode": "regular",
+                "new_q_length_mode": "fixed_per_request",
+            },
+        )
     ).generate(metadata_seed=1, value_seed=99, device="cpu")
 
     page_ids = _page_ids(inputs)
@@ -301,17 +427,21 @@ def test_mha_inputs_generate_identity_page_table_indexing() -> None:
 
 def test_mha_inputs_generate_random_page_table_indexing_by_default() -> None:
     inputs = MHAInputs(
-        batch_size=3,
-        total_cached_tokens=36,
-        total_new_q_tokens=12,
-        num_q_heads=4,
-        num_kv_heads=2,
-        head_dim=16,
-        q_dtype=torch.float32,
-        cache_layout="paged",
-        cached_length_mode="regular",
-        new_q_length_mode="fixed_per_request",
-        page_size=4,
+        _mha_config(
+            batch_size=3,
+            total_cached_tokens=36,
+            total_new_q_tokens=12,
+            num_q_heads=4,
+            num_kv_heads=2,
+            head_dim=16,
+            q_dtype=torch.float32,
+            cache_layout="paged",
+            page_size=4,
+            metadata_kwargs={
+                "cached_length_mode": "regular",
+                "new_q_length_mode": "fixed_per_request",
+            },
+        )
     ).generate(metadata_seed=1, value_seed=99, device="cpu")
 
     page_ids = _page_ids(inputs)
@@ -322,17 +452,21 @@ def test_mha_inputs_generate_random_page_table_indexing_by_default() -> None:
 
 def test_mha_inputs_allows_nested_page_table_generator_configuration() -> None:
     generator = MHAInputs(
-        batch_size=3,
-        total_cached_tokens=36,
-        total_new_q_tokens=12,
-        num_q_heads=4,
-        num_kv_heads=2,
-        head_dim=16,
-        q_dtype=torch.float32,
-        cache_layout="paged",
-        cached_length_mode="regular",
-        new_q_length_mode="fixed_per_request",
-        page_size=4,
+        _mha_config(
+            batch_size=3,
+            total_cached_tokens=36,
+            total_new_q_tokens=12,
+            num_q_heads=4,
+            num_kv_heads=2,
+            head_dim=16,
+            q_dtype=torch.float32,
+            cache_layout="paged",
+            page_size=4,
+            metadata_kwargs={
+                "cached_length_mode": "regular",
+                "new_q_length_mode": "fixed_per_request",
+            },
+        )
     )
     assert generator.cache_input is not None
     assert generator.cache_input.page_table_input is not None
@@ -533,8 +667,8 @@ def test_mha_input_config_rejects_mismatched_page_table_override() -> None:
         )
 
 
-def test_mha_inputs_preserves_nested_cache_generator_object() -> None:
-    cache_input = KVCacheInput(
+def test_mha_inputs_uses_nested_cache_config() -> None:
+    cache_config = KVCacheInputConfig(
         cache_layout="paged",
         batch_size=3,
         max_seqlen_k=1,
@@ -542,27 +676,37 @@ def test_mha_inputs_preserves_nested_cache_generator_object() -> None:
         head_dim=16,
         dtype=torch.float32,
         page_size=4,
+        page_table_input=PageTableInputConfig(
+            batch_size=3,
+            max_pages_per_request=1,
+            indexing="identity",
+        ),
     )
-    assert cache_input.page_table_input is not None
-    cache_input.page_table_input.config.indexing = "identity"
 
     generator = MHAInputs(
-        num_q_heads=4,
-        num_kv_heads=2,
-        head_dim=16,
-        q_dtype=torch.float32,
-        metadata_input=MHARequestMetadataInputConfig(
+        MHAInputConfig(
             batch_size=3,
             total_cached_tokens=36,
             total_new_q_tokens=12,
-            cached_length_mode="regular",
-            new_q_length_mode="fixed_per_request",
+            num_q_heads=4,
+            num_kv_heads=2,
+            head_dim=16,
+            q_dtype=torch.float32,
             cache_layout="paged",
-        ),
-        cache_input=cache_input,
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=3,
+                total_cached_tokens=36,
+                total_new_q_tokens=12,
+                cached_length_mode="regular",
+                new_q_length_mode="fixed_per_request",
+                cache_layout="paged",
+            ),
+            cache_input=cache_config,
+        )
     )
 
-    assert generator.cache_input is cache_input
+    assert generator.cache_input is not None
+    assert generator.cache_input.config is cache_config
 
     inputs = generator.generate(metadata_seed=1, value_seed=99, device="cpu")
 
@@ -572,21 +716,25 @@ def test_mha_inputs_preserves_nested_cache_generator_object() -> None:
 
 def test_mla_prefill_generator_allows_independent_q_and_kv_lengths() -> None:
     inputs = MLAInputs(
-        batch_size=3,
-        total_cached_tokens=0,
-        total_new_q_tokens=12,
-        total_new_kv_tokens=15,
-        tie_new_kv_to_query=False,
-        num_q_heads=4,
-        num_kv_heads=2,
-        qk_nope_head_dim=8,
-        qk_rope_head_dim=4,
-        kv_lora_rank=16,
-        v_head_dim=6,
-        q_dtype=torch.float32,
-        cache_layout="none",
-        new_q_length_mode="regular",
-        new_kv_length_mode="regular",
+        _mla_config(
+            batch_size=3,
+            total_cached_tokens=0,
+            total_new_q_tokens=12,
+            num_q_heads=4,
+            num_kv_heads=2,
+            qk_nope_head_dim=8,
+            qk_rope_head_dim=4,
+            kv_lora_rank=16,
+            v_head_dim=6,
+            q_dtype=torch.float32,
+            cache_layout="none",
+            metadata_kwargs={
+                "total_new_kv_tokens": 15,
+                "tie_new_kv_to_query": False,
+                "new_q_length_mode": "regular",
+                "new_kv_length_mode": "regular",
+            },
+        )
     ).generate(metadata_seed=1, value_seed=2, device="cpu")
 
     assert inputs.cache is None
@@ -602,21 +750,25 @@ def test_mla_prefill_generator_allows_independent_q_and_kv_lengths() -> None:
 
 def test_mla_paged_decode_generator_shapes() -> None:
     inputs = MLAInputs(
-        batch_size=3,
-        total_cached_tokens=21,
-        total_new_q_tokens=3,
-        num_q_heads=4,
-        qk_nope_head_dim=8,
-        qk_rope_head_dim=4,
-        kv_lora_rank=16,
-        v_head_dim=6,
-        q_dtype=torch.float32,
-        cache_layout="paged",
-        page_size=4,
-        indexing="identity",
-        max_seqlen_k=9,
-        cached_length_mode="regular",
-        new_q_length_mode="fixed_per_request",
+        _mla_config(
+            batch_size=3,
+            total_cached_tokens=21,
+            total_new_q_tokens=3,
+            num_q_heads=4,
+            qk_nope_head_dim=8,
+            qk_rope_head_dim=4,
+            kv_lora_rank=16,
+            v_head_dim=6,
+            q_dtype=torch.float32,
+            cache_layout="paged",
+            page_size=4,
+            indexing="identity",
+            metadata_kwargs={
+                "max_seqlen_k": 9,
+                "cached_length_mode": "regular",
+                "new_q_length_mode": "fixed_per_request",
+            },
+        )
     ).generate(metadata_seed=1, value_seed=2, device="cpu")
 
     assert inputs.q is not None
@@ -640,16 +792,18 @@ def test_mha_prefill_generator_runs_attention_kernel(
     require("attention", "mha_prefill", solution, dtype, "q")
 
     inputs = MHAInputs(
-        batch_size=3,
-        total_cached_tokens=0,
-        total_new_q_tokens=33,
-        num_q_heads=8,
-        num_kv_heads=2,
-        head_dim=64,
-        q_dtype=dtype,
-        cache_layout="none",
-        new_q_length_mode="ragged",
-        include_sinks=True,
+        _mha_config(
+            batch_size=3,
+            total_cached_tokens=0,
+            total_new_q_tokens=33,
+            num_q_heads=8,
+            num_kv_heads=2,
+            head_dim=64,
+            q_dtype=dtype,
+            cache_layout="none",
+            include_sinks=True,
+            metadata_kwargs={"new_q_length_mode": "ragged"},
+        )
     ).generate(metadata_seed=101, value_seed=201, device=device)
 
     out = mha_prefill(**mha_prefill_kwargs(inputs), solution=solution)
@@ -668,18 +822,22 @@ def test_mha_paged_extend_generator_runs_triton_attention_kernel(
     require("attention", "mha_extend_with_kvcache", solution, dtype, "q")
 
     inputs = MHAInputs(
-        batch_size=4,
-        total_cached_tokens=47,
-        total_new_q_tokens=11,
-        num_q_heads=8,
-        num_kv_heads=2,
-        head_dim=64,
-        q_dtype=dtype,
-        cache_layout="paged",
-        cached_length_mode="ragged",
-        new_q_length_mode="ragged",
-        page_size=64,
-        include_sinks=True,
+        _mha_config(
+            batch_size=4,
+            total_cached_tokens=47,
+            total_new_q_tokens=11,
+            num_q_heads=8,
+            num_kv_heads=2,
+            head_dim=64,
+            q_dtype=dtype,
+            cache_layout="paged",
+            page_size=64,
+            include_sinks=True,
+            metadata_kwargs={
+                "cached_length_mode": "ragged",
+                "new_q_length_mode": "ragged",
+            },
+        )
     ).generate(metadata_seed=102, value_seed=202, device=device)
 
     out = mha_extend_with_kvcache(
@@ -701,18 +859,20 @@ def test_mla_prefill_generator_runs_attention_kernel(
     require("attention", "mla_prefill", solution, dtype, "q")
 
     inputs = MLAInputs(
-        batch_size=2,
-        total_cached_tokens=0,
-        total_new_q_tokens=33,
-        num_q_heads=8,
-        num_kv_heads=8,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        kv_lora_rank=128,
-        v_head_dim=128,
-        q_dtype=dtype,
-        cache_layout="none",
-        new_q_length_mode="ragged",
+        _mla_config(
+            batch_size=2,
+            total_cached_tokens=0,
+            total_new_q_tokens=33,
+            num_q_heads=8,
+            num_kv_heads=8,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            kv_lora_rank=128,
+            v_head_dim=128,
+            q_dtype=dtype,
+            cache_layout="none",
+            metadata_kwargs={"new_q_length_mode": "ragged"},
+        )
     ).generate(metadata_seed=104, value_seed=204, device=device)
 
     out = mla_prefill(
@@ -735,21 +895,25 @@ def test_mla_paged_decode_generator_runs_attention_kernel(
     require("attention", "mla_decode_with_kvcache", solution, dtype, "q")
 
     inputs = MLAInputs(
-        batch_size=2,
-        total_cached_tokens=12,
-        total_new_q_tokens=2,
-        num_q_heads=8,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        kv_lora_rank=128,
-        v_head_dim=128,
-        q_dtype=dtype,
-        cache_layout="paged",
-        page_size=4,
-        indexing="identity",
-        max_seqlen_k=7,
-        cached_length_mode="regular",
-        new_q_length_mode="fixed_per_request",
+        _mla_config(
+            batch_size=2,
+            total_cached_tokens=12,
+            total_new_q_tokens=2,
+            num_q_heads=8,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            kv_lora_rank=128,
+            v_head_dim=128,
+            q_dtype=dtype,
+            cache_layout="paged",
+            page_size=4,
+            indexing="identity",
+            metadata_kwargs={
+                "max_seqlen_k": 7,
+                "cached_length_mode": "regular",
+                "new_q_length_mode": "fixed_per_request",
+            },
+        )
     ).generate(metadata_seed=105, value_seed=205, device=device)
 
     out = mla_decode_with_kvcache(
@@ -772,18 +936,22 @@ def test_mha_paged_decode_generator_runs_attention_kernel(
     require("attention", "mha_decode_with_kvcache", solution, dtype, "q")
 
     inputs = MHAInputs(
-        batch_size=4,
-        total_cached_tokens=51,
-        total_new_q_tokens=4,
-        num_q_heads=8,
-        num_kv_heads=2,
-        head_dim=64,
-        q_dtype=dtype,
-        cache_layout="paged",
-        cached_length_mode="ragged",
-        new_q_length_mode="fixed_per_request",
-        page_size=64,
-        include_sinks=True,
+        _mha_config(
+            batch_size=4,
+            total_cached_tokens=51,
+            total_new_q_tokens=4,
+            num_q_heads=8,
+            num_kv_heads=2,
+            head_dim=64,
+            q_dtype=dtype,
+            cache_layout="paged",
+            page_size=64,
+            include_sinks=True,
+            metadata_kwargs={
+                "cached_length_mode": "ragged",
+                "new_q_length_mode": "fixed_per_request",
+            },
+        )
     ).generate(metadata_seed=103, value_seed=203, device=device)
 
     out = mha_decode_with_kvcache(

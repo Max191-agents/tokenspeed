@@ -315,12 +315,9 @@ class MHARequestMetadataInput(NumericsInputGenerator):
 
     def __init__(
         self,
-        config: MHARequestMetadataInputConfig | None = None,
-        **kwargs: object,
+        config: MHARequestMetadataInputConfig,
     ) -> None:
-        if config is not None and kwargs:
-            raise TypeError("pass either config or keyword parameters, not both")
-        self.config = config or MHARequestMetadataInputConfig(**kwargs)  # type: ignore[arg-type]
+        self.config = config
         self.__post_init__()
 
     def __post_init__(self) -> None:

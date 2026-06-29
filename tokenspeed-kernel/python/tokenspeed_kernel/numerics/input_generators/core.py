@@ -240,16 +240,12 @@ class TensorInput(NumericsInputGenerator):
 
     def __init__(
         self,
-        shape: TensorInputConfig | tuple[int, ...],
+        shape: tuple[int, ...],
         dtype: torch.dtype | None = None,
         *,
         device: DeviceLike = None,
     ) -> None:
-        self.config = (
-            shape
-            if isinstance(shape, TensorInputConfig)
-            else TensorInputConfig(shape=shape, dtype=dtype, device=device)
-        )
+        self.config = TensorInputConfig(shape=shape, dtype=dtype, device=device)
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -267,6 +263,10 @@ class TensorInput(NumericsInputGenerator):
             device=target_device,
             generator=generator,
         )
+
+
+def _tensor_input_from_config(config: TensorInputConfig) -> TensorInput:
+    return TensorInput(config.shape, config.dtype, device=config.device)
 
 
 @dataclass
@@ -340,47 +340,11 @@ class ScaledTensorInput(NumericsInputGenerator):
 
     def __init__(
         self,
-        value_shape: ScaledTensorInputConfig | tuple[int, ...] | None = None,
-        value_dtype: InputDType = None,
-        scale_shape: tuple[int, ...] | None = None,
-        scale_dtype: torch.dtype | None = None,
-        *,
-        value_device: DeviceLike = None,
-        scale_device: DeviceLike = None,
-        values_input: TensorInput | TensorInputConfig | None = None,
-        scales_input: TensorInput | TensorInputConfig | None = None,
+        config: ScaledTensorInputConfig,
     ) -> None:
-        if isinstance(value_shape, ScaledTensorInputConfig):
-            self.config = value_shape
-            values_input = values_input or self.config.values_input
-            scales_input = scales_input or self.config.scales_input
-        else:
-            if value_shape is None:
-                raise TypeError("ScaledTensorInput requires value_shape")
-            self.config = ScaledTensorInputConfig(
-                value_shape=value_shape,
-                value_dtype=value_dtype,
-                scale_shape=scale_shape,
-                scale_dtype=scale_dtype,
-                value_device=value_device,
-                scale_device=scale_device,
-                values_input=(
-                    values_input.config
-                    if isinstance(values_input, TensorInput)
-                    else values_input
-                ),
-                scales_input=(
-                    scales_input.config
-                    if isinstance(scales_input, TensorInput)
-                    else scales_input
-                ),
-            )
-        self.values_input = (
-            values_input if isinstance(values_input, TensorInput) else None
-        )
-        self.scales_input = (
-            scales_input if isinstance(scales_input, TensorInput) else None
-        )
+        self.config = config
+        self.values_input = None
+        self.scales_input = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -388,25 +352,21 @@ class ScaledTensorInput(NumericsInputGenerator):
         if self.config.scale_shape is not None:
             self.config.scale_shape = _normalize_shape(self.config.scale_shape)
         if self.values_input is None:
-            self.values_input = TensorInput(
-                self.config.values_input
-                or TensorInputConfig(
-                    self.config.value_shape,
-                    None
-                    if self.config.value_dtype is None
-                    else _storage_dtype(self.config.value_dtype),
-                    device=self.config.value_device,
-                )
+            values_config = self.config.values_input or TensorInputConfig(
+                self.config.value_shape,
+                None
+                if self.config.value_dtype is None
+                else _storage_dtype(self.config.value_dtype),
+                device=self.config.value_device,
             )
+            self.values_input = _tensor_input_from_config(values_config)
         if self.scales_input is None and self.config.scale_shape is not None:
-            self.scales_input = TensorInput(
-                self.config.scales_input
-                or TensorInputConfig(
-                    self.config.scale_shape,
-                    self.config.scale_dtype,
-                    device=self.config.scale_device,
-                )
+            scales_config = self.config.scales_input or TensorInputConfig(
+                self.config.scale_shape,
+                self.config.scale_dtype,
+                device=self.config.scale_device,
             )
+            self.scales_input = _tensor_input_from_config(scales_config)
         self.config.values_input = (
             None if self.values_input is None else self.values_input.config
         )
