@@ -46,6 +46,7 @@ class CustomDType(str, Enum):
     """Custom numerical dtype handled by core input generators."""
 
     MXFP4 = "mxfp4"
+    UE8M0 = "ue8m0"
 
 
 InputDType = torch.dtype | CustomDType | None
@@ -53,6 +54,7 @@ InputDType = torch.dtype | CustomDType | None
 _DEFAULT_DEVICE = torch.device("cpu")
 _MXFP4_VALUES_PER_BYTE = 2
 _MXFP4_SCALE_MAX = 0.125
+_UE8M0_SCALE_EXPONENTS = (121, 122, 123, 124)
 
 
 class NumericsInputGenerator(ABC):
@@ -88,7 +90,7 @@ def _child_seed(seed: int, offset: int) -> int:
 
 
 def _is_floating_storage_dtype(dtype: torch.dtype) -> bool:
-    return dtype in {
+    dtypes = {
         torch.float16,
         torch.bfloat16,
         torch.float32,
@@ -97,6 +99,10 @@ def _is_floating_storage_dtype(dtype: torch.dtype) -> bool:
         torch.float8_e4m3fnuz,
         torch.float8_e5m2,
     }
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is not None:
+        dtypes.add(e8m0_dtype)
+    return dtype in dtypes
 
 
 def _packed_mxfp4_shape(
@@ -178,12 +184,29 @@ def _generate_scaled_torch_values(
 
 def _generate_scale_tensor(
     shape: tuple[int, ...],
-    dtype: torch.dtype,
+    dtype: torch.dtype | CustomDType,
     *,
     device: torch.device,
     generator: torch.Generator,
     max_value: float,
 ) -> torch.Tensor:
+    if dtype == CustomDType.UE8M0:
+        exponents = torch.tensor(
+            _UE8M0_SCALE_EXPONENTS,
+            dtype=torch.uint8,
+            device=device,
+        )
+        indices = torch.randint(
+            0,
+            len(_UE8M0_SCALE_EXPONENTS),
+            shape,
+            dtype=torch.int64,
+            device=device,
+            generator=generator,
+        )
+        return exponents[indices]
+    if isinstance(dtype, CustomDType):
+        raise ValueError(f"unsupported scale custom dtype={dtype!r}")
     if not _is_floating_storage_dtype(dtype):
         raise ValueError("scale tensors must use a floating torch dtype")
     values = torch.rand(
@@ -230,7 +253,7 @@ class TensorInput(NumericsInputGenerator):
     shape: tuple[int, ...]
     dtype: InputDType
     scale_shape: tuple[int, ...] | None
-    scale_dtype: torch.dtype | None
+    scale_dtype: InputDType
     device: DeviceLike
     scale_device: DeviceLike
 
@@ -240,7 +263,7 @@ class TensorInput(NumericsInputGenerator):
         dtype: InputDType = None,
         *,
         scale_shape: tuple[int, ...] | None = None,
-        scale_dtype: torch.dtype | None = None,
+        scale_dtype: InputDType = None,
         device: DeviceLike = None,
         scale_device: DeviceLike = None,
     ) -> None:
@@ -254,7 +277,14 @@ class TensorInput(NumericsInputGenerator):
 
     def __post_init__(self) -> None:
         self.shape = _normalize_shape(self.shape)
-        if (self.scale_shape is None) != (self.scale_dtype is None):
+        if self.dtype == CustomDType.MXFP4:
+            if self.scale_shape is None:
+                raise ValueError("mxfp4 tensors require scale_shape")
+            if self.scale_dtype is None:
+                self.scale_dtype = CustomDType.UE8M0
+            elif self.scale_dtype != CustomDType.UE8M0:
+                raise ValueError("mxfp4 scale_dtype must be CustomDType.UE8M0 or None")
+        elif (self.scale_shape is None) != (self.scale_dtype is None):
             raise ValueError("scale_shape and scale_dtype must be provided together")
         if self.scale_shape is not None:
             self.scale_shape = _normalize_shape(self.scale_shape)

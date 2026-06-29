@@ -115,9 +115,9 @@ def test_gemm_input_generator_uses_signature_scale_metadata() -> None:
     assert inputs["block_size"] == [128, 128]
 
 
-def test_gemm_input_generator_supports_mxfp4_fp8_scales() -> None:
+def test_gemm_input_generator_supports_mxfp4_ue8m0_scales() -> None:
     scale = ScaleFormat(
-        storage_dtype=_fp8_dtype,
+        storage_dtype=torch.uint8,
         granularity="block",
         block_shape=(32,),
     )
@@ -144,8 +144,8 @@ def test_gemm_input_generator_supports_mxfp4_fp8_scales() -> None:
     assert inputs["C"].dtype == torch.bfloat16
     assert inputs["A_scales"].shape == (4, 2)
     assert inputs["B_scales"].shape == (8, 2)
-    assert inputs["A_scales"].dtype == _fp8_dtype
-    assert inputs["B_scales"].dtype == _fp8_dtype
+    assert inputs["A_scales"].dtype == torch.uint8
+    assert inputs["B_scales"].dtype == torch.uint8
     assert inputs["block_size"] == [32]
 
 
@@ -269,16 +269,40 @@ def test_tensor_input_generates_mxfp4_values_and_scales() -> None:
         (4, 8),
         CustomDType.MXFP4,
         scale_shape=(4, 1),
-        scale_dtype=torch.float32,
     ).generate(seed=126, device="cpu")
 
     assert tensor.values is not None
     assert tensor.scales is not None
     assert tensor.values.shape == (4, 8)
     assert tensor.values.dtype == torch.uint8
-    assert tensor.scales.dtype == torch.float32
-    assert torch.all(tensor.scales > 0.0)
-    assert torch.all(tensor.scales <= 0.125)
+    assert tensor.scales.dtype == torch.uint8
+    assert torch.all(tensor.scales >= 121)
+    assert torch.all(tensor.scales <= 124)
+
+
+def test_tensor_input_requires_mxfp4_scales() -> None:
+    with pytest.raises(ValueError, match="mxfp4 tensors require scale_shape"):
+        TensorInput((4, 8), CustomDType.MXFP4)
+
+
+def test_tensor_input_requires_ue8m0_scales_for_mxfp4() -> None:
+    with pytest.raises(ValueError, match="mxfp4 scale_dtype"):
+        TensorInput(
+            (4, 8),
+            CustomDType.MXFP4,
+            scale_shape=(4, 1),
+            scale_dtype=torch.float32,
+        )
+
+    values = TensorInput(
+        (4, 8),
+        CustomDType.MXFP4,
+        scale_shape=(4, 1),
+        scale_dtype=CustomDType.UE8M0,
+    ).generate(seed=127, device="cpu")
+
+    assert values.scales is not None
+    assert values.scales.dtype == torch.uint8
 
 
 def test_tensor_input_requires_scale_shape_and_dtype_together() -> None:
@@ -389,8 +413,8 @@ def test_gemm_inputs_require_c_dtype() -> None:
         inputs.generate(seed=8, device="cpu")
 
 
-def test_gemm_inputs_support_custom_mxfp4_dtype() -> None:
-    values = GemmInputs(
+def test_gemm_inputs_reject_custom_mxfp4_without_scales() -> None:
+    inputs = GemmInputs(
         GemmInputConfig(
             M=4,
             N=8,
@@ -399,16 +423,10 @@ def test_gemm_inputs_support_custom_mxfp4_dtype() -> None:
             b_dtype=CustomDType.MXFP4,
             c_dtype=torch.float32,
         )
-    ).generate(seed=9, device="cpu")
+    )
 
-    assert values.A is not None
-    assert values.B is not None
-    assert values.C is not None
-    assert values.A.shape == (4, 32)
-    assert values.B.shape == (8, 32)
-    assert values.A.dtype == torch.uint8
-    assert values.B.dtype == torch.uint8
-    assert values.C.shape == (4, 8)
+    with pytest.raises(ValueError, match="mxfp4 tensors require scale_shape"):
+        inputs.generate(seed=9, device="cpu")
 
 
 def test_scaled_gemm_inputs_generate_scaled_operands() -> None:
@@ -494,13 +512,12 @@ def test_scaled_gemm_inputs_accept_config_objects() -> None:
     assert values.C.dtype == torch.float32
 
 
-def test_scaled_gemm_inputs_support_mxfp4_fp8_scales() -> None:
+def test_scaled_gemm_inputs_support_mxfp4_ue8m0_scales() -> None:
     inputs = ScaledGemmInputs(
         mxfp4_scaled_gemm_input_config(
             M=4,
             N=8,
             K=64,
-            scale_dtype=_fp8_dtype,
             c_dtype=torch.float32,
         )
     ).generate(seed=19, device="cpu")
@@ -517,8 +534,8 @@ def test_scaled_gemm_inputs_support_mxfp4_fp8_scales() -> None:
     assert inputs.B.values.dtype == torch.uint8
     assert inputs.A.scales.shape == (4, 2)
     assert inputs.B.scales.shape == (8, 2)
-    assert inputs.A.scales.dtype == _fp8_dtype
-    assert inputs.B.scales.dtype == _fp8_dtype
+    assert inputs.A.scales.dtype == torch.uint8
+    assert inputs.B.scales.dtype == torch.uint8
     assert inputs.C is not None
     assert inputs.C.shape == (4, 8)
 
@@ -632,7 +649,6 @@ def test_moe_inputs_compose_mxfp4_scaled_weight_gemms() -> None:
             top_k=2,
             hidden_dtype=torch.float16,
             weight_format="mxfp4",
-            weight_scale_dtype=_fp8_dtype,
         )
     ).generate(seed=29, device="cpu")
 
@@ -655,7 +671,7 @@ def test_moe_inputs_compose_mxfp4_scaled_weight_gemms() -> None:
     assert inputs.w2.B.values.shape == (4, 64, 16)
     assert inputs.w2.B.scales.shape == (4, 64, 1)
     assert inputs.w13.B.values.dtype == torch.uint8
-    assert inputs.w13.B.scales.dtype == _fp8_dtype
+    assert inputs.w13.B.scales.dtype == torch.uint8
 
 
 def test_moe_align_block_size_generator_uses_typed_tensor_input() -> None:

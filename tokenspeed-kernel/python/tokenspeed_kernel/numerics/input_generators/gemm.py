@@ -349,11 +349,13 @@ class ScaledGemmInputConfig:
     # Required: generated B value dtype. ``None`` skips B values/scales.
     b_dtype: InputDType
 
-    # Required: generated A scale dtype. ``None`` skips A scales.
-    a_scale_dtype: torch.dtype | None
+    # Required: generated A scale dtype. ``None`` skips A scales unless A uses
+    # a custom dtype with an inferred scale dtype, such as MXFP4.
+    a_scale_dtype: InputDType
 
-    # Required: generated B scale dtype. ``None`` skips B scales.
-    b_scale_dtype: torch.dtype | None
+    # Required: generated B scale dtype. ``None`` skips B scales unless B uses
+    # a custom dtype with an inferred scale dtype, such as MXFP4.
+    b_scale_dtype: InputDType
 
     # Required: dtype for generated C/output accumulator.
     c_dtype: torch.dtype
@@ -403,7 +405,7 @@ def mxfp4_scaled_gemm_input_config(
     N: int,
     K: int,
     c_dtype: torch.dtype,
-    scale_dtype: torch.dtype = torch.float8_e4m3fn,
+    scale_dtype: InputDType = None,
     a_dtype: InputDType = CustomDType.MXFP4,
     b_dtype: InputDType = CustomDType.MXFP4,
     a_layout: GemmLayout = "MK",
@@ -411,7 +413,7 @@ def mxfp4_scaled_gemm_input_config(
     batch_shape: tuple[int, ...] = (),
     block_size: int = _DEFAULT_MXFP4_BLOCK_SIZE,
 ) -> ScaledGemmInputConfig:
-    """Build a scaled GEMM config for mxfp4 values with fp8-compatible scales."""
+    """Build a scaled GEMM config for mxfp4 values with UE8M0 scales."""
 
     return ScaledGemmInputConfig(
         M=M,

@@ -99,8 +99,9 @@ class MoeInputConfig:
     # Optional: expert-weight storage/scale format.
     weight_format: str = "dense"
 
-    # Optional: expert-weight scale dtype for scaled formats.
-    weight_scale_dtype: torch.dtype | None = None
+    # Optional: expert-weight scale dtype for scaled formats. MXFP4 accepts
+    # ``None`` to infer raw UE8M0 scale storage.
+    weight_scale_dtype: InputDType = None
 
     # Optional: output dtype metadata reserved for layer-level tests.
     output_dtype: torch.dtype | None = None
@@ -189,7 +190,7 @@ class MoeInputs(NumericsInputGenerator):
                 else self.config.hidden_dtype
             )
         if (
-            self.config.weight_format != "dense"
+            self.config.weight_format not in {"dense", "mxfp4"}
             and self.config.weight_scale_dtype is None
         ):
             self.config.weight_scale_dtype = torch.float8_e4m3fn
@@ -271,7 +272,7 @@ class MoeInputs(NumericsInputGenerator):
                 K=K,
                 a_dtype=None,
                 b_dtype=self.config.weight_dtype,
-                scale_dtype=self.config.weight_scale_dtype or torch.float8_e4m3fn,
+                scale_dtype=self.config.weight_scale_dtype,
                 c_dtype=c_dtype,
                 batch_shape=(self.config.num_experts,),
             )

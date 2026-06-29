@@ -139,9 +139,15 @@ class GemmInputGenerator(InputGenerator):
             return CustomDType.MXFP4
         return tensor_format.storage_dtype
 
-    def _scale_dtype(self, tensor_format: Any | None) -> torch.dtype | None:
+    def _scale_dtype(self, tensor_format: Any | None) -> InputDType:
         scale = tensor_format.scale if tensor_format is not None else None
-        return None if scale is None else scale.storage_dtype
+        if scale is None:
+            return None
+        if tensor_format.format == "mxfp4":
+            if scale.storage_dtype != torch.uint8:
+                raise ValueError("mxfp4 scales must use torch.uint8 UE8M0 storage")
+            return CustomDType.UE8M0
+        return scale.storage_dtype
 
     def _scale_shape(
         self,
