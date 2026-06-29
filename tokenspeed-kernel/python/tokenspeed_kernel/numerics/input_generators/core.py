@@ -45,7 +45,12 @@ DeviceLike = str | torch.device | None
 class CustomDType(str, Enum):
     """Custom numerical dtype handled by core input generators."""
 
+    # Packed MXFP4 values. Storage is torch.uint8 with two E2M1 nibbles per byte;
+    # TensorInput requires a scale_shape and generates paired UE8M0 scales.
     MXFP4 = "mxfp4"
+
+    # Raw UE8M0 scale bytes. Storage is torch.uint8 exponent values interpreted
+    # by MXFP4 kernels as unsigned exponent-only FP8 scales.
     UE8M0 = "ue8m0"
 
 
