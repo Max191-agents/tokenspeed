@@ -32,10 +32,14 @@ from tokenspeed_kernel.numerics.input_generators.attention import (
     MHAInputValues,
 )
 from tokenspeed_kernel.numerics.input_generators.attention_cache import (
+    AttentionCacheInput,
     KVCacheInput,
     KVCacheInputConfig,
     KVCacheLayout,
     KVCacheValues,
+    MLAKVCacheInput,
+    MLAKVCacheInputConfig,
+    MLAKVCacheValues,
     PageTableInput,
     PageTableInputConfig,
     PageTableValues,
@@ -70,8 +74,14 @@ from tokenspeed_kernel.numerics.input_generators.moe import (
     MoeInputs,
     MoeInputValues,
 )
+from tokenspeed_kernel.numerics.input_generators.mla import (
+    MLAInputConfig,
+    MLAInputs,
+    MLAInputValues,
+)
 
 __all__ = [
+    "AttentionCacheInput",
     "CustomDType",
     "DeviceLike",
     "GemmInputConfig",
@@ -85,6 +95,12 @@ __all__ = [
     "MHAInputConfig",
     "MHAInputValues",
     "MHAInputs",
+    "MLAInputConfig",
+    "MLAInputValues",
+    "MLAInputs",
+    "MLAKVCacheInput",
+    "MLAKVCacheInputConfig",
+    "MLAKVCacheValues",
     "MHARequestMetadataInputConfig",
     "MHARequestMetadataInput",
     "MHARequestMetadataValues",

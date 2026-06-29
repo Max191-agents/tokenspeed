@@ -40,10 +40,14 @@ from tokenspeed_kernel.numerics.input_generators.core import (
 )
 
 __all__ = [
+    "AttentionCacheInput",
     "KVCacheInput",
     "KVCacheInputConfig",
     "KVCacheLayout",
     "KVCacheValues",
+    "MLAKVCacheInput",
+    "MLAKVCacheInputConfig",
+    "MLAKVCacheValues",
     "PageTableInput",
     "PageTableInputConfig",
     "PageTableValues",
@@ -198,6 +202,126 @@ class PageTableInput(NumericsInputGenerator):
         return page_table
 
 
+class AttentionCacheInput(NumericsInputGenerator):
+    """Shared dense/paged cache layout logic for attention cache generators.
+
+    Subclasses own the tensors stored inside each cache slot. This base owns
+    the common cache-layout controls: dense vs paged shape construction, page
+    table generation, and page-table metadata returned with generated values.
+    """
+
+    page_table_input: PageTableInput | None
+
+    def _coerce_page_table_input_kwargs(
+        self,
+        kwargs: dict[str, object],
+    ) -> PageTableInput | None:
+        page_table_indexing = kwargs.pop("page_table_indexing", None)
+        page_table_input = kwargs.get("page_table_input")
+        page_table_input_obj = (
+            page_table_input if isinstance(page_table_input, PageTableInput) else None
+        )
+        if isinstance(page_table_input, PageTableInput):
+            kwargs["page_table_input"] = page_table_input.config
+        page_table_config = kwargs.get("page_table_input")
+        if page_table_indexing is not None:
+            if page_table_config is None:
+                page_table_config = PageTableInputConfig(
+                    batch_size=int(kwargs["batch_size"]),
+                    max_pages_per_request=1,
+                    indexing=_check_page_table_indexing(str(page_table_indexing)),
+                    device=kwargs.get("device"),
+                )
+                kwargs["page_table_input"] = page_table_config
+            else:
+                page_table_config.indexing = _check_page_table_indexing(
+                    str(page_table_indexing)
+                )
+        return page_table_input_obj
+
+    def _normalize_common_config(self) -> None:
+        self.config.cache_layout = _check_cache_layout(self.config.cache_layout)
+        self.config.batch_size = _check_positive("batch_size", self.config.batch_size)
+        self.config.max_seqlen_k = _check_nonnegative(
+            "max_seqlen_k", self.config.max_seqlen_k
+        )
+        if self.config.cache_layout == "paged":
+            if self.config.page_size is None:
+                raise ValueError("cache_layout='paged' requires page_size")
+            self.config.page_size = _check_positive("page_size", self.config.page_size)
+        elif self.config.page_size is not None:
+            self.config.page_size = _check_positive("page_size", self.config.page_size)
+
+    def _make_page_table_config(self) -> PageTableInputConfig:
+        return PageTableInputConfig(
+            batch_size=self.config.batch_size,
+            max_pages_per_request=1,
+            device=self.config.device,
+        )
+
+    def _make_cache_shape(
+        self,
+        seed: int,
+        device: torch.device,
+        *,
+        inner_shape: tuple[int, ...],
+    ) -> tuple[tuple[int, ...], PageTableValues | None, int, int]:
+        if self.config.cache_layout == "dense":
+            return (
+                (
+                    self.config.batch_size,
+                    self.config.max_seqlen_k,
+                    *inner_shape,
+                ),
+                None,
+                0,
+                0,
+            )
+
+        if self.config.page_size is None:
+            raise ValueError("paged cache requires page_size")
+        if self.page_table_input is None:
+            self.page_table_input = PageTableInput(self._make_page_table_config())
+        max_pages_per_request = max(
+            1,
+            math.ceil(self.config.max_seqlen_k / self.config.page_size),
+        )
+        self.page_table_input.config.batch_size = self.config.batch_size
+        self.page_table_input.config.max_pages_per_request = max_pages_per_request
+        page_table_values = self.page_table_input.generate(seed=seed, device=device)
+        return (
+            (
+                page_table_values.num_pages,
+                self.config.page_size,
+                *inner_shape,
+            ),
+            page_table_values,
+            max_pages_per_request,
+            page_table_values.num_pages,
+        )
+
+    def _common_values(
+        self,
+        *,
+        cache_shape: tuple[int, ...],
+        page_table_values: PageTableValues | None,
+        max_pages_per_request: int,
+        num_pages: int,
+    ) -> dict[str, object]:
+        return {
+            "page_table": (
+                None if page_table_values is None else page_table_values.page_table
+            ),
+            "page_table_cpu": (
+                None if page_table_values is None else page_table_values.page_table_cpu
+            ),
+            "cache_shape": cache_shape,
+            "max_pages_per_request": max_pages_per_request,
+            "num_pages": num_pages,
+            "page_table_values": page_table_values,
+        }
+
+
 @dataclass
 class KVCacheValues:
     """Generated values for ``KVCacheInput``."""
@@ -268,7 +392,7 @@ class KVCacheInputConfig:
 
 
 @dataclass(init=False)
-class KVCacheInput(NumericsInputGenerator):
+class KVCacheInput(AttentionCacheInput):
     """Generator for dense or paged MHA KV-cache storage.
 
     ``cache_layout`` controls the physical cache representation. Dense caches
@@ -292,31 +416,11 @@ class KVCacheInput(NumericsInputGenerator):
 
         k_cache_input = kwargs.get("k_cache_input")
         v_cache_input = kwargs.get("v_cache_input")
-        page_table_indexing = kwargs.pop("page_table_indexing", None)
-        page_table_input = kwargs.get("page_table_input")
-        page_table_input_obj = (
-            page_table_input if isinstance(page_table_input, PageTableInput) else None
-        )
         if isinstance(k_cache_input, TensorInput):
             kwargs["k_cache_input"] = k_cache_input.config
         if isinstance(v_cache_input, TensorInput):
             kwargs["v_cache_input"] = v_cache_input.config
-        if isinstance(page_table_input, PageTableInput):
-            kwargs["page_table_input"] = page_table_input.config
-        page_table_config = kwargs.get("page_table_input")
-        if page_table_indexing is not None:
-            if page_table_config is None:
-                page_table_config = PageTableInputConfig(
-                    batch_size=int(kwargs["batch_size"]),
-                    max_pages_per_request=1,
-                    indexing=_check_page_table_indexing(str(page_table_indexing)),
-                    device=kwargs.get("device"),
-                )
-                kwargs["page_table_input"] = page_table_config
-            else:
-                page_table_config.indexing = _check_page_table_indexing(
-                    str(page_table_indexing)
-                )
+        page_table_input_obj = self._coerce_page_table_input_kwargs(kwargs)
 
         self.config = config or KVCacheInputConfig(**kwargs)  # type: ignore[arg-type]
         self.k_cache_input = (
@@ -372,7 +476,11 @@ class KVCacheInput(NumericsInputGenerator):
             page_table_values,
             max_pages_per_request,
             num_pages,
-        ) = self._make_cache_shape(page_table_seed, target_device)
+        ) = self._make_cache_shape(
+            page_table_seed,
+            target_device,
+            inner_shape=(self.config.num_kv_heads, self.config.head_dim),
+        )
         if self.k_cache_input is None or self.v_cache_input is None:
             raise ValueError("KVCacheInput child tensor generators must be initialized")
         self.k_cache_input.config.shape = cache_shape
@@ -390,79 +498,192 @@ class KVCacheInput(NumericsInputGenerator):
         return KVCacheValues(
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=(
-                None if page_table_values is None else page_table_values.page_table
+            **self._common_values(
+                cache_shape=cache_shape,
+                page_table_values=page_table_values,
+                max_pages_per_request=max_pages_per_request,
+                num_pages=num_pages,
             ),
-            page_table_cpu=(
-                None if page_table_values is None else page_table_values.page_table_cpu
-            ),
-            cache_shape=cache_shape,
-            max_pages_per_request=max_pages_per_request,
-            num_pages=num_pages,
-            page_table_values=page_table_values,
         )
 
     def _normalize_config(self) -> None:
-        self.config.cache_layout = _check_cache_layout(self.config.cache_layout)
-        self.config.batch_size = _check_positive("batch_size", self.config.batch_size)
-        self.config.max_seqlen_k = _check_nonnegative(
-            "max_seqlen_k", self.config.max_seqlen_k
-        )
+        self._normalize_common_config()
         self.config.num_kv_heads = _check_positive(
             "num_kv_heads", self.config.num_kv_heads
         )
         self.config.head_dim = _check_positive("head_dim", self.config.head_dim)
-        if self.config.cache_layout == "paged":
-            if self.config.page_size is None:
-                raise ValueError("cache_layout='paged' requires page_size")
-            self.config.page_size = _check_positive("page_size", self.config.page_size)
-        elif self.config.page_size is not None:
-            self.config.page_size = _check_positive("page_size", self.config.page_size)
 
-    def _make_page_table_config(self) -> PageTableInputConfig:
-        return PageTableInputConfig(
-            batch_size=self.config.batch_size,
-            max_pages_per_request=1,
-            device=self.config.device,
-        )
 
-    def _make_cache_shape(
+@dataclass
+class MLAKVCacheValues:
+    """Generated values for ``MLAKVCacheInput``."""
+
+    kv_cache: torch.Tensor
+    page_table: torch.Tensor | None
+    page_table_cpu: list[list[int]] | None
+    cache_shape: tuple[int, ...]
+    max_pages_per_request: int
+    num_pages: int
+    page_table_values: PageTableValues | None = None
+
+
+@dataclass
+class MLAKVCacheInputConfig:
+    """Initialization parameters for compressed MLA KV-cache storage."""
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: cache representation to generate. TokenSpeed MLA decode uses
+    # paged cache; dense is accepted for value-generation tests.
+    cache_layout: KVCacheLayout
+
+    # Required: number of request rows represented by the cache.
+    batch_size: int
+
+    # Required: maximum visible KV tokens per request.
+    max_seqlen_k: int
+
+    # Required: MLA latent KV rank stored in each compressed cache row.
+    kv_lora_rank: int
+
+    # Required: RoPE key dimension stored next to the latent KV row.
+    qk_rope_head_dim: int
+
+    # Required: dtype for generated compressed cache storage.
+    dtype: torch.dtype
+
+    # ------------------------------------------------------------------
+    # Optional cache/page configuration.
+    # ------------------------------------------------------------------
+
+    # Optional but required for paged cache: number of tokens per physical page.
+    page_size: int | None = None
+
+    # ------------------------------------------------------------------
+    # Optional device configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: default generation device.
+    device: DeviceLike = None
+
+    # ------------------------------------------------------------------
+    # Optional child generator configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: child generator for compressed MLA cache storage.
+    kv_cache_input: TensorInputConfig | None = None
+
+    # Optional: child generator for paged-cache page tables. Defaults to None
+    # for dense cache and to a nested PageTableInput for paged cache.
+    page_table_input: PageTableInputConfig | None = None
+
+
+@dataclass(init=False)
+class MLAKVCacheInput(AttentionCacheInput):
+    """Generator for dense or paged compressed MLA KV-cache storage.
+
+    MLA decode stores one compressed cache tensor instead of separate K and V
+    caches. Each cache row has shape ``[1, kv_lora_rank + qk_rope_head_dim]``:
+    one shared KV head containing latent KV values followed by the RoPE key
+    part.
+    """
+
+    config: MLAKVCacheInputConfig
+    kv_cache_input: TensorInput | None
+    page_table_input: PageTableInput | None
+
+    def __init__(
         self,
-        seed: int,
-        device: torch.device,
-    ) -> tuple[tuple[int, ...], PageTableValues | None, int, int]:
-        if self.config.cache_layout == "dense":
-            return (
-                (
-                    self.config.batch_size,
-                    self.config.max_seqlen_k,
-                    self.config.num_kv_heads,
-                    self.config.head_dim,
-                ),
-                None,
-                0,
-                0,
-            )
+        config: MLAKVCacheInputConfig | None = None,
+        **kwargs: object,
+    ) -> None:
+        if config is not None and kwargs:
+            raise TypeError("pass either config or keyword parameters, not both")
 
-        if self.config.page_size is None:
-            raise ValueError("paged cache requires page_size")
-        if self.page_table_input is None:
-            self.page_table_input = PageTableInput(self._make_page_table_config())
-        max_pages_per_request = max(
-            1,
-            math.ceil(self.config.max_seqlen_k / self.config.page_size),
+        kv_cache_input = kwargs.get("kv_cache_input")
+        if isinstance(kv_cache_input, TensorInput):
+            kwargs["kv_cache_input"] = kv_cache_input.config
+        page_table_input_obj = self._coerce_page_table_input_kwargs(kwargs)
+
+        self.config = config or MLAKVCacheInputConfig(**kwargs)  # type: ignore[arg-type]
+        self.kv_cache_input = (
+            kv_cache_input if isinstance(kv_cache_input, TensorInput) else None
         )
-        self.page_table_input.config.batch_size = self.config.batch_size
-        self.page_table_input.config.max_pages_per_request = max_pages_per_request
-        page_table_values = self.page_table_input.generate(seed=seed, device=device)
-        return (
-            (
-                page_table_values.num_pages,
-                self.config.page_size,
-                self.config.num_kv_heads,
-                self.config.head_dim,
-            ),
+        self.page_table_input = page_table_input_obj
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.kv_cache_input = self.kv_cache_input or TensorInput(
+            self.config.kv_cache_input
+            or TensorInputConfig(
+                (0, 1, self._cache_head_dim()),
+                self.config.dtype,
+                device=self.config.device,
+            )
+        )
+        if self.config.cache_layout == "paged" and self.page_table_input is None:
+            self.page_table_input = PageTableInput(
+                self.config.page_table_input or self._make_page_table_config()
+            )
+        self.config.kv_cache_input = self.kv_cache_input.config
+        self.config.page_table_input = (
+            None if self.page_table_input is None else self.page_table_input.config
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+        page_table_seed: int | None = None,
+    ) -> MLAKVCacheValues:
+        self._normalize_config()
+        target_device = _resolve_device(self.config.device, device)
+        if page_table_seed is None:
+            page_table_seed = seed
+        (
+            cache_shape,
             page_table_values,
             max_pages_per_request,
-            page_table_values.num_pages,
+            num_pages,
+        ) = self._make_cache_shape(
+            page_table_seed,
+            target_device,
+            inner_shape=(1, self._cache_head_dim()),
         )
+        if self.kv_cache_input is None:
+            raise ValueError(
+                "MLAKVCacheInput child tensor generator must be initialized"
+            )
+        self.kv_cache_input.config.shape = cache_shape
+        self.kv_cache_input.config.dtype = self.config.dtype
+        kv_cache = self.kv_cache_input.generate(
+            seed=_child_seed(seed, 1),
+            device=target_device,
+        )
+        if kv_cache is None:
+            raise ValueError("MLAKVCacheInput dtype must generate a tensor")
+        return MLAKVCacheValues(
+            kv_cache=kv_cache,
+            **self._common_values(
+                cache_shape=cache_shape,
+                page_table_values=page_table_values,
+                max_pages_per_request=max_pages_per_request,
+                num_pages=num_pages,
+            ),
+        )
+
+    def _normalize_config(self) -> None:
+        self._normalize_common_config()
+        self.config.kv_lora_rank = _check_positive(
+            "kv_lora_rank", self.config.kv_lora_rank
+        )
+        self.config.qk_rope_head_dim = _check_positive(
+            "qk_rope_head_dim", self.config.qk_rope_head_dim
+        )
+
+    def _cache_head_dim(self) -> int:
+        return self.config.kv_lora_rank + self.config.qk_rope_head_dim

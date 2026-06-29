@@ -26,8 +26,12 @@ from tokenspeed_kernel import (
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_prefill,
+    mla_decode_with_kvcache,
+    mla_prefill,
 )
 from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
+    mla_decode_with_kvcache_kwargs,
+    mla_prefill_kwargs,
     mha_decode_with_kvcache_kwargs,
     mha_extend_with_kvcache_kwargs,
     mha_prefill_kwargs,
@@ -38,6 +42,8 @@ from tokenspeed_kernel.numerics.input_generators import (
     MHAInputConfig,
     MHAInputValues,
     MHAInputs,
+    MLAInputs,
+    MLAKVCacheInput,
     MHARequestMetadataInputConfig,
     PageTableInput,
     PageTableInputConfig,
@@ -151,6 +157,25 @@ def test_kv_cache_input_preserves_nested_page_table_generator_object() -> None:
 
     assert cache.page_table_values is not None
     assert cache.page_table_values.page_ids() == list(range(15))
+
+
+def test_mla_kv_cache_input_generates_paged_compressed_cache() -> None:
+    cache = MLAKVCacheInput(
+        cache_layout="paged",
+        batch_size=2,
+        max_seqlen_k=9,
+        kv_lora_rank=16,
+        qk_rope_head_dim=4,
+        dtype=torch.float32,
+        page_size=4,
+        page_table_indexing="identity",
+    ).generate(seed=1, device="cpu")
+
+    assert cache.page_table is not None
+    assert cache.page_table.shape == (2, 3)
+    assert cache.kv_cache.shape == (6, 4, 1, 20)
+    assert cache.page_table_values is not None
+    assert cache.page_table_values.page_ids() == list(range(6))
 
 
 def test_mha_inputs_without_cache_leaves_cache_input_none() -> None:
@@ -545,6 +570,66 @@ def test_mha_inputs_preserves_nested_cache_generator_object() -> None:
     assert page_ids == list(range(len(page_ids)))
 
 
+def test_mla_prefill_generator_allows_independent_q_and_kv_lengths() -> None:
+    inputs = MLAInputs(
+        batch_size=3,
+        total_cached_tokens=0,
+        total_new_q_tokens=12,
+        total_new_kv_tokens=15,
+        tie_new_kv_to_query=False,
+        num_q_heads=4,
+        num_kv_heads=2,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=4,
+        kv_lora_rank=16,
+        v_head_dim=6,
+        q_dtype=torch.float32,
+        cache_layout="none",
+        new_q_length_mode="regular",
+        new_kv_length_mode="regular",
+    ).generate(metadata_seed=1, value_seed=2, device="cpu")
+
+    assert inputs.cache is None
+    assert inputs.q is not None
+    assert inputs.k is not None
+    assert inputs.v is not None
+    assert inputs.q.shape == (12, 4, 12)
+    assert inputs.k.shape == (15, 2, 12)
+    assert inputs.v.shape == (15, 2, 6)
+    assert inputs.metadata.cu_seqlens_q_cpu[-1] == 12
+    assert inputs.metadata.cu_seqlens_kv_cpu[-1] == 15
+
+
+def test_mla_paged_decode_generator_shapes() -> None:
+    inputs = MLAInputs(
+        batch_size=3,
+        total_cached_tokens=21,
+        total_new_q_tokens=3,
+        num_q_heads=4,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=4,
+        kv_lora_rank=16,
+        v_head_dim=6,
+        q_dtype=torch.float32,
+        cache_layout="paged",
+        page_size=4,
+        indexing="identity",
+        max_seqlen_k=9,
+        cached_length_mode="regular",
+        new_q_length_mode="fixed_per_request",
+    ).generate(metadata_seed=1, value_seed=2, device="cpu")
+
+    assert inputs.q is not None
+    assert inputs.k is None
+    assert inputs.v is None
+    assert inputs.cache is not None
+    assert inputs.q.shape == (3, 1, 4, 20)
+    assert inputs.cache.kv_cache.shape == (9, 4, 1, 20)
+    assert inputs.cache.page_table is not None
+    assert inputs.cache.page_table.shape == (3, 3)
+    assert inputs.metadata.cache_seqlens.tolist() == [8, 8, 8]
+
+
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
 def test_mha_prefill_generator_runs_attention_kernel(
     device: str,
@@ -604,6 +689,76 @@ def test_mha_paged_extend_generator_runs_triton_attention_kernel(
 
     assert inputs.q is not None
     assert out.shape == inputs.q.shape
+    assert not torch.isnan(out.float()).any()
+
+
+def test_mla_prefill_generator_runs_attention_kernel(
+    device: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    solution = "triton"
+    require("attention", "mla_prefill", solution, dtype, "q")
+
+    inputs = MLAInputs(
+        batch_size=2,
+        total_cached_tokens=0,
+        total_new_q_tokens=33,
+        num_q_heads=8,
+        num_kv_heads=8,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        kv_lora_rank=128,
+        v_head_dim=128,
+        q_dtype=dtype,
+        cache_layout="none",
+        new_q_length_mode="ragged",
+    ).generate(metadata_seed=104, value_seed=204, device=device)
+
+    out = mla_prefill(
+        **mla_prefill_kwargs(inputs),
+        solution=solution,
+    )
+
+    assert inputs.q is not None
+    assert inputs.v is not None
+    assert out.shape == (inputs.q.shape[0], inputs.q.shape[1], inputs.v.shape[-1])
+    assert not torch.isnan(out.float()).any()
+
+
+def test_mla_paged_decode_generator_runs_attention_kernel(
+    device: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    solution = "triton"
+    require("attention", "mla_decode_with_kvcache", solution, dtype, "q")
+
+    inputs = MLAInputs(
+        batch_size=2,
+        total_cached_tokens=12,
+        total_new_q_tokens=2,
+        num_q_heads=8,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        kv_lora_rank=128,
+        v_head_dim=128,
+        q_dtype=dtype,
+        cache_layout="paged",
+        page_size=4,
+        indexing="identity",
+        max_seqlen_k=7,
+        cached_length_mode="regular",
+        new_q_length_mode="fixed_per_request",
+    ).generate(metadata_seed=105, value_seed=205, device=device)
+
+    out = mla_decode_with_kvcache(
+        **mla_decode_with_kvcache_kwargs(inputs),
+        solution=solution,
+    )
+
+    assert inputs.q is not None
+    assert out.shape == (inputs.q.shape[0], inputs.q.shape[1], inputs.q.shape[2], 128)
     assert not torch.isnan(out.float()).any()
 
 

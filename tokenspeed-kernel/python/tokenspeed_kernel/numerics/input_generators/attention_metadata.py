@@ -276,6 +276,12 @@ class MHARequestMetadataInputConfig:
     # Optional: keep per-request new K/V lengths identical to new Q lengths.
     tie_new_kv_to_query: bool = True
 
+    # Optional: allow independent Q and KV lengths for non-cached attention.
+    # MHA prefill normally leaves this false because it has one cumulative
+    # sequence-length input. MLA prefill can set this true because Q and KV
+    # cumulative sequence lengths are separate inputs.
+    allow_untied_non_cached_kv: bool = False
+
     # ------------------------------------------------------------------
     # Optional cache metadata configuration.
     # ------------------------------------------------------------------
@@ -471,5 +477,9 @@ class MHARequestMetadataInput(NumericsInputGenerator):
             )
         if self.config.cache_layout == "none" and self.config.total_cached_tokens != 0:
             raise ValueError("cache_layout='none' requires total_cached_tokens == 0")
-        if self.config.cache_layout == "none" and not self.config.tie_new_kv_to_query:
+        if (
+            self.config.cache_layout == "none"
+            and not self.config.tie_new_kv_to_query
+            and not self.config.allow_untied_non_cached_kv
+        ):
             raise ValueError("cache_layout='none' requires tie_new_kv_to_query=True")
