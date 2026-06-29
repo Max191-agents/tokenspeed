@@ -49,7 +49,6 @@ from tokenspeed_kernel.numerics.input_generators import (
     MHARequestMetadataInputConfig,
     PageTableInput,
     PageTableInputConfig,
-    TensorInputConfig,
 )
 
 
@@ -512,10 +511,11 @@ def test_mha_inputs_accepts_nested_config_objects() -> None:
                 indexing="identity",
             ),
         ),
-        q_input=TensorInputConfig((0, 4, 16), torch.float64),
     )
 
     generator = MHAInputs(config)
+    assert generator.q_input is not None
+    generator.q_input.dtype = torch.float64
 
     assert generator.config is config
     assert generator.metadata_input is not None
@@ -527,8 +527,6 @@ def test_mha_inputs_accepts_nested_config_objects() -> None:
         generator.cache_input.page_table_input.config
         is config.cache_input.page_table_input
     )
-    assert generator.q_input is not None
-    assert generator.q_input.config is config.q_input
 
     inputs = generator.generate(metadata_seed=1, value_seed=99, device="cpu")
 

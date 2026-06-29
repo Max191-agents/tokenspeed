@@ -41,11 +41,9 @@ from tokenspeed_kernel.numerics.input_generators.attention_metadata import (
 from tokenspeed_kernel.numerics.input_generators.core import (
     DeviceLike,
     NumericsInputGenerator,
-    TensorInputConfig,
     TensorInput,
     _child_seed,
     _resolve_device,
-    _tensor_input_from_config,
 )
 
 __all__ = ["MHAInputConfig", "MHAInputValues", "MHAInputs"]
@@ -209,23 +207,10 @@ class MHAInputConfig:
     # sequence lengths, detailed length modes, and max K length.
     metadata_input: MHARequestMetadataInputConfig | None = None
 
-    # Optional: nested config for Q. Initialized automatically so tests can
-    # mutate shape-independent leaf settings before calling generate().
-    q_input: TensorInputConfig | None = None
-
-    # Optional: nested config for explicit non-cached or newly inserted K.
-    k_input: TensorInputConfig | None = None
-
-    # Optional: nested config for explicit non-cached or newly inserted V.
-    v_input: TensorInputConfig | None = None
-
     # Optional: nested config for dense/paged KV-cache storage and page table.
     # Required when metadata_input.cache_layout != "none" and cache defaults
     # are insufficient, for example paged cache needs page_size.
     cache_input: KVCacheInputConfig | None = None
-
-    # Optional: nested config for attention sinks.
-    sinks_input: TensorInputConfig | None = None
 
 
 @dataclass(init=False)
@@ -234,7 +219,7 @@ class MHAInputs(NumericsInputGenerator):
 
     Child tensor/cache/metadata generators are created during initialization
     from ``MHAInputConfig`` and reused by ``generate``. Tests may mutate those
-    child generator configs before generation.
+    child generator fields before generation.
     """
 
     config: MHAInputConfig
@@ -302,37 +287,29 @@ class MHAInputs(NumericsInputGenerator):
         if self.cache_input is not None:
             self._verify_cache_config_matches_parent()
 
-        q_config = self.config.q_input or TensorInputConfig(
+        self.q_input = self.q_input or TensorInput(
             (0, self.config.num_q_heads, self.config.head_dim),
             self.config.q_dtype,
             device=self.config.device,
         )
-        k_config = self.config.k_input or TensorInputConfig(
+        self.k_input = self.k_input or TensorInput(
             (0, self.config.num_kv_heads, self.config.head_dim),
             self.config.k_dtype,
             device=self.config.device,
         )
-        v_config = self.config.v_input or TensorInputConfig(
+        self.v_input = self.v_input or TensorInput(
             (0, self.config.num_kv_heads, self.config.head_dim),
             self.config.v_dtype,
             device=self.config.device,
         )
-        sinks_config = self.config.sinks_input or TensorInputConfig(
+        self.sinks_input = self.sinks_input or TensorInput(
             (self.config.num_q_heads,),
             self.config.sink_dtype if self.config.include_sinks else None,
             device=self.config.device,
         )
-        self.q_input = self.q_input or _tensor_input_from_config(q_config)
-        self.k_input = self.k_input or _tensor_input_from_config(k_config)
-        self.v_input = self.v_input or _tensor_input_from_config(v_config)
-        self.sinks_input = self.sinks_input or _tensor_input_from_config(sinks_config)
-        self.config.q_input = self.q_input.config
-        self.config.k_input = self.k_input.config
-        self.config.v_input = self.v_input.config
         self.config.cache_input = (
             None if self.cache_input is None else self.cache_input.config
         )
-        self.config.sinks_input = self.sinks_input.config
 
     def generate(
         self,
@@ -506,23 +483,23 @@ class MHAInputs(NumericsInputGenerator):
 
         total_q = sum(metadata.new_q_lens_cpu)
         total_new_kv = sum(metadata.new_kv_lens_cpu)
-        self.q_input.config.shape = (
+        self.q_input.shape = (
             total_q,
             self.config.num_q_heads,
             self.config.head_dim,
         )
-        self.k_input.config.shape = (
+        self.k_input.shape = (
             total_new_kv,
             self.config.num_kv_heads,
             self.config.head_dim,
         )
-        self.v_input.config.shape = (
+        self.v_input.shape = (
             total_new_kv,
             self.config.num_kv_heads,
             self.config.head_dim,
         )
-        self.sinks_input.config.shape = (self.config.num_q_heads,)
-        self.sinks_input.config.dtype = (
+        self.sinks_input.shape = (self.config.num_q_heads,)
+        self.sinks_input.dtype = (
             self.config.sink_dtype if self.config.include_sinks else None
         )
 

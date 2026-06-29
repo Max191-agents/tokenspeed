@@ -43,10 +43,8 @@ from tokenspeed_kernel.numerics.input_generators.core import (
     DeviceLike,
     NumericsInputGenerator,
     TensorInput,
-    TensorInputConfig,
     _child_seed,
     _resolve_device,
-    _tensor_input_from_config,
 )
 
 __all__ = ["MLAInputConfig", "MLAInputValues", "MLAInputs"]
@@ -207,16 +205,6 @@ class MLAInputConfig:
     # sequence lengths, detailed length modes, and max K length.
     metadata_input: MHARequestMetadataInputConfig | None = None
 
-    # Optional: nested config for Q. Initialized automatically so tests can
-    # mutate shape-independent leaf settings before calling generate().
-    q_input: TensorInputConfig | None = None
-
-    # Optional: nested config for explicit non-cached K.
-    k_input: TensorInputConfig | None = None
-
-    # Optional: nested config for explicit non-cached V.
-    v_input: TensorInputConfig | None = None
-
     # Optional: nested config for compressed dense/paged MLA cache storage and
     # page table.
     cache_input: MLAKVCacheInputConfig | None = None
@@ -300,27 +288,21 @@ class MLAInputs(NumericsInputGenerator):
         if self.cache_input is not None:
             self._verify_cache_config_matches_parent()
 
-        q_config = self.config.q_input or TensorInputConfig(
+        self.q_input = self.q_input or TensorInput(
             (0, self.config.num_q_heads, self._prefill_qk_head_dim()),
             self.config.q_dtype,
             device=self.config.device,
         )
-        k_config = self.config.k_input or TensorInputConfig(
+        self.k_input = self.k_input or TensorInput(
             (0, self.config.num_kv_heads, self._prefill_qk_head_dim()),
             self.config.k_dtype,
             device=self.config.device,
         )
-        v_config = self.config.v_input or TensorInputConfig(
+        self.v_input = self.v_input or TensorInput(
             (0, self.config.num_kv_heads, self.config.v_head_dim),
             self.config.v_dtype,
             device=self.config.device,
         )
-        self.q_input = self.q_input or _tensor_input_from_config(q_config)
-        self.k_input = self.k_input or _tensor_input_from_config(k_config)
-        self.v_input = self.v_input or _tensor_input_from_config(v_config)
-        self.config.q_input = self.q_input.config
-        self.config.k_input = self.k_input.config
-        self.config.v_input = self.v_input.config
         self.config.cache_input = (
             None if self.cache_input is None else self.cache_input.config
         )
@@ -500,17 +482,17 @@ class MLAInputs(NumericsInputGenerator):
         if self.config.cache_layout == "none":
             total_q = sum(metadata.new_q_lens_cpu)
             total_kv = sum(metadata.new_kv_lens_cpu)
-            self.q_input.config.shape = (
+            self.q_input.shape = (
                 total_q,
                 self.config.num_q_heads,
                 self._prefill_qk_head_dim(),
             )
-            self.k_input.config.shape = (
+            self.k_input.shape = (
                 total_kv,
                 self.config.num_kv_heads,
                 self._prefill_qk_head_dim(),
             )
-            self.v_input.config.shape = (
+            self.v_input.shape = (
                 total_kv,
                 self.config.num_kv_heads,
                 self.config.v_head_dim,
@@ -527,7 +509,7 @@ class MLAInputs(NumericsInputGenerator):
         if self.cache_input is None:
             self.cache_input = MLAKVCacheInput(self._make_cache_config())
         q_len = metadata.new_q_lens_cpu[0]
-        self.q_input.config.shape = (
+        self.q_input.shape = (
             self.config.batch_size,
             q_len,
             self.config.num_q_heads,

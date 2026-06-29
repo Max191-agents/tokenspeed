@@ -29,11 +29,9 @@ from tokenspeed_kernel.numerics.input_generators.core import (
     DeviceLike,
     InputDType,
     NumericsInputGenerator,
-    TensorInputConfig,
     TensorInput,
     _child_seed,
     _resolve_device,
-    _tensor_input_from_config,
 )
 from tokenspeed_kernel.numerics.input_generators.gemm import (
     GemmInputConfig,
@@ -123,23 +121,11 @@ class MoeInputConfig:
     # Optional child generator configuration.
     # ------------------------------------------------------------------
 
-    # Optional: nested config for generated hidden states.
-    hidden_states_input: TensorInputConfig | None = None
-
-    # Optional: nested config for generated router logits.
-    router_logits_input: TensorInputConfig | None = None
-
     # Optional: nested config for gate/up projection expert weights.
     w13: GemmInputConfig | ScaledGemmInputConfig | None = None
 
     # Optional: nested config for down projection expert weights.
     w2: GemmInputConfig | ScaledGemmInputConfig | None = None
-
-    # Optional: nested config for gate/up projection bias.
-    w13_bias_input: TensorInputConfig | None = None
-
-    # Optional: nested config for down projection bias.
-    w2_bias_input: TensorInputConfig | None = None
 
 
 @dataclass(init=False)
@@ -154,7 +140,7 @@ class MoeInputs(NumericsInputGenerator):
 
     Leaf tensor generators and child GEMM generators are initialized at
     construction time and reused by ``generate`` so callers can mutate child
-    configuration before generating through this parent.
+    generator fields before generating through this parent.
     """
 
     config: MoeInputConfig
@@ -208,19 +194,17 @@ class MoeInputs(NumericsInputGenerator):
         ):
             self.config.weight_scale_dtype = torch.float8_e4m3fn
         if self.hidden_states_input is None:
-            hidden_config = self.config.hidden_states_input or TensorInputConfig(
+            self.hidden_states_input = TensorInput(
                 (self.config.num_tokens, self.config.hidden_size),
                 self.config.hidden_dtype,
                 device=self.config.device,
             )
-            self.hidden_states_input = _tensor_input_from_config(hidden_config)
         if self.router_logits_input is None:
-            router_config = self.config.router_logits_input or TensorInputConfig(
+            self.router_logits_input = TensorInput(
                 (self.config.num_tokens, self.config.num_experts),
                 self.config.router_dtype,
                 device=self.config.device,
             )
-            self.router_logits_input = _tensor_input_from_config(router_config)
         if self.w13 is None:
             self.w13 = self._make_weight_gemm(
                 self.config.w13
@@ -238,25 +222,19 @@ class MoeInputs(NumericsInputGenerator):
                 )
             )
         if self.w13_bias_input is None:
-            w13_bias_config = self.config.w13_bias_input or TensorInputConfig(
+            self.w13_bias_input = TensorInput(
                 (self.config.num_experts, 2 * self.config.intermediate_size),
                 self.config.bias_dtype,
                 device=self.config.device,
             )
-            self.w13_bias_input = _tensor_input_from_config(w13_bias_config)
         if self.w2_bias_input is None:
-            w2_bias_config = self.config.w2_bias_input or TensorInputConfig(
+            self.w2_bias_input = TensorInput(
                 (self.config.num_experts, self.config.hidden_size),
                 self.config.bias_dtype,
                 device=self.config.device,
             )
-            self.w2_bias_input = _tensor_input_from_config(w2_bias_config)
-        self.config.hidden_states_input = self.hidden_states_input.config
-        self.config.router_logits_input = self.router_logits_input.config
         self.config.w13 = self.w13.config
         self.config.w2 = self.w2.config
-        self.config.w13_bias_input = self.w13_bias_input.config
-        self.config.w2_bias_input = self.w2_bias_input.config
 
     def _make_weight_gemm(
         self,

@@ -36,7 +36,6 @@ from tokenspeed_kernel.numerics.input_generators import (
     ScaledGemmInputs,
     ScaledTensorInputConfig,
     ScaledTensorInput,
-    TensorInputConfig,
     TensorInput,
     gemm_scale_shape,
     mxfp4_scaled_gemm_input_config,
@@ -234,16 +233,14 @@ def test_scaled_tensor_inputs_accept_config_objects() -> None:
         value_dtype=torch.float16,
         scale_shape=(2, 1),
         scale_dtype=torch.float32,
-        values_input=TensorInputConfig((2, 4), torch.float64),
     )
     scaled = ScaledTensorInput(scaled_config)
     scaled_values = scaled.generate(seed=124, device="cpu")
 
     assert scaled.config is scaled_config
     assert scaled.values_input is not None
-    assert scaled.values_input.config is scaled_config.values_input
     assert scaled_values.values is not None
-    assert scaled_values.values.dtype == torch.float64
+    assert scaled_values.values.dtype == torch.float16
 
 
 def test_scaled_tensor_input_generates_torch_values_and_scales() -> None:
@@ -278,7 +275,7 @@ def test_scaled_tensor_input_reuses_mutable_value_generator_dtype() -> None:
     )
     assert tensor.values_input is not None
     values_input = tensor.values_input
-    values_input.config.dtype = torch.float64
+    values_input.dtype = torch.float64
 
     values = tensor.generate(seed=125, device="cpu")
 
@@ -586,7 +583,7 @@ def test_moe_inputs_reuse_mutable_child_generators() -> None:
     assert isinstance(inputs.w13, GemmInputs)
     hidden_states_input = inputs.hidden_states_input
     w13 = inputs.w13
-    hidden_states_input.config.dtype = torch.float32
+    hidden_states_input.dtype = torch.float32
     inputs.w13.config.b_dtype = torch.float64
     values = inputs.generate(seed=24, device="cpu")
 

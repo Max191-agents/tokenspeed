@@ -33,11 +33,9 @@ from tokenspeed_kernel.numerics.input_generators.attention_metadata import (
 from tokenspeed_kernel.numerics.input_generators.core import (
     DeviceLike,
     NumericsInputGenerator,
-    TensorInputConfig,
     TensorInput,
     _child_seed,
     _resolve_device,
-    _tensor_input_from_config,
 )
 
 __all__ = [
@@ -351,12 +349,6 @@ class KVCacheInputConfig:
     # Optional child generator configuration.
     # ------------------------------------------------------------------
 
-    # Optional: child generator for K-cache storage.
-    k_cache_input: TensorInputConfig | None = None
-
-    # Optional: child generator for V-cache storage.
-    v_cache_input: TensorInputConfig | None = None
-
     # Optional: child generator for paged-cache page tables. Defaults to None
     # for dense cache and to a nested PageTableInput for paged cache.
     page_table_input: PageTableInputConfig | None = None
@@ -389,28 +381,20 @@ class KVCacheInput(AttentionCacheInput):
 
     def __post_init__(self) -> None:
         self._normalize_config()
-        k_cache_config = self.config.k_cache_input or TensorInputConfig(
+        self.k_cache_input = self.k_cache_input or TensorInput(
             (0, self.config.num_kv_heads, self.config.head_dim),
             self.config.dtype,
             device=self.config.device,
         )
-        v_cache_config = self.config.v_cache_input or TensorInputConfig(
+        self.v_cache_input = self.v_cache_input or TensorInput(
             (0, self.config.num_kv_heads, self.config.head_dim),
             self.config.dtype,
             device=self.config.device,
-        )
-        self.k_cache_input = self.k_cache_input or _tensor_input_from_config(
-            k_cache_config
-        )
-        self.v_cache_input = self.v_cache_input or _tensor_input_from_config(
-            v_cache_config
         )
         if self.config.cache_layout == "paged" and self.page_table_input is None:
             self.page_table_input = PageTableInput(
                 self.config.page_table_input or self._make_page_table_config()
             )
-        self.config.k_cache_input = self.k_cache_input.config
-        self.config.v_cache_input = self.v_cache_input.config
         self.config.page_table_input = (
             None if self.page_table_input is None else self.page_table_input.config
         )
@@ -438,10 +422,10 @@ class KVCacheInput(AttentionCacheInput):
         )
         if self.k_cache_input is None or self.v_cache_input is None:
             raise ValueError("KVCacheInput child tensor generators must be initialized")
-        self.k_cache_input.config.shape = cache_shape
-        self.v_cache_input.config.shape = cache_shape
-        self.k_cache_input.config.dtype = self.config.dtype
-        self.v_cache_input.config.dtype = self.config.dtype
+        self.k_cache_input.shape = cache_shape
+        self.v_cache_input.shape = cache_shape
+        self.k_cache_input.dtype = self.config.dtype
+        self.v_cache_input.dtype = self.config.dtype
         k_cache = self.k_cache_input.generate(
             seed=_child_seed(seed, 1),
             device=target_device,
@@ -527,9 +511,6 @@ class MLAKVCacheInputConfig:
     # Optional child generator configuration.
     # ------------------------------------------------------------------
 
-    # Optional: child generator for compressed MLA cache storage.
-    kv_cache_input: TensorInputConfig | None = None
-
     # Optional: child generator for paged-cache page tables. Defaults to None
     # for dense cache and to a nested PageTableInput for paged cache.
     page_table_input: PageTableInputConfig | None = None
@@ -560,19 +541,15 @@ class MLAKVCacheInput(AttentionCacheInput):
 
     def __post_init__(self) -> None:
         self._normalize_config()
-        kv_cache_config = self.config.kv_cache_input or TensorInputConfig(
+        self.kv_cache_input = self.kv_cache_input or TensorInput(
             (0, 1, self._cache_head_dim()),
             self.config.dtype,
             device=self.config.device,
-        )
-        self.kv_cache_input = self.kv_cache_input or _tensor_input_from_config(
-            kv_cache_config
         )
         if self.config.cache_layout == "paged" and self.page_table_input is None:
             self.page_table_input = PageTableInput(
                 self.config.page_table_input or self._make_page_table_config()
             )
-        self.config.kv_cache_input = self.kv_cache_input.config
         self.config.page_table_input = (
             None if self.page_table_input is None else self.page_table_input.config
         )
@@ -602,8 +579,8 @@ class MLAKVCacheInput(AttentionCacheInput):
             raise ValueError(
                 "MLAKVCacheInput child tensor generator must be initialized"
             )
-        self.kv_cache_input.config.shape = cache_shape
-        self.kv_cache_input.config.dtype = self.config.dtype
+        self.kv_cache_input.shape = cache_shape
+        self.kv_cache_input.dtype = self.config.dtype
         kv_cache = self.kv_cache_input.generate(
             seed=_child_seed(seed, 1),
             device=target_device,

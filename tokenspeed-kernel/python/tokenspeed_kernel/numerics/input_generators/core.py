@@ -38,7 +38,6 @@ __all__ = [
     "ScaledTensorInputConfig",
     "ScaledTensorInput",
     "ScaledTensorValues",
-    "TensorInputConfig",
     "TensorInput",
 ]
 
@@ -207,36 +206,13 @@ def _generate_scale_tensor(
     return values.to(dtype)
 
 
-@dataclass
-class TensorInputConfig:
-    """Initialization parameters for ``TensorInput``."""
-
-    # ------------------------------------------------------------------
-    # Required configuration fields.
-    # ------------------------------------------------------------------
-
-    # Required: physical tensor shape to generate.
-    shape: tuple[int, ...]
-
-    # Required: builtin torch dtype. ``None`` skips generation and returns
-    # ``None``.
-    dtype: torch.dtype | None
-
-    # ------------------------------------------------------------------
-    # Optional configuration fields.
-    # ------------------------------------------------------------------
-
-    # Optional: device override for this tensor. If omitted, the
-    # caller-supplied ``generate(..., device=...)`` device is used; if that is
-    # also omitted, generation defaults to CPU.
-    device: DeviceLike = None
-
-
 @dataclass(init=False)
 class TensorInput(NumericsInputGenerator):
     """Generator for one tensor operand."""
 
-    config: TensorInputConfig
+    shape: tuple[int, ...]
+    dtype: torch.dtype | None
+    device: DeviceLike
 
     def __init__(
         self,
@@ -245,28 +221,26 @@ class TensorInput(NumericsInputGenerator):
         *,
         device: DeviceLike = None,
     ) -> None:
-        self.config = TensorInputConfig(shape=shape, dtype=dtype, device=device)
+        self.shape = shape
+        self.dtype = dtype
+        self.device = device
         self.__post_init__()
 
     def __post_init__(self) -> None:
-        self.config.shape = _normalize_shape(self.config.shape)
+        self.shape = _normalize_shape(self.shape)
 
     def generate(self, *, seed: int, device: DeviceLike = None) -> torch.Tensor | None:
-        if self.config.dtype is None:
+        if self.dtype is None:
             return None
 
-        target_device = _resolve_device(self.config.device, device)
+        target_device = _resolve_device(self.device, device)
         generator = _rng_for_device(target_device, seed)
         return _generate_torch_tensor(
-            self.config.shape,
-            self.config.dtype,
+            self.shape,
+            self.dtype,
             device=target_device,
             generator=generator,
         )
-
-
-def _tensor_input_from_config(config: TensorInputConfig) -> TensorInput:
-    return TensorInput(config.shape, config.dtype, device=config.device)
 
 
 @dataclass
@@ -309,16 +283,6 @@ class ScaledTensorInputConfig:
     # Optional: scale tensor device override.
     scale_device: DeviceLike = None
 
-    # ------------------------------------------------------------------
-    # Optional child generator configuration.
-    # ------------------------------------------------------------------
-
-    # Optional: nested config for generated tensor values.
-    values_input: TensorInputConfig | None = None
-
-    # Optional: nested config for generated tensor scales.
-    scales_input: TensorInputConfig | None = None
-
 
 @dataclass(init=False)
 class ScaledTensorInput(NumericsInputGenerator):
@@ -330,8 +294,8 @@ class ScaledTensorInput(NumericsInputGenerator):
     tensor is supplied by an earlier operation.
 
     Child tensor generators are initialized when this generator is constructed
-    and reused by ``generate``. Tests can mutate those child generator
-    configurations before generating through a parent.
+    and reused by ``generate``. Tests can mutate those child generator fields
+    before generating through a parent.
     """
 
     config: ScaledTensorInputConfig
@@ -352,33 +316,25 @@ class ScaledTensorInput(NumericsInputGenerator):
         if self.config.scale_shape is not None:
             self.config.scale_shape = _normalize_shape(self.config.scale_shape)
         if self.values_input is None:
-            values_config = self.config.values_input or TensorInputConfig(
+            self.values_input = TensorInput(
                 self.config.value_shape,
                 None
                 if self.config.value_dtype is None
                 else _storage_dtype(self.config.value_dtype),
                 device=self.config.value_device,
             )
-            self.values_input = _tensor_input_from_config(values_config)
         if self.scales_input is None and self.config.scale_shape is not None:
-            scales_config = self.config.scales_input or TensorInputConfig(
+            self.scales_input = TensorInput(
                 self.config.scale_shape,
                 self.config.scale_dtype,
                 device=self.config.scale_device,
             )
-            self.scales_input = _tensor_input_from_config(scales_config)
-        self.config.values_input = (
-            None if self.values_input is None else self.values_input.config
-        )
-        self.config.scales_input = (
-            None if self.scales_input is None else self.scales_input.config
-        )
 
     def generate(self, *, seed: int, device: DeviceLike = None) -> ScaledTensorValues:
         if self.values_input is None:
             raise ValueError("ScaledTensorInput requires a values_input generator")
         value_dtype = self._resolved_value_dtype()
-        value_device = _resolve_device(self.config.value_device, device)
+        value_device = _resolve_device(self.values_input.device, device)
         value_generator = _rng_for_device(value_device, _child_seed(seed, 1))
         values = self._generate_values(
             dtype=value_dtype,
@@ -392,17 +348,17 @@ class ScaledTensorInput(NumericsInputGenerator):
                 scales=None,
             )
 
-        scale_dtype = self.scales_input.config.dtype
+        scale_dtype = self.scales_input.dtype
         if scale_dtype is None:
             return ScaledTensorValues(
                 values=values,
                 scales=None,
             )
 
-        scale_device = _resolve_device(self.config.scale_device, device)
+        scale_device = _resolve_device(self.scales_input.device, device)
         scale_generator = _rng_for_device(scale_device, _child_seed(seed, 2))
         scales = _generate_scale_tensor(
-            self.scales_input.config.shape,
+            self.scales_input.shape,
             scale_dtype,
             device=scale_device,
             generator=scale_generator,
@@ -423,9 +379,7 @@ class ScaledTensorInput(NumericsInputGenerator):
         if dtype is None:
             return None
         storage_shape = (
-            self.values_input.config.shape
-            if self.values_input
-            else self.config.value_shape
+            self.values_input.shape if self.values_input else self.config.value_shape
         )
         if dtype == CustomDType.MXFP4:
             return _generate_mxfp4_packed(
@@ -451,5 +405,5 @@ class ScaledTensorInput(NumericsInputGenerator):
         if self.config.value_dtype == CustomDType.MXFP4:
             return CustomDType.MXFP4
         if self.values_input is not None:
-            return self.values_input.config.dtype
+            return self.values_input.dtype
         return self.config.value_dtype
