@@ -24,8 +24,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from tokenspeed_kernel.numerics.input_generators.attention import MHAInputValues
-from tokenspeed_kernel.numerics.input_generators.mla import MLAInputValues
+from tokenspeed_kernel.numerics.input_generators.attention import (
+    MHAInputValues,
+    MLAInputValues,
+)
 
 __all__ = [
     "mla_decode_with_kvcache_kwargs",

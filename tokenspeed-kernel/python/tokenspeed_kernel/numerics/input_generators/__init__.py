@@ -30,6 +30,9 @@ from tokenspeed_kernel.numerics.input_generators.attention import (
     MHAInputConfig,
     MHAInputs,
     MHAInputValues,
+    MLAInputConfig,
+    MLAInputs,
+    MLAInputValues,
 )
 from tokenspeed_kernel.numerics.input_generators.attention_cache import (
     AttentionCacheInput,
@@ -71,11 +74,6 @@ from tokenspeed_kernel.numerics.input_generators.moe import (
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
-)
-from tokenspeed_kernel.numerics.input_generators.mla import (
-    MLAInputConfig,
-    MLAInputs,
-    MLAInputValues,
 )
 
 __all__ = [
