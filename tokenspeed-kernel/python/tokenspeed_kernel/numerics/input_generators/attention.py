@@ -107,6 +107,14 @@ def _check_matches(
         )
 
 
+def _metadata_config(
+    metadata_input: MHARequestMetadataInput | None,
+) -> MHARequestMetadataInputConfig:
+    if metadata_input is None:
+        raise ValueError("metadata_input must be initialized")
+    return metadata_input.config
+
+
 class _GenerateCacheFn(Protocol[_AttentionCacheT]):
     def __call__(
         self,
@@ -397,7 +405,6 @@ class MHAInputs(NumericsInputGenerator):
             self.config.metadata_input or self._make_metadata_config()
         )
         self._verify_metadata_config_matches_parent()
-        self._refresh_metadata_state_from_child()
         self.config.metadata_input = self.metadata_input.config
 
         self.config.num_q_heads = _check_positive(
@@ -536,28 +543,6 @@ class MHAInputs(NumericsInputGenerator):
                 child_value=getattr(metadata.config, name),
             )
 
-    def _refresh_metadata_state_from_child(self) -> None:
-        if self.metadata_input is None:
-            raise ValueError("metadata_input must be initialized")
-        metadata = self.metadata_input
-        self.config.batch_size = metadata.config.batch_size
-        self.config.total_cached_tokens = metadata.config.total_cached_tokens
-        self.config.total_new_q_tokens = metadata.config.total_new_q_tokens
-        self.total_new_kv_tokens = metadata.config.total_new_kv_tokens
-        self.config.cache_layout = metadata.config.cache_layout
-        self.cached_length_mode = metadata.config.cached_length_mode
-        self.max_cached_tokens_per_request = (
-            metadata.config.max_cached_tokens_per_request
-        )
-        self.new_q_length_mode = metadata.config.new_q_length_mode
-        self.max_new_q_tokens_per_request = metadata.config.max_new_q_tokens_per_request
-        self.new_kv_length_mode = metadata.config.new_kv_length_mode
-        self.max_new_kv_tokens_per_request = (
-            metadata.config.max_new_kv_tokens_per_request
-        )
-        self.tie_new_kv_to_query = metadata.config.tie_new_kv_to_query
-        self.max_seqlen_k = metadata.config.max_seqlen_k
-
     def _prepare_cache_config(
         self,
         cache_config: KVCacheInputConfig,
@@ -611,7 +596,6 @@ class MHAInputs(NumericsInputGenerator):
         self._verify_metadata_config_matches_parent()
         metadata = self.metadata_input.generate(seed=seed, device=device)
         self._verify_metadata_config_matches_parent()
-        self._refresh_metadata_state_from_child()
         return metadata
 
     def _generate_attention_values(
@@ -692,7 +676,7 @@ class MHAInputs(NumericsInputGenerator):
         return KVCacheInputConfig(
             cache_layout=self.config.cache_layout,
             batch_size=self.config.batch_size,
-            max_seqlen_k=self.max_seqlen_k or 0,
+            max_seqlen_k=_metadata_config(self.metadata_input).max_seqlen_k or 0,
             num_kv_heads=self.config.num_kv_heads,
             head_dim=self.config.head_dim,
             dtype=self.config.k_dtype,
@@ -922,7 +906,6 @@ class MLAInputs(NumericsInputGenerator):
             self.config.metadata_input or self._make_metadata_config()
         )
         self._verify_metadata_config_matches_parent()
-        self._refresh_metadata_state_from_child()
         self.config.metadata_input = self.metadata_input.config
 
         if self.config.num_kv_heads is None:
@@ -1070,28 +1053,6 @@ class MLAInputs(NumericsInputGenerator):
                 child_value=getattr(metadata.config, name),
             )
 
-    def _refresh_metadata_state_from_child(self) -> None:
-        if self.metadata_input is None:
-            raise ValueError("metadata_input must be initialized")
-        metadata = self.metadata_input
-        self.config.batch_size = metadata.config.batch_size
-        self.config.total_cached_tokens = metadata.config.total_cached_tokens
-        self.config.total_new_q_tokens = metadata.config.total_new_q_tokens
-        self.total_new_kv_tokens = metadata.config.total_new_kv_tokens
-        self.config.cache_layout = metadata.config.cache_layout
-        self.cached_length_mode = metadata.config.cached_length_mode
-        self.max_cached_tokens_per_request = (
-            metadata.config.max_cached_tokens_per_request
-        )
-        self.new_q_length_mode = metadata.config.new_q_length_mode
-        self.max_new_q_tokens_per_request = metadata.config.max_new_q_tokens_per_request
-        self.new_kv_length_mode = metadata.config.new_kv_length_mode
-        self.max_new_kv_tokens_per_request = (
-            metadata.config.max_new_kv_tokens_per_request
-        )
-        self.tie_new_kv_to_query = metadata.config.tie_new_kv_to_query
-        self.max_seqlen_k = metadata.config.max_seqlen_k
-
     def _prepare_cache_config(
         self,
         cache_config: MLAKVCacheInputConfig,
@@ -1150,7 +1111,6 @@ class MLAInputs(NumericsInputGenerator):
         self._verify_metadata_config_matches_parent()
         metadata = self.metadata_input.generate(seed=seed, device=device)
         self._verify_metadata_config_matches_parent()
-        self._refresh_metadata_state_from_child()
         return metadata
 
     def _generate_attention_values(
@@ -1240,7 +1200,7 @@ class MLAInputs(NumericsInputGenerator):
         return MLAKVCacheInputConfig(
             cache_layout=self.config.cache_layout,
             batch_size=self.config.batch_size,
-            max_seqlen_k=self.max_seqlen_k or 0,
+            max_seqlen_k=_metadata_config(self.metadata_input).max_seqlen_k or 0,
             kv_lora_rank=self.config.kv_lora_rank,
             qk_rope_head_dim=self.config.qk_rope_head_dim,
             dtype=self.config.kv_cache_dtype,
