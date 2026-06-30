@@ -118,17 +118,6 @@ class _GenerateCacheFn(Protocol[_AttentionCacheT]):
     ) -> _AttentionCacheT: ...
 
 
-class _CopyNewKVIntoCacheFn(Protocol[_AttentionCacheT]):
-    def __call__(
-        self,
-        *,
-        metadata: MHARequestMetadataValues,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
-        cache: _AttentionCacheT,
-    ) -> None: ...
-
-
 @dataclass
 class AttentionGeneratedValues(Generic[_AttentionCacheT]):
     """Tensor/cache values produced by the shared attention generation path."""
@@ -195,14 +184,12 @@ def attention_generate(
     cache_seed_index: int = 4,
     page_table_seed_index: int = 4,
     fixed_q_length_error: str | None = None,
-    copy_new_kv_into_cache: _CopyNewKVIntoCacheFn[_AttentionCacheT] | None = None,
 ) -> AttentionGeneratedValues[_AttentionCacheT]:
     """Generate common attention tensors and optional cache.
 
     Family-specific generators own the shape choices and cache type. This
     shared path owns applying those shapes to child tensor generators, deriving
-    deterministic child seeds, invoking cache generation, and running optional
-    cache post-processing.
+    deterministic child seeds, and invoking cache generation.
     """
 
     if fixed_q_length_error is not None and cache_layout != "none":
@@ -244,8 +231,6 @@ def attention_generate(
         page_table_seed=_child_seed(metadata_seed, page_table_seed_index),
         device=device,
     )
-    if copy_new_kv_into_cache is not None:
-        copy_new_kv_into_cache(metadata=metadata, k=k, v=v, cache=cache)
     return AttentionGeneratedValues(
         q=q,
         k=k,
@@ -652,7 +637,7 @@ class MHAInputs(NumericsInputGenerator):
         total_q = sum(metadata.new_q_lens_cpu)
         total_new_kv = sum(metadata.new_kv_lens_cpu)
 
-        return attention_generate(
+        generated = attention_generate(
             metadata=metadata,
             value_seed=value_seed,
             metadata_seed=metadata_seed,
@@ -670,8 +655,15 @@ class MHAInputs(NumericsInputGenerator):
             generate_cache=self._generate_cache,
             cache_seed_index=5,
             page_table_seed_index=5,
-            copy_new_kv_into_cache=self._copy_new_kv_into_cache,
         )
+        if generated.cache is not None:
+            self._copy_new_kv_into_cache(
+                metadata=metadata,
+                k=generated.k,
+                v=generated.v,
+                cache=generated.cache,
+            )
+        return generated
 
     def _generate_cache(
         self,
