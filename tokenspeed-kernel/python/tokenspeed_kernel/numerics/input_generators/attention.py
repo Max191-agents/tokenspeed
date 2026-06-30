@@ -1127,31 +1127,39 @@ class MLAInputs(NumericsInputGenerator):
         if self.config.cache_layout == "none":
             total_q = sum(metadata.new_q_lens_cpu)
             total_kv = sum(metadata.new_kv_lens_cpu)
-            return attention_generate(
-                metadata=metadata,
-                value_seed=value_seed,
-                metadata_seed=metadata_seed,
-                device=device,
-                cache_layout=self.config.cache_layout,
-                q_input=self.q_input,
-                q_shape=(total_q, self.config.num_q_heads, self._prefill_qk_head_dim()),
-                k_input=self.k_input,
-                k_shape=(
-                    total_kv,
-                    self.config.num_kv_heads,
-                    self._prefill_qk_head_dim(),
-                ),
-                v_input=self.v_input,
-                v_shape=(
-                    total_kv,
-                    self.config.num_kv_heads,
-                    self.config.v_head_dim,
-                ),
+            q_shape = (total_q, self.config.num_q_heads, self._prefill_qk_head_dim())
+            k_input = self.k_input
+            k_shape = (
+                total_kv,
+                self.config.num_kv_heads,
+                self._prefill_qk_head_dim(),
             )
-
-        if self.cache_input is None:
-            self.cache_input = MLAKVCacheInput(self._make_cache_config())
-        q_len = metadata.new_q_lens_cpu[0]
+            v_input = self.v_input
+            v_shape = (
+                total_kv,
+                self.config.num_kv_heads,
+                self.config.v_head_dim,
+            )
+            generate_cache = None
+            fixed_q_length_error = None
+        else:
+            if self.cache_input is None:
+                self.cache_input = MLAKVCacheInput(self._make_cache_config())
+            q_len = metadata.new_q_lens_cpu[0]
+            q_shape = (
+                self.config.batch_size,
+                q_len,
+                self.config.num_q_heads,
+                self._decode_qk_head_dim(),
+            )
+            k_input = None
+            k_shape = None
+            v_input = None
+            v_shape = None
+            generate_cache = self._generate_cache
+            fixed_q_length_error = (
+                "cached MLA generation requires a fixed query length per request"
+            )
 
         return attention_generate(
             metadata=metadata,
@@ -1160,18 +1168,15 @@ class MLAInputs(NumericsInputGenerator):
             device=device,
             cache_layout=self.config.cache_layout,
             q_input=self.q_input,
-            q_shape=(
-                self.config.batch_size,
-                q_len,
-                self.config.num_q_heads,
-                self._decode_qk_head_dim(),
-            ),
-            generate_cache=self._generate_cache,
+            q_shape=q_shape,
+            k_input=k_input,
+            k_shape=k_shape,
+            v_input=v_input,
+            v_shape=v_shape,
+            generate_cache=generate_cache,
             cache_seed_index=4,
             page_table_seed_index=4,
-            fixed_q_length_error=(
-                "cached MLA generation requires a fixed query length per request"
-            ),
+            fixed_q_length_error=fixed_q_length_error,
         )
 
     def _generate_cache(
