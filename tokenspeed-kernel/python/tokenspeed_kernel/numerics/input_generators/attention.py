@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Protocol, TypeVar
+from typing import Generic, Protocol, TypeVar
 
 import torch
 from tokenspeed_kernel.numerics.input_generators.attention_cache import (
@@ -61,7 +61,7 @@ __all__ = [
     "MLAInputs",
 ]
 
-_AttentionValuesT = TypeVar("_AttentionValuesT")
+_AttentionCacheT = TypeVar("_AttentionCacheT")
 
 
 def _check_positive(name: str, value: int) -> int:
@@ -107,33 +107,45 @@ def _check_matches(
         )
 
 
-class _GenerateMetadataFn(Protocol):
-    def __call__(self, seed: int, device: torch.device) -> MHARequestMetadataValues: ...
-
-
-class _GenerateAttentionValuesFn(Protocol[_AttentionValuesT]):
+class _GenerateCacheFn(Protocol[_AttentionCacheT]):
     def __call__(
         self,
         *,
         metadata: MHARequestMetadataValues,
         value_seed: int,
-        metadata_seed: int,
+        page_table_seed: int,
         device: torch.device,
-    ) -> _AttentionValuesT: ...
+    ) -> _AttentionCacheT: ...
 
 
-def attention_generate(
+class _CopyNewKVIntoCacheFn(Protocol[_AttentionCacheT]):
+    def __call__(
+        self,
+        *,
+        metadata: MHARequestMetadataValues,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        cache: _AttentionCacheT,
+    ) -> None: ...
+
+
+@dataclass
+class AttentionGeneratedValues(Generic[_AttentionCacheT]):
+    """Tensor/cache values produced by the shared attention generation path."""
+
+    q: torch.Tensor | None
+    k: torch.Tensor | None
+    v: torch.Tensor | None
+    sinks: torch.Tensor | None
+    cache: _AttentionCacheT | None
+
+
+def _resolve_attention_seeds(
     *,
-    seed: int | None = None,
-    metadata_seed: int | None = None,
-    value_seed: int | None = None,
-    configured_device: DeviceLike = None,
-    device: DeviceLike = None,
-    generate_metadata: _GenerateMetadataFn,
-    generate_values: _GenerateAttentionValuesFn[_AttentionValuesT],
-) -> _AttentionValuesT:
-    """Run the common seed/device/metadata flow for attention generators."""
-
+    seed: int | None,
+    metadata_seed: int | None,
+    value_seed: int | None,
+) -> tuple[int, int]:
     if seed is None and (metadata_seed is None or value_seed is None):
         raise ValueError("provide either seed or both metadata_seed and value_seed")
     if seed is not None:
@@ -143,14 +155,103 @@ def attention_generate(
             value_seed = _child_seed(seed, 2)
     assert metadata_seed is not None
     assert value_seed is not None
+    return metadata_seed, value_seed
 
-    target_device = _resolve_device(configured_device, device)
-    metadata = generate_metadata(metadata_seed, target_device)
-    return generate_values(
+
+def _generate_optional_tensor(
+    *,
+    tensor_input: TensorInput | None,
+    shape: tuple[int, ...] | None,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if tensor_input is None:
+        if shape is not None:
+            raise ValueError("shape requires a tensor_input")
+        return None
+    if shape is None:
+        raise ValueError("tensor_input requires a shape")
+    tensor_input.shape = shape
+    return tensor_input.generate(seed=seed, device=device).values
+
+
+def attention_generate(
+    *,
+    metadata: MHARequestMetadataValues,
+    value_seed: int,
+    metadata_seed: int,
+    device: torch.device,
+    cache_layout: CacheLayout,
+    q_input: TensorInput,
+    q_shape: tuple[int, ...],
+    k_input: TensorInput | None = None,
+    k_shape: tuple[int, ...] | None = None,
+    v_input: TensorInput | None = None,
+    v_shape: tuple[int, ...] | None = None,
+    sinks_input: TensorInput | None = None,
+    sinks_shape: tuple[int, ...] | None = None,
+    sinks_dtype: torch.dtype | None = None,
+    generate_cache: _GenerateCacheFn[_AttentionCacheT] | None = None,
+    cache_seed_index: int = 4,
+    page_table_seed_index: int = 4,
+    fixed_q_length_error: str | None = None,
+    copy_new_kv_into_cache: _CopyNewKVIntoCacheFn[_AttentionCacheT] | None = None,
+) -> AttentionGeneratedValues[_AttentionCacheT]:
+    """Generate common attention tensors and optional cache.
+
+    Family-specific generators own the shape choices and cache type. This
+    shared path owns applying those shapes to child tensor generators, deriving
+    deterministic child seeds, invoking cache generation, and running optional
+    cache post-processing.
+    """
+
+    if fixed_q_length_error is not None and cache_layout != "none":
+        if len(set(metadata.new_q_lens_cpu)) != 1:
+            raise ValueError(fixed_q_length_error)
+
+    q_input.shape = q_shape
+    q = q_input.generate(seed=_child_seed(value_seed, 1), device=device).values
+    k = _generate_optional_tensor(
+        tensor_input=k_input,
+        shape=k_shape,
+        seed=_child_seed(value_seed, 2),
+        device=device,
+    )
+    v = _generate_optional_tensor(
+        tensor_input=v_input,
+        shape=v_shape,
+        seed=_child_seed(value_seed, 3),
+        device=device,
+    )
+
+    if sinks_input is not None:
+        sinks_input.dtype = sinks_dtype
+    sinks = _generate_optional_tensor(
+        tensor_input=sinks_input,
+        shape=sinks_shape,
+        seed=_child_seed(value_seed, 4),
+        device=device,
+    )
+
+    if cache_layout == "none":
+        return AttentionGeneratedValues(q=q, k=k, v=v, sinks=sinks, cache=None)
+
+    if generate_cache is None:
+        raise ValueError("cache_layout != 'none' requires generate_cache")
+    cache = generate_cache(
         metadata=metadata,
-        value_seed=value_seed,
-        metadata_seed=metadata_seed,
-        device=target_device,
+        value_seed=_child_seed(value_seed, cache_seed_index),
+        page_table_seed=_child_seed(metadata_seed, page_table_seed_index),
+        device=device,
+    )
+    if copy_new_kv_into_cache is not None:
+        copy_new_kv_into_cache(metadata=metadata, k=k, v=v, cache=cache)
+    return AttentionGeneratedValues(
+        q=q,
+        k=k,
+        v=v,
+        sinks=sinks,
+        cache=cache,
     )
 
 
@@ -381,14 +482,26 @@ class MHAInputs(NumericsInputGenerator):
         value_seed: int | None = None,
         device: DeviceLike = None,
     ) -> MHAInputValues:
-        return attention_generate(
+        metadata_seed, value_seed = _resolve_attention_seeds(
             seed=seed,
             metadata_seed=metadata_seed,
             value_seed=value_seed,
-            configured_device=self.config.device,
-            device=device,
-            generate_metadata=self._generate_metadata,
-            generate_values=self._generate_values,
+        )
+        target_device = _resolve_device(self.config.device, device)
+        metadata = self._generate_metadata(metadata_seed, target_device)
+        generated = self._generate_attention_values(
+            metadata=metadata,
+            value_seed=value_seed,
+            metadata_seed=metadata_seed,
+            device=target_device,
+        )
+        return self._make_values(
+            metadata=metadata,
+            q=generated.q,
+            k=generated.k,
+            v=generated.v,
+            sinks=generated.sinks,
+            cache=generated.cache,
         )
 
     def _normalize_config(self) -> None:
@@ -516,14 +629,14 @@ class MHAInputs(NumericsInputGenerator):
         self._refresh_metadata_state_from_child()
         return metadata
 
-    def _generate_values(
+    def _generate_attention_values(
         self,
         *,
         metadata: MHARequestMetadataValues,
         value_seed: int,
         metadata_seed: int,
         device: torch.device,
-    ) -> MHAInputValues:
+    ) -> AttentionGeneratedValues[KVCacheValues]:
         if (
             self.q_input is None
             or self.k_input is None
@@ -533,67 +646,31 @@ class MHAInputs(NumericsInputGenerator):
             raise ValueError("MHAInputs child generators must be initialized")
         if self.config.cache_layout != "none" and self.cache_input is None:
             self.cache_input = KVCacheInput(self._make_cache_config())
+        if self.config.cache_layout == "none":
+            self.cache_input = None
 
         total_q = sum(metadata.new_q_lens_cpu)
         total_new_kv = sum(metadata.new_kv_lens_cpu)
-        self.q_input.shape = (
-            total_q,
-            self.config.num_q_heads,
-            self.config.head_dim,
-        )
-        self.k_input.shape = (
-            total_new_kv,
-            self.config.num_kv_heads,
-            self.config.head_dim,
-        )
-        self.v_input.shape = (
-            total_new_kv,
-            self.config.num_kv_heads,
-            self.config.head_dim,
-        )
-        self.sinks_input.shape = (self.config.num_q_heads,)
-        self.sinks_input.dtype = (
-            self.config.sink_dtype if self.config.include_sinks else None
-        )
 
-        q = self.q_input.generate(seed=_child_seed(value_seed, 1), device=device).values
-        k = self.k_input.generate(seed=_child_seed(value_seed, 2), device=device).values
-        v = self.v_input.generate(seed=_child_seed(value_seed, 3), device=device).values
-        sinks = self.sinks_input.generate(
-            seed=_child_seed(value_seed, 4),
+        return attention_generate(
+            metadata=metadata,
+            value_seed=value_seed,
+            metadata_seed=metadata_seed,
             device=device,
-        ).values
-
-        if self.config.cache_layout == "none":
-            self.cache_input = None
-            return self._make_values(
-                metadata=metadata,
-                q=q,
-                k=k,
-                v=v,
-                sinks=sinks,
-                cache=None,
-            )
-
-        cache = self._generate_cache(
-            metadata=metadata,
-            value_seed=_child_seed(value_seed, 5),
-            page_table_seed=_child_seed(metadata_seed, 5),
-            device=device,
-        )
-        self._copy_new_kv_into_cache(
-            metadata=metadata,
-            k=k,
-            v=v,
-            cache=cache,
-        )
-        return self._make_values(
-            metadata=metadata,
-            q=q,
-            k=k,
-            v=v,
-            sinks=sinks,
-            cache=cache,
+            cache_layout=self.config.cache_layout,
+            q_input=self.q_input,
+            q_shape=(total_q, self.config.num_q_heads, self.config.head_dim),
+            k_input=self.k_input,
+            k_shape=(total_new_kv, self.config.num_kv_heads, self.config.head_dim),
+            v_input=self.v_input,
+            v_shape=(total_new_kv, self.config.num_kv_heads, self.config.head_dim),
+            sinks_input=self.sinks_input,
+            sinks_shape=(self.config.num_q_heads,),
+            sinks_dtype=self.config.sink_dtype if self.config.include_sinks else None,
+            generate_cache=self._generate_cache,
+            cache_seed_index=5,
+            page_table_seed_index=5,
+            copy_new_kv_into_cache=self._copy_new_kv_into_cache,
         )
 
     def _generate_cache(
@@ -929,14 +1006,25 @@ class MLAInputs(NumericsInputGenerator):
         value_seed: int | None = None,
         device: DeviceLike = None,
     ) -> MLAInputValues:
-        return attention_generate(
+        metadata_seed, value_seed = _resolve_attention_seeds(
             seed=seed,
             metadata_seed=metadata_seed,
             value_seed=value_seed,
-            configured_device=self.config.device,
-            device=device,
-            generate_metadata=self._generate_metadata,
-            generate_values=self._generate_values,
+        )
+        target_device = _resolve_device(self.config.device, device)
+        metadata = self._generate_metadata(metadata_seed, target_device)
+        generated = self._generate_attention_values(
+            metadata=metadata,
+            value_seed=value_seed,
+            metadata_seed=metadata_seed,
+            device=target_device,
+        )
+        return self._make_values(
+            metadata=metadata,
+            q=generated.q,
+            k=generated.k,
+            v=generated.v,
+            cache=generated.cache,
         )
 
     def _normalize_config(self) -> None:
@@ -1073,70 +1161,66 @@ class MLAInputs(NumericsInputGenerator):
         self._refresh_metadata_state_from_child()
         return metadata
 
-    def _generate_values(
+    def _generate_attention_values(
         self,
         *,
         metadata: MHARequestMetadataValues,
         value_seed: int,
         metadata_seed: int,
         device: torch.device,
-    ) -> MLAInputValues:
+    ) -> AttentionGeneratedValues[MLAKVCacheValues]:
         if self.q_input is None or self.k_input is None or self.v_input is None:
             raise ValueError("MLAInputs child generators must be initialized")
 
         if self.config.cache_layout == "none":
             total_q = sum(metadata.new_q_lens_cpu)
             total_kv = sum(metadata.new_kv_lens_cpu)
-            self.q_input.shape = (
-                total_q,
-                self.config.num_q_heads,
-                self._prefill_qk_head_dim(),
-            )
-            self.k_input.shape = (
-                total_kv,
-                self.config.num_kv_heads,
-                self._prefill_qk_head_dim(),
-            )
-            self.v_input.shape = (
-                total_kv,
-                self.config.num_kv_heads,
-                self.config.v_head_dim,
-            )
-            q = self.q_input.generate(
-                seed=_child_seed(value_seed, 1),
+            return attention_generate(
+                metadata=metadata,
+                value_seed=value_seed,
+                metadata_seed=metadata_seed,
                 device=device,
-            ).values
-            k = self.k_input.generate(
-                seed=_child_seed(value_seed, 2),
-                device=device,
-            ).values
-            v = self.v_input.generate(
-                seed=_child_seed(value_seed, 3),
-                device=device,
-            ).values
-            return self._make_values(metadata=metadata, q=q, k=k, v=v, cache=None)
+                cache_layout=self.config.cache_layout,
+                q_input=self.q_input,
+                q_shape=(total_q, self.config.num_q_heads, self._prefill_qk_head_dim()),
+                k_input=self.k_input,
+                k_shape=(
+                    total_kv,
+                    self.config.num_kv_heads,
+                    self._prefill_qk_head_dim(),
+                ),
+                v_input=self.v_input,
+                v_shape=(
+                    total_kv,
+                    self.config.num_kv_heads,
+                    self.config.v_head_dim,
+                ),
+            )
 
-        if len(set(metadata.new_q_lens_cpu)) != 1:
-            raise ValueError(
-                "cached MLA generation requires a fixed query length per request"
-            )
         if self.cache_input is None:
             self.cache_input = MLAKVCacheInput(self._make_cache_config())
         q_len = metadata.new_q_lens_cpu[0]
-        self.q_input.shape = (
-            self.config.batch_size,
-            q_len,
-            self.config.num_q_heads,
-            self._decode_qk_head_dim(),
-        )
-        q = self.q_input.generate(seed=_child_seed(value_seed, 1), device=device).values
-        cache = self._generate_cache(
+
+        return attention_generate(
             metadata=metadata,
-            value_seed=_child_seed(value_seed, 4),
-            page_table_seed=_child_seed(metadata_seed, 4),
+            value_seed=value_seed,
+            metadata_seed=metadata_seed,
             device=device,
+            cache_layout=self.config.cache_layout,
+            q_input=self.q_input,
+            q_shape=(
+                self.config.batch_size,
+                q_len,
+                self.config.num_q_heads,
+                self._decode_qk_head_dim(),
+            ),
+            generate_cache=self._generate_cache,
+            cache_seed_index=4,
+            page_table_seed_index=4,
+            fixed_q_length_error=(
+                "cached MLA generation requires a fixed query length per request"
+            ),
         )
-        return self._make_values(metadata=metadata, q=q, k=None, v=None, cache=cache)
 
     def _generate_cache(
         self,
