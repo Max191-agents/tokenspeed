@@ -112,6 +112,7 @@ from tokenspeed_numerics_input_generators.attention import (
     MLAPrefillFP8Inputs,
     MLAPrefillFP8InputValues,
     MLAPrefillFP8ReferenceValues,
+    MLAReferenceValues,
     PackedQKVComplexRotaryInputConfig,
     PackedQKVComplexRotaryInputs,
     PackedQKVComplexRotaryInputValues,
@@ -139,6 +140,7 @@ from tokenspeed_numerics_input_generators.attention import (
     gdn_qkv_split_reference,
     mla_kv_pack_quantize_fp8_reference,
     mla_prefill_fp8_reference,
+    mla_reference,
     packed_qkv_complex_rotary_reference,
 )
 from tokenspeed_numerics_input_generators.attention_cache import (
@@ -478,6 +480,7 @@ __all__ = [
     "MLAInputConfig",
     "MLAInputValues",
     "MLAInputs",
+    "MLAReferenceValues",
     "MLAKVPackQuantizeFP8InputConfig",
     "MLAKVPackQuantizeFP8InputValues",
     "MLAKVPackQuantizeFP8Inputs",
@@ -631,6 +634,7 @@ __all__ = [
     "mla_kv_cache_transfer_reference",
     "mla_kv_pack_quantize_fp8_reference",
     "mla_prefill_fp8_reference",
+    "mla_reference",
     "mla_rope_quantize_fp8_reference",
     "moe_align_block_size_buffer_dims",
     "moe_align_block_size_reference",

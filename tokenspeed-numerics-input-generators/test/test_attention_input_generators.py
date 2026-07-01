@@ -95,6 +95,7 @@ from tokenspeed_numerics_input_generators import (
     gdn_qkv_split_reference,
     mla_kv_pack_quantize_fp8_reference,
     mla_prefill_fp8_reference,
+    mla_reference,
     packed_qkv_complex_rotary_reference,
 )
 
@@ -3095,6 +3096,50 @@ def test_mla_prefill_generator_allows_independent_q_and_kv_lengths() -> None:
     assert inputs.metadata.cu_seqlens_kv_cpu[-1] == 15
 
 
+def test_mla_reference_prefill_supports_grouped_kv_heads() -> None:
+    values = MLAInputs(
+        _mla_config(
+            batch_size=2,
+            total_cached_tokens=0,
+            total_new_q_tokens=6,
+            num_q_heads=4,
+            num_kv_heads=2,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=2,
+            kv_lora_rank=8,
+            v_head_dim=5,
+            q_dtype=torch.float32,
+            cache_layout="none",
+            metadata_kwargs={"new_q_length_mode": "fixed_per_request"},
+        )
+    ).generate(metadata_seed=11, value_seed=12, device="cpu")
+
+    ref = mla_reference(values, is_causal=False)
+
+    assert values.q is not None
+    assert values.v is not None
+    assert ref.out.shape == (6, 4, 5)
+    assert ref.out.dtype == torch.float32
+    assert ref.lse.shape == (6, 4)
+    assert torch.isfinite(ref.out).all()
+    assert torch.isfinite(ref.lse).all()
+
+    req = 0
+    q_start = values.metadata.cu_seqlens_q_cpu[req]
+    q_end = values.metadata.cu_seqlens_q_cpu[req + 1]
+    kv_start = values.metadata.cu_seqlens_kv_cpu[req]
+    kv_end = values.metadata.cu_seqlens_kv_cpu[req + 1]
+    assert values.k is not None
+    k = values.k[kv_start:kv_end].repeat_interleave(2, dim=1)
+    v = values.v[kv_start:kv_end].repeat_interleave(2, dim=1)
+    scores = (
+        torch.einsum("qhd,khd->qkh", values.q[q_start:q_end], k) * values.softmax_scale
+    )
+    probs = torch.softmax(scores, dim=1)
+    expected = torch.einsum("qkh,khd->qhd", probs, v)
+    torch.testing.assert_close(ref.out[q_start:q_end], expected)
+
+
 def test_mla_paged_decode_generator_shapes() -> None:
     inputs = MLAInputs(
         _mla_config(
@@ -3127,3 +3172,61 @@ def test_mla_paged_decode_generator_shapes() -> None:
     assert inputs.cache.page_table is not None
     assert inputs.cache.page_table.shape == (3, 3)
     assert inputs.metadata.cache_seqlens.tolist() == [8, 8, 8]
+
+
+def test_mla_reference_paged_decode_shapes() -> None:
+    values = MLAInputs(
+        _mla_config(
+            batch_size=2,
+            total_cached_tokens=10,
+            total_new_q_tokens=2,
+            num_q_heads=4,
+            qk_nope_head_dim=8,
+            qk_rope_head_dim=4,
+            kv_lora_rank=12,
+            v_head_dim=6,
+            q_dtype=torch.float32,
+            cache_layout="paged",
+            page_size=4,
+            indexing="identity",
+            metadata_kwargs={
+                "max_seqlen_k": 6,
+                "cached_length_mode": "regular",
+                "new_q_length_mode": "fixed_per_request",
+            },
+        )
+    ).generate(metadata_seed=13, value_seed=14, device="cpu")
+
+    ref = mla_reference(values)
+
+    assert values.q is not None
+    assert ref.out.shape == (2, 1, 4, 12)
+    assert ref.out.dtype == torch.float32
+    assert ref.lse.shape == (2, 1, 4)
+    assert torch.isfinite(ref.out).all()
+    assert torch.isfinite(ref.lse).all()
+
+
+def test_mla_reference_rejects_incompatible_prefill_heads() -> None:
+    values = MLAInputs(
+        _mla_config(
+            batch_size=1,
+            total_cached_tokens=0,
+            total_new_q_tokens=4,
+            num_q_heads=4,
+            num_kv_heads=2,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=2,
+            kv_lora_rank=8,
+            v_head_dim=5,
+            q_dtype=torch.float32,
+            cache_layout="none",
+        )
+    ).generate(metadata_seed=15, value_seed=16, device="cpu")
+    assert values.k is not None
+    assert values.v is not None
+    values.k = torch.cat((values.k, values.k[:, :1, :]), dim=1)
+    values.v = torch.cat((values.v, values.v[:, :1, :]), dim=1)
+
+    with pytest.raises(ValueError, match="divisible"):
+        mla_reference(values)

@@ -25,6 +25,12 @@ metadata and cache-layout concepts as MHA, but uses MLA-specific operand shapes:
 query-nope, query positional embedding channels, compressed KV cache contents,
 and optional new compressed KV inputs.
 
+`mla_reference` evaluates generated MLA values at the operation level. Uncached
+inputs use explicit varlen Q/K/V attention, including grouped KV heads when the
+generated head counts require expansion. Paged-cache inputs gather compressed
+cache rows through the generated page table and compute absorbed MLA decode
+outputs over the latent KV channels.
+
 ### MLA K/V Pack And FP8 Quantize
 
 `MLAKVPackQuantizeFP8Inputs` represents the utility operation that materializes
@@ -451,6 +457,9 @@ values:
 - cache configuration must match the requested cache layout
 - paged caches require consistent page-table configuration
 - MHA query heads must be compatible with KV heads for grouped attention
+- MLA prefill references require matching Q/K dimensions and compatible
+  grouped K/V heads; MLA paged-decode references require valid page-table
+  metadata and compressed cache rows with one cached KV row per logical token
 - GDN QKV split inputs require positive head counts/dimensions, a packed last
   dimension equal to `q_dim + k_dim + v_dim`, and a positive L2-normalization
   epsilon when the fused normalization path is used

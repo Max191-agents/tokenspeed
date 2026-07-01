@@ -141,6 +141,8 @@ __all__ = [
     "MLAInputConfig",
     "MLAInputValues",
     "MLAInputs",
+    "MLAReferenceValues",
+    "mla_reference",
     "PackedQKVComplexRotaryInputConfig",
     "PackedQKVComplexRotaryInputs",
     "PackedQKVComplexRotaryInputValues",
@@ -8114,6 +8116,14 @@ class MLAInputValues:
 
 
 @dataclass
+class MLAReferenceValues:
+    """Reference output tensors for ``MLAInputValues``."""
+
+    out: torch.Tensor
+    lse: torch.Tensor
+
+
+@dataclass
 class MLAInputConfig:
     """Initialization parameters for ``MLAInputs``.
 
@@ -8584,3 +8594,185 @@ class MLAInputs(NumericsInputGenerator):
 
     def _decode_qk_head_dim(self) -> int:
         return self.config.kv_lora_rank + self.config.qk_rope_head_dim
+
+
+def _apply_attention_logit_cap(scores: torch.Tensor, logit_cap: float) -> torch.Tensor:
+    logit_cap = float(logit_cap)
+    if logit_cap == 0.0:
+        return scores
+    if logit_cap < 0.0:
+        raise ValueError(f"logit_cap must be non-negative, got {logit_cap}")
+    return torch.tanh(scores / logit_cap) * logit_cap
+
+
+def _attention_output_dtype(input_dtype: torch.dtype) -> torch.dtype:
+    return torch.bfloat16 if input_dtype in _fp8_dtypes() else input_dtype
+
+
+def _expand_kv_heads_for_queries(
+    tensor: torch.Tensor,
+    *,
+    num_q_heads: int,
+    name: str,
+) -> torch.Tensor:
+    if tensor.ndim != 3:
+        raise ValueError(f"{name} must be rank-3, got {tensor.ndim}")
+    num_kv_heads = tensor.shape[1]
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_q_heads must be divisible by {name} heads; got "
+            f"{num_q_heads} and {num_kv_heads}"
+        )
+    return tensor.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+
+
+def _mla_prefill_reference(
+    values: MLAInputValues,
+    *,
+    is_causal: bool,
+    logit_cap: float,
+) -> MLAReferenceValues:
+    if values.q is None or values.k is None or values.v is None:
+        raise ValueError("MLA prefill reference requires q, k, and v tensors")
+    q = values.q
+    k = values.k
+    v = values.v
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+        raise ValueError("MLA prefill q, k, and v must be rank-3 tensors")
+    if q.shape[-1] != k.shape[-1]:
+        raise ValueError("MLA prefill q and k head dimensions must match")
+    if k.shape[:2] != v.shape[:2]:
+        raise ValueError("MLA prefill k and v token/head dimensions must match")
+    if values.softmax_scale <= 0.0:
+        raise ValueError("softmax_scale must be positive")
+    metadata = values.metadata
+    q_offsets = metadata.cu_seqlens_q_cpu
+    kv_offsets = metadata.cu_seqlens_kv_cpu
+    if len(q_offsets) != len(kv_offsets):
+        raise ValueError("MLA prefill q and kv offsets must have the same length")
+    if q_offsets[0] != 0 or kv_offsets[0] != 0:
+        raise ValueError("MLA prefill offsets must start at zero")
+    if q_offsets[-1] != q.shape[0]:
+        raise ValueError("MLA prefill q offsets must end at q token count")
+    if kv_offsets[-1] != k.shape[0]:
+        raise ValueError("MLA prefill kv offsets must end at k token count")
+
+    outputs = []
+    lses = []
+    for request_idx in range(len(q_offsets) - 1):
+        q_start, q_end = q_offsets[request_idx], q_offsets[request_idx + 1]
+        kv_start, kv_end = kv_offsets[request_idx], kv_offsets[request_idx + 1]
+        cur_s_q = q_end - q_start
+        cur_s_kv = kv_end - kv_start
+        if cur_s_q <= 0 or cur_s_kv <= 0:
+            raise ValueError("MLA prefill requests must have non-empty q and kv")
+        if is_causal and cur_s_kv < cur_s_q:
+            raise ValueError("causal MLA prefill requires kv length >= q length")
+
+        q_i = q[q_start:q_end].float()
+        k_i = _expand_kv_heads_for_queries(
+            k[kv_start:kv_end].float(),
+            num_q_heads=q.shape[1],
+            name="k",
+        )
+        v_i = _expand_kv_heads_for_queries(
+            v[kv_start:kv_end].float(),
+            num_q_heads=q.shape[1],
+            name="v",
+        )
+        scores = torch.einsum("qhd,khd->qkh", q_i, k_i) * values.softmax_scale
+        scores = _apply_attention_logit_cap(scores, logit_cap)
+        if is_causal:
+            q_idx = torch.arange(cur_s_q, device=q.device).view(-1, 1)
+            k_idx = torch.arange(cur_s_kv, device=q.device).view(1, -1)
+            offset = cur_s_kv - cur_s_q
+            mask = k_idx > q_idx + offset
+            scores = scores.masked_fill(mask.unsqueeze(-1), float("-inf"))
+        probs = torch.softmax(scores, dim=1)
+        outputs.append(torch.einsum("qkh,khd->qhd", probs, v_i))
+        lses.append(torch.logsumexp(scores, dim=1))
+    return MLAReferenceValues(
+        out=torch.cat(outputs, dim=0).to(_attention_output_dtype(q.dtype)),
+        lse=torch.cat(lses, dim=0).to(torch.float32),
+    )
+
+
+def _gather_mla_paged_cache_rows(
+    cache: MLAKVCacheValues,
+    *,
+    batch_idx: int,
+    cache_len: int,
+) -> torch.Tensor:
+    if cache.kv_cache.ndim != 4 or cache.kv_cache.shape[2] != 1:
+        raise ValueError("paged MLA cache must have shape [pages, page, 1, dim]")
+    if cache.page_table_cpu is None:
+        raise ValueError("paged MLA cache reference requires page_table_cpu")
+    if cache_len <= 0:
+        raise ValueError("MLA decode cache lengths must be positive")
+    page_size = cache.kv_cache.shape[1]
+    rows = []
+    for pos in range(cache_len):
+        page_col = pos // page_size
+        page_offset = pos % page_size
+        physical_page = cache.page_table_cpu[batch_idx][page_col]
+        rows.append(cache.kv_cache[physical_page, page_offset, 0])
+    return torch.stack(rows, dim=0)
+
+
+def _mla_decode_reference(
+    values: MLAInputValues,
+    *,
+    logit_cap: float,
+) -> MLAReferenceValues:
+    if values.q is None or values.cache is None:
+        raise ValueError("MLA decode reference requires q and cache tensors")
+    q = values.q
+    cache = values.cache
+    if q.ndim != 4:
+        raise ValueError(f"MLA decode q must be rank-4, got {q.ndim}")
+    if cache.kv_cache is None:
+        raise ValueError("MLA decode reference requires kv_cache")
+    if values.kv_lora_rank + values.qk_rope_head_dim != q.shape[-1]:
+        raise ValueError("MLA decode q last dimension does not match MLA ranks")
+    if values.kv_lora_rank <= 0:
+        raise ValueError("kv_lora_rank must be positive")
+
+    outputs = []
+    lses = []
+    cache_lens = values.metadata.cache_seqlens.detach().cpu().tolist()
+    for batch_idx, cache_len_raw in enumerate(cache_lens):
+        cache_len = int(cache_len_raw)
+        kv = _gather_mla_paged_cache_rows(
+            cache,
+            batch_idx=batch_idx,
+            cache_len=cache_len,
+        ).float()
+        q_i = q[batch_idx].float()
+        scores = torch.einsum("qhd,kd->qhk", q_i, kv) * values.softmax_scale
+        scores = _apply_attention_logit_cap(scores, logit_cap)
+        probs = torch.softmax(scores, dim=-1)
+        outputs.append(torch.einsum("qhk,kr->qhr", probs, kv[:, : values.kv_lora_rank]))
+        lses.append(torch.logsumexp(scores, dim=-1))
+    return MLAReferenceValues(
+        out=torch.stack(outputs, dim=0).to(_attention_output_dtype(q.dtype)),
+        lse=torch.stack(lses, dim=0).to(torch.float32),
+    )
+
+
+def mla_reference(
+    values: MLAInputValues,
+    *,
+    is_causal: bool = True,
+    logit_cap: float = 0.0,
+) -> MLAReferenceValues:
+    """Reference MLA output for generated prefill or paged decode inputs."""
+
+    if values.cache is None:
+        return _mla_prefill_reference(
+            values,
+            is_causal=is_causal,
+            logit_cap=logit_cap,
+        )
+    if values.cache.page_table is None:
+        raise ValueError("MLA cache reference currently requires paged cache inputs")
+    return _mla_decode_reference(values, logit_cap=logit_cap)

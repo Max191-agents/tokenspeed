@@ -20,8 +20,6 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 from tokenspeed_kernel import (
@@ -36,12 +34,17 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mha_decode_with_kvcache_kwargs,
     mha_extend_with_kvcache_kwargs,
     mha_prefill_kwargs,
+    mla_decode_with_kvcache_kwargs,
+    mla_prefill_kwargs,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
     MHAInputConfig,
     MHAInputs,
     MHARequestMetadataInputConfig,
+    MLAInputConfig,
+    MLAInputs,
+    mla_reference,
 )
 
 platform = current_platform()
@@ -87,12 +90,50 @@ def _mha_config(
     )
 
 
-def _randn(shape: tuple[int, ...], *, device: str, dtype: torch.dtype) -> torch.Tensor:
-    init_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
-    tensor = torch.randn(shape, device=device, dtype=init_dtype)
-    if dtype != init_dtype:
-        tensor = tensor.to(dtype)
-    return tensor
+def _mla_config(
+    *,
+    batch_size: int,
+    total_cached_tokens: int,
+    total_new_q_tokens: int,
+    num_q_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    v_head_dim: int,
+    q_dtype: torch.dtype,
+    cache_layout: str = "none",
+    page_size: int | None = None,
+    indexing: str | None = None,
+    metadata_kwargs: dict[str, object] | None = None,
+) -> MLAInputConfig:
+    metadata_fields = {
+        "allow_untied_non_cached_kv": True,
+        "new_q_length_mode": (
+            "fixed_per_request" if cache_layout != "none" else "ragged"
+        ),
+        **(metadata_kwargs or {}),
+    }
+    return MLAInputConfig(
+        batch_size=batch_size,
+        total_cached_tokens=total_cached_tokens,
+        total_new_q_tokens=total_new_q_tokens,
+        num_q_heads=num_q_heads,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        v_head_dim=v_head_dim,
+        q_dtype=q_dtype,
+        cache_layout=cache_layout,  # type: ignore[arg-type]
+        page_size=page_size,
+        indexing=indexing,  # type: ignore[arg-type]
+        metadata_input=MHARequestMetadataInputConfig(
+            batch_size=batch_size,
+            total_cached_tokens=total_cached_tokens,
+            total_new_q_tokens=total_new_q_tokens,
+            cache_layout=cache_layout,  # type: ignore[arg-type]
+            **metadata_fields,
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -293,67 +334,38 @@ def test_mla_prefill(
 ) -> None:
     require("attention", "mla_prefill", solution, dtype, "q")
 
-    q_lens = [853, 1045]
-    kv_lens = q_lens
-    cu_seqlens_q = torch.tensor([0, 853, 1898], device=device, dtype=torch.int32)
-    cu_seqlens_kv = cu_seqlens_q
-    init_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
-    q = torch.randn(
-        sum(q_lens), num_heads, qk_head_dim, device=device, dtype=init_dtype
-    )
-    k = torch.randn(
-        sum(kv_lens), num_heads, qk_head_dim, device=device, dtype=init_dtype
-    )
-    v = torch.randn(
-        sum(kv_lens), num_heads, v_head_dim, device=device, dtype=init_dtype
-    )
-    if dtype != init_dtype:
-        q = q.to(dtype)
-        k = k.to(dtype)
-        v = v.to(dtype)
-    softmax_scale = 1.0 / math.sqrt(qk_head_dim)
+    inputs = MLAInputs(
+        _mla_config(
+            batch_size=2,
+            total_cached_tokens=0,
+            total_new_q_tokens=1898,
+            num_q_heads=num_heads,
+            qk_nope_head_dim=qk_head_dim - 64,
+            qk_rope_head_dim=64,
+            kv_lora_rank=128,
+            v_head_dim=v_head_dim,
+            q_dtype=dtype,
+            cache_layout="none",
+            metadata_kwargs={
+                "new_q_length_mode": "regular",
+                "tie_new_kv_to_query": True,
+            },
+        )
+    ).generate(metadata_seed=301, value_seed=401, device=device)
+    ref = mla_reference(inputs, is_causal=is_causal)
 
     out, lse = mla_prefill(
-        q=q,
-        k=k,
-        v=v,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_kv=cu_seqlens_kv,
-        max_seqlen_q=max(q_lens),
-        max_seqlen_kv=max(kv_lens),
-        softmax_scale=softmax_scale,
-        is_causal=is_causal,
-        return_lse=True,
+        **mla_prefill_kwargs(inputs, is_causal=is_causal, return_lse=True),
         solution=solution,
     )
 
-    refs = []
-    ref_lses = []
-    q_offset = 0
-    kv_offset = 0
-    for q_len, kv_len in zip(q_lens, kv_lens, strict=True):
-        q_i = q[q_offset : q_offset + q_len].float()
-        k_i = k[kv_offset : kv_offset + kv_len].float()
-        v_i = v[kv_offset : kv_offset + kv_len].float()
-        scores = torch.einsum("qhd,khd->hqk", q_i, k_i) * softmax_scale
-        if is_causal:
-            q_pos = torch.arange(q_len, device=device) + max(kv_len - q_len, 0)
-            k_pos = torch.arange(kv_len, device=device)
-            mask = q_pos[:, None] >= k_pos[None, :]
-            scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
-        probs = torch.softmax(scores, dim=-1)
-        refs.append(torch.einsum("hqk,khd->qhd", probs, v_i))
-        ref_lses.append(torch.logsumexp(scores, dim=-1).transpose(0, 1))
-        q_offset += q_len
-        kv_offset += kv_len
-    out_ref = torch.cat(refs, dim=0)
-    lse_ref = torch.cat(ref_lses, dim=0)
-
-    assert out.shape == (q.shape[0], q.shape[1], v.shape[-1])
-    assert lse.shape == (q.shape[0], q.shape[1])
+    assert inputs.q is not None
+    assert inputs.v is not None
+    assert out.shape == (inputs.q.shape[0], inputs.q.shape[1], inputs.v.shape[-1])
+    assert lse.shape == (inputs.q.shape[0], inputs.q.shape[1])
     out_tol = 1e-1 if dtype in _FP8_DTYPES else 8e-2
-    torch.testing.assert_close(out.float(), out_ref, rtol=out_tol, atol=out_tol)
-    torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
+    torch.testing.assert_close(out.float(), ref.out.float(), rtol=out_tol, atol=out_tol)
+    torch.testing.assert_close(lse, ref.lse, rtol=8e-2, atol=8e-2)
 
 
 @pytest.mark.parametrize(
@@ -379,68 +391,42 @@ def test_mla_decode_with_kvcache(
     q_len = 1
     page_size = 4
     max_seqlen_k = 7
-    num_pages = 4
     qk_nope_head_dim = 128
-    qk_head_dim = kv_lora_rank + qk_rope_head_dim
-    init_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
-    q = torch.randn(
-        batch_size,
-        q_len,
-        num_heads,
-        qk_head_dim,
-        device=device,
-        dtype=init_dtype,
-    )
-    kv_cache = torch.randn(
-        num_pages,
-        page_size,
-        1,
-        qk_head_dim,
-        device=device,
-        dtype=init_dtype,
-    )
-    if dtype != init_dtype:
-        q = q.to(dtype)
-        kv_cache = kv_cache.to(dtype)
-    page_table = torch.tensor([[0, 1], [2, 3]], device=device, dtype=torch.int32)
-    cache_seqlens = torch.tensor([5, 7], device=device, dtype=torch.int32)
-    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+
+    inputs = MLAInputs(
+        _mla_config(
+            batch_size=batch_size,
+            total_cached_tokens=10,
+            total_new_q_tokens=batch_size * q_len,
+            num_q_heads=num_heads,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            v_head_dim=128,
+            q_dtype=dtype,
+            cache_layout="paged",
+            page_size=page_size,
+            indexing="identity",
+            metadata_kwargs={
+                "max_seqlen_k": max_seqlen_k,
+                "cached_length_mode": "regular",
+                "new_q_length_mode": "fixed_per_request",
+            },
+        )
+    ).generate(metadata_seed=302, value_seed=402, device=device)
+    ref = mla_reference(inputs)
 
     out, lse = mla_decode_with_kvcache(
-        q=q,
-        kv_cache=kv_cache,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        max_seqlen_k=max_seqlen_k,
-        qk_nope_head_dim=qk_nope_head_dim,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-        softmax_scale=softmax_scale,
-        return_lse=True,
+        **mla_decode_with_kvcache_kwargs(inputs, return_lse=True),
         solution=solution,
     )
 
-    refs = []
-    ref_lses = []
-    for batch_idx in range(batch_size):
-        kv_rows = []
-        for pos in range(int(cache_seqlens[batch_idx].item())):
-            page = page_table[batch_idx, pos // page_size]
-            kv_rows.append(kv_cache[page, pos % page_size, 0])
-        kv = torch.stack(kv_rows).float()
-        scores = torch.einsum("hd,kd->hk", q[batch_idx, 0].float(), kv)
-        scores = scores * softmax_scale
-        probs = torch.softmax(scores, dim=-1)
-        refs.append(torch.matmul(probs, kv[:, :kv_lora_rank]).unsqueeze(0))
-        ref_lses.append(torch.logsumexp(scores, dim=-1).unsqueeze(0))
-    out_ref = torch.stack(refs, dim=0)
-    lse_ref = torch.stack(ref_lses, dim=0)
-
+    assert inputs.q is not None
     assert out.shape == (batch_size, q_len, num_heads, kv_lora_rank)
     assert lse.shape == (batch_size, q_len, num_heads)
     out_tol = 1e-1 if dtype in _FP8_DTYPES else 8e-2
-    torch.testing.assert_close(out.float(), out_ref, rtol=out_tol, atol=out_tol)
-    torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
+    torch.testing.assert_close(out.float(), ref.out.float(), rtol=out_tol, atol=out_tol)
+    torch.testing.assert_close(lse, ref.lse, rtol=8e-2, atol=8e-2)
 
 
 @pytest.mark.parametrize(
