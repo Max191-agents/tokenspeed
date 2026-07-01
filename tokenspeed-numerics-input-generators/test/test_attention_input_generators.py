@@ -23,6 +23,8 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_numerics_input_generators import (
+    AttentionMergeStateInputConfig,
+    AttentionMergeStateInputs,
     KVCacheInput,
     KVCacheInputConfig,
     MHAInputConfig,
@@ -35,6 +37,7 @@ from tokenspeed_numerics_input_generators import (
     MHARequestMetadataInputConfig,
     PageTableInput,
     PageTableInputConfig,
+    attention_merge_state_reference,
 )
 
 
@@ -127,6 +130,79 @@ def _mla_config(
             **metadata_fields,
         ),
     )
+
+
+def test_attention_merge_state_inputs_generate_values_and_reference() -> None:
+    values = AttentionMergeStateInputs(
+        AttentionMergeStateInputConfig(
+            total_q=7,
+            num_heads=3,
+            head_dim=16,
+            dtype=torch.float32,
+            lse_bound=4.0,
+        )
+    ).generate(seed=1, device="cpu")
+
+    assert values.out_a.shape == (7, 3, 16)
+    assert values.out_b.shape == (7, 3, 16)
+    assert values.lse_a.shape == (7, 3)
+    assert values.lse_b.shape == (7, 3)
+    assert values.lse_a.dtype == torch.float32
+    assert values.lse_b.dtype == torch.float32
+    assert torch.all(values.lse_a >= -4.0)
+    assert torch.all(values.lse_a <= 4.0)
+
+    out, lse = attention_merge_state_reference(values)
+    lse_ref = torch.maximum(values.lse_a, values.lse_b)
+    weight_a = torch.exp(values.lse_a - lse_ref)
+    weight_b = torch.exp(values.lse_b - lse_ref)
+    denom = weight_a + weight_b
+    out_ref = (
+        values.out_a.float() * weight_a[..., None]
+        + values.out_b.float() * weight_b[..., None]
+    ) / denom[..., None]
+    lse_ref = lse_ref + torch.log(denom)
+
+    torch.testing.assert_close(out.float(), out_ref)
+    torch.testing.assert_close(lse, lse_ref)
+
+
+def test_attention_merge_state_inputs_support_log2_lse_scale() -> None:
+    values = AttentionMergeStateInputs(
+        AttentionMergeStateInputConfig(
+            total_q=5,
+            num_heads=2,
+            head_dim=8,
+            dtype=torch.float32,
+            lse_scale_log2=1.0,
+        )
+    ).generate(seed=2, device="cpu")
+
+    out, lse = attention_merge_state_reference(values)
+    lse_ref = torch.maximum(values.lse_a, values.lse_b)
+    weight_a = torch.exp2(values.lse_a - lse_ref)
+    weight_b = torch.exp2(values.lse_b - lse_ref)
+    denom = weight_a + weight_b
+    out_ref = (
+        values.out_a.float() * weight_a[..., None]
+        + values.out_b.float() * weight_b[..., None]
+    ) / denom[..., None]
+    lse_ref = lse_ref + torch.log2(denom)
+
+    torch.testing.assert_close(out.float(), out_ref)
+    torch.testing.assert_close(lse, lse_ref)
+
+
+def test_attention_merge_state_rejects_invalid_config() -> None:
+    with pytest.raises(ValueError, match="lse_scale_log2"):
+        AttentionMergeStateInputs(
+            AttentionMergeStateInputConfig(
+                total_q=7,
+                num_heads=3,
+                head_dim=16,
+                lse_scale_log2=0.0,
+            )
+        )
 
 
 def test_page_table_input_generates_identity_and_random_indexing() -> None:

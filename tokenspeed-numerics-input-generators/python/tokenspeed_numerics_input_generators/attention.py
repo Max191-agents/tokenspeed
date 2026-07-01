@@ -52,7 +52,11 @@ from tokenspeed_numerics_input_generators.core import (
 )
 
 __all__ = [
+    "AttentionMergeStateInputConfig",
+    "AttentionMergeStateInputs",
+    "AttentionMergeStateInputValues",
     "attention_generate",
+    "attention_merge_state_reference",
     "MHAInputConfig",
     "MHAInputValues",
     "MHAInputs",
@@ -76,6 +80,14 @@ def _check_nonnegative(name: str, value: int) -> int:
     if value < 0:
         raise ValueError(f"{name} must be non-negative, got {value}")
     return value
+
+
+def _check_float_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"{name} must be a torch.dtype")
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise ValueError(f"{name} must be a regular floating torch dtype, got {dtype}")
+    return dtype
 
 
 def _check_cache_layout(value: str) -> CacheLayout:
@@ -153,6 +165,12 @@ def _resolve_attention_seeds(
     assert metadata_seed is not None
     assert value_seed is not None
     return metadata_seed, value_seed
+
+
+def _require_tensor(values: torch.Tensor | None, name: str) -> torch.Tensor:
+    if values is None:
+        raise ValueError(f"{name} generation unexpectedly returned None")
+    return values
 
 
 def _generate_optional_tensor(
@@ -246,6 +264,186 @@ def attention_generate(
         sinks=sinks,
         cache=cache,
     )
+
+
+@dataclass
+class AttentionMergeStateInputValues:
+    """Generated values for merging two partial attention states."""
+
+    out_a: torch.Tensor
+    lse_a: torch.Tensor
+    out_b: torch.Tensor
+    lse_b: torch.Tensor
+    lse_scale_log2: float
+
+
+@dataclass
+class AttentionMergeStateInputConfig:
+    """Initialization parameters for attention merge-state inputs.
+
+    The represented operation merges two partial attention outputs and their
+    log-sum-exp values into one equivalent state. ``lse_scale_log2`` converts
+    the LSE inputs into log2 space before the numerically stable merge.
+    """
+
+    # Required: total query rows being merged.
+    total_q: int
+
+    # Required: number of attention heads.
+    num_heads: int
+
+    # Required: per-head output dimension.
+    head_dim: int
+
+    # Optional: generated dtype for partial output tensors.
+    dtype: torch.dtype = torch.bfloat16
+
+    # Optional: scalar that maps input LSE values to log2 space. The default
+    # corresponds to natural-log LSE inputs.
+    lse_scale_log2: float = math.log2(math.e)
+
+    # Optional: generated LSE values are sampled from [-lse_bound, lse_bound].
+    lse_bound: float = 6.0
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class AttentionMergeStateInputs(NumericsInputGenerator):
+    """Generator for attention merge-state inputs."""
+
+    config: AttentionMergeStateInputConfig
+    out_a_input: TensorInput | None
+    out_b_input: TensorInput | None
+
+    def __init__(self, config: AttentionMergeStateInputConfig) -> None:
+        self.config = config
+        self.out_a_input = None
+        self.out_b_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.total_q = _check_nonnegative("total_q", self.config.total_q)
+        self.config.num_heads = _check_positive("num_heads", self.config.num_heads)
+        self.config.head_dim = _check_positive("head_dim", self.config.head_dim)
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        if self.config.lse_scale_log2 <= 0.0:
+            raise ValueError(
+                f"lse_scale_log2 must be positive, got {self.config.lse_scale_log2}"
+            )
+        if self.config.lse_bound <= 0.0:
+            raise ValueError(f"lse_bound must be positive, got {self.config.lse_bound}")
+        output_shape = (
+            self.config.total_q,
+            self.config.num_heads,
+            self.config.head_dim,
+        )
+        self.out_a_input = self.out_a_input or TensorInput(
+            output_shape,
+            self.config.dtype,
+            device=self.config.device,
+        )
+        self.out_b_input = self.out_b_input or TensorInput(
+            output_shape,
+            self.config.dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> AttentionMergeStateInputValues:
+        del metadata_seed
+        self.__post_init__()
+        if self.out_a_input is None or self.out_b_input is None:
+            raise ValueError(
+                "AttentionMergeStateInputs child generators must be initialized"
+            )
+        target_device = _resolve_device(self.config.device, device)
+        lse_generator = torch.Generator(
+            device="cuda" if target_device.type == "cuda" else "cpu"
+        ).manual_seed(_child_seed(seed, 3))
+        lse_shape = (self.config.total_q, self.config.num_heads)
+        lse_a = (
+            torch.rand(
+                lse_shape,
+                dtype=torch.float32,
+                device=target_device,
+                generator=lse_generator,
+            )
+            * (2.0 * self.config.lse_bound)
+            - self.config.lse_bound
+        )
+        lse_b = (
+            torch.rand(
+                lse_shape,
+                dtype=torch.float32,
+                device=target_device,
+                generator=lse_generator,
+            )
+            * (2.0 * self.config.lse_bound)
+            - self.config.lse_bound
+        )
+        return AttentionMergeStateInputValues(
+            out_a=_require_tensor(
+                self.out_a_input.generate(
+                    seed=_child_seed(seed, 1), device=device
+                ).values,
+                "out_a",
+            ).contiguous(),
+            lse_a=lse_a.contiguous(),
+            out_b=_require_tensor(
+                self.out_b_input.generate(
+                    seed=_child_seed(seed, 2), device=device
+                ).values,
+                "out_b",
+            ).contiguous(),
+            lse_b=lse_b.contiguous(),
+            lse_scale_log2=float(self.config.lse_scale_log2),
+        )
+
+
+def attention_merge_state_reference(
+    values: AttentionMergeStateInputValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the merged partial attention output and LSE state."""
+
+    if values.out_a.shape != values.out_b.shape:
+        raise ValueError(
+            f"out_a/out_b shape mismatch: {tuple(values.out_a.shape)} vs {tuple(values.out_b.shape)}"
+        )
+    if values.out_a.ndim != 3:
+        raise ValueError(f"out tensors must be rank 3, got {values.out_a.ndim}")
+    expected_lse_shape = values.out_a.shape[:2]
+    if (
+        values.lse_a.shape != expected_lse_shape
+        or values.lse_b.shape != expected_lse_shape
+    ):
+        raise ValueError(
+            "lse tensors must match out tensor leading dimensions; "
+            f"expected {tuple(expected_lse_shape)}, "
+            f"got {tuple(values.lse_a.shape)} and {tuple(values.lse_b.shape)}"
+        )
+    if values.lse_scale_log2 <= 0.0:
+        raise ValueError(
+            f"lse_scale_log2 must be positive, got {values.lse_scale_log2}"
+        )
+    lse_a_log2 = values.lse_a.to(torch.float32) * values.lse_scale_log2
+    lse_b_log2 = values.lse_b.to(torch.float32) * values.lse_scale_log2
+    lse_max_log2 = torch.maximum(lse_a_log2, lse_b_log2)
+    weight_a = torch.exp2(lse_a_log2 - lse_max_log2)
+    weight_b = torch.exp2(lse_b_log2 - lse_max_log2)
+    denom = weight_a + weight_b
+    out = (
+        values.out_a.to(torch.float32) * weight_a[..., None]
+        + values.out_b.to(torch.float32) * weight_b[..., None]
+    ) / denom[..., None]
+    lse = (lse_max_log2 + torch.log2(denom)) / values.lse_scale_log2
+    return out.to(values.out_a.dtype), lse
 
 
 @dataclass

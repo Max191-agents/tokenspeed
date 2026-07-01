@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import (
+    attn_merge_state,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_prefill,
@@ -37,11 +38,14 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mha_prefill_kwargs,
 )
 from tokenspeed_numerics_input_generators import (
+    AttentionMergeStateInputConfig,
+    AttentionMergeStateInputs,
     MHAInputConfig,
     MHAInputs,
     MLAInputConfig,
     MLAInputs,
     MHARequestMetadataInputConfig,
+    attention_merge_state_reference,
 )
 
 
@@ -126,6 +130,38 @@ def _mla_config(
             **metadata_fields,
         ),
     )
+
+
+def test_attention_merge_state_generator_runs_triton_kernel(
+    device: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    solution = "triton"
+    require("attention", "attn_merge_state", solution, dtype, "out_a")
+
+    values = AttentionMergeStateInputs(
+        AttentionMergeStateInputConfig(
+            total_q=31,
+            num_heads=8,
+            head_dim=64,
+            dtype=dtype,
+        )
+    ).generate(seed=301, device=device)
+    expected_out, expected_lse = attention_merge_state_reference(values)
+
+    out, lse = attn_merge_state(
+        values.out_a,
+        values.lse_a,
+        values.out_b,
+        values.lse_b,
+        lse_scale_log2=values.lse_scale_log2,
+        solution=solution,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out.float(), expected_out.float(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, expected_lse, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("solution", ["triton", "gluon"])

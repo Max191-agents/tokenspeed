@@ -41,12 +41,16 @@ from tokenspeed_numerics_input_generators.activation import (
     SigmoidMulInputValues,
 )
 from tokenspeed_numerics_input_generators.attention import (
+    AttentionMergeStateInputConfig,
+    AttentionMergeStateInputs,
+    AttentionMergeStateInputValues,
     MHAInputConfig,
     MHAInputs,
     MHAInputValues,
     MLAInputConfig,
     MLAInputs,
     MLAInputValues,
+    attention_merge_state_reference,
 )
 from tokenspeed_numerics_input_generators.attention_cache import (
     AttentionCacheInput,
@@ -180,6 +184,9 @@ __all__ = [
     "AllReduceInputConfig",
     "AllReduceInputValues",
     "AllReduceInputs",
+    "AttentionMergeStateInputConfig",
+    "AttentionMergeStateInputValues",
+    "AttentionMergeStateInputs",
     "ArgmaxInputConfig",
     "ArgmaxInputValues",
     "ArgmaxInputs",
@@ -276,6 +283,7 @@ __all__ = [
     "argmax_reference",
     "all_gather_reference",
     "all_reduce_sum_reference",
+    "attention_merge_state_reference",
     "build_rope_cos_sin_cache",
     "fp8_quantization_reference",
     "fp8_kv_cache_write_reference",
