@@ -35,7 +35,10 @@ from tokenspeed_numerics_input_generators import (
     MLAKVPackQuantizeFP8InputConfig,
     MLAKVPackQuantizeFP8Inputs,
     MLAKVPackQuantizeFP8InputValues,
+    MLAPrefillFP8InputConfig,
+    MLAPrefillFP8Inputs,
     mla_kv_pack_quantize_fp8_reference,
+    mla_prefill_fp8_reference,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -314,6 +317,59 @@ def test_kernel_tokenspeed_mla_prefill_binary_e2e(
         torch.testing.assert_close(
             actual_lse.float(), expected_lse.float(), atol=tolerance, rtol=1e-5
         )
+
+
+def test_kernel_tokenspeed_mla_prefill_binary_uses_generator(
+    device: str,
+    monkeypatch,
+) -> None:
+    _require_mla_binary_prefill()
+
+    import tokenspeed_mla.mla_prefill as mla_prefill
+
+    monkeypatch.setattr(mla_prefill, "_PREFILL_BACKEND_ENV", "binary")
+    mla_prefill._resolve_backend.cache_clear()
+
+    values = MLAPrefillFP8Inputs(
+        MLAPrefillFP8InputConfig(
+            batch_size=3,
+            total_tokens=192,
+            num_heads=8,
+            qk_head_dim=QK_NOPE + QK_ROPE,
+            v_head_dim=V_HEAD,
+            source_dtype=torch.bfloat16,
+            length_mode="fixed_per_request",
+        )
+    ).generate(seed=30, metadata_seed=31, device=device)
+    expected = mla_prefill_fp8_reference(values, is_causal=True)
+
+    try:
+        actual, actual_lse = kernel_mla.tokenspeed_mla_prefill(
+            values.query,
+            values.key,
+            values.value,
+            values.metadata.cache_seqlens,
+            values.metadata.cu_seqlens_kv,
+            values.metadata.resolved_max_seqlen_k,
+            batch_size=len(values.metadata.visible_kv_lens_cpu),
+            softmax_scale=values.softmax_scale,
+            is_causal=True,
+            return_lse=True,
+            cum_seq_lens_q=values.metadata.cu_seqlens_q,
+            max_seq_len_q=values.metadata.max_seqlen_q,
+        )
+    finally:
+        mla_prefill._resolve_backend.cache_clear()
+    torch.cuda.synchronize()
+
+    assert actual.shape == expected.out.shape
+    assert actual.dtype == expected.out.dtype
+    torch.testing.assert_close(
+        actual.float(), expected.out.float(), atol=0.25, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        actual_lse.float(), expected.lse.float(), atol=0.25, rtol=1e-5
+    )
 
 
 def test_pure_cast_strided_inputs(device: str) -> None:

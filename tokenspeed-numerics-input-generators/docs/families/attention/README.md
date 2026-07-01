@@ -16,6 +16,8 @@ compressed/cache-specific representations with different per-token shapes.
   partial attention results.
 - `MLAKVPackQuantizeFP8Inputs`: generates MLA KV pack and FP8 quantization
   inputs.
+- `MLAPrefillFP8Inputs`: generates varlen FP8 Q/K/V tensors and tied prefill
+  request metadata for MLA prefill attention.
 - `GDNQKVSplitInputs`: generates packed QKV inputs for split operations.
 - `GDNChunkPrefillInputs`: generates Gated DeltaNet chunked-prefill tensors,
   log-space gates, recurrent state, and sequence metadata.
