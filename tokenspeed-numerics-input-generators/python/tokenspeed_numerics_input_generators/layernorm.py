@@ -18,7 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Layernorm-family input generators for numerical correctness tests."""
+"""Layernorm-family input generators for numerical correctness tests.
+
+This family covers RMSNorm-style operations. RMSNorm normalizes each row by
+``rsqrt(mean(x * x) + eps)`` and then applies a learned multiplicative weight.
+The residual variant first forms ``x + residual`` and returns both the
+normalized output and that residual sum. Q/K RMSNorm applies the same reduction
+independently to each attention head, using ``head_dim`` as the reduction
+width. The fused Q/K RMSNorm + RoPE + gate operation additionally splits
+``q_gate`` into per-head ``[q | gate]`` values, normalizes q and k, applies
+rotary embedding to the first ``rotary_dim`` channels of each normalized head,
+and copies the gate half through unchanged.
+"""
 
 from __future__ import annotations
 

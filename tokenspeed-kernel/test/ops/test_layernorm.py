@@ -8,9 +8,19 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     rmsnorm,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_numerics_input_generators import (
+    FusedQKRMSNormRopeGateInputConfig,
+    FusedQKRMSNormRopeGateInputs,
+    QKRMSNormInputConfig,
+    QKRMSNormInputs,
+    RMSNormInputConfig,
+    RMSNormInputs,
+    fused_qk_rmsnorm_rope_gate_reference,
+    qk_rmsnorm_reference,
+    rmsnorm_reference,
+)
 
 platform = current_platform()
-torch.manual_seed(42)
 
 pytestmark = pytest.mark.skipif(
     not (platform.is_nvidia or platform.is_amd),
@@ -21,16 +31,19 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [128, 2880])
 def test_rmsnorm(dtype: torch.dtype, hidden_size: int, device: str) -> None:
-    num_tokens = 7
     eps = 1e-6
-    x = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
-    weight = torch.randn(hidden_size, device=device, dtype=torch.float32)
+    values = RMSNormInputs(
+        RMSNormInputConfig(
+            num_tokens=7,
+            hidden_dim=hidden_size,
+            dtype=dtype,
+            eps=eps,
+        )
+    ).generate(seed=41, device=device)
 
-    out = rmsnorm(x, weight, eps)
+    out = rmsnorm(values.x, values.weight, eps)
+    ref = rmsnorm_reference(values.x, values.weight, eps)
 
-    x_float = x.to(torch.float32)
-    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
@@ -39,29 +52,33 @@ def test_rmsnorm(dtype: torch.dtype, hidden_size: int, device: str) -> None:
 def test_rmsnorm_with_residual(
     dtype: torch.dtype, hidden_size: int, device: str
 ) -> None:
-    num_tokens = 7
     eps = 1e-6
-    x = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
-    residual = torch.randn(num_tokens, hidden_size, device=device, dtype=dtype)
-    weight = torch.randn(hidden_size, device=device, dtype=torch.float32)
+    values = RMSNormInputs(
+        RMSNormInputConfig(
+            num_tokens=7,
+            hidden_dim=hidden_size,
+            dtype=dtype,
+            eps=eps,
+            with_residual=True,
+        )
+    ).generate(seed=42, device=device)
+    assert values.residual is not None
 
-    out, residual_out = rmsnorm(x, weight, eps, residual=residual)
+    out, residual_out = rmsnorm(
+        values.x,
+        values.weight,
+        eps,
+        residual=values.residual,
+    )
+    ref, ref_residual = rmsnorm_reference(
+        values.x,
+        values.weight,
+        eps,
+        residual=values.residual,
+    )
 
-    x_float = x.to(torch.float32) + residual.to(torch.float32)
-    ref_residual = x_float.to(dtype)
-    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(residual_out, ref_residual, atol=2e-2, rtol=2e-2)
-
-
-def _gemma_ref(
-    x: torch.Tensor, w: torch.Tensor, head_dim: int, eps: float, dtype: torch.dtype
-) -> torch.Tensor:
-    x_by_head = x.reshape(-1, head_dim).to(torch.float32)
-    variance = x_by_head.pow(2).mean(dim=-1, keepdim=True)
-    out = x_by_head * torch.rsqrt(variance + eps) * (1.0 + w)
-    return out.to(dtype).view(x.shape)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -78,135 +95,82 @@ def test_qk_rmsnorm_gemma_weight_matches_two_calls(
     head_dim: int,
     device: str,
 ) -> None:
-    num_tokens = 17
     eps = 1e-6
-    q = torch.randn(num_tokens, num_q_heads * head_dim, device=device, dtype=dtype)
-    k = torch.randn(num_tokens, num_kv_heads * head_dim, device=device, dtype=dtype)
-    q_weight = torch.randn(head_dim, device=device, dtype=torch.float32) * 0.1
-    k_weight = torch.randn(head_dim, device=device, dtype=torch.float32) * 0.1
-    q_gemma_weight = q_weight + 1.0
-    k_gemma_weight = k_weight + 1.0
+    values = QKRMSNormInputs(
+        QKRMSNormInputConfig(
+            num_tokens=17,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            eps=eps,
+        )
+    ).generate(seed=num_q_heads * 1000 + num_kv_heads * 100 + head_dim, device=device)
 
-    q_out, k_out = qk_rmsnorm(q, k, q_gemma_weight, k_gemma_weight, eps)
+    q_out, k_out = qk_rmsnorm(
+        values.q,
+        values.k,
+        values.q_weight,
+        values.k_weight,
+        eps,
+    )
+    q_ref, k_ref = qk_rmsnorm_reference(
+        values.q,
+        values.k,
+        values.q_weight,
+        values.k_weight,
+        eps,
+        head_dim=head_dim,
+    )
 
-    torch.testing.assert_close(
-        q_out, _gemma_ref(q, q_weight, head_dim, eps, dtype), atol=2e-2, rtol=2e-2
-    )
-    torch.testing.assert_close(
-        k_out, _gemma_ref(k, k_weight, head_dim, eps, dtype), atol=2e-2, rtol=2e-2
-    )
+    torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=2e-2)
 
 
 def test_qk_rmsnorm_gemma_weight_strided_qkv_split(device: str) -> None:
     """Runtime path: q and k arrive as strided views from a packed qkv split.
     The kernel's stride-aware addressing must handle the non-contiguous
     leading-axis case without needing a ``.contiguous()`` copy."""
-    num_tokens = 19
     num_q_heads, num_kv_heads, head_dim = 16, 2, 256
-    q_size = num_q_heads * head_dim
-    kv_size = num_kv_heads * head_dim
     dtype = torch.bfloat16
     eps = 1e-6
-
-    qkv = torch.randn(num_tokens, q_size + 2 * kv_size, device=device, dtype=dtype)
-    q, k, _v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    values = QKRMSNormInputs(
+        QKRMSNormInputConfig(
+            num_tokens=19,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            eps=eps,
+            input_layout="qkv_split",
+        )
+    ).generate(seed=43, device=device)
+    assert values.qkv_storage is not None
     # Sanity: the views must share storage with qkv and be non-contiguous so we
     # actually exercise the strided path.
-    assert q.data_ptr() == qkv.data_ptr()
-    assert q.stride(0) == qkv.stride(0)
-    assert not q.is_contiguous()
-    assert not k.is_contiguous()
+    assert values.q.data_ptr() == values.qkv_storage.data_ptr()
+    assert values.q.stride(0) == values.qkv_storage.stride(0)
+    assert not values.q.is_contiguous()
+    assert not values.k.is_contiguous()
 
-    q_weight = torch.randn(head_dim, device=device, dtype=torch.float32) * 0.1
-    k_weight = torch.randn(head_dim, device=device, dtype=torch.float32) * 0.1
-    q_gemma_weight = q_weight + 1.0
-    k_gemma_weight = k_weight + 1.0
-
-    q_out, k_out = qk_rmsnorm(q, k, q_gemma_weight, k_gemma_weight, eps)
-
-    torch.testing.assert_close(
-        q_out, _gemma_ref(q, q_weight, head_dim, eps, dtype), atol=2e-2, rtol=2e-2
+    q_out, k_out = qk_rmsnorm(
+        values.q,
+        values.k,
+        values.q_weight,
+        values.k_weight,
+        eps,
     )
-    torch.testing.assert_close(
-        k_out, _gemma_ref(k, k_weight, head_dim, eps, dtype), atol=2e-2, rtol=2e-2
-    )
-
-
-def _build_rope_cache(
-    rotary_dim: int, max_pos: int, base: float, device: str
-) -> torch.Tensor:
-    """Mirror tokenspeed.runtime.layers.rotary_embedding._compute_cos_sin_cache."""
-    inv_freq = 1.0 / (
-        base
-        ** (
-            torch.arange(0, rotary_dim, 2, dtype=torch.float, device=device)
-            / rotary_dim
-        )
-    )
-    t = torch.arange(max_pos, dtype=torch.float, device=device)
-    freqs = torch.einsum("i,j -> ij", t, inv_freq)
-    # Per-position layout: [cos(rotary_dim/2), sin(rotary_dim/2)] — total rotary_dim.
-    return torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
-
-
-def _ref_qk_rmsnorm_rope_gate(
-    q_gate: torch.Tensor,
-    k: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    positions: torch.Tensor,
-    eps: float,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    rotary_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pure-PyTorch reference matching unfused (split → qk_rmsnorm → apply_rope).
-
-    Mirrors the bf16 round-trips at the same boundaries as the production path:
-      1. GemmaRMSNorm computes fp32 then stores bf16  (qk_rmsnorm output)
-      2. RoPE reads bf16, computes fp32, stores bf16  (apply_rope_with_cos_sin_cache_inplace)
-    """
-    dtype = q_gate.dtype
-    n_tokens = q_gate.shape[0]
-
-    # 1. Split q_gate into q and gate per head.
-    q_gate_3d = q_gate.view(n_tokens, num_q_heads, 2 * head_dim)
-    q, gate = torch.chunk(q_gate_3d, 2, dim=-1)
-    q = q.reshape(n_tokens, num_q_heads * head_dim).contiguous()
-    gate = gate.reshape(n_tokens, num_q_heads * head_dim).contiguous()
-
-    # 2. GemmaRMSNorm over the full head_dim, with weight already +1.
-    def _rmsnorm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        x_h = x.reshape(-1, head_dim).to(torch.float32)
-        var = x_h.pow(2).mean(dim=-1, keepdim=True)
-        return (x_h * torch.rsqrt(var + eps) * w).to(dtype).view(x.shape)
-
-    q_normed = _rmsnorm(q, q_weight)
-    k_normed = _rmsnorm(k, k_weight)
-
-    # 3. Partial RoPE on the first rotary_dim elements of each head.
-    half_rotary = rotary_dim // 2
-    cos = cos_sin_cache[positions, :half_rotary].unsqueeze(1).to(torch.float32)
-    sin = (
-        cos_sin_cache[positions, half_rotary:rotary_dim].unsqueeze(1).to(torch.float32)
+    q_ref, k_ref = qk_rmsnorm_reference(
+        values.q,
+        values.k,
+        values.q_weight,
+        values.k_weight,
+        eps,
+        head_dim=head_dim,
     )
 
-    def _apply_partial_rope(x: torch.Tensor, num_heads: int) -> torch.Tensor:
-        x_h = x.reshape(n_tokens, num_heads, head_dim).to(torch.float32)
-        x1 = x_h[..., :half_rotary]
-        x2 = x_h[..., half_rotary:rotary_dim]
-        o1 = x1 * cos - x2 * sin
-        o2 = x2 * cos + x1 * sin
-        out = x_h.clone()
-        out[..., :half_rotary] = o1
-        out[..., half_rotary:rotary_dim] = o2
-        return out.reshape(n_tokens, num_heads * head_dim).to(dtype)
-
-    q_out = _apply_partial_rope(q_normed, num_q_heads)
-    k_out = _apply_partial_rope(k_normed, num_kv_heads)
-    return q_out, k_out, gate
+    torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -236,30 +200,30 @@ def test_fused_qk_rmsnorm_rope_gate_matches_reference(
     cos/sin cache reads on Qwen3.5 (rotary_dim=64, head_dim=256), tanking
     the MTP speculative-decode acceptance rate.
     """
-    num_tokens = 23
     eps = 1e-6
-    max_pos = 1024
-
-    q_gate = torch.randn(
-        num_tokens, num_q_heads * 2 * head_dim, device=device, dtype=dtype
+    config = FusedQKRMSNormRopeGateInputConfig(
+        num_tokens=23,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        max_position=1024,
+        dtype=dtype,
+        eps=eps,
     )
-    k = torch.randn(num_tokens, num_kv_heads * head_dim, device=device, dtype=dtype)
-    q_weight = torch.randn(head_dim, device=device, dtype=torch.float32) * 0.1
-    k_weight = torch.randn(head_dim, device=device, dtype=torch.float32) * 0.1
-    q_gemma_weight = q_weight + 1.0
-    k_gemma_weight = k_weight + 1.0
-    cos_sin_cache = _build_rope_cache(rotary_dim, max_pos, base=10000.0, device=device)
-    positions = torch.randint(
-        0, max_pos, (num_tokens,), device=device, dtype=torch.int64
+    values = FusedQKRMSNormRopeGateInputs(config).generate(
+        seed=num_q_heads * 1000 + num_kv_heads * 100 + head_dim + rotary_dim,
+        metadata_seed=45,
+        device=device,
     )
 
     q_out, k_out, gate_out = fused_qk_rmsnorm_rope_gate(
-        q_gate,
-        k,
-        q_gemma_weight,
-        k_gemma_weight,
-        cos_sin_cache,
-        positions,
+        values.q_gate,
+        values.k,
+        values.q_weight,
+        values.k_weight,
+        values.cos_sin_cache,
+        values.positions,
         eps,
         num_q_heads,
         num_kv_heads,
@@ -267,18 +231,18 @@ def test_fused_qk_rmsnorm_rope_gate_matches_reference(
         rotary_dim,
     )
 
-    q_ref, k_ref, gate_ref = _ref_qk_rmsnorm_rope_gate(
-        q_gate,
-        k,
-        q_gemma_weight,
-        k_gemma_weight,
-        cos_sin_cache,
-        positions,
+    q_ref, k_ref, gate_ref = fused_qk_rmsnorm_rope_gate_reference(
+        values.q_gate,
+        values.k,
+        values.q_weight,
+        values.k_weight,
+        values.cos_sin_cache,
+        values.positions,
         eps,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        rotary_dim,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
     )
 
     torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
@@ -291,21 +255,25 @@ def test_fused_qk_rmsnorm_rope_gate_empty(device: str) -> None:
     """Zero-token batch returns correctly shaped empty tensors without launching."""
     head_dim, rotary_dim = 256, 64
     num_q_heads, num_kv_heads = 4, 1
-    q_gate = torch.empty(
-        0, num_q_heads * 2 * head_dim, device=device, dtype=torch.bfloat16
-    )
-    k = torch.empty(0, num_kv_heads * head_dim, device=device, dtype=torch.bfloat16)
-    weight = torch.ones(head_dim, device=device, dtype=torch.float32)
-    cos_sin_cache = _build_rope_cache(rotary_dim, 16, base=10000.0, device=device)
-    positions = torch.empty(0, device=device, dtype=torch.int64)
+    values = FusedQKRMSNormRopeGateInputs(
+        FusedQKRMSNormRopeGateInputConfig(
+            num_tokens=0,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            rotary_dim=rotary_dim,
+            max_position=16,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=46, metadata_seed=47, device=device)
 
     q_out, k_out, gate_out = fused_qk_rmsnorm_rope_gate(
-        q_gate,
-        k,
-        weight,
-        weight,
-        cos_sin_cache,
-        positions,
+        values.q_gate,
+        values.k,
+        values.q_weight,
+        values.k_weight,
+        values.cos_sin_cache,
+        values.positions,
         1e-6,
         num_q_heads,
         num_kv_heads,
@@ -324,26 +292,25 @@ def test_fused_qk_rmsnorm_rope_gate_rejects_invalid_rotary_dim(
     """rotary_dim must be a positive even integer <= head_dim."""
     head_dim = 64
     num_q_heads, num_kv_heads, n = 2, 1, 3
-    q_gate = torch.randn(
-        n, num_q_heads * 2 * head_dim, device=device, dtype=torch.bfloat16
-    )
-    k = torch.randn(n, num_kv_heads * head_dim, device=device, dtype=torch.bfloat16)
-    weight = torch.ones(head_dim, device=device, dtype=torch.float32)
-    cos_sin_cache = _build_rope_cache(
-        max(2, bad_rotary_dim if bad_rotary_dim > 0 else 2),
-        16,
-        base=10000.0,
-        device=device,
-    )
-    positions = torch.zeros(n, device=device, dtype=torch.int64)
+    values = FusedQKRMSNormRopeGateInputs(
+        FusedQKRMSNormRopeGateInputConfig(
+            num_tokens=n,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            rotary_dim=head_dim,
+            max_position=16,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=49, metadata_seed=50, device=device)
     with pytest.raises(ValueError, match="rotary_dim"):
         fused_qk_rmsnorm_rope_gate(
-            q_gate,
-            k,
-            weight,
-            weight,
-            cos_sin_cache,
-            positions,
+            values.q_gate,
+            values.k,
+            values.q_weight,
+            values.k_weight,
+            values.cos_sin_cache,
+            values.positions,
             1e-6,
             num_q_heads,
             num_kv_heads,
@@ -353,17 +320,19 @@ def test_fused_qk_rmsnorm_rope_gate_rejects_invalid_rotary_dim(
 
 
 def test_rmsnorm_inplace(device: str) -> None:
-    num_tokens = 7
-    hidden_size = 128
     eps = 1e-6
-    x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16)
-    x_ref = x.clone()
-    weight = torch.randn(hidden_size, device=device, dtype=torch.float32)
+    values = RMSNormInputs(
+        RMSNormInputConfig(
+            num_tokens=7,
+            hidden_dim=128,
+            dtype=torch.bfloat16,
+            eps=eps,
+        )
+    ).generate(seed=48, device=device)
+    x_ref = values.x.clone()
 
-    out = rmsnorm(x, weight, eps, out=x)
+    out = rmsnorm(values.x, values.weight, eps, out=values.x)
+    ref = rmsnorm_reference(x_ref, values.weight, eps)
 
-    x_float = x_ref.to(torch.float32)
-    variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-    ref = (x_float * torch.rsqrt(variance + eps) * weight).to(torch.bfloat16)
-    assert out.data_ptr() == x.data_ptr()
+    assert out.data_ptr() == values.x.data_ptr()
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
