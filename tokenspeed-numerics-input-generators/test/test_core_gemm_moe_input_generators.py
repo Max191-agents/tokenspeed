@@ -33,6 +33,9 @@ from tokenspeed_numerics_input_generators import (
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
+    MoESoftmaxTopKRoutingInputConfig,
+    MoESoftmaxTopKRoutingInputs,
+    MoESoftmaxTopKRoutingInputValues,
     NVFP4GemmSwiGLUNVFP4QuantInputConfig,
     NVFP4GemmSwiGLUNVFP4QuantInputs,
     TensorInput,
@@ -42,6 +45,7 @@ from tokenspeed_numerics_input_generators import (
     moe_align_block_size_buffer_dims,
     moe_align_block_size_reference,
     moe_reference,
+    moe_softmax_topk_routing_reference,
     mxfp4_gemm_input_config,
     mxint4_gemm_input_config,
     nvfp4_dequantization_reference,
@@ -1129,6 +1133,91 @@ def test_moe_inputs_verify_child_gemm_shapes() -> None:
                 ),
             )
         )
+
+
+def test_moe_softmax_topk_routing_inputs_generate_values_and_reference() -> None:
+    values = MoESoftmaxTopKRoutingInputs(
+        MoESoftmaxTopKRoutingInputConfig(
+            num_tokens=3,
+            num_experts=8,
+            num_experts_real=6,
+            top_k=4,
+            scaling_factor=2.0,
+        )
+    ).generate(seed=51, device="cpu")
+
+    ref = moe_softmax_topk_routing_reference(values)
+
+    assert values.logits.shape == (3, 8)
+    assert values.logits.dtype == torch.float32
+    assert values.correction_bias.shape == (8,)
+    assert values.topk_indices.shape == (3, 4)
+    assert values.topk_indices.dtype == torch.int32
+    assert values.topk_weights.shape == (3, 4)
+    assert values.topk_weights.dtype == torch.float32
+    assert ref.topk_indices.shape == (3, 4)
+    assert ref.topk_weights.shape == (3, 4)
+    assert torch.all(ref.topk_indices[:, 0] == -1)
+    assert torch.all(ref.topk_weights >= 0.0)
+    assert torch.isfinite(ref.topk_weights).all()
+
+
+def test_moe_softmax_topk_routing_reference_handles_renormalization() -> None:
+    values = MoESoftmaxTopKRoutingInputValues(
+        logits=torch.tensor([[0.0, 1.0, -1.0, 0.5]], dtype=torch.float32),
+        correction_bias=torch.tensor([0.0, 1.0, 0.0, 3.0], dtype=torch.float32),
+        topk_indices=torch.empty((1, 2), dtype=torch.int64),
+        topk_weights=torch.empty((1, 2), dtype=torch.float32),
+        num_experts_real=3,
+        scaling_factor=6.0,
+        renormalize=True,
+    )
+
+    ref = moe_softmax_topk_routing_reference(values)
+    probs = torch.softmax(values.logits, dim=-1)
+    selected = probs[:, [3, 1]]
+    expected_weights = selected / selected.sum(dim=-1, keepdim=True) * 6.0
+
+    torch.testing.assert_close(
+        ref.topk_indices,
+        torch.tensor([[-1, 1]], dtype=torch.int64),
+    )
+    torch.testing.assert_close(ref.topk_weights, expected_weights)
+
+
+def test_moe_softmax_topk_routing_verifies_config_and_values() -> None:
+    with pytest.raises(ValueError, match="num_experts_real must be < num_experts"):
+        MoESoftmaxTopKRoutingInputs(
+            MoESoftmaxTopKRoutingInputConfig(
+                num_tokens=3,
+                num_experts=8,
+                num_experts_real=8,
+                top_k=2,
+            )
+        )
+
+    with pytest.raises(ValueError, match="topk_indices_dtype"):
+        MoESoftmaxTopKRoutingInputs(
+            MoESoftmaxTopKRoutingInputConfig(
+                num_tokens=3,
+                num_experts=8,
+                num_experts_real=6,
+                top_k=2,
+                topk_indices_dtype=torch.float32,
+            )
+        )
+
+    values = MoESoftmaxTopKRoutingInputValues(
+        logits=torch.zeros((2, 4), dtype=torch.float32),
+        correction_bias=torch.zeros((3,), dtype=torch.float32),
+        topk_indices=torch.empty((2, 2), dtype=torch.int32),
+        topk_weights=torch.empty((2, 2), dtype=torch.float32),
+        num_experts_real=3,
+        scaling_factor=1.0,
+        renormalize=False,
+    )
+    with pytest.raises(ValueError, match="one value per expert"):
+        moe_softmax_topk_routing_reference(values)
 
 
 def test_moe_align_block_size_inputs_generate_topk_ids() -> None:

@@ -49,6 +49,23 @@ flattened token-expert slots by expert, and pads each expert group to a multiple
 of `block_size`. The output metadata identifies which flattened token slots are
 processed by each expert-local GEMM block.
 
+`MoESoftmaxTopKRoutingInputs` generates inputs for a router operation that
+converts router logits to probabilities, selects experts using a correction
+bias, and emits top-k expert ids and route weights. The operation is:
+
+1. `probs = softmax(logits, dim=-1)`.
+2. Select top-k expert ids from `probs + correction_bias`.
+3. Gather output weights from the original `probs`, not the biased scores.
+4. Optionally renormalize selected weights by their selected-weight sum.
+5. Multiply selected weights by `scaling_factor`.
+6. Replace selected expert ids greater than or equal to `num_experts_real` with
+   `-1` to represent padded zero experts.
+
+The generated correction bias can intentionally force a padded expert into the
+selected top-k set. That gives consumers coverage for both ordinary expert
+selection and zero-expert masking without making the generator depend on any
+particular fused routing kernel.
+
 ## References
 
 `moe_reference` implements the routed layer computation for generated MoE
@@ -71,6 +88,11 @@ semantics directly:
 `canonicalize_moe_align_block_size` packs those outputs into a deterministic
 comparison tensor while ignoring intra-block ordering differences that can arise
 from parallel implementations.
+
+`moe_softmax_topk_routing_reference` implements the softmax, correction-bias
+selection, optional selected-weight renormalization, scaling, and padded-expert
+masking semantics described above. Ties are resolved by selecting the smaller
+expert id first so reference output is deterministic.
 
 ## TokenSpeed API Mapping
 
@@ -103,6 +125,13 @@ those bytes into checkpoint-style int32 words, attach the BF16 scale tensors to
 the runtime weight module, and let `moe_process_weights` handle backend block
 layout conversion and scale interleaving.
 
+The CUDA `routing_flash` helper maps directly to
+`MoESoftmaxTopKRoutingInputs`: generated `logits`, `correction_bias`, output
+buffers, `num_experts_real`, `scaling_factor`, and `renormalize` become the
+helper arguments. The generator keeps the routing operation independent of that
+helper's supported expert counts and extension-loading details; those remain
+adapter/test concerns.
+
 ## Verification
 
 MoE configs verify token counts, hidden/intermediate widths, expert counts,
@@ -115,3 +144,9 @@ finite, non-negative, duplicate-free per token, and normalized across each
 token's selected experts. The align-block-size reference also checks that
 provided top-k ids are rank-2 and within `[0, num_experts)`, so invalid routing
 metadata fails before reaching a kernel adapter.
+
+Softmax top-k routing verifies that logits and correction bias are finite FP32
+tensors with matching expert width, output buffers are rank-2 with matching
+token/top-k shape, output indices use `torch.int32` or `torch.int64`, output
+weights use FP32, `num_experts_real` identifies a proper prefix of real experts,
+and `scaling_factor` is positive and finite.

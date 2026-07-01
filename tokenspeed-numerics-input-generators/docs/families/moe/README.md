@@ -12,6 +12,9 @@ route weights.
   per-expert activation scales for quantized projection inputs.
 - `MoeAlignBlockSizeInputs`: generates top-k expert ids and block-size metadata
   for expert-local token grouping and padding.
+- `MoESoftmaxTopKRoutingInputs`: generates FP32 router logits, correction bias,
+  and output buffers for softmax/correction-bias top-k routing with padded
+  zero-expert masking.
 
 `MoeInputs` composes the GEMM generator for expert weights. Dense, MXFP4, and
 MXINT4 expert weights are operation-level choices; backend preprocessing such
@@ -31,5 +34,10 @@ MXINT4 MoE weights are generated as packed signed INT4 bytes with BF16 group
 scales. Backend adapters can repack those bytes into checkpoint or block-major
 layouts without changing the operation-level generator contract.
 
-The generator intentionally describes the layer-level routed computation rather
-than any one fused MoE kernel signature.
+Softmax top-k routing values describe the standalone router operation used to
+produce selected expert ids and scaled route weights. Expert ids greater than
+or equal to `num_experts_real` are generated and referenced as padded experts
+that map to `-1` in the output ids.
+
+These generators intentionally describe operation-level routed computations
+rather than any one fused MoE kernel signature.

@@ -34,9 +34,12 @@ from tokenspeed_numerics_input_generators import (
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
+    MoESoftmaxTopKRoutingInputConfig,
+    MoESoftmaxTopKRoutingInputs,
     canonicalize_moe_align_block_size,
     moe_align_block_size_reference,
     moe_reference,
+    moe_softmax_topk_routing_reference,
 )
 
 
@@ -140,6 +143,48 @@ def test_moe_align_block_size_numerics_adapter_uses_generator() -> None:
         canonicalize_moe_align_block_size(ref, block_size=values.block_size),
         atol=0,
         rtol=0,
+    )
+
+
+def test_moe_softmax_topk_routing_generator_runs_cuda_helper() -> None:
+    platform = current_platform()
+    if not torch.cuda.is_available() or not platform.is_nvidia:
+        pytest.skip("routing_flash compatibility test requires an NVIDIA CUDA GPU")
+
+    from tokenspeed_kernel.thirdparty.cuda import routing_flash
+
+    values = MoESoftmaxTopKRoutingInputs(
+        MoESoftmaxTopKRoutingInputConfig(
+            num_tokens=8,
+            num_experts=384,
+            num_experts_real=256,
+            top_k=12,
+            scaling_factor=6.0,
+            renormalize=False,
+        )
+    ).generate(seed=45, device="cuda")
+    expected = moe_softmax_topk_routing_reference(values)
+
+    try:
+        routing_flash(
+            values.logits,
+            values.correction_bias,
+            values.topk_indices,
+            values.topk_weights,
+            values.num_experts_real,
+            values.scaling_factor,
+            values.renormalize,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"routing_flash extension unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(values.topk_indices, expected.topk_indices)
+    torch.testing.assert_close(
+        values.topk_weights,
+        expected.topk_weights,
+        rtol=1.0e-3,
+        atol=8.0e-2,
     )
 
 

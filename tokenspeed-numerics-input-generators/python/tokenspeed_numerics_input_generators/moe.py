@@ -50,6 +50,10 @@ __all__ = [
     "MoeAlignBlockSizeInputs",
     "MoeAlignBlockSizeInputValues",
     "MoeAlignBlockSizeReferenceValues",
+    "MoESoftmaxTopKRoutingInputConfig",
+    "MoESoftmaxTopKRoutingInputs",
+    "MoESoftmaxTopKRoutingInputValues",
+    "MoESoftmaxTopKRoutingReferenceValues",
     "MoeInputConfig",
     "MoeInputValues",
     "MoeInputs",
@@ -57,6 +61,7 @@ __all__ = [
     "moe_align_block_size_buffer_dims",
     "moe_align_block_size_reference",
     "moe_reference",
+    "moe_softmax_topk_routing_reference",
 ]
 
 
@@ -88,6 +93,13 @@ def _check_positive_finite_float(name: str, value: float) -> float:
     return value
 
 
+def _check_nonnegative(name: str, value: int) -> int:
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
+    return value
+
+
 @dataclass
 class MoeAlignBlockSizeInputValues:
     """Generated values for ``MoeAlignBlockSizeInputs``."""
@@ -104,6 +116,27 @@ class MoeAlignBlockSizeReferenceValues:
     sorted_token_ids: torch.Tensor
     expert_ids: torch.Tensor
     num_tokens_post_pad: torch.Tensor
+
+
+@dataclass
+class MoESoftmaxTopKRoutingInputValues:
+    """Generated values for softmax/bias top-k MoE routing."""
+
+    logits: torch.Tensor
+    correction_bias: torch.Tensor
+    topk_indices: torch.Tensor
+    topk_weights: torch.Tensor
+    num_experts_real: int
+    scaling_factor: float
+    renormalize: bool
+
+
+@dataclass
+class MoESoftmaxTopKRoutingReferenceValues:
+    """Reference outputs for softmax/bias top-k MoE routing."""
+
+    topk_indices: torch.Tensor
+    topk_weights: torch.Tensor
 
 
 @dataclass
@@ -140,6 +173,45 @@ class MoeAlignBlockSizeInputConfig:
     topk_ids_dtype: torch.dtype = torch.int32
 
     # Optional: generation device for top-k ids.
+    device: DeviceLike = None
+
+
+@dataclass
+class MoESoftmaxTopKRoutingInputConfig:
+    """Initialization parameters for softmax/bias top-k MoE routing.
+
+    The represented operation computes probabilities from router logits,
+    selects experts by adding a correction bias to those probabilities, and
+    emits selected expert ids plus route weights from the original softmax
+    probabilities. Expert ids greater than or equal to ``num_experts_real`` are
+    masked to ``-1`` to model padded zero experts.
+    """
+
+    # Required: number of token rows to route.
+    num_tokens: int
+
+    # Required: total experts including padded/zero experts.
+    num_experts: int
+
+    # Required: number of real experts before the padded zero-expert range.
+    num_experts_real: int
+
+    # Required: number of selected experts per token.
+    top_k: int
+
+    # Optional: generated output index dtype.
+    topk_indices_dtype: torch.dtype = torch.int32
+
+    # Optional: multiply selected route weights by this positive scalar.
+    scaling_factor: float = 1.0
+
+    # Optional: renormalize selected probabilities before scaling.
+    renormalize: bool = False
+
+    # Optional: bias at least one padded expert into the selected top-k set.
+    include_zero_expert_selection: bool = True
+
+    # Optional: generated tensor device override.
     device: DeviceLike = None
 
 
@@ -195,6 +267,100 @@ class MoeAlignBlockSizeInputs(NumericsInputGenerator):
         )
 
 
+@dataclass(init=False)
+class MoESoftmaxTopKRoutingInputs(NumericsInputGenerator):
+    """Input generator for softmax/bias top-k MoE routing."""
+
+    config: MoESoftmaxTopKRoutingInputConfig
+
+    def __init__(self, config: MoESoftmaxTopKRoutingInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.num_experts = int(self.config.num_experts)
+        self.config.num_experts_real = int(self.config.num_experts_real)
+        self.config.top_k = int(self.config.top_k)
+        if self.config.num_experts <= 0:
+            raise ValueError("num_experts must be positive")
+        if self.config.num_experts_real <= 0:
+            raise ValueError("num_experts_real must be positive")
+        if self.config.num_experts_real >= self.config.num_experts:
+            raise ValueError("num_experts_real must be < num_experts")
+        if self.config.top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if self.config.top_k > self.config.num_experts:
+            raise ValueError("top_k must be <= num_experts")
+        if self.config.topk_indices_dtype not in (torch.int32, torch.int64):
+            raise ValueError("topk_indices_dtype must be torch.int32 or torch.int64")
+        self.config.scaling_factor = _check_positive_finite_float(
+            "scaling_factor", self.config.scaling_factor
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> MoESoftmaxTopKRoutingInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=rng_device).manual_seed(seed)
+        logits = (
+            torch.randn(
+                (self.config.num_tokens, self.config.num_experts),
+                dtype=torch.float32,
+                device=target_device,
+                generator=generator,
+            )
+            * 0.25
+        )
+        correction_bias = torch.zeros(
+            (self.config.num_experts,),
+            dtype=torch.float32,
+            device=target_device,
+        )
+        preferred = self._preferred_experts()
+        for rank, expert in enumerate(preferred):
+            correction_bias[expert] = float(len(preferred) - rank)
+        topk_indices = torch.full(
+            (self.config.num_tokens, self.config.top_k),
+            -1,
+            dtype=self.config.topk_indices_dtype,
+            device=target_device,
+        )
+        topk_weights = torch.zeros(
+            (self.config.num_tokens, self.config.top_k),
+            dtype=torch.float32,
+            device=target_device,
+        )
+        values = MoESoftmaxTopKRoutingInputValues(
+            logits=logits.contiguous(),
+            correction_bias=correction_bias.contiguous(),
+            topk_indices=topk_indices,
+            topk_weights=topk_weights,
+            num_experts_real=self.config.num_experts_real,
+            scaling_factor=self.config.scaling_factor,
+            renormalize=self.config.renormalize,
+        )
+        _validate_moe_softmax_topk_routing_values(values)
+        return values
+
+    def _preferred_experts(self) -> list[int]:
+        candidates: list[int] = []
+        if self.config.include_zero_expert_selection:
+            candidates.append(self.config.num_experts_real)
+        candidates.extend(range(self.config.num_experts_real))
+        candidates.extend(
+            range(self.config.num_experts_real + 1, self.config.num_experts)
+        )
+        return candidates[: self.config.top_k]
+
+
 def _validate_moe_align_block_size_values(
     values: MoeAlignBlockSizeInputValues,
 ) -> None:
@@ -212,6 +378,54 @@ def _validate_moe_align_block_size_values(
         raise ValueError("topk_ids must be non-negative")
     if values.topk_ids.max().item() >= values.num_experts:
         raise ValueError("topk_ids must be less than num_experts")
+
+
+def _validate_moe_softmax_topk_routing_values(
+    values: MoESoftmaxTopKRoutingInputValues,
+) -> None:
+    if values.logits.ndim != 2:
+        raise ValueError("logits must be rank-2")
+    if values.correction_bias.ndim != 1:
+        raise ValueError("correction_bias must be rank-1")
+    if values.logits.dtype != torch.float32:
+        raise TypeError(f"logits must use torch.float32, got {values.logits.dtype}")
+    if values.correction_bias.dtype != torch.float32:
+        raise TypeError(
+            f"correction_bias must use torch.float32, got {values.correction_bias.dtype}"
+        )
+    num_tokens, num_experts = values.logits.shape
+    if values.correction_bias.shape != (num_experts,):
+        raise ValueError("correction_bias must have one value per expert")
+    if values.topk_indices.ndim != 2:
+        raise ValueError("topk_indices must be rank-2")
+    if values.topk_weights.ndim != 2:
+        raise ValueError("topk_weights must be rank-2")
+    if values.topk_indices.shape != values.topk_weights.shape:
+        raise ValueError("topk_indices and topk_weights must have matching shapes")
+    if values.topk_indices.shape[0] != num_tokens:
+        raise ValueError("topk output rows must match logits rows")
+    top_k = values.topk_indices.shape[1]
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if top_k > num_experts:
+        raise ValueError("top_k must be <= num_experts")
+    if values.topk_indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError("topk_indices must use torch.int32 or torch.int64")
+    if values.topk_weights.dtype != torch.float32:
+        raise TypeError("topk_weights must use torch.float32")
+    if values.logits.device != values.correction_bias.device:
+        raise ValueError("logits and correction_bias must share device")
+    if values.topk_indices.device != values.logits.device:
+        raise ValueError("topk_indices must share device with logits")
+    if values.topk_weights.device != values.logits.device:
+        raise ValueError("topk_weights must share device with logits")
+    if values.num_experts_real <= 0 or values.num_experts_real >= num_experts:
+        raise ValueError("num_experts_real must be in [1, num_experts)")
+    _check_positive_finite_float("scaling_factor", values.scaling_factor)
+    if not torch.isfinite(values.logits).all():
+        raise ValueError("logits must be finite")
+    if not torch.isfinite(values.correction_bias).all():
+        raise ValueError("correction_bias must be finite")
 
 
 def moe_align_block_size_buffer_dims(
@@ -738,6 +952,46 @@ def _moe_topk_from_router_logits(
     topk_weights, topk_ids = torch.topk(scores, k=top_k, dim=-1, sorted=False)
     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
     return topk_weights.to(dtype), topk_ids.to(torch.int32)
+
+
+def moe_softmax_topk_routing_reference(
+    values: MoESoftmaxTopKRoutingInputValues,
+) -> MoESoftmaxTopKRoutingReferenceValues:
+    """Reference implementation for softmax/bias top-k MoE routing."""
+
+    _validate_moe_softmax_topk_routing_values(values)
+    probs = torch.softmax(values.logits.float(), dim=-1)
+    selection_scores = probs + values.correction_bias.reshape(1, -1)
+    top_k = values.topk_indices.shape[1]
+    out_indices = torch.empty_like(values.topk_indices)
+    out_weights = torch.empty_like(values.topk_weights)
+    scores_cpu = selection_scores.detach().cpu()
+    probs_cpu = probs.detach().cpu()
+    for row_idx in range(scores_cpu.shape[0]):
+        ordered = sorted(
+            range(scores_cpu.shape[1]),
+            key=lambda expert: (-float(scores_cpu[row_idx, expert]), expert),
+        )[:top_k]
+        selected_probs = torch.tensor(
+            [float(probs_cpu[row_idx, expert]) for expert in ordered],
+            dtype=torch.float32,
+            device=values.logits.device,
+        )
+        if values.renormalize:
+            selected_probs = selected_probs / (selected_probs.sum() + 1.0e-10)
+        indices = [
+            -1 if expert >= values.num_experts_real else expert for expert in ordered
+        ]
+        out_indices[row_idx] = torch.tensor(
+            indices,
+            dtype=values.topk_indices.dtype,
+            device=values.logits.device,
+        )
+        out_weights[row_idx] = selected_probs * float(values.scaling_factor)
+    return MoESoftmaxTopKRoutingReferenceValues(
+        topk_indices=out_indices,
+        topk_weights=out_weights,
+    )
 
 
 def _moe_weight_operand(
