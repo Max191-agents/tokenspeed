@@ -84,6 +84,13 @@ satisfy the operation-level constraints documented for that generator. In other
 words, correctness tests should get well-formed inputs by construction as long
 as they use the generator API.
 
+The verification standard is misuse resistance, not exhaustive defensive
+programming. It should be difficult to call a generator in a way that produces
+broken tensors, inconsistent metadata, unsupported dtype combinations, or
+operation inputs with no valid mathematical interpretation. That confidence is
+one of the reasons to use the generator library instead of ad hoc tensor setup
+inside each test.
+
 Verification belongs at the same semantic level as generation. It should check
 shape relationships, datatype compatibility, required metadata, cache/page
 constraints, scale requirements, and other invariants that define whether the
