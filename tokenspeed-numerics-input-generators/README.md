@@ -84,11 +84,15 @@ constraints documented for that generator. Correctness tests should get
 well-formed inputs by construction as long as they stay inside the public
 generator API.
 
-That makes the generator library the trust boundary for input validity.
-Consumers may still check implementation-specific ABI details, but they should
-not need to rediscover whether an operation-family config is coherent, whether
-metadata can describe a valid computation, or whether generated tensors satisfy
-generic shape and dtype relationships.
+That makes the generator library the trust boundary for input validity. The
+goal is confidence by construction: a consumer that uses the public input
+generator API should be able to assume that generated shapes, dtypes, metadata,
+scales, routing state, cache state, and index structures are internally
+coherent for the operation being represented. Consumers may still check
+implementation-specific ABI details, but they should not need to rediscover
+whether an operation-family config is coherent, whether metadata can describe a
+valid computation, or whether generated tensors satisfy generic shape and dtype
+relationships.
 
 Verification is therefore part of the public contract, not an optional debug
 aid. Configs should reject impossible or contradictory operation descriptions
