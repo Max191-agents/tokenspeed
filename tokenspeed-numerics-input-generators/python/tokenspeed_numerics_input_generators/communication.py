@@ -44,6 +44,10 @@ __all__ = [
     "AllReduceInputConfig",
     "AllReduceInputs",
     "AllReduceInputValues",
+    "DPSamplingInputConfig",
+    "DPSamplingInputs",
+    "DPSamplingInputValues",
+    "DPSamplingReferenceValues",
     "ExpertParallelDispatchRecord",
     "ExpertParallelRoutingInputConfig",
     "ExpertParallelRoutingInputs",
@@ -55,6 +59,9 @@ __all__ = [
     "all_gather_reference",
     "all_reduce_residual_rmsnorm_reference",
     "all_reduce_sum_reference",
+    "dp_sampling_gather_reference",
+    "dp_sampling_reference",
+    "dp_sampling_swap_reference",
     "expert_parallel_routing_reference",
     "reduce_scatter_sum_reference",
 ]
@@ -65,6 +72,7 @@ _REGULAR_FLOAT_DTYPES = {
     torch.float32,
     torch.float64,
 }
+_DP_SAMPLING_LOGITS_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
 _TOPK_ID_DTYPES = {torch.int32, torch.int64}
 
 
@@ -93,6 +101,15 @@ def _check_float_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
 def _check_topk_id_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
     if dtype not in _TOPK_ID_DTYPES:
         raise ValueError(f"{name} must be an integer routing dtype, got {dtype}")
+    return dtype
+
+
+def _check_dp_sampling_logits_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+    if dtype not in _DP_SAMPLING_LOGITS_DTYPES:
+        raise ValueError(
+            f"{name} must be one of {sorted(str(d) for d in _DP_SAMPLING_LOGITS_DTYPES)}, "
+            f"got {dtype}"
+        )
     return dtype
 
 
@@ -199,6 +216,48 @@ def _generate_topk_weights(
         generator=generator,
     )
     return (weights / weights.sum(dim=-1, keepdim=True)).contiguous()
+
+
+def _generate_dp_sampling_verify_outputs(
+    *,
+    reqs_per_rank: int,
+    num_tokens_per_request: int,
+    vocab_size: int,
+    seed: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    predict = torch.randint(
+        0,
+        vocab_size,
+        (reqs_per_rank, num_tokens_per_request),
+        dtype=torch.int32,
+        generator=generator,
+    )
+    accept_length = torch.randint(
+        0,
+        num_tokens_per_request + 1,
+        (reqs_per_rank,),
+        dtype=torch.int32,
+        generator=generator,
+    )
+    accept_index = torch.full(
+        (reqs_per_rank, num_tokens_per_request),
+        -1,
+        dtype=torch.int32,
+    )
+    for local_req, length in enumerate(accept_length.tolist()):
+        if length > 0:
+            accept_index[local_req, :length] = torch.arange(
+                local_req * num_tokens_per_request,
+                local_req * num_tokens_per_request + length,
+                dtype=torch.int32,
+            )
+    return (
+        predict.to(device=device).contiguous(),
+        accept_index.to(device=device).contiguous(),
+        accept_length.to(device=device).contiguous(),
+    )
 
 
 def _generate_tensor(
@@ -337,6 +396,32 @@ class ExpertParallelRoutingReferenceValues:
 
 
 @dataclass
+class DPSamplingInputValues:
+    """Generated values for batch-DP sampling communication.
+
+    ``local_logits[rank]`` is that rank's full padded-batch logits for its
+    local vocabulary shard, shaped ``[pad_batch_size * N, vocab_size / world]``.
+    The verify tensors are rank-local request shards shaped by
+    ``reqs_per_rank = pad_batch_size / world_size``.
+    """
+
+    local_logits: list[torch.Tensor]
+    predict_local: list[torch.Tensor]
+    accept_index_local: list[torch.Tensor]
+    accept_length_local: list[torch.Tensor]
+
+
+@dataclass
+class DPSamplingReferenceValues:
+    """Reference outputs for ``DPSamplingInputs`` communication transforms."""
+
+    swapped_logits: list[torch.Tensor]
+    predict: torch.Tensor
+    accept_index: torch.Tensor
+    accept_length: torch.Tensor
+
+
+@dataclass
 class AllReduceInputConfig:
     """Initialization parameters for sum all-reduce inputs.
 
@@ -428,6 +513,37 @@ class ExpertParallelRoutingInputConfig:
 
     # Optional: generated top-k id dtype.
     topk_ids_dtype: torch.dtype = torch.int64
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class DPSamplingInputConfig:
+    """Initialization parameters for batch-DP sampling communication inputs.
+
+    Batch-DP sampling starts with vocabulary-sharded logits on every rank and
+    redistributes them so each rank owns a request shard with full vocabulary
+    logits. After speculative verification, rank-local verify outputs are
+    gathered back into rank-major full padded-batch tensors.
+    """
+
+    # Required: number of tensor-parallel ranks participating in communication.
+    world_size: int
+
+    # Required: padded request count. Must be divisible by ``world_size``.
+    pad_batch_size: int
+
+    # Required: number of speculative/verify token positions per request.
+    num_tokens_per_request: int
+
+    # Required: padded communication vocabulary size. Must be divisible by
+    # ``world_size``.
+    vocab_size: int
+
+    # Optional: generated logits dtype. Matches the TokenSpeed one-sided kernel
+    # support surface.
+    logits_dtype: torch.dtype = torch.bfloat16
 
     # Optional: generated tensor device override.
     device: DeviceLike = None
@@ -657,6 +773,80 @@ class ExpertParallelRoutingInputs(NumericsInputGenerator):
             expert_outputs=expert_outputs,
             tokens_per_rank=tokens_per_rank,
             num_experts=self.config.num_experts,
+        )
+
+
+@dataclass(init=False)
+class DPSamplingInputs(NumericsInputGenerator):
+    """Generator for batch-DP sampling swap/gather communication inputs."""
+
+    config: DPSamplingInputConfig
+
+    def __init__(self, config: DPSamplingInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.world_size = _check_positive("world_size", self.config.world_size)
+        self.config.pad_batch_size = _check_positive(
+            "pad_batch_size", self.config.pad_batch_size
+        )
+        self.config.num_tokens_per_request = _check_positive(
+            "num_tokens_per_request", self.config.num_tokens_per_request
+        )
+        self.config.vocab_size = _check_positive("vocab_size", self.config.vocab_size)
+        if self.config.pad_batch_size % self.config.world_size != 0:
+            raise ValueError("pad_batch_size must be divisible by world_size")
+        if self.config.vocab_size % self.config.world_size != 0:
+            raise ValueError("vocab_size must be divisible by world_size")
+        self.config.logits_dtype = _check_dp_sampling_logits_dtype(
+            "logits_dtype", self.config.logits_dtype
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> DPSamplingInputValues:
+        self.__post_init__()
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        target_device = _resolve_device(self.config.device, device)
+        reqs_per_rank = self.config.pad_batch_size // self.config.world_size
+        v_local = self.config.vocab_size // self.config.world_size
+        local_logits = [
+            _generate_tensor(
+                shape=(
+                    self.config.pad_batch_size * self.config.num_tokens_per_request,
+                    v_local,
+                ),
+                dtype=self.config.logits_dtype,
+                seed=_child_seed(seed, rank + 1),
+                device=target_device,
+                configured_device=self.config.device,
+            )
+            for rank in range(self.config.world_size)
+        ]
+        predict_local: list[torch.Tensor] = []
+        accept_index_local: list[torch.Tensor] = []
+        accept_length_local: list[torch.Tensor] = []
+        for rank in range(self.config.world_size):
+            predict, accept_index, accept_length = _generate_dp_sampling_verify_outputs(
+                reqs_per_rank=reqs_per_rank,
+                num_tokens_per_request=self.config.num_tokens_per_request,
+                vocab_size=self.config.vocab_size,
+                seed=_child_seed(metadata_base_seed, rank + 1),
+                device=target_device,
+            )
+            predict_local.append(predict)
+            accept_index_local.append(accept_index)
+            accept_length_local.append(accept_length)
+        return DPSamplingInputValues(
+            local_logits=local_logits,
+            predict_local=predict_local,
+            accept_index_local=accept_index_local,
+            accept_length_local=accept_length_local,
         )
 
 
@@ -1111,6 +1301,151 @@ def expert_parallel_routing_reference(
         recv_expert_outputs=recv_expert_outputs,
         num_recv_tokens_per_expert=per_expert_counts,
         combined_outputs=[output.contiguous() for output in combined_outputs],
+    )
+
+
+def _validate_dp_sampling_values(
+    values: DPSamplingInputValues,
+) -> tuple[int, int, int, int, torch.device]:
+    world_size = len(values.local_logits)
+    if world_size == 0:
+        raise ValueError("local_logits must be non-empty")
+    if (
+        len(values.predict_local) != world_size
+        or len(values.accept_index_local) != world_size
+        or len(values.accept_length_local) != world_size
+    ):
+        raise ValueError("all DP sampling per-rank inputs must match world_size")
+    first_logits = values.local_logits[0]
+    if first_logits.ndim != 2:
+        raise ValueError("local_logits entries must be rank-2")
+    dtype = first_logits.dtype
+    _check_dp_sampling_logits_dtype("local_logits dtype", dtype)
+    device = first_logits.device
+    rows = int(first_logits.shape[0])
+    v_local = int(first_logits.shape[1])
+    if rows <= 0 or v_local <= 0:
+        raise ValueError("local_logits dimensions must be positive")
+
+    reqs_per_rank: int | None = None
+    num_tokens_per_request: int | None = None
+    for rank in range(world_size):
+        logits = values.local_logits[rank]
+        predict = values.predict_local[rank]
+        accept_index = values.accept_index_local[rank]
+        accept_length = values.accept_length_local[rank]
+        if logits.shape != first_logits.shape:
+            raise ValueError("all local_logits tensors must have the same shape")
+        if logits.dtype != dtype or logits.device != device:
+            raise ValueError("all local_logits tensors must share dtype and device")
+        if predict.ndim != 2 or accept_index.ndim != 2:
+            raise ValueError("predict_local and accept_index_local must be rank-2")
+        if accept_length.ndim != 1:
+            raise ValueError("accept_length_local must be rank-1")
+        if predict.shape != accept_index.shape:
+            raise ValueError(f"predict/accept_index shape mismatch on rank {rank}")
+        if predict.shape[0] != accept_length.shape[0]:
+            raise ValueError(f"accept_length shape mismatch on rank {rank}")
+        if reqs_per_rank is None:
+            reqs_per_rank = int(predict.shape[0])
+            num_tokens_per_request = int(predict.shape[1])
+            if reqs_per_rank <= 0 or num_tokens_per_request <= 0:
+                raise ValueError("verify-output dimensions must be positive")
+            expected_rows = world_size * reqs_per_rank * num_tokens_per_request
+            if rows != expected_rows:
+                raise ValueError(
+                    "local_logits rows must equal "
+                    "world_size * reqs_per_rank * num_tokens_per_request; "
+                    f"rows={rows}, expected={expected_rows}"
+                )
+        elif predict.shape != (reqs_per_rank, num_tokens_per_request):
+            raise ValueError("all verify-output tensors must have the same shape")
+        if predict.dtype != torch.int32:
+            raise ValueError("predict_local tensors must use torch.int32")
+        if accept_index.dtype != torch.int32:
+            raise ValueError("accept_index_local tensors must use torch.int32")
+        if accept_length.dtype != torch.int32:
+            raise ValueError("accept_length_local tensors must use torch.int32")
+        if (
+            predict.device != device
+            or accept_index.device != device
+            or accept_length.device != device
+        ):
+            raise ValueError("all DP sampling tensors must be on the same device")
+
+        vocab_size = world_size * v_local
+        if predict.numel() > 0:
+            if predict.min().item() < 0 or predict.max().item() >= vocab_size:
+                raise ValueError("predict_local token ids must be within vocab_size")
+        if accept_index.numel() > 0:
+            max_local_index = reqs_per_rank * num_tokens_per_request
+            if accept_index.min().item() < -1:
+                raise ValueError("accept_index_local entries must be >= -1")
+            if accept_index.max().item() >= max_local_index:
+                raise ValueError(
+                    "accept_index_local entries must index the rank-local "
+                    "flattened prediction buffer"
+                )
+        if accept_length.numel() > 0:
+            if accept_length.min().item() < 0:
+                raise ValueError("accept_length_local entries must be non-negative")
+            if accept_length.max().item() > num_tokens_per_request:
+                raise ValueError("accept_length_local entries must be <= N")
+            valid_counts = (accept_index >= 0).sum(dim=1).to(torch.int32)
+            if not torch.equal(valid_counts, accept_length):
+                raise ValueError(
+                    "accept_length_local must match non-negative accept_index counts"
+                )
+    assert reqs_per_rank is not None
+    assert num_tokens_per_request is not None
+    return world_size, reqs_per_rank, num_tokens_per_request, v_local, device
+
+
+def dp_sampling_swap_reference(values: DPSamplingInputValues) -> list[torch.Tensor]:
+    """Return per-rank full-vocabulary request shards after DP logits swap."""
+
+    world_size, reqs_per_rank, num_tokens_per_request, v_local, _ = (
+        _validate_dp_sampling_values(values)
+    )
+    reshaped_logits = [
+        logits.view(world_size, reqs_per_rank, num_tokens_per_request, v_local)
+        for logits in values.local_logits
+    ]
+    swapped: list[torch.Tensor] = []
+    for dst_rank in range(world_size):
+        rank_shards = [logits[dst_rank] for logits in reshaped_logits]
+        rank_full_vocab = torch.cat(rank_shards, dim=-1)
+        swapped.append(
+            rank_full_vocab.contiguous().view(
+                reqs_per_rank * num_tokens_per_request,
+                world_size * v_local,
+            )
+        )
+    return swapped
+
+
+def dp_sampling_gather_reference(
+    values: DPSamplingInputValues,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return full padded-batch verify outputs in source-rank order."""
+
+    _validate_dp_sampling_values(values)
+    return (
+        torch.cat(values.predict_local, dim=0).contiguous(),
+        torch.cat(values.accept_index_local, dim=0).contiguous(),
+        torch.cat(values.accept_length_local, dim=0).contiguous(),
+    )
+
+
+def dp_sampling_reference(values: DPSamplingInputValues) -> DPSamplingReferenceValues:
+    """Return both DP sampling communication reference transforms."""
+
+    predict, accept_index, accept_length = dp_sampling_gather_reference(values)
+    return DPSamplingReferenceValues(
+        swapped_logits=dp_sampling_swap_reference(values),
+        predict=predict,
+        accept_index=accept_index,
+        accept_length=accept_length,
     )
 
 

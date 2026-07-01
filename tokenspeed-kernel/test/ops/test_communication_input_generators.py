@@ -39,12 +39,15 @@ from tokenspeed_numerics_input_generators import (
     AllGatherInputs,
     AllReduceInputConfig,
     AllReduceInputs,
+    DPSamplingInputConfig,
+    DPSamplingInputs,
     ExpertParallelRoutingInputConfig,
     ExpertParallelRoutingInputs,
     ReduceScatterInputConfig,
     ReduceScatterInputs,
     all_gather_reference,
     all_reduce_sum_reference,
+    dp_sampling_reference,
     expert_parallel_routing_reference,
     reduce_scatter_sum_reference,
 )
@@ -209,6 +212,62 @@ def test_expert_parallel_generator_maps_to_deepep_dispatch_contract() -> None:
     assert refs.recv_topk_ids[rank].shape[1] == 2
     assert refs.num_recv_tokens_per_expert[rank].shape == (2,)
     assert refs.combined_outputs[rank].shape == local_x.shape
+
+
+def test_dp_sampling_generator_matches_triton_kernel_contract() -> None:
+    config = DPSamplingInputConfig(
+        world_size=2,
+        pad_batch_size=4,
+        num_tokens_per_request=3,
+        vocab_size=8,
+        logits_dtype=torch.bfloat16,
+    )
+    values = DPSamplingInputs(config).generate(
+        seed=98,
+        metadata_seed=99,
+        device="cpu",
+    )
+    refs = dp_sampling_reference(values)
+
+    reqs_per_rank = config.pad_batch_size // config.world_size
+    v_local = config.vocab_size // config.world_size
+    for rank in range(config.world_size):
+        assert values.local_logits[rank].shape == (
+            config.pad_batch_size * config.num_tokens_per_request,
+            v_local,
+        )
+        assert values.local_logits[rank].dtype == config.logits_dtype
+        assert values.local_logits[rank].is_contiguous()
+
+        assert refs.swapped_logits[rank].shape == (
+            reqs_per_rank * config.num_tokens_per_request,
+            config.vocab_size,
+        )
+        assert refs.swapped_logits[rank].dtype == config.logits_dtype
+        assert refs.swapped_logits[rank].is_contiguous()
+
+        assert values.predict_local[rank].shape == (
+            reqs_per_rank,
+            config.num_tokens_per_request,
+        )
+        assert values.accept_index_local[rank].shape == (
+            reqs_per_rank,
+            config.num_tokens_per_request,
+        )
+        assert values.accept_length_local[rank].shape == (reqs_per_rank,)
+        assert values.predict_local[rank].dtype == torch.int32
+        assert values.accept_index_local[rank].dtype == torch.int32
+        assert values.accept_length_local[rank].dtype == torch.int32
+        assert values.predict_local[rank].is_contiguous()
+        assert values.accept_index_local[rank].is_contiguous()
+        assert values.accept_length_local[rank].is_contiguous()
+
+    assert refs.predict.shape == (
+        config.pad_batch_size,
+        config.num_tokens_per_request,
+    )
+    assert refs.accept_index.shape == refs.predict.shape
+    assert refs.accept_length.shape == (config.pad_batch_size,)
 
 
 def test_communication_generators_run_triton_collectives_world2() -> None:

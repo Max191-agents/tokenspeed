@@ -29,6 +29,9 @@ from tokenspeed_numerics_input_generators import (
     AllReduceInputs,
     AllReduceResidualRMSNormInputConfig,
     AllReduceResidualRMSNormInputs,
+    DPSamplingInputConfig,
+    DPSamplingInputs,
+    DPSamplingInputValues,
     ExpertParallelRoutingInputConfig,
     ExpertParallelRoutingInputs,
     ExpertParallelRoutingInputValues,
@@ -37,6 +40,9 @@ from tokenspeed_numerics_input_generators import (
     all_gather_reference,
     all_reduce_residual_rmsnorm_reference,
     all_reduce_sum_reference,
+    dp_sampling_gather_reference,
+    dp_sampling_reference,
+    dp_sampling_swap_reference,
     expert_parallel_routing_reference,
     reduce_scatter_sum_reference,
 )
@@ -210,6 +216,167 @@ def test_expert_parallel_routing_metadata_seed_controls_routing_layout() -> None
     assert not torch.equal(values1.topk_weights[0], values2.topk_weights[0])
 
 
+def test_dp_sampling_inputs_generate_values_and_reference() -> None:
+    config = DPSamplingInputConfig(
+        world_size=3,
+        pad_batch_size=6,
+        num_tokens_per_request=4,
+        vocab_size=12,
+        logits_dtype=torch.float32,
+    )
+    values = DPSamplingInputs(config).generate(
+        seed=131,
+        metadata_seed=132,
+        device="cpu",
+    )
+
+    assert len(values.local_logits) == 3
+    assert len(values.predict_local) == 3
+    assert all(logits.shape == (24, 4) for logits in values.local_logits)
+    assert all(predict.shape == (2, 4) for predict in values.predict_local)
+    assert all(index.shape == (2, 4) for index in values.accept_index_local)
+    assert all(length.shape == (2,) for length in values.accept_length_local)
+    for rank in range(3):
+        assert values.local_logits[rank].dtype == torch.float32
+        assert values.predict_local[rank].dtype == torch.int32
+        assert values.accept_index_local[rank].dtype == torch.int32
+        assert values.accept_length_local[rank].dtype == torch.int32
+        assert torch.all(values.predict_local[rank] >= 0)
+        assert torch.all(values.predict_local[rank] < 12)
+        assert torch.all(values.accept_index_local[rank] >= -1)
+        assert torch.all(values.accept_index_local[rank] < 8)
+        torch.testing.assert_close(
+            (values.accept_index_local[rank] >= 0).sum(dim=1).to(torch.int32),
+            values.accept_length_local[rank],
+            atol=0,
+            rtol=0,
+        )
+
+    refs = dp_sampling_reference(values)
+
+    assert [logits.shape for logits in refs.swapped_logits] == [
+        (8, 12),
+        (8, 12),
+        (8, 12),
+    ]
+    assert refs.predict.shape == (6, 4)
+    assert refs.accept_index.shape == (6, 4)
+    assert refs.accept_length.shape == (6,)
+
+
+def test_dp_sampling_metadata_seed_controls_verify_outputs_only() -> None:
+    generator = DPSamplingInputs(
+        DPSamplingInputConfig(
+            world_size=2,
+            pad_batch_size=4,
+            num_tokens_per_request=3,
+            vocab_size=10,
+            logits_dtype=torch.float32,
+        )
+    )
+
+    values1 = generator.generate(seed=133, metadata_seed=134, device="cpu")
+    values2 = generator.generate(seed=135, metadata_seed=134, device="cpu")
+
+    assert not torch.equal(values1.local_logits[0], values2.local_logits[0])
+    for rank in range(2):
+        torch.testing.assert_close(
+            values1.predict_local[rank],
+            values2.predict_local[rank],
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            values1.accept_index_local[rank],
+            values2.accept_index_local[rank],
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            values1.accept_length_local[rank],
+            values2.accept_length_local[rank],
+            atol=0,
+            rtol=0,
+        )
+
+
+def test_dp_sampling_swap_reference_matches_batch_vocab_layout() -> None:
+    world_size = 2
+    pad_batch_size = 4
+    num_tokens_per_request = 2
+    vocab_size = 6
+    v_local = vocab_size // world_size
+    full_logits = torch.arange(
+        pad_batch_size * num_tokens_per_request * vocab_size,
+        dtype=torch.float32,
+    ).view(pad_batch_size * num_tokens_per_request, vocab_size)
+    values = DPSamplingInputValues(
+        local_logits=[
+            full_logits[:, rank * v_local : (rank + 1) * v_local].contiguous()
+            for rank in range(world_size)
+        ],
+        predict_local=[
+            torch.zeros((2, 2), dtype=torch.int32),
+            torch.zeros((2, 2), dtype=torch.int32),
+        ],
+        accept_index_local=[
+            torch.full((2, 2), -1, dtype=torch.int32),
+            torch.full((2, 2), -1, dtype=torch.int32),
+        ],
+        accept_length_local=[
+            torch.zeros((2,), dtype=torch.int32),
+            torch.zeros((2,), dtype=torch.int32),
+        ],
+    )
+
+    swapped = dp_sampling_swap_reference(values)
+
+    torch.testing.assert_close(swapped[0], full_logits[:4])
+    torch.testing.assert_close(swapped[1], full_logits[4:])
+
+
+def test_dp_sampling_gather_reference_preserves_rank_major_verify_outputs() -> None:
+    values = DPSamplingInputValues(
+        local_logits=[
+            torch.zeros((8, 3), dtype=torch.float32),
+            torch.zeros((8, 3), dtype=torch.float32),
+        ],
+        predict_local=[
+            torch.arange(0, 4, dtype=torch.int32).view(2, 2),
+            torch.tensor([[4, 5], [0, 1]], dtype=torch.int32),
+        ],
+        accept_index_local=[
+            torch.tensor([[0, -1], [2, 3]], dtype=torch.int32),
+            torch.tensor([[0, 1], [-1, -1]], dtype=torch.int32),
+        ],
+        accept_length_local=[
+            torch.tensor([1, 2], dtype=torch.int32),
+            torch.tensor([2, 0], dtype=torch.int32),
+        ],
+    )
+
+    predict, accept_index, accept_length = dp_sampling_gather_reference(values)
+
+    torch.testing.assert_close(
+        predict,
+        torch.tensor([[0, 1], [2, 3], [4, 5], [0, 1]], dtype=torch.int32),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        accept_index,
+        torch.tensor([[0, -1], [2, 3], [0, 1], [-1, -1]], dtype=torch.int32),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        accept_length,
+        torch.tensor([1, 2, 2, 0], dtype=torch.int32),
+        atol=0,
+        rtol=0,
+    )
+
+
 def test_all_gather_inputs_generate_values_and_reference() -> None:
     config = AllGatherInputConfig(
         world_size=4,
@@ -355,6 +522,56 @@ def test_collectives_reject_nonfloating_dtype() -> None:
                 dtype=torch.int32,
             )
         )
+
+
+def test_dp_sampling_rejects_nondivisible_batch_or_vocab() -> None:
+    with pytest.raises(ValueError, match="pad_batch_size"):
+        DPSamplingInputs(
+            DPSamplingInputConfig(
+                world_size=3,
+                pad_batch_size=5,
+                num_tokens_per_request=2,
+                vocab_size=12,
+            )
+        )
+    with pytest.raises(ValueError, match="vocab_size"):
+        DPSamplingInputs(
+            DPSamplingInputConfig(
+                world_size=3,
+                pad_batch_size=6,
+                num_tokens_per_request=2,
+                vocab_size=10,
+            )
+        )
+
+
+def test_dp_sampling_rejects_unsupported_logits_dtype() -> None:
+    with pytest.raises(ValueError, match="logits_dtype"):
+        DPSamplingInputs(
+            DPSamplingInputConfig(
+                world_size=2,
+                pad_batch_size=4,
+                num_tokens_per_request=2,
+                vocab_size=8,
+                logits_dtype=torch.float64,
+            )
+        )
+
+
+def test_dp_sampling_reference_rejects_inconsistent_accept_length() -> None:
+    values = DPSamplingInputs(
+        DPSamplingInputConfig(
+            world_size=2,
+            pad_batch_size=4,
+            num_tokens_per_request=2,
+            vocab_size=8,
+            logits_dtype=torch.float32,
+        )
+    ).generate(seed=136, metadata_seed=137, device="cpu")
+    values.accept_length_local[0][0] += 1
+
+    with pytest.raises(ValueError, match="accept_length_local"):
+        dp_sampling_reference(values)
 
 
 def test_expert_parallel_routing_rejects_invalid_expert_partition() -> None:
