@@ -10,9 +10,10 @@ logits.
 
 ## Generators
 
-- `ArgmaxInputs`: generates logits with optional planted unique maxima and
-  optional output buffers.
-- `ArgmaxPairInputs`: generates logits for `(max_value, argmax_index)` outputs.
+- `ArgmaxInputs`: generates logits with optional planted unique or tied maxima
+  and optional output buffers.
+- `ArgmaxPairInputs`: generates logits for `(max_value, argmax_index)` outputs
+  with the same maximum-pattern controls as `ArgmaxInputs`.
 - `GatherExpandScalarsInputs`: generates scalar pools, request indices, and
   optional min-p/seed/offset streams.
 - `SoftmaxInputs`: generates logits plus optional scalar or per-row temperature

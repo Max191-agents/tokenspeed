@@ -39,6 +39,7 @@ __all__ = [
     "ArgmaxInputConfig",
     "ArgmaxInputs",
     "ArgmaxInputValues",
+    "ArgmaxMaxPattern",
     "ArgmaxPairInputConfig",
     "ArgmaxPairInputs",
     "ArgmaxPairInputValues",
@@ -90,6 +91,7 @@ __all__ = [
     "top_k_top_p_sampling_reference",
 ]
 
+ArgmaxMaxPattern = Literal["unique", "tied", "random"]
 SoftmaxTemperatureMode = Literal["none", "scalar", "per_row"]
 
 _LOGIT_DTYPES = {
@@ -168,6 +170,62 @@ def _randint(
         device=target_device,
         generator=generator,
     )
+
+
+def _check_argmax_max_pattern(name: str, value: str) -> ArgmaxMaxPattern:
+    if value not in ("unique", "tied", "random"):
+        raise ValueError(f"{name} must be 'unique', 'tied', or 'random'; got {value!r}")
+    return value  # type: ignore[return-value]
+
+
+def _plant_argmax_maxima(
+    logits: torch.Tensor,
+    *,
+    pattern: ArgmaxMaxPattern,
+    dtype: torch.dtype,
+    seed: int,
+    device: DeviceLike,
+    configured_device: DeviceLike,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Plant deterministic argmax maxima and return expected first indices."""
+
+    num_rows, vocab_size = logits.shape
+    if pattern == "random":
+        return logits, argmax_reference(logits).to(torch.int64)
+
+    high = vocab_size if pattern == "unique" else vocab_size - 1
+    expected = _randint(
+        low=0,
+        high=high,
+        shape=(num_rows,),
+        dtype=torch.int64,
+        seed=seed,
+        device=device,
+        configured_device=configured_device,
+    )
+    logits = (logits.float() * 0.25).to(dtype)
+    if num_rows == 0:
+        return logits, expected
+
+    rows = torch.arange(num_rows, dtype=torch.int64, device=logits.device)
+    max_value = torch.tensor(8.0, dtype=logits.dtype, device=logits.device)
+    logits[rows, expected] = max_value
+
+    if pattern == "tied":
+        offsets = _randint(
+            low=0,
+            high=vocab_size,
+            shape=(num_rows,),
+            dtype=torch.int64,
+            seed=_child_seed(seed, 1),
+            device=device,
+            configured_device=configured_device,
+        )
+        remaining = vocab_size - expected - 1
+        tied_indices = expected + 1 + (offsets % remaining)
+        logits[rows, tied_indices] = max_value
+
+    return logits, expected
 
 
 @dataclass
@@ -255,8 +313,8 @@ class ArgmaxInputConfig:
     """Initialization parameters for row-wise argmax inputs.
 
     The represented operation returns the lowest index whose logit is maximal
-    for each row. The default generation plants a dominant maximum in every row
-    so correctness tests are not accidentally dominated by random ties.
+    for each row. The default generation plants one dominant maximum in every
+    row so correctness tests are not accidentally dominated by random maxima.
     """
 
     # Required: number of independent rows. Zero is valid.
@@ -271,8 +329,10 @@ class ArgmaxInputConfig:
     # Optional: generate an output tensor for APIs that support out=.
     out_dtype: torch.dtype | None = None
 
-    # Optional: ensure each row has a known unique maximum.
-    plant_unique_max: bool = True
+    # Optional: "unique" plants one known maximum per row; "tied" plants two
+    # equal maxima and expects the lower index; "random" leaves generated
+    # logits untouched and derives expected indices from the reference.
+    max_pattern: ArgmaxMaxPattern = "unique"
 
     # Optional: generated tensor device override.
     device: DeviceLike = None
@@ -299,8 +359,10 @@ class ArgmaxPairInputConfig:
     # Optional: generate an output tensor for APIs that support out=.
     include_out: bool = False
 
-    # Optional: ensure each row has a known unique maximum.
-    plant_unique_max: bool = True
+    # Optional: "unique" plants one known maximum per row; "tied" plants two
+    # equal maxima and expects the lower index; "random" leaves generated
+    # logits untouched and derives expected pairs from the reference.
+    max_pattern: ArgmaxMaxPattern = "unique"
 
     # Optional: generated tensor device override.
     device: DeviceLike = None
@@ -437,6 +499,11 @@ class ArgmaxInputs(NumericsInputGenerator):
         self.config.dtype = _check_float_dtype(
             "dtype", self.config.dtype, allowed=_LOGIT_DTYPES
         )
+        self.config.max_pattern = _check_argmax_max_pattern(
+            "max_pattern", self.config.max_pattern
+        )
+        if self.config.max_pattern == "tied" and self.config.vocab_size < 2:
+            raise ValueError("max_pattern='tied' requires vocab_size >= 2")
         if self.config.out_dtype is not None:
             self.config.out_dtype = _check_index_dtype(
                 "out_dtype", self.config.out_dtype
@@ -461,31 +528,15 @@ class ArgmaxInputs(NumericsInputGenerator):
             self.logits_input.generate(seed=_child_seed(seed, 1), device=device).values,
             "logits",
         ).contiguous()
-        if self.config.plant_unique_max:
-            metadata_base_seed = seed if metadata_seed is None else metadata_seed
-            expected = _randint(
-                low=0,
-                high=self.config.vocab_size,
-                shape=(self.config.num_rows,),
-                dtype=torch.int64,
-                seed=_child_seed(metadata_base_seed, 1),
-                device=device,
-                configured_device=self.config.device,
-            )
-            logits = (logits.float() * 0.25).to(self.config.dtype)
-            if self.config.num_rows > 0:
-                rows = torch.arange(
-                    self.config.num_rows,
-                    dtype=torch.int64,
-                    device=logits.device,
-                )
-                logits[rows, expected] = torch.tensor(
-                    8.0,
-                    dtype=logits.dtype,
-                    device=logits.device,
-                )
-        else:
-            expected = argmax_reference(logits).to(torch.int64)
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        logits, expected = _plant_argmax_maxima(
+            logits,
+            pattern=self.config.max_pattern,
+            dtype=self.config.dtype,
+            seed=_child_seed(metadata_base_seed, 1),
+            device=device,
+            configured_device=self.config.device,
+        )
         out = None
         if self.config.out_dtype is not None:
             out = torch.empty(
@@ -514,6 +565,11 @@ class ArgmaxPairInputs(NumericsInputGenerator):
         self.config.dtype = _check_float_dtype(
             "dtype", self.config.dtype, allowed=_LOGIT_DTYPES
         )
+        self.config.max_pattern = _check_argmax_max_pattern(
+            "max_pattern", self.config.max_pattern
+        )
+        if self.config.max_pattern == "tied" and self.config.vocab_size < 2:
+            raise ValueError("max_pattern='tied' requires vocab_size >= 2")
         self.logits_input = self.logits_input or TensorInput(
             (self.config.num_rows, self.config.vocab_size),
             self.config.dtype,
@@ -534,29 +590,15 @@ class ArgmaxPairInputs(NumericsInputGenerator):
             self.logits_input.generate(seed=_child_seed(seed, 1), device=device).values,
             "logits",
         ).contiguous()
-        if self.config.plant_unique_max:
-            metadata_base_seed = seed if metadata_seed is None else metadata_seed
-            expected = _randint(
-                low=0,
-                high=self.config.vocab_size,
-                shape=(self.config.num_rows,),
-                dtype=torch.int64,
-                seed=_child_seed(metadata_base_seed, 1),
-                device=device,
-                configured_device=self.config.device,
-            )
-            logits = (logits.float() * 0.25).to(self.config.dtype)
-            if self.config.num_rows > 0:
-                rows = torch.arange(
-                    self.config.num_rows,
-                    dtype=torch.int64,
-                    device=logits.device,
-                )
-                logits[rows, expected] = torch.tensor(
-                    8.0,
-                    dtype=logits.dtype,
-                    device=logits.device,
-                )
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        logits, _ = _plant_argmax_maxima(
+            logits,
+            pattern=self.config.max_pattern,
+            dtype=self.config.dtype,
+            seed=_child_seed(metadata_base_seed, 1),
+            device=device,
+            configured_device=self.config.device,
+        )
         out = None
         if self.config.include_out:
             out = torch.empty(

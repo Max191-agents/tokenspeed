@@ -40,6 +40,7 @@ from tokenspeed_numerics_input_generators import (
     ArgmaxInputConfig,
     ArgmaxInputs,
     ArgmaxInputValues,
+    ArgmaxMaxPattern,
     ArgmaxPairInputConfig,
     ArgmaxPairInputs,
     ArgmaxPairInputValues,
@@ -75,6 +76,7 @@ def _argmax_values(
     device: str,
     dtype: torch.dtype = torch.float32,
     out_dtype: torch.dtype | None = None,
+    max_pattern: ArgmaxMaxPattern = "unique",
     seed: int = 0,
 ) -> ArgmaxInputValues:
     return ArgmaxInputs(
@@ -83,6 +85,7 @@ def _argmax_values(
             vocab_size=N,
             dtype=dtype,
             out_dtype=out_dtype,
+            max_pattern=max_pattern,
         )
     ).generate(seed=seed, metadata_seed=seed + 1, device=device)
 
@@ -337,20 +340,11 @@ def test_argmax_returns_first_index_on_ties_like_torch():
     do the same."""
     _need_cuda()
     M, N = 4, MODEL_VOCABS["qwen3_5"]
-    x = torch.full((M, N), -100.0, device="cuda", dtype=torch.float32)
-    # Plant several rows where many positions hold the maximum value 0.0 at
-    # known indices — the kernel must return the first.
-    plant_positions = [
-        [0, 7, 9],
-        [3, 4],
-        [128, 1024, 65536],
-        [N - 1, 17],
-    ]
-    for row, positions in enumerate(plant_positions):
-        for pos in positions:
-            x[row, pos] = 0.0
-    out = cute_argmax(x)
-    torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
+    values = _argmax_values(M, N, device="cuda", max_pattern="tied", seed=44)
+    row_max = values.logits.max(dim=-1, keepdim=True).values
+    assert torch.all(torch.count_nonzero(values.logits == row_max, dim=-1) == 2)
+    out = cute_argmax(values.logits)
+    torch.testing.assert_close(out, values.expected_indices, atol=0, rtol=0)
 
 
 def test_argmax_mtp_pattern():

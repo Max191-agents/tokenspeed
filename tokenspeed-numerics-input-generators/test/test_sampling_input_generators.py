@@ -93,6 +93,21 @@ def test_argmax_metadata_seed_controls_planted_indices() -> None:
     assert not torch.equal(values1.logits, values2.logits)
 
 
+def test_argmax_inputs_generate_tied_maxima() -> None:
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(
+            num_rows=5,
+            vocab_size=17,
+            dtype=torch.float32,
+            max_pattern="tied",
+        )
+    ).generate(seed=43, metadata_seed=44, device="cpu")
+
+    row_max = values.logits.max(dim=-1, keepdim=True).values
+    assert torch.all(torch.count_nonzero(values.logits == row_max, dim=-1) == 2)
+    torch.testing.assert_close(argmax_reference(values.logits), values.expected_indices)
+
+
 def test_argmax_reference_ignores_nans_and_marks_all_nan_rows() -> None:
     logits = torch.tensor(
         [[float("nan"), 1.0, 2.0], [float("nan"), float("nan"), float("nan")]],
@@ -124,6 +139,25 @@ def test_argmax_pair_inputs_generate_planted_maxima() -> None:
     torch.testing.assert_close(
         values.expected_pair[:, 0],
         torch.full((5,), 8.0, dtype=torch.float32),
+    )
+
+
+def test_argmax_pair_inputs_generate_tied_maxima() -> None:
+    values = ArgmaxPairInputs(
+        ArgmaxPairInputConfig(
+            num_rows=5,
+            vocab_size=17,
+            dtype=torch.float32,
+            include_out=True,
+            max_pattern="tied",
+        )
+    ).generate(seed=45, metadata_seed=46, device="cpu")
+
+    row_max = values.logits.max(dim=-1, keepdim=True).values
+    assert torch.all(torch.count_nonzero(values.logits == row_max, dim=-1) == 2)
+    torch.testing.assert_close(
+        argmax_pair_reference(values.logits),
+        values.expected_pair,
     )
 
 
@@ -708,6 +742,30 @@ def test_argmax_rejects_invalid_dtype(bad_dtype: torch.dtype) -> None:
                 num_rows=1,
                 vocab_size=8,
                 dtype=bad_dtype,
+            )
+        )
+
+
+def test_argmax_rejects_invalid_max_pattern() -> None:
+    with pytest.raises(ValueError, match="max_pattern"):
+        ArgmaxInputs(
+            ArgmaxInputConfig(
+                num_rows=1,
+                vocab_size=8,
+                dtype=torch.float32,
+                max_pattern="highest",  # type: ignore[arg-type]
+            )
+        )
+
+
+def test_argmax_tied_pattern_requires_two_vocab_entries() -> None:
+    with pytest.raises(ValueError, match="requires vocab_size >= 2"):
+        ArgmaxInputs(
+            ArgmaxInputConfig(
+                num_rows=1,
+                vocab_size=1,
+                dtype=torch.float32,
+                max_pattern="tied",
             )
         )
 

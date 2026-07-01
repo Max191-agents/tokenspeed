@@ -16,7 +16,9 @@ top-k/top-p sampling from probabilities or logits.
 `ArgmaxInputs` represents row-wise argmax over logits. The semantic result is
 the lowest column index whose value is maximal in each row. By default the
 generator plants a known dominant maximum in every row, so correctness tests do
-not depend on accidental random maxima or ties.
+not depend on accidental random maxima or ties. It can also generate rows with
+two equal maxima to exercise the first-index tie rule, or leave random logits
+untouched and derive expected indices from the reference.
 
 ### Argmax Pair
 
@@ -30,7 +32,8 @@ out[row, 1] = first argmax index for logits[row]
 
 This models direct helper APIs that need both the selected value and selected
 index. The generator can create the optional caller-provided output buffer used
-by in-place kernel paths.
+by in-place kernel paths. Its logit generation supports the same unique,
+tied, and random maximum patterns as `ArgmaxInputs`.
 
 ### Softmax
 
@@ -197,7 +200,8 @@ The generators reject invalid sampling inputs before values are returned:
 - top-k/top-p sampling rows have one survivor after both filters for exact
   reference comparison, with logits rows containing one finite token before
   softmax
-- planted argmax rows have a unique known maximum
+- planted argmax rows have either a unique known maximum or two tied known
+  maxima whose lower index is the expected result
 
 Metadata such as argmax planted indices, scalar gather indices, top-k/top-p
 controls, speculative accepted-prefix lengths, and min-p thresholds are generated
