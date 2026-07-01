@@ -66,6 +66,20 @@ from tokenspeed_numerics_input_generators.attention_metadata import (
     MHARequestMetadataInput,
     MHARequestMetadataValues,
 )
+from tokenspeed_numerics_input_generators.communication import (
+    AllGatherInputConfig,
+    AllGatherInputs,
+    AllGatherInputValues,
+    AllReduceInputConfig,
+    AllReduceInputs,
+    AllReduceInputValues,
+    ReduceScatterInputConfig,
+    ReduceScatterInputs,
+    ReduceScatterInputValues,
+    all_gather_reference,
+    all_reduce_sum_reference,
+    reduce_scatter_sum_reference,
+)
 from tokenspeed_numerics_input_generators.core import (
     CustomDType,
     DeviceLike,
@@ -156,6 +170,12 @@ from tokenspeed_numerics_input_generators.sampling import (
 )
 
 __all__ = [
+    "AllGatherInputConfig",
+    "AllGatherInputValues",
+    "AllGatherInputs",
+    "AllReduceInputConfig",
+    "AllReduceInputValues",
+    "AllReduceInputs",
     "ArgmaxInputConfig",
     "ArgmaxInputValues",
     "ArgmaxInputs",
@@ -228,6 +248,9 @@ __all__ = [
     "QKRMSNormInputConfig",
     "QKRMSNormInputValues",
     "QKRMSNormInputs",
+    "ReduceScatterInputConfig",
+    "ReduceScatterInputValues",
+    "ReduceScatterInputs",
     "RMSNormInputConfig",
     "RMSNormInputValues",
     "RMSNormInputs",
@@ -244,6 +267,8 @@ __all__ = [
     "TopKTopPRenormInputValues",
     "TopKTopPRenormInputs",
     "argmax_reference",
+    "all_gather_reference",
+    "all_reduce_sum_reference",
     "build_rope_cos_sin_cache",
     "fp8_quantization_reference",
     "fp8_scale_shape",
@@ -257,6 +282,7 @@ __all__ = [
     "mxfp4_gemm_input_config",
     "qk_rmsnorm_reference",
     "page_table_gather_reference",
+    "reduce_scatter_sum_reference",
     "rope_reference",
     "rmsnorm_reference",
     "top_k_top_p_renorm_reference",
