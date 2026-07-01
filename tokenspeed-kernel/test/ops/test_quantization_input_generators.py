@@ -22,14 +22,25 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import quantize_fp8, quantize_mxfp4
+from tokenspeed_kernel import (
+    quantize_fp8,
+    quantize_mxfp4,
+    quantize_mxfp8,
+    quantize_nvfp4,
+)
 from tokenspeed_numerics_input_generators import (
     FP8QuantizationInputConfig,
     FP8QuantizationInputs,
+    MXFP8QuantizationInputConfig,
+    MXFP8QuantizationInputs,
     MXFP4QuantizationInputConfig,
     MXFP4QuantizationInputs,
+    NVFP4QuantizationInputConfig,
+    NVFP4QuantizationInputs,
     fp8_quantization_reference,
     mxfp4_quantization_reference,
+    mxfp8_quantization_reference,
+    nvfp4_quantization_reference,
 )
 
 
@@ -93,6 +104,64 @@ def test_mxfp4_quantization_generator_runs_kernel(
     assert scales.shape == expected_scales.shape
     assert _uint8_equal(out, expected_out)
     assert _uint8_equal(scales, expected_scales)
+
+
+@pytest.mark.parametrize("solution", ["flashinfer"])
+def test_mxfp8_quantization_generator_runs_kernel(
+    device: str,
+    solution: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    require("quantization", "mxfp8", solution, dtype, "x")
+    values = MXFP8QuantizationInputs(
+        MXFP8QuantizationInputConfig(
+            shape=(5, 64),
+            dtype=dtype,
+        )
+    ).generate(seed=54, device=device)
+    expected_out, _expected_scales = mxfp8_quantization_reference(values.x)
+
+    out, scales = quantize_mxfp8(values.x, solution=solution)
+    torch.cuda.synchronize()
+
+    assert out.shape == expected_out.shape
+    assert _bitwise_equal(out, expected_out)
+    assert scales.numel() > 0
+
+
+@pytest.mark.parametrize("solution", ["flashinfer"])
+def test_nvfp4_quantization_generator_runs_kernel(
+    device: str,
+    solution: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    require("quantization", "nvfp4", solution, dtype, "x")
+    values = NVFP4QuantizationInputs(
+        NVFP4QuantizationInputConfig(
+            shape=(5, 64),
+            dtype=dtype,
+            scale=0.125,
+        )
+    ).generate(seed=55, device=device)
+    expected_out, expected_scales = nvfp4_quantization_reference(
+        values.x,
+        scale=values.scale,
+    )
+
+    out, scales = quantize_nvfp4(
+        values.x,
+        scale=values.scale,
+        scale_layout=values.scale_layout,
+        solution=solution,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == expected_out.shape
+    assert scales.shape == expected_scales.shape
+    assert _uint8_equal(out, expected_out)
+    assert _bitwise_equal(scales, expected_scales)
 
 
 @pytest.mark.parametrize("solution", ["triton"])

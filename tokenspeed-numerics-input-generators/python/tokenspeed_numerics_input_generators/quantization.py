@@ -41,18 +41,29 @@ __all__ = [
     "FP8QuantizationInputConfig",
     "FP8QuantizationInputs",
     "FP8QuantizationInputValues",
+    "MXFP8QuantizationInputConfig",
+    "MXFP8QuantizationInputs",
+    "MXFP8QuantizationInputValues",
     "MXFP4QuantizationInputConfig",
     "MXFP4QuantizationInputs",
     "MXFP4QuantizationInputValues",
+    "NVFP4QuantizationInputConfig",
+    "NVFP4QuantizationInputs",
+    "NVFP4QuantizationInputValues",
     "fp8_quantization_reference",
     "fp8_scale_shape",
     "mxfp4_quantization_reference",
     "mxfp4_scale_shape",
+    "mxfp8_quantization_reference",
+    "mxfp8_scale_shape",
+    "nvfp4_quantization_reference",
+    "nvfp4_scale_shape",
 ]
 
 FP8ScaleGranularity = Literal["none", "tensor", "token", "token_group"]
 FP8ScaleEncoding = Literal["float32", "ue8m0", "packed_ue8m0"]
 MXFP4ScaleLayout = Literal["linear"]
+NVFP4ScaleLayout = Literal["linear"]
 
 _E2M1_NIBBLES = torch.tensor(
     [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15],
@@ -100,6 +111,18 @@ def _check_mxfp4_input_dtype(dtype: torch.dtype) -> torch.dtype:
     return dtype
 
 
+def _check_mxfp8_input_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"MXFP8 input dtype must be bf16 or fp16, got {dtype}")
+    return dtype
+
+
+def _check_nvfp4_input_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"NVFP4 input dtype must be bf16 or fp16, got {dtype}")
+    return dtype
+
+
 def _check_fp8_dtype(dtype: torch.dtype) -> torch.dtype:
     fp8_dtypes = {
         torch.float8_e4m3fn,
@@ -130,6 +153,44 @@ def mxfp4_scale_shape(
     return shape[:-1] + (shape[-1] // scale_size,)
 
 
+def mxfp8_scale_shape(
+    shape: tuple[int, ...] | list[int],
+    *,
+    scale_size: int = 32,
+) -> tuple[int, ...]:
+    """Return the semantic UE8M0 scale shape for MXFP8 quantization."""
+
+    shape = _check_shape(shape)
+    scale_size = _check_positive("scale_size", scale_size)
+    if scale_size != 32:
+        raise ValueError(f"MXFP8 currently requires scale_size=32, got {scale_size}")
+    if shape[-1] % scale_size != 0:
+        raise ValueError(
+            f"last dimension must be divisible by scale_size, got K={shape[-1]}, "
+            f"scale_size={scale_size}"
+        )
+    return shape[:-1] + (shape[-1] // scale_size,)
+
+
+def nvfp4_scale_shape(
+    shape: tuple[int, ...] | list[int],
+    *,
+    scale_size: int = 16,
+) -> tuple[int, ...]:
+    """Return the semantic FP8 scale shape for NVFP4 quantization."""
+
+    shape = _check_shape(shape)
+    scale_size = _check_positive("scale_size", scale_size)
+    if scale_size != 16:
+        raise ValueError(f"NVFP4 currently requires scale_size=16, got {scale_size}")
+    if shape[-1] % scale_size != 0:
+        raise ValueError(
+            f"last dimension must be divisible by scale_size, got K={shape[-1]}, "
+            f"scale_size={scale_size}"
+        )
+    return shape[:-1] + (shape[-1] // scale_size,)
+
+
 def _e2m1_values_from_nibbles(nibbles: torch.Tensor) -> torch.Tensor:
     magnitude_bits = nibbles & 0x7
     exponent = (magnitude_bits >> 1).to(torch.float32)
@@ -152,6 +213,27 @@ def _nearest_e2m1_nibbles(values: torch.Tensor) -> torch.Tensor:
     table_nibbles = _E2M1_NIBBLES.to(device=values.device)
     distances = (values.unsqueeze(-1) - table_values).abs()
     return table_nibbles[distances.argmin(dim=-1)]
+
+
+def _positive_fp8_scale_values(
+    shape: tuple[int, ...],
+    *,
+    generator: torch.Generator,
+    device: torch.device,
+) -> torch.Tensor:
+    exponent = torch.randint(
+        -5,
+        4,
+        shape,
+        dtype=torch.int32,
+        device=device,
+        generator=generator,
+    )
+    scale = torch.pow(
+        torch.tensor(2.0, dtype=torch.float32, device=device),
+        exponent.to(torch.float32),
+    )
+    return scale.to(torch.float8_e4m3fn).float()
 
 
 def fp8_scale_shape(
@@ -289,6 +371,114 @@ class FP8QuantizationInputs(NumericsInputGenerator):
 
 
 @dataclass
+class MXFP8QuantizationInputValues:
+    """Generated values for ``MXFP8QuantizationInputs``."""
+
+    x: torch.Tensor
+    scale_size: int
+    scale_layout: Literal["linear"]
+
+
+@dataclass
+class MXFP8QuantizationInputConfig:
+    """Initialization parameters for ``MXFP8QuantizationInputs``.
+
+    The represented operation quantizes a bf16/fp16 tensor into FP8 E4M3 values
+    with one UE8M0 scale byte for each contiguous group of 32 values. Generated
+    values are chosen from exactly representable FP8 values multiplied by
+    power-of-two group scales.
+    """
+
+    # Required: full input tensor shape. The last dimension is grouped into
+    # contiguous MXFP8 scale groups.
+    shape: tuple[int, ...]
+
+    # Required: generated input dtype. MXFP8 kernels consume bf16 or fp16
+    # source tensors.
+    dtype: torch.dtype
+
+    # Optional: target FP8 dtype for reference computations.
+    output_dtype: torch.dtype = torch.float8_e4m3fn
+
+    # Optional: number of values per UE8M0 group. Currently fixed to 32.
+    scale_size: int = 32
+
+    # Optional: semantic scale layout. Backend swizzled layouts are adapter
+    # concerns; generated/reference values use linear group order.
+    scale_layout: Literal["linear"] = "linear"
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class MXFP8QuantizationInputs(NumericsInputGenerator):
+    """Generator for MXFP8 quantization input tensors."""
+
+    config: MXFP8QuantizationInputConfig
+
+    def __init__(self, config: MXFP8QuantizationInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.shape = _check_shape(self.config.shape)
+        self.config.dtype = _check_mxfp8_input_dtype(self.config.dtype)
+        self.config.output_dtype = _check_fp8_dtype(self.config.output_dtype)
+        mxfp8_scale_shape(self.config.shape, scale_size=self.config.scale_size)
+        if self.config.scale_layout != "linear":
+            raise ValueError(
+                f"MXFP8 generator currently supports scale_layout='linear', "
+                f"got {self.config.scale_layout!r}"
+            )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> MXFP8QuantizationInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        generator = _rng_for_device(target_device, seed)
+        scale_shape = mxfp8_scale_shape(
+            self.config.shape,
+            scale_size=self.config.scale_size,
+        )
+        group_shape = scale_shape + (self.config.scale_size,)
+        fp8_values = (
+            torch.randn(
+                group_shape,
+                dtype=torch.float32,
+                device=target_device,
+                generator=generator,
+            )
+            .clamp(-4.0, 4.0)
+            .to(self.config.output_dtype)
+            .float()
+        )
+        fp8_values[..., 0] = torch.finfo(self.config.output_dtype).max
+        scale_bytes = torch.randint(
+            123,
+            131,
+            scale_shape,
+            dtype=torch.int32,
+            device=target_device,
+            generator=generator,
+        )
+        scale_values = torch.pow(
+            torch.tensor(2.0, dtype=torch.float32, device=target_device),
+            scale_bytes.to(torch.float32) - 127.0,
+        )
+        x = (fp8_values * scale_values.unsqueeze(-1)).reshape(self.config.shape)
+        return MXFP8QuantizationInputValues(
+            x=x.to(self.config.dtype).contiguous(),
+            scale_size=self.config.scale_size,
+            scale_layout=self.config.scale_layout,
+        )
+
+
+@dataclass
 class MXFP4QuantizationInputValues:
     """Generated values for ``MXFP4QuantizationInputs``."""
 
@@ -393,6 +583,119 @@ class MXFP4QuantizationInputs(NumericsInputGenerator):
         )
 
 
+@dataclass
+class NVFP4QuantizationInputValues:
+    """Generated values for ``NVFP4QuantizationInputs``."""
+
+    x: torch.Tensor
+    scale: torch.Tensor
+    scale_size: int
+    scale_layout: NVFP4ScaleLayout
+
+
+@dataclass
+class NVFP4QuantizationInputConfig:
+    """Initialization parameters for ``NVFP4QuantizationInputs``.
+
+    The represented operation quantizes a bf16/fp16 tensor into packed E2M1
+    values with one FP8 E4M3 scale for each contiguous group of 16 values and
+    one tensor-wide FP32 scale.
+    """
+
+    # Required: full input tensor shape. The last dimension is grouped into
+    # contiguous NVFP4 scale groups.
+    shape: tuple[int, ...]
+
+    # Required: generated input dtype. NVFP4 kernels consume bf16 or fp16 source
+    # tensors.
+    dtype: torch.dtype
+
+    # Optional: tensor-wide scale used by the public TokenSpeed NVFP4 API.
+    scale: float = 0.125
+
+    # Optional: number of values per FP8 group scale. Currently fixed to 16.
+    scale_size: int = 16
+
+    # Optional: semantic scale layout. Backend swizzled layouts are adapter
+    # concerns; generated/reference values use linear group order.
+    scale_layout: NVFP4ScaleLayout = "linear"
+
+    # Optional: generated tensor and scale device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class NVFP4QuantizationInputs(NumericsInputGenerator):
+    """Generator for NVFP4 quantization input tensors."""
+
+    config: NVFP4QuantizationInputConfig
+
+    def __init__(self, config: NVFP4QuantizationInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.shape = _check_shape(self.config.shape)
+        self.config.dtype = _check_nvfp4_input_dtype(self.config.dtype)
+        self.config.scale = float(self.config.scale)
+        if self.config.scale <= 0.0:
+            raise ValueError("NVFP4 scale must be positive")
+        nvfp4_scale_shape(self.config.shape, scale_size=self.config.scale_size)
+        if self.config.scale_layout != "linear":
+            raise ValueError(
+                f"NVFP4 generator currently supports scale_layout='linear', "
+                f"got {self.config.scale_layout!r}"
+            )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> NVFP4QuantizationInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        generator = _rng_for_device(target_device, seed)
+        scale_shape = nvfp4_scale_shape(
+            self.config.shape,
+            scale_size=self.config.scale_size,
+        )
+        group_shape = scale_shape + (self.config.scale_size,)
+        nibble_indices = torch.randint(
+            0,
+            len(_E2M1_NIBBLES),
+            group_shape,
+            dtype=torch.int64,
+            device=target_device,
+            generator=generator,
+        )
+        nibble_table = _E2M1_NIBBLES.to(device=target_device)
+        nibbles = nibble_table[nibble_indices]
+        nibbles[..., 0] = 0x7
+        fp8_scales = _positive_fp8_scale_values(
+            scale_shape,
+            generator=generator,
+            device=target_device,
+        )
+        global_scale = torch.tensor(
+            [self.config.scale],
+            dtype=torch.float32,
+            device=target_device,
+        )
+        e2m1_values = _e2m1_values_from_nibbles(nibbles)
+        x = (
+            e2m1_values
+            * fp8_scales.unsqueeze(-1)
+            * global_scale.reshape((1,) * len(scale_shape) + (1,))
+        ).reshape(self.config.shape)
+        return NVFP4QuantizationInputValues(
+            x=x.to(self.config.dtype).contiguous(),
+            scale=global_scale,
+            scale_size=self.config.scale_size,
+            scale_layout=self.config.scale_layout,
+        )
+
+
 def _fp8_scale(
     x_fp32: torch.Tensor,
     *,
@@ -459,6 +762,44 @@ def fp8_quantization_reference(
     return quantized.to(output_dtype).float()
 
 
+def mxfp8_quantization_reference(
+    x: torch.Tensor,
+    *,
+    scale_size: int = 32,
+    scale_layout: Literal["linear"] = "linear",
+    output_dtype: torch.dtype = torch.float8_e4m3fn,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return FP8 MXFP8 values and UE8M0 scale bytes for ``x``."""
+
+    if scale_layout != "linear":
+        raise ValueError(
+            f"MXFP8 reference currently supports scale_layout='linear', got {scale_layout!r}"
+        )
+    output_dtype = _check_fp8_dtype(output_dtype)
+    shape = _check_shape(tuple(x.shape))
+    scale_shape = mxfp8_scale_shape(shape, scale_size=scale_size)
+    x_groups = x.to(torch.float32).reshape(*scale_shape, scale_size)
+    max_abs = x_groups.abs().amax(dim=-1)
+    zero_groups = max_abs == 0
+    fp8_max = torch.finfo(output_dtype).max
+    scale_exp = torch.ceil(
+        torch.log2((max_abs / fp8_max).clamp(min=torch.finfo(torch.float32).tiny))
+    )
+    scale_exp = torch.where(zero_groups, torch.full_like(scale_exp, -127.0), scale_exp)
+    scale_exp = scale_exp.clamp(min=-127.0, max=127.0)
+    scale_values = torch.pow(
+        torch.tensor(2.0, dtype=torch.float32, device=x.device),
+        scale_exp,
+    )
+    scaled = (x_groups / scale_values.unsqueeze(-1)).clamp(
+        min=torch.finfo(output_dtype).min,
+        max=torch.finfo(output_dtype).max,
+    )
+    quantized = scaled.to(output_dtype).reshape(shape)
+    scales = (scale_exp.to(torch.int32) + 127).to(torch.uint8)
+    return quantized.contiguous(), scales.contiguous()
+
+
 def mxfp4_quantization_reference(
     x: torch.Tensor,
     *,
@@ -497,3 +838,39 @@ def mxfp4_quantization_reference(
     packed = _pack_e2m1_nibbles(nibbles).reshape(*shape[:-1], shape[-1] // 2)
     scales = (scale_exp.to(torch.int32) + 127).to(torch.uint8)
     return packed.contiguous(), scales.contiguous()
+
+
+def nvfp4_quantization_reference(
+    x: torch.Tensor,
+    *,
+    scale: torch.Tensor | float,
+    scale_size: int = 16,
+    scale_layout: NVFP4ScaleLayout = "linear",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return packed NVFP4 bytes and FP8 E4M3 scale values for ``x``."""
+
+    if scale_layout != "linear":
+        raise ValueError(
+            f"NVFP4 reference currently supports scale_layout='linear', got {scale_layout!r}"
+        )
+    shape = _check_shape(tuple(x.shape))
+    scale_shape = nvfp4_scale_shape(shape, scale_size=scale_size)
+    scale_tensor = torch.as_tensor(scale, dtype=torch.float32, device=x.device)
+    if scale_tensor.numel() != 1:
+        raise ValueError("NVFP4 scale must be scalar")
+    scale_value = scale_tensor.reshape(())
+    if scale_value.item() <= 0.0:
+        raise ValueError("NVFP4 scale must be positive")
+
+    x_groups = x.to(torch.float32).reshape(*scale_shape, scale_size)
+    max_abs = x_groups.abs().amax(dim=-1)
+    fp4_max = 6.0
+    local_scale = (max_abs / (scale_value * fp4_max)).clamp(
+        min=torch.finfo(torch.float32).tiny
+    )
+    local_scale = local_scale.to(torch.float8_e4m3fn)
+    local_scale_float = local_scale.float().clamp(min=torch.finfo(torch.float32).tiny)
+    scaled = x_groups / (scale_value * local_scale_float.unsqueeze(-1))
+    nibbles = _nearest_e2m1_nibbles(scaled)
+    packed = _pack_e2m1_nibbles(nibbles).reshape(*shape[:-1], shape[-1] // 2)
+    return packed.contiguous(), local_scale.contiguous()

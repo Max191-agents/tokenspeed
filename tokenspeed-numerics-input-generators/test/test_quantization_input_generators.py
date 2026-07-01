@@ -25,12 +25,20 @@ import torch
 from tokenspeed_numerics_input_generators import (
     FP8QuantizationInputConfig,
     FP8QuantizationInputs,
+    MXFP8QuantizationInputConfig,
+    MXFP8QuantizationInputs,
     MXFP4QuantizationInputConfig,
     MXFP4QuantizationInputs,
+    NVFP4QuantizationInputConfig,
+    NVFP4QuantizationInputs,
     fp8_quantization_reference,
     fp8_scale_shape,
     mxfp4_quantization_reference,
     mxfp4_scale_shape,
+    mxfp8_quantization_reference,
+    mxfp8_scale_shape,
+    nvfp4_quantization_reference,
+    nvfp4_scale_shape,
 )
 
 
@@ -56,6 +64,29 @@ def _dequantize_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return out * scale_values.repeat_interleave(32, dim=-1)
 
 
+def _dequantize_mxfp8(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    scale_values = torch.pow(2.0, scale.to(torch.int32) - 127).to(torch.float32)
+    return q.float() * scale_values.repeat_interleave(32, dim=-1)
+
+
+def _dequantize_nvfp4(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> torch.Tensor:
+    out = packed.new_empty(
+        (*packed.shape[:-1], packed.shape[-1] * 2),
+        dtype=torch.float32,
+    )
+    out[..., 0::2] = _e2m1_values(packed & 0xF)
+    out[..., 1::2] = _e2m1_values(packed >> 4)
+    return (
+        out
+        * scale.float().repeat_interleave(16, dim=-1)
+        * global_scale.reshape((1,) * (out.ndim - 1) + (1,))
+    )
+
+
 def test_fp8_scale_shape_matches_granularity() -> None:
     shape = (5, 256)
 
@@ -67,6 +98,14 @@ def test_fp8_scale_shape_matches_granularity() -> None:
 
 def test_mxfp4_scale_shape_matches_scale_groups() -> None:
     assert mxfp4_scale_shape((5, 256)) == (5, 8)
+
+
+def test_mxfp8_scale_shape_matches_scale_groups() -> None:
+    assert mxfp8_scale_shape((5, 256)) == (5, 8)
+
+
+def test_nvfp4_scale_shape_matches_scale_groups() -> None:
+    assert nvfp4_scale_shape((5, 256)) == (5, 16)
 
 
 @pytest.mark.parametrize("granularity", ["none", "tensor", "token", "token_group"])
@@ -161,6 +200,70 @@ def test_mxfp4_quantization_inputs_generate_representable_values() -> None:
     torch.testing.assert_close(dequant, values.x.float(), atol=0, rtol=0)
 
 
+def test_mxfp8_quantization_inputs_generate_representable_values() -> None:
+    values = MXFP8QuantizationInputs(
+        MXFP8QuantizationInputConfig(
+            shape=(3, 64),
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=45, device="cpu")
+
+    assert values.x.shape == (3, 64)
+    assert values.x.dtype == torch.bfloat16
+    assert values.scale_size == 32
+    assert values.scale_layout == "linear"
+
+    q, scales = mxfp8_quantization_reference(
+        values.x,
+        scale_size=values.scale_size,
+        scale_layout=values.scale_layout,
+    )
+    assert q.shape == values.x.shape
+    assert q.dtype == torch.float8_e4m3fn
+    assert scales.shape == (3, 2)
+    assert scales.dtype == torch.uint8
+    torch.testing.assert_close(
+        _dequantize_mxfp8(q, scales),
+        values.x.float(),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_nvfp4_quantization_inputs_generate_representable_values() -> None:
+    values = NVFP4QuantizationInputs(
+        NVFP4QuantizationInputConfig(
+            shape=(3, 64),
+            dtype=torch.bfloat16,
+            scale=0.125,
+        )
+    ).generate(seed=46, device="cpu")
+
+    assert values.x.shape == (3, 64)
+    assert values.x.dtype == torch.bfloat16
+    assert values.scale.shape == (1,)
+    assert values.scale.dtype == torch.float32
+    assert values.scale_size == 16
+    assert values.scale_layout == "linear"
+
+    packed, scales = nvfp4_quantization_reference(
+        values.x,
+        scale=values.scale,
+        scale_size=values.scale_size,
+        scale_layout=values.scale_layout,
+    )
+    assert packed.shape == (3, 32)
+    assert packed.dtype == torch.uint8
+    assert scales.shape == (3, 4)
+    assert scales.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(
+        _dequantize_nvfp4(packed, scales, values.scale),
+        values.x.float(),
+        atol=0,
+        rtol=0,
+    )
+
+
 def test_mxfp4_quantization_reference_matches_known_values() -> None:
     base = torch.tensor(
         [
@@ -232,12 +335,63 @@ def test_mxfp4_quantization_rejects_incompatible_last_dim() -> None:
         )
 
 
+def test_mxfp8_quantization_rejects_incompatible_last_dim() -> None:
+    with pytest.raises(ValueError, match="last dimension must be divisible"):
+        MXFP8QuantizationInputs(
+            MXFP8QuantizationInputConfig(
+                shape=(4, 63),
+                dtype=torch.bfloat16,
+            )
+        )
+
+
+def test_nvfp4_quantization_rejects_incompatible_last_dim() -> None:
+    with pytest.raises(ValueError, match="last dimension must be divisible"):
+        NVFP4QuantizationInputs(
+            NVFP4QuantizationInputConfig(
+                shape=(4, 63),
+                dtype=torch.bfloat16,
+            )
+        )
+
+
 def test_mxfp4_quantization_rejects_invalid_dtype() -> None:
     with pytest.raises(ValueError, match="bf16 or fp16"):
         MXFP4QuantizationInputs(
             MXFP4QuantizationInputConfig(
                 shape=(4, 64),
                 dtype=torch.float32,
+            )
+        )
+
+
+def test_mxfp8_quantization_rejects_invalid_dtype() -> None:
+    with pytest.raises(ValueError, match="bf16 or fp16"):
+        MXFP8QuantizationInputs(
+            MXFP8QuantizationInputConfig(
+                shape=(4, 64),
+                dtype=torch.float32,
+            )
+        )
+
+
+def test_nvfp4_quantization_rejects_invalid_dtype() -> None:
+    with pytest.raises(ValueError, match="bf16 or fp16"):
+        NVFP4QuantizationInputs(
+            NVFP4QuantizationInputConfig(
+                shape=(4, 64),
+                dtype=torch.float32,
+            )
+        )
+
+
+def test_nvfp4_quantization_rejects_invalid_scale() -> None:
+    with pytest.raises(ValueError, match="scale must be positive"):
+        NVFP4QuantizationInputs(
+            NVFP4QuantizationInputConfig(
+                shape=(4, 64),
+                dtype=torch.bfloat16,
+                scale=0.0,
             )
         )
 
