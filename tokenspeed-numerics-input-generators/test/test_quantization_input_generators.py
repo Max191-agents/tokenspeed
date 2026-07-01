@@ -25,10 +25,10 @@ import torch
 from tokenspeed_numerics_input_generators import (
     FP8QuantizationInputConfig,
     FP8QuantizationInputs,
-    MXFP8QuantizationInputConfig,
-    MXFP8QuantizationInputs,
     MXFP4QuantizationInputConfig,
     MXFP4QuantizationInputs,
+    MXFP8QuantizationInputConfig,
+    MXFP8QuantizationInputs,
     NVFP4QuantizationInputConfig,
     NVFP4QuantizationInputs,
     fp8_quantization_reference,

@@ -23,10 +23,6 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from tokenspeed_numerics_input_generators import (
-    FP8QuantizationInputConfig,
-    FP8QuantizationInputs,
-)
 from tokenspeed_kernel.numerics.inputs import (
     InputGenerator,
     set_benchmark_shapes,
@@ -34,6 +30,10 @@ from tokenspeed_kernel.numerics.inputs import (
     set_standard_shapes,
 )
 from tokenspeed_kernel.numerics.tolerance import Tolerance, set_family_tolerance
+from tokenspeed_numerics_input_generators import (
+    FP8QuantizationInputConfig,
+    FP8QuantizationInputs,
+)
 
 # ---------------------------------------------------------------------------
 # Tolerance

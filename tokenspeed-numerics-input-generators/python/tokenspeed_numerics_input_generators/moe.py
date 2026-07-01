@@ -36,8 +36,8 @@ from tokenspeed_numerics_input_generators.core import (
 )
 from tokenspeed_numerics_input_generators.gemm import (
     GemmInputConfig,
-    GemmInputValues,
     GemmInputs,
+    GemmInputValues,
     _check_gemm_layout,
     _logical_operand,
     mxfp4_gemm_input_config,
@@ -696,7 +696,9 @@ def _validate_topk_values(
     if topk_ids.max().item() >= num_experts:
         raise ValueError("topk_ids must be less than the number of experts")
     sorted_ids = topk_ids.to(torch.long).sort(dim=-1).values
-    if sorted_ids.shape[-1] > 1 and torch.any(sorted_ids[..., 1:] == sorted_ids[..., :-1]):
+    if sorted_ids.shape[-1] > 1 and torch.any(
+        sorted_ids[..., 1:] == sorted_ids[..., :-1]
+    ):
         raise ValueError("topk_ids must not contain duplicate experts per token")
     weights = topk_weights.float()
     if not torch.isfinite(weights).all():
@@ -755,8 +757,7 @@ def moe_reference(
         raise ValueError("hidden_states are required for moe_reference")
     if values.hidden_states.ndim != 2:
         raise ValueError(
-            "hidden_states must be rank-2, got "
-            f"{tuple(values.hidden_states.shape)}"
+            "hidden_states must be rank-2, got " f"{tuple(values.hidden_states.shape)}"
         )
     num_tokens, hidden_size = values.hidden_states.shape
     if values.router_logits is not None:
@@ -772,9 +773,13 @@ def moe_reference(
     w13 = _moe_weight_operand(values.w13, name="w13", layout=w13_b_layout)
     w2 = _moe_weight_operand(values.w2, name="w2", layout=w2_b_layout)
     if w13.ndim != 3:
-        raise ValueError(f"w13.B must be rank-3 after layout normalization, got {w13.ndim}D")
+        raise ValueError(
+            f"w13.B must be rank-3 after layout normalization, got {w13.ndim}D"
+        )
     if w2.ndim != 3:
-        raise ValueError(f"w2.B must be rank-3 after layout normalization, got {w2.ndim}D")
+        raise ValueError(
+            f"w2.B must be rank-3 after layout normalization, got {w2.ndim}D"
+        )
     num_experts, two_intermediate_size, w13_hidden_size = w13.shape
     w2_num_experts, w2_hidden_size, intermediate_size = w2.shape
     if two_intermediate_size % 2 != 0:
@@ -789,7 +794,10 @@ def moe_reference(
         )
     if w2_num_experts != num_experts:
         raise ValueError("w13 and w2 must have matching expert counts")
-    if values.router_logits is not None and values.router_logits.shape[1] != num_experts:
+    if (
+        values.router_logits is not None
+        and values.router_logits.shape[1] != num_experts
+    ):
         raise ValueError("router_logits expert dimension must match weight experts")
     _validate_topk_values(
         topk_ids=values.topk_ids,
@@ -801,7 +809,9 @@ def moe_reference(
         num_experts,
         two_intermediate_size,
     ):
-        raise ValueError("w13_bias must have shape [num_experts, 2 * intermediate_size]")
+        raise ValueError(
+            "w13_bias must have shape [num_experts, 2 * intermediate_size]"
+        )
     if values.w2_bias is not None and values.w2_bias.shape != (
         num_experts,
         hidden_size,

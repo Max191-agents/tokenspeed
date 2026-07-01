@@ -30,66 +30,66 @@ from tokenspeed_kernel import (
     mla_decode_with_kvcache,
     mla_prefill,
 )
-from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
-from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
-    fused_qkv_split_gdn_prefill,
+from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
+    mha_decode_with_kvcache_kwargs,
+    mha_extend_with_kvcache_kwargs,
+    mha_prefill_kwargs,
+    mla_decode_with_kvcache_kwargs,
+    mla_prefill_kwargs,
 )
-from tokenspeed_kernel.ops.attention.triton.qkv_rotary import packed_qkv_complex_rotary
+from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_build_dense_prefill_local_compressed_indices,
+    deepseek_v4_combine_dense_swa_indices,
+    deepseek_v4_combine_topk_swa_indices,
+    deepseek_v4_compressed_slot_mapping,
+    deepseek_v4_compute_global_topk_indices_and_lens,
+    deepseek_v4_decode_swa_indices_and_lens,
+    deepseek_v4_indexer_decode_metadata_compute,
+)
 from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
     full_context_topk_to_global_slots,
     local_topk_to_global_slots,
     pack_sparse_decode_kv,
 )
-from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
-    deepseek_v4_build_dense_prefill_local_compressed_indices,
-    deepseek_v4_compressed_slot_mapping,
-    deepseek_v4_combine_dense_swa_indices,
-    deepseek_v4_combine_topk_swa_indices,
-    deepseek_v4_compute_global_topk_indices_and_lens,
-    deepseek_v4_decode_swa_indices_and_lens,
-    deepseek_v4_indexer_decode_metadata_compute,
+from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
+    fused_qkv_split_gdn_prefill,
 )
+from tokenspeed_kernel.ops.attention.triton.qkv_rotary import packed_qkv_complex_rotary
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
-    mla_decode_with_kvcache_kwargs,
-    mla_prefill_kwargs,
-    mha_decode_with_kvcache_kwargs,
-    mha_extend_with_kvcache_kwargs,
-    mha_prefill_kwargs,
-)
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    DeepSeekV4PagedIndexInputConfig,
+    DeepSeekV4PagedIndexInputs,
+    DeepSeekV4SparsePrefillIndexInputConfig,
+    DeepSeekV4SparsePrefillIndexInputs,
     DSASparseDecodeKVPackInputConfig,
     DSASparseDecodeKVPackInputs,
     DSATopKSlotInputConfig,
     DSATopKSlotInputs,
     GDNQKVSplitInputConfig,
     GDNQKVSplitInputs,
-    DeepSeekV4PagedIndexInputConfig,
-    DeepSeekV4PagedIndexInputs,
-    DeepSeekV4SparsePrefillIndexInputConfig,
-    DeepSeekV4SparsePrefillIndexInputs,
     MHAInputConfig,
     MHAInputs,
+    MHARequestMetadataInputConfig,
     MLAInputConfig,
     MLAInputs,
     MLAKVPackQuantizeFP8InputConfig,
     MLAKVPackQuantizeFP8Inputs,
-    MHARequestMetadataInputConfig,
     PackedQKVComplexRotaryInputConfig,
     PackedQKVComplexRotaryInputs,
     attention_merge_state_reference,
-    dsa_sparse_decode_kv_pack_reference,
-    dsa_full_context_topk_to_global_slots_reference,
-    dsa_local_topk_to_global_slots_reference,
-    deepseek_v4_compressed_slot_mapping_reference,
-    deepseek_v4_compute_global_topk_indices_and_lens_reference,
-    deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_build_dense_prefill_local_compressed_indices_reference,
     deepseek_v4_combine_dense_swa_indices_reference,
     deepseek_v4_combine_topk_swa_indices_reference,
+    deepseek_v4_compressed_slot_mapping_reference,
+    deepseek_v4_compute_global_topk_indices_and_lens_reference,
+    deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_indexer_decode_metadata_reference,
+    dsa_full_context_topk_to_global_slots_reference,
+    dsa_local_topk_to_global_slots_reference,
+    dsa_sparse_decode_kv_pack_reference,
     gdn_qkv_split_reference,
     mla_kv_pack_quantize_fp8_reference,
     packed_qkv_complex_rotary_reference,

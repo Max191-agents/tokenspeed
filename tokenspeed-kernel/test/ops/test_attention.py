@@ -37,12 +37,12 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mha_extend_with_kvcache_kwargs,
     mha_prefill_kwargs,
 )
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
     MHAInputConfig,
     MHAInputs,
     MHARequestMetadataInputConfig,
 )
-from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
 torch.manual_seed(42)

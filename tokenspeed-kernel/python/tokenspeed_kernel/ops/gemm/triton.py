@@ -83,9 +83,9 @@ def prepare_block_fp8_matmul_inputs(
     if As.dtype == torch.float:
         assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     elif As.dtype == torch.int:
-        assert triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1], (
-            f"{A.shape=} {As.shape=} {block_size=}"
-        )
+        assert (
+            triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
+        ), f"{A.shape=} {As.shape=} {block_size=}"
     else:
         raise NotImplementedError
 
@@ -101,9 +101,9 @@ def prepare_block_fp8_matmul_inputs(
         assert triton.cdiv(K, block_k) == Bs.shape[1]
     elif Bs.dtype == torch.int:
         assert N == Bs.shape[0], f"{B.shape=} {Bs.shape=} {block_size=}"
-        assert triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1], (
-            f"{B.shape=} {Bs.shape=} {block_size=}"
-        )
+        assert (
+            triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
+        ), f"{B.shape=} {Bs.shape=} {block_size=}"
     else:
         raise NotImplementedError
 
@@ -745,9 +745,9 @@ def triton_mm_fp8_blockscale(
 ) -> torch.Tensor:
     del C
     assert block_size is not None, "block_size is required for triton_mm_fp8_blockscale"
-    assert A_scales is not None, (
-        "A_scales is required; online quantization should be done by the caller"
-    )
+    assert (
+        A_scales is not None
+    ), "A_scales is required; online quantization should be done by the caller"
     return w8a8_block_fp8_matmul_triton(
         A,
         B,

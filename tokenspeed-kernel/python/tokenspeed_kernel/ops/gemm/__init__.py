@@ -307,9 +307,9 @@ def mm(
 
     # Online activation quantization
     if quant == "mxfp8" and A_scales is None:
-        assert block_size is not None, (
-            "block_size is required for online activation quantization"
-        )
+        assert (
+            block_size is not None
+        ), "block_size is required for online activation quantization"
         A, A_scales = _online_quantize_mxfp8(A, block_size, kernel.name)
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)

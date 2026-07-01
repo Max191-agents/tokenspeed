@@ -40,8 +40,8 @@ from tokenspeed_numerics_input_generators.attention_cache import (
 )
 from tokenspeed_numerics_input_generators.attention_metadata import (
     CacheLayout,
-    MHARequestMetadataInputConfig,
     MHARequestMetadataInput,
+    MHARequestMetadataInputConfig,
     MHARequestMetadataValues,
     PageTableIndexing,
 )

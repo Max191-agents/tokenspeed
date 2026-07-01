@@ -167,7 +167,9 @@ def _generate_tensor(
 
 def _check_gemm_layout(name: str, layout: GemmLayout) -> GemmLayout:
     if layout not in _GEMM_LAYOUTS:
-        raise ValueError(f"{name} must be one of {sorted(_GEMM_LAYOUTS)}, got {layout!r}")
+        raise ValueError(
+            f"{name} must be one of {sorted(_GEMM_LAYOUTS)}, got {layout!r}"
+        )
     return layout
 
 
@@ -210,10 +212,13 @@ def _dequantize_mxfp4_linear(
             f"got scales={tuple(scales.shape)}, values={tuple(out.shape)}"
         )
     scale_values = torch.pow(2.0, scales.to(torch.int32) - 127).to(torch.float32)
-    return out * scale_values.repeat_interleave(
-        _DEFAULT_MXFP4_BLOCK_SIZE,
-        dim=-1,
-    )[..., : out.shape[-1]]
+    return (
+        out
+        * scale_values.repeat_interleave(
+            _DEFAULT_MXFP4_BLOCK_SIZE,
+            dim=-1,
+        )[..., : out.shape[-1]]
+    )
 
 
 def _apply_regular_scales(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -239,7 +244,9 @@ def _apply_regular_scales(values: torch.Tensor, scales: torch.Tensor) -> torch.T
 
 def _check_nvfp4_source_dtype(dtype: torch.dtype) -> torch.dtype:
     if dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(f"NVFP4 fused GEMM input dtype must be bf16 or fp16, got {dtype}")
+        raise ValueError(
+            f"NVFP4 fused GEMM input dtype must be bf16 or fp16, got {dtype}"
+        )
     return dtype
 
 
@@ -464,16 +471,16 @@ class GemmInputs(NumericsInputGenerator):
         return TensorInput(
             self._value_shape(role),
             self.config.a_dtype if is_a else self.config.b_dtype,
-            scale_shape=self.config.a_scale_shape
-            if is_a
-            else self.config.b_scale_shape,
-            scale_dtype=self.config.a_scale_dtype
-            if is_a
-            else self.config.b_scale_dtype,
+            scale_shape=(
+                self.config.a_scale_shape if is_a else self.config.b_scale_shape
+            ),
+            scale_dtype=(
+                self.config.a_scale_dtype if is_a else self.config.b_scale_dtype
+            ),
             device=self.config.a_device if is_a else self.config.b_device,
-            scale_device=self.config.a_scale_device
-            if is_a
-            else self.config.b_scale_device,
+            scale_device=(
+                self.config.a_scale_device if is_a else self.config.b_scale_device
+            ),
         ).generate(seed=seed, device=device)
 
     def generate(self, *, seed: int, device: DeviceLike = None) -> GemmInputValues:

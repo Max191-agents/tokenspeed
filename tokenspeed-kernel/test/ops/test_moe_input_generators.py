@@ -20,8 +20,8 @@
 
 from __future__ import annotations
 
-import torch
 import tokenspeed_kernel.numerics.moe  # noqa: F401
+import torch
 from tokenspeed_kernel.numerics.inputs import get_input_generator
 from tokenspeed_kernel.numerics.moe import canonicalize_align_block_size
 from tokenspeed_numerics_input_generators import (

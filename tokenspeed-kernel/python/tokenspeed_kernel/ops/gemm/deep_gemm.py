@@ -83,9 +83,9 @@ if fp8_gemm_nt is not None:
         C: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del C
-        assert A_scales is not None, (
-            "A_scales is required; online quantization should be done by the caller"
-        )
+        assert (
+            A_scales is not None
+        ), "A_scales is required; online quantization should be done by the caller"
         if A_scales.dtype == torch.float32:
             A_scales = get_mn_major_tma_aligned_tensor(A_scales)
         N = B.shape[0]

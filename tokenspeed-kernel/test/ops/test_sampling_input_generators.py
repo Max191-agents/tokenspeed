@@ -22,8 +22,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.sampling.cuda import fused_topk_topp_renorm
 from tokenspeed_kernel.ops.sampling import argmax
+from tokenspeed_kernel.ops.sampling.cuda import fused_topk_topp_renorm
 from tokenspeed_kernel.ops.sampling.cute_dsl import argmax_pair
 from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,

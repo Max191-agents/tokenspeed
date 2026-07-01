@@ -21,8 +21,8 @@
 from __future__ import annotations
 
 import pytest
-import torch
 import tokenspeed_kernel
+import torch
 from tokenspeed_numerics_input_generators import (
     GemmInputs,
     gemm_reference,

@@ -25,8 +25,8 @@ import torch
 from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
 from tokenspeed_numerics_input_generators import (
     RopeInputConfig,
-    RopeInputValues,
     RopeInputs,
+    RopeInputValues,
     rope_reference,
 )
 
@@ -173,14 +173,18 @@ def test_rope_neox_partial_bf16(
         config.num_q_heads,
         config.head_size,
     )
-    assert torch.equal(q_view[..., config.rotary_dim :], q_orig_view[..., config.rotary_dim :])
+    assert torch.equal(
+        q_view[..., config.rotary_dim :], q_orig_view[..., config.rotary_dim :]
+    )
     k_view = values.key.view(config.num_tokens, config.num_kv_heads, config.head_size)
     k_orig_view = key_orig.view(
         config.num_tokens,
         config.num_kv_heads,
         config.head_size,
     )
-    assert torch.equal(k_view[..., config.rotary_dim :], k_orig_view[..., config.rotary_dim :])
+    assert torch.equal(
+        k_view[..., config.rotary_dim :], k_orig_view[..., config.rotary_dim :]
+    )
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])

@@ -25,14 +25,14 @@ import torch
 from tokenspeed_numerics_input_generators import (
     CustomDType,
     GemmInputConfig,
-    GemmInputValues,
     GemmInputs,
+    GemmInputValues,
     MoeAlignBlockSizeInputConfig,
     MoeAlignBlockSizeInputs,
     MoeAlignBlockSizeInputValues,
     MoeInputConfig,
-    MoeInputValues,
     MoeInputs,
+    MoeInputValues,
     NVFP4GemmSwiGLUNVFP4QuantInputConfig,
     NVFP4GemmSwiGLUNVFP4QuantInputs,
     TensorInput,
@@ -487,10 +487,7 @@ def test_gemm_reference_applies_scaled_operands() -> None:
     assert values.B_scales is not None
 
     ref = gemm_reference(values)
-    manual = (
-        values.A.float()
-        * values.A_scales.float().view(3, 1)
-    ) @ (
+    manual = (values.A.float() * values.A_scales.float().view(3, 1)) @ (
         values.B.float() * values.B_scales.float().view(5, 1)
     ).T
 

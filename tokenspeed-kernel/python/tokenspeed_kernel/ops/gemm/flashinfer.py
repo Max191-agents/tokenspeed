@@ -113,9 +113,9 @@ if gemm_fp8_nt_groupwise is not error_fn:
         C: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del C
-        assert A_scales is not None, (
-            "A_scales is required; online quantization should be done by the caller"
-        )
+        assert (
+            A_scales is not None
+        ), "A_scales is required; online quantization should be done by the caller"
         assert B_scales is not None, "B_scales is required for FP8 blockscale GEMM"
         orig_m = A.shape[0]
         scale_m = A_scales.shape[0]

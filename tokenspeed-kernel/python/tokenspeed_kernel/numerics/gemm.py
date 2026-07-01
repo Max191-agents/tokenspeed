@@ -24,13 +24,6 @@ import math
 from typing import Any, Literal
 
 import torch
-from tokenspeed_numerics_input_generators import (
-    CustomDType,
-    GemmInputConfig,
-    GemmInputs,
-    InputDType,
-    gemm_scale_shape,
-)
 from tokenspeed_kernel.numerics.inputs import (
     InputGenerator,
     set_benchmark_shapes,
@@ -38,6 +31,13 @@ from tokenspeed_kernel.numerics.inputs import (
     set_standard_shapes,
 )
 from tokenspeed_kernel.numerics.tolerance import Tolerance, set_family_tolerance
+from tokenspeed_numerics_input_generators import (
+    CustomDType,
+    GemmInputConfig,
+    GemmInputs,
+    InputDType,
+    gemm_scale_shape,
+)
 
 # ---------------------------------------------------------------------------
 # Tolerance

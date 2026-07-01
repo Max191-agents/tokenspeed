@@ -39,8 +39,8 @@ being dominated by sigmoid saturation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -398,9 +398,7 @@ def fused_gate_sigmoid_mul_add_reference(
     """Return a float32 reference for fused gate-sigmoid-mul-add inputs."""
 
     if values.hidden_states.ndim != 2:
-        raise ValueError(
-            f"hidden_states must be 2D, got {values.hidden_states.ndim}D"
-        )
+        raise ValueError(f"hidden_states must be 2D, got {values.hidden_states.ndim}D")
     num_tokens, hidden_dim = values.hidden_states.shape
     if values.gate_weight.shape != (hidden_dim,):
         raise ValueError(
