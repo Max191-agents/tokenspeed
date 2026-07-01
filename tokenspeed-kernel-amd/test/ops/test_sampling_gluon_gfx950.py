@@ -46,14 +46,19 @@ if not _is_gfx950():
 from tokenspeed_kernel_amd.ops.sampling.gluon import (  # noqa: E402
     argmax_gfx950,
 )
+from tokenspeed_numerics_input_generators import (  # noqa: E402
+    ArgmaxInputConfig,
+    ArgmaxInputs,
+)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_argmax_matches_torch_for_dtypes(dtype):
-    torch.manual_seed(0xA950)
-    x = torch.randn(8, 4096, device="cuda", dtype=dtype)
-    out = argmax_gfx950.argmax(x)
-    torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(num_rows=8, vocab_size=4096, dtype=dtype)
+    ).generate(seed=0xA950, metadata_seed=0xA951, device="cuda")
+    out = argmax_gfx950.argmax(values.logits)
+    torch.testing.assert_close(out, values.expected_indices, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -69,10 +74,11 @@ def test_argmax_matches_torch_for_dtypes(dtype):
     ],
 )
 def test_argmax_matches_torch_for_model_shapes(M, N):
-    torch.manual_seed(M ^ N)
-    x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
-    out = argmax_gfx950.argmax(x)
-    torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(num_rows=M, vocab_size=N, dtype=torch.float32)
+    ).generate(seed=M ^ N, metadata_seed=(M ^ N ^ 0xA950), device="cuda")
+    out = argmax_gfx950.argmax(values.logits)
+    torch.testing.assert_close(out, values.expected_indices, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -85,60 +91,66 @@ def test_argmax_matches_torch_for_model_shapes(M, N):
     ],
 )
 def test_argmax_all_nan_rows_return_sentinel(M, N, dtype):
-    x = torch.full((M, N), float("nan"), device="cuda", dtype=dtype)
-    out = argmax_gfx950.argmax(x)
-    expected = torch.full((M,), -1, device="cuda", dtype=out.dtype)
-    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(num_rows=M, vocab_size=N, dtype=dtype, nan_pattern="all")
+    ).generate(seed=M ^ N, metadata_seed=(M ^ N ^ 0xA951), device="cuda")
+    out = argmax_gfx950.argmax(values.logits)
+    torch.testing.assert_close(out, values.expected_indices, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("M", [4, 128])
 def test_argmax_ignores_nan_but_preserves_valid_negative_infinity(M):
     N = MODEL_VOCABS["deepseek_v4"]
-    x = torch.full((M, N), float("nan"), device="cuda", dtype=torch.float32)
-    x[0, 123] = 0.5
-    x[0, 456] = 1.0
-    x[1].fill_(-float("inf"))
-    x[2, 7] = 3.0
-    x[2, 5] = 3.0
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(
+            num_rows=M,
+            vocab_size=N,
+            dtype=torch.float32,
+            nan_pattern="mixed",
+        )
+    ).generate(seed=M ^ N, metadata_seed=(M ^ N ^ 0xA952), device="cuda")
 
-    out = argmax_gfx950.argmax(x)
-    expected = torch.full((M,), -1, device="cuda", dtype=out.dtype)
-    expected[:3] = torch.tensor([456, 0, 5], device="cuda", dtype=out.dtype)
-    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    out = argmax_gfx950.argmax(values.logits)
+    torch.testing.assert_close(out, values.expected_indices, atol=0, rtol=0)
 
 
 def test_argmax_returns_first_index_on_ties():
     M, N = 4, 4096
-    x = torch.full((M, N), -100.0, device="cuda", dtype=torch.float32)
-    plant_positions = [
-        [0, 7, 9],
-        [3, 4],
-        [128, 1024, 2048],
-        [N - 1, 17],
-    ]
-    for row, positions in enumerate(plant_positions):
-        for pos in positions:
-            x[row, pos] = 0.0
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(
+            num_rows=M,
+            vocab_size=N,
+            dtype=torch.float32,
+            max_pattern="tied",
+        )
+    ).generate(seed=0xA952, metadata_seed=0xA953, device="cuda")
     torch.testing.assert_close(
-        argmax_gfx950.argmax(x), torch.argmax(x, dim=-1), atol=0, rtol=0
+        argmax_gfx950.argmax(values.logits),
+        values.expected_indices,
+        atol=0,
+        rtol=0,
     )
 
 
 @pytest.mark.parametrize("out_dtype", [torch.int32, torch.int64])
 def test_argmax_writes_into_strided_caller_buffer(out_dtype):
     M, N = 8, 4096
-    x = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(num_rows=M, vocab_size=N, dtype=torch.float32)
+    ).generate(seed=0xA954, metadata_seed=0xA955, device="cuda")
     storage = torch.empty(M * 2, device="cuda", dtype=out_dtype)
     out = storage[::2]
-    returned = argmax_gfx950.argmax(x, out=out)
+    returned = argmax_gfx950.argmax(values.logits, out=out)
     assert returned.data_ptr() == out.data_ptr()
-    torch.testing.assert_close(out.long(), torch.argmax(x, dim=-1), atol=0, rtol=0)
+    torch.testing.assert_close(out.long(), values.expected_indices, atol=0, rtol=0)
 
 
 def test_argmax_out_buffer_under_cuda_graph():
     M, N = 16, MODEL_VOCABS["deepseek_v4"]
-    torch.manual_seed(M ^ N ^ 0xC0DE)
-    x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(num_rows=M, vocab_size=N, dtype=torch.float32)
+    ).generate(seed=M ^ N ^ 0xC0DE, metadata_seed=M ^ N ^ 0xC0DF, device="cuda")
+    x = values.logits
     out = torch.empty(M, dtype=torch.int32, device="cuda")
 
     argmax_gfx950.argmax(x, out=out)
@@ -148,8 +160,10 @@ def test_argmax_out_buffer_under_cuda_graph():
     with torch.cuda.graph(graph):
         argmax_gfx950.argmax(x, out=out)
 
-    new_x = 0.1 * torch.randn_like(x)
-    x.copy_(new_x)
+    new_values = ArgmaxInputs(
+        ArgmaxInputConfig(num_rows=M, vocab_size=N, dtype=torch.float32)
+    ).generate(seed=M ^ N ^ 0xC1DE, metadata_seed=M ^ N ^ 0xC1DF, device="cuda")
+    x.copy_(new_values.logits)
     graph.replay()
     torch.cuda.synchronize()
-    torch.testing.assert_close(out.long(), torch.argmax(x, dim=-1), atol=0, rtol=0)
+    torch.testing.assert_close(out.long(), new_values.expected_indices, atol=0, rtol=0)

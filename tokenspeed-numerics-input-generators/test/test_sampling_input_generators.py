@@ -108,6 +108,42 @@ def test_argmax_inputs_generate_tied_maxima() -> None:
     torch.testing.assert_close(argmax_reference(values.logits), values.expected_indices)
 
 
+def test_argmax_inputs_generate_all_nan_rows() -> None:
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(
+            num_rows=4,
+            vocab_size=17,
+            dtype=torch.float32,
+            nan_pattern="all",
+        )
+    ).generate(seed=47, metadata_seed=48, device="cpu")
+
+    assert torch.isnan(values.logits).all()
+    torch.testing.assert_close(
+        values.expected_indices, torch.full((4,), -1, dtype=torch.int64)
+    )
+    torch.testing.assert_close(argmax_reference(values.logits), values.expected_indices)
+
+
+def test_argmax_inputs_generate_mixed_nan_rows() -> None:
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(
+            num_rows=8,
+            vocab_size=17,
+            dtype=torch.float32,
+            nan_pattern="mixed",
+        )
+    ).generate(seed=49, metadata_seed=50, device="cpu")
+
+    torch.testing.assert_close(
+        values.expected_indices,
+        torch.tensor([1, 0, 0, -1, 1, 0, 0, -1], dtype=torch.int64),
+    )
+    assert torch.isnan(values.logits[3]).all()
+    assert torch.isneginf(values.logits[1]).all()
+    torch.testing.assert_close(argmax_reference(values.logits), values.expected_indices)
+
+
 def test_argmax_reference_ignores_nans_and_marks_all_nan_rows() -> None:
     logits = torch.tensor(
         [[float("nan"), 1.0, 2.0], [float("nan"), float("nan"), float("nan")]],
@@ -807,6 +843,30 @@ def test_argmax_tied_pattern_requires_two_vocab_entries() -> None:
                 vocab_size=1,
                 dtype=torch.float32,
                 max_pattern="tied",
+            )
+        )
+
+
+def test_argmax_mixed_nan_pattern_requires_two_vocab_entries() -> None:
+    with pytest.raises(ValueError, match="requires vocab_size >= 2"):
+        ArgmaxInputs(
+            ArgmaxInputConfig(
+                num_rows=1,
+                vocab_size=1,
+                dtype=torch.float32,
+                nan_pattern="mixed",
+            )
+        )
+
+
+def test_argmax_rejects_invalid_nan_pattern() -> None:
+    with pytest.raises(ValueError, match="nan_pattern"):
+        ArgmaxInputs(
+            ArgmaxInputConfig(
+                num_rows=1,
+                vocab_size=8,
+                dtype=torch.float32,
+                nan_pattern="some",  # type: ignore[arg-type]
             )
         )
 

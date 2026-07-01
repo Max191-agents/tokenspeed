@@ -40,6 +40,7 @@ __all__ = [
     "ArgmaxInputs",
     "ArgmaxInputValues",
     "ArgmaxMaxPattern",
+    "ArgmaxNaNPattern",
     "ArgmaxPairInputConfig",
     "ArgmaxPairInputs",
     "ArgmaxPairInputValues",
@@ -93,6 +94,7 @@ __all__ = [
 ]
 
 ArgmaxMaxPattern = Literal["unique", "tied", "random"]
+ArgmaxNaNPattern = Literal["none", "all", "mixed"]
 SoftmaxTemperatureMode = Literal["none", "scalar", "per_row"]
 TopKTopPFilterMode = Literal[
     "random", "top_k_only", "top_p_only", "top_k_top_p", "mixed"
@@ -182,6 +184,12 @@ def _check_argmax_max_pattern(name: str, value: str) -> ArgmaxMaxPattern:
     return value  # type: ignore[return-value]
 
 
+def _check_argmax_nan_pattern(name: str, value: str) -> ArgmaxNaNPattern:
+    if value not in ("none", "all", "mixed"):
+        raise ValueError(f"{name} must be 'none', 'all', or 'mixed'; got {value!r}")
+    return value  # type: ignore[return-value]
+
+
 def _check_top_k_top_p_filter_mode(name: str, value: str) -> TopKTopPFilterMode:
     if value not in ("random", "top_k_only", "top_p_only", "top_k_top_p", "mixed"):
         raise ValueError(
@@ -239,6 +247,46 @@ def _plant_argmax_maxima(
         logits[rows, tied_indices] = max_value
 
     return logits, expected
+
+
+def _apply_argmax_nan_pattern(
+    logits: torch.Tensor,
+    *,
+    pattern: ArgmaxNaNPattern,
+) -> torch.Tensor:
+    """Apply deterministic NaN layouts used to validate argmax NaN semantics."""
+
+    if pattern == "none":
+        return logits
+    if pattern == "all":
+        return torch.full_like(logits, float("nan"))
+
+    logits = torch.full_like(logits, float("nan"))
+    num_rows = logits.shape[0]
+    if num_rows == 0:
+        return logits
+
+    low_index = 0
+    high_index = 1
+    for row in range(num_rows):
+        row_kind = row % 4
+        if row_kind == 0:
+            logits[row, low_index] = torch.tensor(
+                0.5, dtype=logits.dtype, device=logits.device
+            )
+            logits[row, high_index] = torch.tensor(
+                1.0, dtype=logits.dtype, device=logits.device
+            )
+        elif row_kind == 1:
+            logits[row].fill_(-float("inf"))
+        elif row_kind == 2:
+            logits[row, low_index] = torch.tensor(
+                3.0, dtype=logits.dtype, device=logits.device
+            )
+            logits[row, high_index] = torch.tensor(
+                3.0, dtype=logits.dtype, device=logits.device
+            )
+    return logits
 
 
 @dataclass
@@ -346,6 +394,12 @@ class ArgmaxInputConfig:
     # equal maxima and expects the lower index; "random" leaves generated
     # logits untouched and derives expected indices from the reference.
     max_pattern: ArgmaxMaxPattern = "unique"
+
+    # Optional: generate NaN-focused rows. "all" makes every row all-NaN and
+    # expects the -1 sentinel. "mixed" cycles through rows with valid finite
+    # maxima among NaNs, all -inf valid values, tied finite maxima among NaNs,
+    # and all-NaN rows.
+    nan_pattern: ArgmaxNaNPattern = "none"
 
     # Optional: generated tensor device override.
     device: DeviceLike = None
@@ -515,8 +569,13 @@ class ArgmaxInputs(NumericsInputGenerator):
         self.config.max_pattern = _check_argmax_max_pattern(
             "max_pattern", self.config.max_pattern
         )
+        self.config.nan_pattern = _check_argmax_nan_pattern(
+            "nan_pattern", self.config.nan_pattern
+        )
         if self.config.max_pattern == "tied" and self.config.vocab_size < 2:
             raise ValueError("max_pattern='tied' requires vocab_size >= 2")
+        if self.config.nan_pattern == "mixed" and self.config.vocab_size < 2:
+            raise ValueError("nan_pattern='mixed' requires vocab_size >= 2")
         if self.config.out_dtype is not None:
             self.config.out_dtype = _check_index_dtype(
                 "out_dtype", self.config.out_dtype
@@ -550,6 +609,8 @@ class ArgmaxInputs(NumericsInputGenerator):
             device=device,
             configured_device=self.config.device,
         )
+        logits = _apply_argmax_nan_pattern(logits, pattern=self.config.nan_pattern)
+        expected = argmax_reference(logits)
         out = None
         if self.config.out_dtype is not None:
             out = torch.empty(

@@ -20,6 +20,12 @@ not depend on accidental random maxima or ties. It can also generate rows with
 two equal maxima to exercise the first-index tie rule, or leave random logits
 untouched and derive expected indices from the reference.
 
+For kernels that define NaN handling, the argmax reference ignores NaN values
+when any non-NaN value is present and returns `-1` for all-NaN rows. The
+generator can produce all-NaN rows or mixed batches containing finite maxima
+among NaNs, all-valid `-inf` rows, tied finite maxima among NaNs, and all-NaN
+rows.
+
 ### Argmax Pair
 
 `ArgmaxPairInputs` represents row-wise max plus argmax packed into a float32
@@ -207,6 +213,9 @@ The generators reject invalid sampling inputs before values are returned:
   softmax
 - planted argmax rows have either a unique known maximum or two tied known
   maxima whose lower index is the expected result
+- NaN-focused argmax rows either produce the documented `-1` all-NaN sentinel
+  or include enough valid non-NaN values to make the expected first argmax
+  index unambiguous
 
 Metadata such as argmax planted indices, scalar gather indices, top-k/top-p
 controls, speculative accepted-prefix lengths, and min-p thresholds are generated
