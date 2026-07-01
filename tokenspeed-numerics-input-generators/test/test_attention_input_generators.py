@@ -33,6 +33,8 @@ from tokenspeed_numerics_input_generators import (
     DeepSeekV4IndexerMXFP4CacheWriteInputs,
     DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig,
     DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs,
+    DeepSeekV4InvRoPEFP8QuantInputConfig,
+    DeepSeekV4InvRoPEFP8QuantInputs,
     DeepSeekV4KCacheGatherInputConfig,
     DeepSeekV4KCacheGatherInputs,
     DeepSeekV4PagedIndexInputConfig,
@@ -75,6 +77,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_indexer_mxfp4_cache_gather_reference,
     deepseek_v4_indexer_mxfp4_cache_write_reference,
     deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference,
+    deepseek_v4_inv_rope_fp8_quant_reference,
     deepseek_v4_save_compressor_state_reference,
     dsa_full_context_topk_to_global_slots_reference,
     dsa_local_topk_to_global_slots_reference,
@@ -1193,6 +1196,114 @@ def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_rejects_invalid_values() -> N
     values.positions = torch.tensor([2], dtype=torch.int64)
     with pytest.raises(ValueError, match="positions"):
         deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(values)
+
+
+def test_deepseek_v4_inv_rope_fp8_quant_inputs_generate_tma_reference() -> None:
+    values = DeepSeekV4InvRoPEFP8QuantInputs(
+        DeepSeekV4InvRoPEFP8QuantInputConfig(
+            num_tokens=5,
+            n_groups=2,
+            heads_per_group=2,
+            dtype=torch.bfloat16,
+            max_position=32,
+            value_scale=0.25,
+        )
+    ).generate(metadata_seed=111, value_seed=121, device="cpu")
+
+    fp8, scales = deepseek_v4_inv_rope_fp8_quant_reference(values)
+
+    assert values.o.shape == (5, 4, 512)
+    assert values.positions.shape == (5,)
+    assert values.cos_sin_cache.shape == (32, 64)
+    assert fp8.shape == (5, 2, 1024)
+    assert fp8.dtype == torch.float8_e4m3fn
+    assert scales.shape == (5, 2, 2)
+    assert scales.dtype == torch.int32
+    assert int(values.positions.min().item()) >= 0
+    assert int(values.positions.max().item()) < values.cos_sin_cache.shape[0]
+
+
+def test_deepseek_v4_inv_rope_fp8_quant_inputs_generate_float_scale_reference() -> None:
+    values = DeepSeekV4InvRoPEFP8QuantInputs(
+        DeepSeekV4InvRoPEFP8QuantInputConfig(
+            num_tokens=3,
+            n_groups=1,
+            heads_per_group=2,
+            dtype=torch.float32,
+            tma_aligned_scales=False,
+            value_scale=0.25,
+        )
+    ).generate(seed=131, device="cpu")
+
+    fp8, scales = deepseek_v4_inv_rope_fp8_quant_reference(values)
+
+    assert fp8.shape == (3, 1, 1024)
+    assert scales.shape == (3, 1, 8)
+    assert scales.dtype == torch.float32
+    assert torch.all(scales > 0)
+
+
+def test_deepseek_v4_inv_rope_fp8_quant_keeps_metadata_seed_independent() -> None:
+    generator = DeepSeekV4InvRoPEFP8QuantInputs(
+        DeepSeekV4InvRoPEFP8QuantInputConfig(
+            num_tokens=4,
+            n_groups=2,
+            heads_per_group=1,
+            dtype=torch.float32,
+            max_position=128,
+        )
+    )
+
+    first = generator.generate(metadata_seed=141, value_seed=151, device="cpu")
+    same_metadata = generator.generate(metadata_seed=141, value_seed=152, device="cpu")
+    same_values = generator.generate(metadata_seed=142, value_seed=151, device="cpu")
+
+    torch.testing.assert_close(first.positions, same_metadata.positions)
+    torch.testing.assert_close(first.cos_sin_cache, same_metadata.cos_sin_cache)
+    assert not torch.equal(first.o, same_metadata.o)
+    torch.testing.assert_close(first.o, same_values.o)
+    assert not torch.equal(first.positions, same_values.positions)
+
+
+def test_deepseek_v4_inv_rope_fp8_quant_rejects_invalid_configs_and_values() -> None:
+    with pytest.raises(ValueError, match="nope_dim \\+ rope_dim"):
+        DeepSeekV4InvRoPEFP8QuantInputs(
+            DeepSeekV4InvRoPEFP8QuantInputConfig(
+                num_tokens=1,
+                n_groups=1,
+                heads_per_group=1,
+                dtype=torch.float32,
+                head_dim=512,
+                nope_dim=384,
+                rope_dim=64,
+            )
+        )
+    with pytest.raises(ValueError, match="tma_aligned_scales"):
+        DeepSeekV4InvRoPEFP8QuantInputs(
+            DeepSeekV4InvRoPEFP8QuantInputConfig(
+                num_tokens=1,
+                n_groups=1,
+                heads_per_group=1,
+                dtype=torch.float32,
+                head_dim=256,
+                nope_dim=192,
+                rope_dim=64,
+                tma_aligned_scales=True,
+            )
+        )
+
+    values = DeepSeekV4InvRoPEFP8QuantInputs(
+        DeepSeekV4InvRoPEFP8QuantInputConfig(
+            num_tokens=1,
+            n_groups=1,
+            heads_per_group=1,
+            dtype=torch.float32,
+            max_position=2,
+        )
+    ).generate(seed=161, device="cpu")
+    values.positions = torch.tensor([2], dtype=torch.int64)
+    with pytest.raises(ValueError, match="positions"):
+        deepseek_v4_inv_rope_fp8_quant_reference(values)
 
 
 def test_deepseek_v4_indexer_mxfp4_cache_write_inputs_generate_reference() -> None:

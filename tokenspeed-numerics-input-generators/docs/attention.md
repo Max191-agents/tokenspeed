@@ -201,6 +201,34 @@ operation also scales a `[num_tokens, num_heads]` weight tensor by
 generated RoPE cache, and the indexer width is fixed to the DeepSeek V4
 operation width rather than exposed as a free-form kernel constant.
 
+### DeepSeek V4 Inverse-RoPE FP8 Quantization
+
+`DeepSeekV4InvRoPEFP8QuantInputs` represents the output-projection input
+preparation used after DeepSeek V4 attention. Each generated attention output
+row has shape `[num_tokens, n_groups * heads_per_group, head_dim]`. The
+operation applies inverse interleaved RoPE to the rotary suffix of every head:
+
+```text
+even' = even * cos + odd * sin
+odd'  = odd * cos - even * sin
+```
+
+The heads are then regrouped as `[num_tokens, n_groups,
+heads_per_group * head_dim]` and each contiguous `quant_group_size` block is
+quantized to FP8 E4M3. The block scale is rounded up to a power of two:
+
+```text
+scale = 2 ** ceil(log2(max(abs(block)) / fp8_max))
+fp8 = clamp(block / scale, -fp8_max, fp8_max).to(fp8_e4m3)
+```
+
+When `tma_aligned_scales` is true, each head's four UE8M0 scale bytes are
+packed into one int32 value for the grouped DeepGEMM path. Otherwise, scales are
+returned as one float32 value per quantization block. The generator verifies the
+DeepSeek V4 shape relationship that the rotary suffix fits in the final
+quantization group, and generated positions are always in range for the RoPE
+cache.
+
 ### DeepSeek V4 Indexer MXFP4 Cache Write
 
 `DeepSeekV4IndexerMXFP4CacheWriteInputs` represents writing 128-channel indexer
@@ -364,6 +392,10 @@ values:
 - DeepSeek V4 indexer-Q RoPE/Hadamard/MXFP4 inputs require 128-channel indexer
   Q rows, a 64-channel RoPE cache, per-token positions within that cache, and
   per-head weights matching the token/head dimensions
+- DeepSeek V4 inverse-RoPE FP8 quantization inputs require grouped head counts
+  matching the attention-output head dimension, an even rotary suffix, a head
+  dimension divisible by the quantization group size, and a rotary suffix that
+  fits in the final quantization group
 - merge-state outputs must have shape `[total_q, num_heads, head_dim]`
 - merge-state LSE tensors must have shape `[total_q, num_heads]` and use fp32
   generated values
@@ -388,7 +420,9 @@ paged-cache index helpers similarly consume `DeepSeekV4PagedIndexInputs`
 through small adapters. The DeepSeek V4 K-cache gather/dequantize helper
 consumes `DeepSeekV4KCacheGatherInputs` directly, and the DeepSeek V4
 indexer-Q RoPE/Hadamard/MXFP4 helper consumes
-`DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues` directly. The generator values
-are operation-level values. Tests or adapters are responsible for converting
+`DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues` directly. The DeepSeek V4
+inverse-RoPE FP8 quantization helper consumes
+`DeepSeekV4InvRoPEFP8QuantInputValues` directly. The generator values are
+operation-level values. Tests or adapters are responsible for converting
 generated values into the exact keyword arguments expected by a selected
 TokenSpeed backend.

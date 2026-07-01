@@ -89,6 +89,10 @@ __all__ = [
     "DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs",
     "DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues",
     "deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference",
+    "DeepSeekV4InvRoPEFP8QuantInputConfig",
+    "DeepSeekV4InvRoPEFP8QuantInputs",
+    "DeepSeekV4InvRoPEFP8QuantInputValues",
+    "deepseek_v4_inv_rope_fp8_quant_reference",
     "DeepSeekV4IndexerMXFP4CacheWriteInputConfig",
     "DeepSeekV4IndexerMXFP4CacheWriteInputs",
     "DeepSeekV4IndexerMXFP4CacheWriteInputValues",
@@ -3206,6 +3210,382 @@ def deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(
         q_packed.contiguous(),
         q_scale_bytes.view(torch.int32).squeeze(-1).contiguous(),
     ), weights_out
+
+
+@dataclass
+class DeepSeekV4InvRoPEFP8QuantInputValues:
+    """Generated values for DeepSeek V4 inverse-RoPE FP8 quantization."""
+
+    o: torch.Tensor
+    positions: torch.Tensor
+    cos_sin_cache: torch.Tensor
+    n_groups: int
+    heads_per_group: int
+    nope_dim: int
+    rope_dim: int
+    quant_group_size: int
+    tma_aligned_scales: bool
+
+
+@dataclass
+class DeepSeekV4InvRoPEFP8QuantInputConfig:
+    """Initialization parameters for inverse-RoPE FP8 output quantization.
+
+    The represented operation starts from attention output rows shaped as
+    ``[num_tokens, num_heads, head_dim]``. It applies the inverse RoPE transform
+    to the final rotary channels, groups heads into ``n_groups`` output groups,
+    and block-quantizes each grouped row to FP8 E4M3 with power-of-two scales.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of attention-output token rows.
+    num_tokens: int
+
+    # Required: number of output-projection groups.
+    n_groups: int
+
+    # Required: number of heads packed into each output-projection group.
+    heads_per_group: int
+
+    # Required: generated dtype for attention output rows before FP8 quant.
+    dtype: torch.dtype
+
+    # ------------------------------------------------------------------
+    # Optional shape and quantization configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: attention output width per head. DeepSeek V4 uses 512.
+    head_dim: int = _DEEPSEEK_V4_HEAD_DIM
+
+    # Optional: non-rotary prefix width per head. DeepSeek V4 uses 448.
+    nope_dim: int = _DEEPSEEK_V4_NOPE_DIM
+
+    # Optional: rotary suffix width per head. DeepSeek V4 uses 64.
+    rope_dim: int = _DEEPSEEK_V4_ROPE_DIM
+
+    # Optional: number of contiguous values sharing one FP8 scale.
+    quant_group_size: int = _DEEPSEEK_V4_FP8_QUANT_BLOCK * 2
+
+    # Optional: when true, pack each head's four UE8M0 scale bytes into int32
+    # values laid out for the DeepGEMM TMA-aligned path.
+    tma_aligned_scales: bool = True
+
+    # ------------------------------------------------------------------
+    # Optional metadata/value generation configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: number of RoPE cache rows. Generated positions are in
+    # [0, max_position), so this controls the generated absolute-position range.
+    max_position: int = 1024
+
+    # Optional: RoPE frequency base used to build the generated cos/sin cache.
+    rope_base: float = 10000.0
+
+    # Optional: dtype for generated position metadata.
+    position_dtype: torch.dtype = torch.int64
+
+    # Optional: scale applied to generated output values before quantization.
+    value_scale: float = 1.0
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DeepSeekV4InvRoPEFP8QuantInputs(NumericsInputGenerator):
+    """Generator for DeepSeek V4 inverse-RoPE FP8 output quantization inputs."""
+
+    config: DeepSeekV4InvRoPEFP8QuantInputConfig
+    o_input: TensorInput | None
+
+    def __init__(self, config: DeepSeekV4InvRoPEFP8QuantInputConfig) -> None:
+        self.config = config
+        self.o_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.o_input = self.o_input or TensorInput(
+            self._o_shape(),
+            self.config.dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int | None = None,
+        metadata_seed: int | None = None,
+        value_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> DeepSeekV4InvRoPEFP8QuantInputValues:
+        self.__post_init__()
+        if self.o_input is None:
+            raise ValueError("o_input must be initialized")
+        metadata_seed, value_seed = _resolve_attention_seeds(
+            seed=seed,
+            metadata_seed=metadata_seed,
+            value_seed=value_seed,
+        )
+        target_device = _resolve_device(self.config.device, device)
+        self.o_input.shape = self._o_shape()
+        self.o_input.dtype = self.config.dtype
+        o = _require_tensor(
+            self.o_input.generate(
+                seed=_child_seed(value_seed, 1),
+                device=target_device,
+            ).values,
+            "o",
+        )
+        values = DeepSeekV4InvRoPEFP8QuantInputValues(
+            o=(o.float() * self.config.value_scale).to(o.dtype).contiguous(),
+            positions=self._generate_positions(
+                seed=_child_seed(metadata_seed, 1),
+                device=target_device,
+            ),
+            cos_sin_cache=build_rope_cos_sin_cache(
+                rotary_dim=self.config.rope_dim,
+                max_position=self.config.max_position,
+                base=self.config.rope_base,
+                device=target_device,
+            ),
+            n_groups=self.config.n_groups,
+            heads_per_group=self.config.heads_per_group,
+            nope_dim=self.config.nope_dim,
+            rope_dim=self.config.rope_dim,
+            quant_group_size=self.config.quant_group_size,
+            tma_aligned_scales=self.config.tma_aligned_scales,
+        )
+        _validate_deepseek_v4_inv_rope_fp8_quant_values(values)
+        return values
+
+    def _normalize_config(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens",
+            self.config.num_tokens,
+        )
+        self.config.n_groups = _check_positive("n_groups", self.config.n_groups)
+        self.config.heads_per_group = _check_positive(
+            "heads_per_group",
+            self.config.heads_per_group,
+        )
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        self.config.head_dim = _check_positive("head_dim", self.config.head_dim)
+        self.config.nope_dim = _check_nonnegative("nope_dim", self.config.nope_dim)
+        self.config.rope_dim = _check_positive("rope_dim", self.config.rope_dim)
+        if self.config.rope_dim % 2 != 0:
+            raise ValueError(f"rope_dim must be even, got {self.config.rope_dim}")
+        if self.config.nope_dim + self.config.rope_dim != self.config.head_dim:
+            raise ValueError(
+                "nope_dim + rope_dim must equal head_dim for inverse-RoPE "
+                f"quantization, got {self.config.nope_dim} + "
+                f"{self.config.rope_dim} != {self.config.head_dim}"
+            )
+        self.config.quant_group_size = _check_positive(
+            "quant_group_size",
+            self.config.quant_group_size,
+        )
+        if self.config.head_dim % self.config.quant_group_size != 0:
+            raise ValueError(
+                "head_dim must be divisible by quant_group_size, got "
+                f"head_dim={self.config.head_dim}, "
+                f"quant_group_size={self.config.quant_group_size}"
+            )
+        if self.config.rope_dim > self.config.quant_group_size:
+            raise ValueError(
+                "rope_dim must fit in the final quantization group, got "
+                f"rope_dim={self.config.rope_dim}, "
+                f"quant_group_size={self.config.quant_group_size}"
+            )
+        chunks_per_head = self.config.head_dim // self.config.quant_group_size
+        if self.config.tma_aligned_scales and chunks_per_head != 4:
+            raise ValueError(
+                "tma_aligned_scales requires exactly four quantization groups "
+                f"per head, got {chunks_per_head}"
+            )
+        self.config.max_position = _check_positive(
+            "max_position",
+            self.config.max_position,
+        )
+        self.config.rope_base = float(self.config.rope_base)
+        if self.config.rope_base <= 0.0 or not math.isfinite(self.config.rope_base):
+            raise ValueError(f"rope_base must be positive, got {self.config.rope_base}")
+        if self.config.position_dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "position_dtype must be torch.int32 or torch.int64, got "
+                f"{self.config.position_dtype}"
+            )
+        self.config.value_scale = float(self.config.value_scale)
+        if self.config.value_scale < 0.0 or not math.isfinite(self.config.value_scale):
+            raise ValueError(
+                f"value_scale must be finite and non-negative, got {self.config.value_scale}"
+            )
+
+    def _num_heads(self) -> int:
+        return self.config.n_groups * self.config.heads_per_group
+
+    def _o_shape(self) -> tuple[int, int, int]:
+        return (self.config.num_tokens, self._num_heads(), self.config.head_dim)
+
+    def _generate_positions(self, *, seed: int, device: torch.device) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        positions = torch.randint(
+            0,
+            self.config.max_position,
+            (self.config.num_tokens,),
+            dtype=self.config.position_dtype,
+            generator=rng,
+        )
+        return positions.to(device)
+
+
+def _validate_deepseek_v4_inv_rope_fp8_quant_values(
+    values: DeepSeekV4InvRoPEFP8QuantInputValues,
+) -> None:
+    if values.o.ndim != 3:
+        raise ValueError(f"o must be rank-3, got {values.o.ndim}")
+    n_groups = _check_positive("n_groups", values.n_groups)
+    heads_per_group = _check_positive("heads_per_group", values.heads_per_group)
+    expected_heads = n_groups * heads_per_group
+    if values.o.shape[1] != expected_heads:
+        raise ValueError(
+            f"o head dimension must be n_groups * heads_per_group={expected_heads}, "
+            f"got {values.o.shape[1]}"
+        )
+    if not values.o.is_floating_point():
+        raise TypeError(f"o must be floating point, got {values.o.dtype}")
+    if values.positions.ndim != 1:
+        raise ValueError("positions must be rank-1")
+    if values.positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"positions must be integer, got {values.positions.dtype}")
+    if values.positions.numel() != values.o.shape[0]:
+        raise ValueError("positions length must match o token dimension")
+    if values.cos_sin_cache.ndim != 2:
+        raise ValueError("cos_sin_cache must be rank-2")
+    rope_dim = _check_positive("rope_dim", values.rope_dim)
+    if rope_dim % 2 != 0:
+        raise ValueError(f"rope_dim must be even, got {rope_dim}")
+    if values.cos_sin_cache.shape[1] != rope_dim:
+        raise ValueError(
+            f"cos_sin_cache width must be rope_dim={rope_dim}, "
+            f"got {values.cos_sin_cache.shape[1]}"
+        )
+    nope_dim = _check_nonnegative("nope_dim", values.nope_dim)
+    head_dim = values.o.shape[-1]
+    if nope_dim + rope_dim != head_dim:
+        raise ValueError(
+            f"nope_dim + rope_dim must match o head_dim={head_dim}, "
+            f"got {nope_dim} + {rope_dim}"
+        )
+    quant_group_size = _check_positive("quant_group_size", values.quant_group_size)
+    if head_dim % quant_group_size != 0:
+        raise ValueError("o head_dim must be divisible by quant_group_size")
+    if rope_dim > quant_group_size:
+        raise ValueError("rope_dim must fit in the final quantization group")
+    chunks_per_head = head_dim // quant_group_size
+    if values.tma_aligned_scales and chunks_per_head != 4:
+        raise ValueError(
+            "tma_aligned_scales requires exactly four quantization groups per head"
+        )
+    if (
+        values.positions.device != values.o.device
+        or values.cos_sin_cache.device != values.o.device
+    ):
+        raise ValueError("o, positions, and cos_sin_cache must share device")
+    if values.positions.numel():
+        min_pos = int(values.positions.min().item())
+        max_pos = int(values.positions.max().item())
+        if min_pos < 0 or max_pos >= values.cos_sin_cache.shape[0]:
+            raise ValueError(
+                "positions must be within cos_sin_cache rows, got range "
+                f"[{min_pos}, {max_pos}] for cache length {values.cos_sin_cache.shape[0]}"
+            )
+
+
+def _deepseek_v4_apply_inverse_rope(
+    values: DeepSeekV4InvRoPEFP8QuantInputValues,
+) -> torch.Tensor:
+    out = values.o.float().clone()
+    half_rope = values.rope_dim // 2
+    rope = out[..., values.nope_dim : values.nope_dim + values.rope_dim]
+    even = rope[..., 0::2].clone()
+    odd = rope[..., 1::2].clone()
+    cos_sin = values.cos_sin_cache[values.positions.to(torch.int64)]
+    cos = cos_sin[:, None, :half_rope].float()
+    sin = cos_sin[:, None, half_rope:].float()
+    rope[..., 0::2] = even * cos + odd * sin
+    rope[..., 1::2] = odd * cos - even * sin
+    return out
+
+
+def _deepseek_v4_grouped_fp8_quant(
+    x: torch.Tensor,
+    *,
+    n_groups: int,
+    heads_per_group: int,
+    quant_group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens, _, head_dim = x.shape
+    grouped = x.reshape(num_tokens, n_groups, heads_per_group * head_dim)
+    num_scale_blocks = grouped.shape[-1] // quant_group_size
+    block_view = grouped.reshape(
+        num_tokens,
+        n_groups,
+        num_scale_blocks,
+        quant_group_size,
+    )
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    max_abs = block_view.abs().amax(dim=-1).clamp(min=1.0e-10)
+    scales = torch.exp2(torch.ceil(torch.log2(max_abs / fp8_max))).to(torch.float32)
+    scaled = (block_view / scales.unsqueeze(-1)).clamp(
+        min=-fp8_max,
+        max=fp8_max,
+    )
+    quantized = scaled.to(torch.float8_e4m3fn).reshape_as(grouped)
+    return quantized.contiguous(), scales.contiguous()
+
+
+def _deepseek_v4_pack_tma_aligned_scale_int32(
+    scales: torch.Tensor,
+    *,
+    heads_per_group: int,
+    chunks_per_head: int,
+) -> torch.Tensor:
+    scale_exp = torch.round(torch.log2(scales)).to(torch.int32)
+    scale_bytes = (scale_exp + 127).clamp(min=0, max=255).to(torch.int32)
+    scale_bytes = scale_bytes.reshape(
+        scales.shape[0],
+        scales.shape[1],
+        heads_per_group,
+        chunks_per_head,
+    )
+    shifts = torch.arange(chunks_per_head, dtype=torch.int32, device=scales.device) * 8
+    return torch.sum(scale_bytes << shifts, dim=-1).to(torch.int32).contiguous()
+
+
+def deepseek_v4_inv_rope_fp8_quant_reference(
+    values: DeepSeekV4InvRoPEFP8QuantInputValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return grouped FP8 output rows and scales after inverse RoPE."""
+
+    _validate_deepseek_v4_inv_rope_fp8_quant_values(values)
+    inv_rope = _deepseek_v4_apply_inverse_rope(values)
+    fp8, scales = _deepseek_v4_grouped_fp8_quant(
+        inv_rope,
+        n_groups=values.n_groups,
+        heads_per_group=values.heads_per_group,
+        quant_group_size=values.quant_group_size,
+    )
+    if not values.tma_aligned_scales:
+        return fp8, scales
+    return fp8, _deepseek_v4_pack_tma_aligned_scale_int32(
+        scales,
+        heads_per_group=values.heads_per_group,
+        chunks_per_head=values.o.shape[-1] // values.quant_group_size,
+    )
 
 
 @dataclass
