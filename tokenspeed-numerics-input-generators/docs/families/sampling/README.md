@@ -2,7 +2,7 @@
 
 Sampling generators cover row-wise selection and probability filtering used in
 token sampling. The operation semantics include deterministic argmax behavior,
-metadata gather/broadcast, min-p filtering, and top-k followed by top-p
+metadata gather/broadcast, softmax, min-p filtering, and top-k followed by top-p
 renormalization.
 
 ## Generators
@@ -12,6 +12,8 @@ renormalization.
 - `ArgmaxPairInputs`: generates logits for `(max_value, argmax_index)` outputs.
 - `GatherExpandScalarsInputs`: generates scalar pools, request indices, and
   optional min-p/seed/offset streams.
+- `SoftmaxInputs`: generates logits plus optional scalar or per-row temperature
+  values for row-wise softmax.
 - `MinPRenormInputs`: generates normalized probability rows and min-p
   thresholds.
 - `TopKTopPRenormInputs`: generates normalized probability rows, top-k values,
@@ -19,10 +21,10 @@ renormalization.
 
 ## Generated Values
 
-Probability generators return rows normalized to sum to one. Argmax generators
-can plant unique maxima so correctness tests are not dominated by random tie
-behavior. Metadata generators keep request indices in range and expose optional
-streams explicitly.
+Softmax references and probability generators return fp32 rows normalized to
+sum to one. Argmax generators can plant unique maxima so correctness tests are
+not dominated by random tie behavior. Metadata generators keep request indices
+in range and expose optional streams explicitly.
 
 References model the sampling operation directly and are suitable for comparing
 different kernel implementations with the same generated inputs.

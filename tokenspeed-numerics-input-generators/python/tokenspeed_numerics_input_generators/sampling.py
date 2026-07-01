@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from tokenspeed_numerics_input_generators.core import (
@@ -47,6 +48,9 @@ __all__ = [
     "MinPRenormInputConfig",
     "MinPRenormInputs",
     "MinPRenormInputValues",
+    "SoftmaxInputConfig",
+    "SoftmaxInputs",
+    "SoftmaxInputValues",
     "TopKTopPRenormInputConfig",
     "TopKTopPRenormInputs",
     "TopKTopPRenormInputValues",
@@ -54,8 +58,11 @@ __all__ = [
     "argmax_reference",
     "gather_expand_scalars_reference",
     "min_p_renorm_reference",
+    "softmax_reference",
     "top_k_top_p_renorm_reference",
 ]
+
+SoftmaxTemperatureMode = Literal["none", "scalar", "per_row"]
 
 _LOGIT_DTYPES = {
     torch.float16,
@@ -147,6 +154,14 @@ class ArgmaxPairInputValues:
 
 
 @dataclass
+class SoftmaxInputValues:
+    """Generated values for ``SoftmaxInputs``."""
+
+    logits: torch.Tensor
+    temperature: float | torch.Tensor | None
+
+
+@dataclass
 class ArgmaxInputConfig:
     """Initialization parameters for row-wise argmax inputs.
 
@@ -197,6 +212,37 @@ class ArgmaxPairInputConfig:
 
     # Optional: ensure each row has a known unique maximum.
     plant_unique_max: bool = True
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class SoftmaxInputConfig:
+    """Initialization parameters for row-wise softmax inputs.
+
+    The represented operation is ``softmax(logits / temperature)`` over each
+    row. Temperature can be omitted, shared by all rows, or generated per row.
+    """
+
+    # Required: number of independent probability rows. Zero is valid.
+    num_rows: int
+
+    # Required: number of logits per row.
+    vocab_size: int
+
+    # Required: generated dtype for logits.
+    dtype: torch.dtype
+
+    # Optional: no temperature, one scalar temperature, or one fp32
+    # temperature per row.
+    temperature_mode: SoftmaxTemperatureMode = "none"
+
+    # Optional: lower bound for generated positive temperatures.
+    min_temperature: float = 0.5
+
+    # Optional: upper bound for generated positive temperatures.
+    max_temperature: float = 1.5
 
     # Optional: generated tensor device override.
     device: DeviceLike = None
@@ -352,6 +398,89 @@ class ArgmaxPairInputs(NumericsInputGenerator):
             out=out,
             expected_pair=argmax_pair_reference(logits),
         )
+
+
+@dataclass(init=False)
+class SoftmaxInputs(NumericsInputGenerator):
+    """Generator for row-wise softmax logits and optional temperatures."""
+
+    config: SoftmaxInputConfig
+    logits_input: TensorInput | None
+
+    def __init__(self, config: SoftmaxInputConfig) -> None:
+        self.config = config
+        self.logits_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_rows = _check_nonnegative("num_rows", self.config.num_rows)
+        self.config.vocab_size = _check_positive("vocab_size", self.config.vocab_size)
+        self.config.dtype = _check_float_dtype(
+            "dtype", self.config.dtype, allowed=_LOGIT_DTYPES
+        )
+        if self.config.temperature_mode not in ("none", "scalar", "per_row"):
+            raise ValueError(
+                "temperature_mode must be 'none', 'scalar', or 'per_row'; "
+                f"got {self.config.temperature_mode!r}"
+            )
+        self.config.min_temperature = float(self.config.min_temperature)
+        self.config.max_temperature = float(self.config.max_temperature)
+        if self.config.min_temperature <= 0.0:
+            raise ValueError(
+                f"min_temperature must be positive, got {self.config.min_temperature}"
+            )
+        if self.config.max_temperature < self.config.min_temperature:
+            raise ValueError(
+                "max_temperature must be >= min_temperature; got "
+                f"{self.config.max_temperature} < {self.config.min_temperature}"
+            )
+        self.logits_input = self.logits_input or TensorInput(
+            (self.config.num_rows, self.config.vocab_size),
+            self.config.dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> SoftmaxInputValues:
+        self.__post_init__()
+        if self.logits_input is None:
+            raise ValueError("SoftmaxInputs child generator must be initialized")
+        target_device = _resolve_device(self.config.device, device)
+        logits = _require_tensor(
+            self.logits_input.generate(seed=_child_seed(seed, 1), device=device).values,
+            "logits",
+        ).contiguous()
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        temperature: float | torch.Tensor | None
+        if self.config.temperature_mode == "none":
+            temperature = None
+        else:
+            generator = _rng_for_device(
+                target_device, _child_seed(metadata_base_seed, 1)
+            )
+            temp_count = (
+                1 if self.config.temperature_mode == "scalar" else self.config.num_rows
+            )
+            temp = torch.rand(
+                (temp_count,),
+                dtype=torch.float32,
+                device=target_device,
+                generator=generator,
+            )
+            temp = (
+                temp * (self.config.max_temperature - self.config.min_temperature)
+                + self.config.min_temperature
+            )
+            if self.config.temperature_mode == "scalar":
+                temperature = float(temp.item())
+            else:
+                temperature = temp.view(self.config.num_rows, 1).contiguous()
+        return SoftmaxInputValues(logits=logits, temperature=temperature)
 
 
 @dataclass
@@ -698,6 +827,43 @@ def argmax_reference(logits: torch.Tensor) -> torch.Tensor:
     out = torch.argmax(masked, dim=-1)
     all_invalid = ~valid.any(dim=-1)
     return torch.where(all_invalid, torch.full_like(out, -1), out)
+
+
+def softmax_reference(
+    logits: torch.Tensor,
+    temperature: float | torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reference row-wise ``softmax(logits / temperature)`` in fp32."""
+
+    if logits.dim() != 2:
+        raise ValueError(f"softmax expects 2D logits, got {logits.dim()}D")
+    _check_float_dtype("logits dtype", logits.dtype, allowed=_LOGIT_DTYPES)
+    logits_fp32 = logits.float()
+    if temperature is not None:
+        if isinstance(temperature, torch.Tensor):
+            if temperature.dtype != torch.float32:
+                raise ValueError(
+                    f"temperature tensor must be float32, got {temperature.dtype}"
+                )
+            if temperature.numel() != logits.shape[0]:
+                raise ValueError(
+                    "temperature tensor must have one entry per row; got "
+                    f"{temperature.numel()} for {logits.shape[0]} rows"
+                )
+            if torch.any(temperature <= 0):
+                raise ValueError("temperature tensor entries must be positive")
+            temp = temperature.to(device=logits.device).view(-1, 1)
+        else:
+            temperature = float(temperature)
+            if temperature <= 0.0:
+                raise ValueError(f"temperature must be positive, got {temperature}")
+            temp = torch.tensor(
+                temperature,
+                dtype=torch.float32,
+                device=logits.device,
+            )
+        logits_fp32 = logits_fp32 / temp
+    return torch.softmax(logits_fp32, dim=-1)
 
 
 def argmax_pair_reference(logits: torch.Tensor) -> torch.Tensor:

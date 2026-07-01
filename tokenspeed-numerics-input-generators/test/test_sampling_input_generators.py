@@ -31,12 +31,15 @@ from tokenspeed_numerics_input_generators import (
     GatherExpandScalarsInputs,
     MinPRenormInputConfig,
     MinPRenormInputs,
+    SoftmaxInputConfig,
+    SoftmaxInputs,
     TopKTopPRenormInputConfig,
     TopKTopPRenormInputs,
     argmax_pair_reference,
     argmax_reference,
     gather_expand_scalars_reference,
     min_p_renorm_reference,
+    softmax_reference,
     top_k_top_p_renorm_reference,
 )
 
@@ -117,6 +120,62 @@ def test_argmax_pair_reference_returns_first_tied_index() -> None:
         argmax_pair_reference(logits),
         torch.tensor([[4.0, 1.0], [-1.0, 1.0]], dtype=torch.float32),
     )
+
+
+def test_softmax_inputs_generate_values_and_reference() -> None:
+    values = SoftmaxInputs(
+        SoftmaxInputConfig(
+            num_rows=4,
+            vocab_size=19,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=45, device="cpu")
+
+    assert values.logits.shape == (4, 19)
+    assert values.logits.dtype == torch.bfloat16
+    assert values.temperature is None
+    ref = softmax_reference(values.logits, values.temperature)
+    assert ref.shape == (4, 19)
+    assert ref.dtype == torch.float32
+    torch.testing.assert_close(ref.sum(dim=-1), torch.ones(4), atol=1e-6, rtol=1e-6)
+
+
+def test_softmax_inputs_generate_scalar_temperature() -> None:
+    values = SoftmaxInputs(
+        SoftmaxInputConfig(
+            num_rows=3,
+            vocab_size=11,
+            dtype=torch.float16,
+            temperature_mode="scalar",
+            min_temperature=0.7,
+            max_temperature=0.7,
+        )
+    ).generate(seed=46, metadata_seed=47, device="cpu")
+
+    assert isinstance(values.temperature, float)
+    assert values.temperature == pytest.approx(0.7)
+    ref = softmax_reference(values.logits, values.temperature)
+    torch.testing.assert_close(ref.sum(dim=-1), torch.ones(3), atol=1e-6, rtol=1e-6)
+
+
+def test_softmax_metadata_seed_controls_temperature_only() -> None:
+    generator = SoftmaxInputs(
+        SoftmaxInputConfig(
+            num_rows=5,
+            vocab_size=13,
+            dtype=torch.float32,
+            temperature_mode="per_row",
+        )
+    )
+
+    values1 = generator.generate(seed=48, metadata_seed=202, device="cpu")
+    values2 = generator.generate(seed=49, metadata_seed=202, device="cpu")
+
+    assert isinstance(values1.temperature, torch.Tensor)
+    assert isinstance(values2.temperature, torch.Tensor)
+    assert values1.temperature.shape == (5, 1)
+    torch.testing.assert_close(values1.temperature, values2.temperature)
+    assert not torch.equal(values1.logits, values2.logits)
 
 
 def test_gather_expand_scalars_inputs_generate_values_and_reference() -> None:
@@ -238,6 +297,33 @@ def test_gather_expand_rejects_invalid_repeat_count() -> None:
 def test_argmax_pair_reference_rejects_non_2d_input() -> None:
     with pytest.raises(ValueError, match="2D"):
         argmax_pair_reference(torch.randn(4))
+
+
+def test_softmax_rejects_invalid_temperature() -> None:
+    with pytest.raises(ValueError, match="temperature_mode"):
+        SoftmaxInputs(
+            SoftmaxInputConfig(
+                num_rows=1,
+                vocab_size=8,
+                dtype=torch.float32,
+                temperature_mode="batch",  # type: ignore[arg-type]
+            )
+        )
+    with pytest.raises(ValueError, match="min_temperature"):
+        SoftmaxInputs(
+            SoftmaxInputConfig(
+                num_rows=1,
+                vocab_size=8,
+                dtype=torch.float32,
+                temperature_mode="scalar",
+                min_temperature=0.0,
+            )
+        )
+    with pytest.raises(ValueError, match="temperature tensor"):
+        softmax_reference(
+            torch.randn(2, 4),
+            torch.ones(3, dtype=torch.float32),
+        )
 
 
 def test_top_k_top_p_rejects_too_large_max_top_k() -> None:

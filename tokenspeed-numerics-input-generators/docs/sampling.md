@@ -4,7 +4,8 @@ Sampling generators cover deterministic helper operations used around token
 selection. They do not generate stochastic draws from a distribution. Instead,
 they model the tensor transforms that TokenSpeed kernels currently implement:
 row-wise argmax, packed max/index argmax pairs, scalar metadata
-gather/broadcast, min-p renormalization, and top-k/top-p renormalization.
+gather/broadcast, softmax, min-p renormalization, and top-k/top-p
+renormalization.
 
 ## Operation Semantics
 
@@ -28,6 +29,18 @@ out[row, 1] = first argmax index for logits[row]
 This models direct helper APIs that need both the selected value and selected
 index. The generator can create the optional caller-provided output buffer used
 by in-place kernel paths.
+
+### Softmax
+
+`SoftmaxInputs` represents row-wise softmax over logits:
+
+```text
+out = softmax(logits / temperature)
+```
+
+`temperature` can be omitted, shared by every row as a scalar, or generated as
+one positive fp32 value per row. The reference always returns fp32 normalized
+probability rows.
 
 ### Gather And Expand Scalars
 
@@ -66,6 +79,7 @@ The generators reject invalid sampling inputs before values are returned:
 - row counts and batch sizes must be non-negative
 - vocabulary sizes, scalar pool sizes, and repeat counts must be positive
 - logits dtypes must be fp16, bf16, or fp32
+- softmax temperatures must be positive when present
 - probability tensors are generated as fp32 normalized rows
 - output/index dtypes must be int32 or int64 where relevant
 - argmax-pair output buffers are float32 with shape `[rows, 2]`
@@ -82,6 +96,8 @@ TokenSpeed exposes sampling kernels through several modules:
 
 - `sampling.argmax` for row-wise argmax
 - `sampling.cute_dsl.argmax_pair` for packed row-wise max/index pairs
+- FlashInfer `sampling.softmax` consumes `SoftmaxInputValues.logits` and
+  optional `.temperature`
 - `sampling.triton.gather_and_expand_scalars`
 - `sampling.triton.min_p_renorm_prob`
 - NVIDIA-only fused top-k/top-p renormalization helpers

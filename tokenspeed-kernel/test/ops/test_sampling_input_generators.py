@@ -25,6 +25,7 @@ import torch
 from tokenspeed_kernel.ops.sampling import argmax
 from tokenspeed_kernel.ops.sampling.cuda import fused_topk_topp_renorm
 from tokenspeed_kernel.ops.sampling.cute_dsl import argmax_pair
+from tokenspeed_kernel.ops.sampling.flashinfer import softmax as flashinfer_softmax
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_k_renorm_prob as flashinfer_top_k_renorm_prob,
 )
@@ -45,12 +46,15 @@ from tokenspeed_numerics_input_generators import (
     GatherExpandScalarsInputs,
     MinPRenormInputConfig,
     MinPRenormInputs,
+    SoftmaxInputConfig,
+    SoftmaxInputs,
     TopKTopPRenormInputConfig,
     TopKTopPRenormInputs,
     argmax_pair_reference,
     argmax_reference,
     gather_expand_scalars_reference,
     min_p_renorm_reference,
+    softmax_reference,
     top_k_top_p_renorm_reference,
 )
 
@@ -161,6 +165,31 @@ def test_min_p_renorm_generator_runs_triton_kernel(device: str) -> None:
         atol=1e-6,
         rtol=1e-6,
     )
+
+
+@requires_nvidia
+def test_softmax_generator_runs_flashinfer_kernel(device: str) -> None:
+    values = SoftmaxInputs(
+        SoftmaxInputConfig(
+            num_rows=5,
+            vocab_size=257,
+            dtype=torch.bfloat16,
+            temperature_mode="per_row",
+        )
+    ).generate(seed=97, metadata_seed=98, device=device)
+
+    try:
+        out = flashinfer_softmax(
+            values.logits,
+            temperature=values.temperature,
+            enable_pdl=False,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"FlashInfer softmax unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    ref = softmax_reference(values.logits, values.temperature)
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
 
 
 @requires_nvidia

@@ -307,6 +307,9 @@ from tokenspeed_numerics_input_generators.sampling import (
     MinPRenormInputConfig,
     MinPRenormInputs,
     MinPRenormInputValues,
+    SoftmaxInputConfig,
+    SoftmaxInputs,
+    SoftmaxInputValues,
     TopKTopPRenormInputConfig,
     TopKTopPRenormInputs,
     TopKTopPRenormInputValues,
@@ -314,6 +317,7 @@ from tokenspeed_numerics_input_generators.sampling import (
     argmax_reference,
     gather_expand_scalars_reference,
     min_p_renorm_reference,
+    softmax_reference,
     top_k_top_p_renorm_reference,
 )
 
@@ -507,6 +511,9 @@ __all__ = [
     "SigmoidMulInputConfig",
     "SigmoidMulInputValues",
     "SigmoidMulInputs",
+    "SoftmaxInputConfig",
+    "SoftmaxInputValues",
+    "SoftmaxInputs",
     "TensorInput",
     "TensorValues",
     "TopKTopPRenormInputConfig",
@@ -581,5 +588,6 @@ __all__ = [
     "rope_reference",
     "rmsnorm_reference",
     "sigmoid_mul_reference",
+    "softmax_reference",
     "top_k_top_p_renorm_reference",
 ]
