@@ -22,13 +22,14 @@
 
 This family covers RMSNorm-style operations. RMSNorm normalizes each row by
 ``rsqrt(mean(x * x) + eps)`` and then applies a learned multiplicative weight.
-The residual variant first forms ``x + residual`` and returns both the
-normalized output and that residual sum. Q/K RMSNorm applies the same reduction
-independently to each attention head, using ``head_dim`` as the reduction
-width. The fused Q/K RMSNorm + RoPE + gate operation additionally splits
-``q_gate`` into per-head ``[q | gate]`` values, normalizes q and k, applies
-rotary embedding to the first ``rotary_dim`` channels of each normalized head,
-and copies the gate half through unchanged.
+Gemma RMSNorm uses the same reduction and inputs, but applies ``1 + weight`` as
+the scale. The residual variants first form ``x + residual`` and return both
+the normalized output and that residual sum. Q/K RMSNorm applies the same
+reduction independently to each attention head, using ``head_dim`` as the
+reduction width. The fused Q/K RMSNorm + RoPE + gate operation additionally
+splits ``q_gate`` into per-head ``[q | gate]`` values, normalizes q and k,
+applies rotary embedding to the first ``rotary_dim`` channels of each
+normalized head, and copies the gate half through unchanged.
 """
 
 from __future__ import annotations
@@ -62,6 +63,7 @@ __all__ = [
     "RMSNormInputValues",
     "build_rope_cos_sin_cache",
     "fused_qk_rmsnorm_rope_gate_reference",
+    "gemma_rmsnorm_reference",
     "qk_rmsnorm_reference",
     "rmsnorm_reference",
 ]
@@ -721,6 +723,27 @@ def rmsnorm_reference(
         x_fp32 = x_fp32 + residual.to(torch.float32)
     variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
     out = (x_fp32 * torch.rsqrt(variance + eps) * weight.to(torch.float32)).to(x.dtype)
+    if residual is None:
+        return out
+    return out, x_fp32.to(x.dtype)
+
+
+def gemma_rmsnorm_reference(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    residual: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Compute Gemma RMSNorm in PyTorch using float32 reduction semantics."""
+
+    x_fp32 = x.to(torch.float32)
+    if residual is not None:
+        x_fp32 = x_fp32 + residual.to(torch.float32)
+    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    out = (x_fp32 * torch.rsqrt(variance + eps) * (1.0 + weight.to(torch.float32))).to(
+        x.dtype
+    )
     if residual is None:
         return out
     return out, x_fp32.to(x.dtype)

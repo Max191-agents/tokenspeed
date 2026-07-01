@@ -25,6 +25,12 @@ import torch
 from tokenspeed_kernel.ops.layernorm.flashinfer import (
     fused_add_rmsnorm as flashinfer_fused_add_rmsnorm,
 )
+from tokenspeed_kernel.ops.layernorm.flashinfer import (
+    gemma_fused_add_rmsnorm as flashinfer_gemma_fused_add_rmsnorm,
+)
+from tokenspeed_kernel.ops.layernorm.flashinfer import (
+    gemma_rmsnorm as flashinfer_gemma_rmsnorm,
+)
 from tokenspeed_kernel.ops.layernorm.flashinfer import rmsnorm as flashinfer_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import (
     fused_qk_rmsnorm_rope_gate,
@@ -43,6 +49,7 @@ from tokenspeed_numerics_input_generators import (
     RMSNormInputConfig,
     RMSNormInputs,
     fused_qk_rmsnorm_rope_gate_reference,
+    gemma_rmsnorm_reference,
     qk_rmsnorm_reference,
     rmsnorm_reference,
 )
@@ -138,6 +145,75 @@ def test_rmsnorm_generator_runs_flashinfer_fused_add_kernel(device: str) -> None
     except RuntimeError as exc:
         pytest.skip(f"FlashInfer fused add RMSNorm kernel unavailable: {exc}")
     ref_out, ref_residual = rmsnorm_reference(
+        values.x,
+        values.weight,
+        config.eps,
+        residual=values.residual,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(x, ref_out, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(residual, ref_residual, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not platform.is_nvidia,
+    reason="FlashInfer Gemma RMSNorm kernels require NVIDIA CUDA.",
+)
+def test_gemma_rmsnorm_generator_runs_flashinfer_kernel(device: str) -> None:
+    config = RMSNormInputConfig(
+        num_tokens=9,
+        hidden_dim=128,
+        dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+    )
+    values = RMSNormInputs(config).generate(seed=67, device=device)
+
+    try:
+        out = flashinfer_gemma_rmsnorm(
+            values.x,
+            values.weight,
+            config.eps,
+            enable_pdl=False,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"FlashInfer Gemma RMSNorm kernel unavailable: {exc}")
+    ref = gemma_rmsnorm_reference(values.x, values.weight, config.eps)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not platform.is_nvidia,
+    reason="FlashInfer Gemma RMSNorm kernels require NVIDIA CUDA.",
+)
+def test_gemma_rmsnorm_generator_runs_flashinfer_fused_add_kernel(
+    device: str,
+) -> None:
+    config = RMSNormInputConfig(
+        num_tokens=9,
+        hidden_dim=128,
+        dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        with_residual=True,
+    )
+    values = RMSNormInputs(config).generate(seed=68, device=device)
+    assert values.residual is not None
+
+    x = values.x.clone()
+    residual = values.residual.clone()
+    try:
+        flashinfer_gemma_fused_add_rmsnorm(
+            x,
+            residual,
+            values.weight,
+            config.eps,
+            enable_pdl=False,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"FlashInfer Gemma fused add RMSNorm kernel unavailable: {exc}")
+    ref_out, ref_residual = gemma_rmsnorm_reference(
         values.x,
         values.weight,
         config.eps,

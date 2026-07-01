@@ -19,6 +19,21 @@ y = x * rsqrt(variance + eps) * weight
 When `with_residual` is enabled, the normalized value is `x + residual`, and
 that summed residual value is also part of the operation output.
 
+### Gemma RMSNorm
+
+Gemma RMSNorm uses the same generated input structure as `RMSNormInputs`, but
+the learned weight is interpreted as an offset from one:
+
+```text
+variance = mean(x * x, dim=-1, keepdim=True)
+y = x * rsqrt(variance + eps) * (1 + weight)
+```
+
+The residual form follows the same residual-add rule as ordinary RMSNorm. The
+input generator does not need a separate config because the operation has the
+same tensor inputs and shape constraints; the distinction is captured by
+`gemma_rmsnorm_reference`.
+
 ### QK RMSNorm
 
 `QKRMSNormInputs` represents two independent RMSNorm operations over query and
@@ -70,9 +85,9 @@ concern.
 
 TokenSpeed currently exposes Triton layernorm functions for ordinary RMSNorm,
 residual RMSNorm, QK RMSNorm, fused QK RMSNorm + RoPE + gate, and fused-parallel
-RMSNorm. It also exposes FlashInfer wrappers for ordinary RMSNorm and in-place
-fused add RMSNorm. The generator values map directly to those APIs with small
-adapters:
+RMSNorm. It also exposes FlashInfer wrappers for ordinary RMSNorm, Gemma
+RMSNorm, and their in-place fused add variants. The generator values map
+directly to those APIs with small adapters:
 
 - `RMSNormInputValues` provides `x`, `weight`, and optional `residual`
 - `QKRMSNormInputValues` provides `q`, `k`, `q_weight`, and `k_weight`

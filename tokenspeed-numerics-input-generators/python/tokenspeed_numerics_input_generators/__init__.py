@@ -254,6 +254,7 @@ from tokenspeed_numerics_input_generators.layernorm import (
     RMSNormInputs,
     RMSNormInputValues,
     fused_qk_rmsnorm_rope_gate_reference,
+    gemma_rmsnorm_reference,
     qk_rmsnorm_reference,
     rmsnorm_reference,
 )
@@ -580,6 +581,7 @@ __all__ = [
     "gdn_chunk_prefill_reference",
     "gdn_qkv_split_reference",
     "gated_activation_reference",
+    "gemma_rmsnorm_reference",
     "gemm_scale_shape",
     "kv_cache_store_reference",
     "kv_cache_transfer_reference",

@@ -33,6 +33,7 @@ from tokenspeed_numerics_input_generators import (
     RMSNormInputs,
     build_rope_cos_sin_cache,
     fused_qk_rmsnorm_rope_gate_reference,
+    gemma_rmsnorm_reference,
     qk_rmsnorm_reference,
     rmsnorm_reference,
 )
@@ -64,6 +65,41 @@ def test_rmsnorm_inputs_generate_values_and_reference() -> None:
     assert out.shape == values.x.shape
     assert out.dtype == values.x.dtype
     torch.testing.assert_close(residual_out, (values.x + values.residual))
+
+
+def test_gemma_rmsnorm_reference_uses_unit_offset_weight() -> None:
+    x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.float32)
+    weight = torch.zeros(4, dtype=torch.float32)
+
+    ordinary = rmsnorm_reference(x, weight, 1e-6)
+    gemma = gemma_rmsnorm_reference(x, weight, 1e-6)
+
+    assert torch.count_nonzero(ordinary) == 0
+    expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+    torch.testing.assert_close(gemma, expected)
+
+
+def test_gemma_rmsnorm_reference_residual_returns_residual_sum() -> None:
+    values = RMSNormInputs(
+        RMSNormInputConfig(
+            num_tokens=3,
+            hidden_dim=8,
+            dtype=torch.float16,
+            with_residual=True,
+        )
+    ).generate(seed=15, device="cpu")
+    assert values.residual is not None
+
+    out, residual_out = gemma_rmsnorm_reference(
+        values.x,
+        values.weight,
+        1e-6,
+        residual=values.residual,
+    )
+
+    assert out.shape == values.x.shape
+    assert out.dtype == values.x.dtype
+    torch.testing.assert_close(residual_out, values.x + values.residual)
 
 
 @pytest.mark.parametrize("input_layout", ["dense", "qkv_split"])
