@@ -11,7 +11,8 @@ logits.
 ## Generators
 
 - `ArgmaxInputs`: generates logits with optional planted unique or tied maxima,
-  optional NaN-focused rows, and optional output buffers.
+  optional fixed planted indices, optional NaN-focused rows, and optional
+  output buffers.
 - `ArgmaxPairInputs`: generates logits for `(max_value, argmax_index)` outputs
   with the same maximum-pattern controls as `ArgmaxInputs`.
 - `GatherExpandScalarsInputs`: generates scalar pools, request indices, and

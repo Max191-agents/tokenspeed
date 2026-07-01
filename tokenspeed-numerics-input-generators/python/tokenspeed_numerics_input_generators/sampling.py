@@ -190,6 +190,34 @@ def _check_argmax_nan_pattern(name: str, value: str) -> ArgmaxNaNPattern:
     return value  # type: ignore[return-value]
 
 
+def _normalize_argmax_planted_indices(
+    indices: tuple[int, ...] | list[int] | None,
+    *,
+    num_rows: int,
+    vocab_size: int,
+    max_pattern: ArgmaxMaxPattern,
+) -> tuple[int, ...] | None:
+    if indices is None:
+        return None
+    indices = tuple(int(index) for index in indices)
+    if len(indices) not in (1, num_rows):
+        raise ValueError(
+            "planted_indices must contain either one index or one index per row; "
+            f"got {len(indices)} entries for num_rows={num_rows}"
+        )
+    if any(index < 0 or index >= vocab_size for index in indices):
+        raise ValueError(
+            f"planted_indices must be in [0, vocab_size), got {indices} "
+            f"for vocab_size={vocab_size}"
+        )
+    if max_pattern == "tied" and any(index >= vocab_size - 1 for index in indices):
+        raise ValueError(
+            "planted_indices for max_pattern='tied' must leave a higher index "
+            "available for the tied maximum"
+        )
+    return indices
+
+
 def _check_top_k_top_p_filter_mode(name: str, value: str) -> TopKTopPFilterMode:
     if value not in ("random", "top_k_only", "top_p_only", "top_k_top_p", "mixed"):
         raise ValueError(
@@ -203,6 +231,7 @@ def _plant_argmax_maxima(
     logits: torch.Tensor,
     *,
     pattern: ArgmaxMaxPattern,
+    planted_indices: tuple[int, ...] | None,
     dtype: torch.dtype,
     seed: int,
     device: DeviceLike,
@@ -214,16 +243,26 @@ def _plant_argmax_maxima(
     if pattern == "random":
         return logits, argmax_reference(logits).to(torch.int64)
 
-    high = vocab_size if pattern == "unique" else vocab_size - 1
-    expected = _randint(
-        low=0,
-        high=high,
-        shape=(num_rows,),
-        dtype=torch.int64,
-        seed=seed,
-        device=device,
-        configured_device=configured_device,
-    )
+    if planted_indices is None:
+        high = vocab_size if pattern == "unique" else vocab_size - 1
+        expected = _randint(
+            low=0,
+            high=high,
+            shape=(num_rows,),
+            dtype=torch.int64,
+            seed=seed,
+            device=device,
+            configured_device=configured_device,
+        )
+    else:
+        target_device = _resolve_device(configured_device, device)
+        expected = torch.tensor(
+            planted_indices,
+            dtype=torch.int64,
+            device=target_device,
+        )
+        if expected.numel() == 1:
+            expected = expected.expand(num_rows).clone()
     logits = (logits.float() * 0.25).to(dtype)
     if num_rows == 0:
         return logits, expected
@@ -401,6 +440,11 @@ class ArgmaxInputConfig:
     # and all-NaN rows.
     nan_pattern: ArgmaxNaNPattern = "none"
 
+    # Optional: fixed maximum locations to plant. Provide one index to reuse
+    # for every row, or one index per row. This is useful for edge cases that
+    # require a known token id instead of a seed-selected maximum.
+    planted_indices: tuple[int, ...] | None = None
+
     # Optional: generated tensor device override.
     device: DeviceLike = None
 
@@ -576,6 +620,22 @@ class ArgmaxInputs(NumericsInputGenerator):
             raise ValueError("max_pattern='tied' requires vocab_size >= 2")
         if self.config.nan_pattern == "mixed" and self.config.vocab_size < 2:
             raise ValueError("nan_pattern='mixed' requires vocab_size >= 2")
+        self.config.planted_indices = _normalize_argmax_planted_indices(
+            self.config.planted_indices,
+            num_rows=self.config.num_rows,
+            vocab_size=self.config.vocab_size,
+            max_pattern=self.config.max_pattern,
+        )
+        if (
+            self.config.planted_indices is not None
+            and self.config.max_pattern == "random"
+        ):
+            raise ValueError("planted_indices cannot be used with max_pattern='random'")
+        if (
+            self.config.planted_indices is not None
+            and self.config.nan_pattern != "none"
+        ):
+            raise ValueError("planted_indices cannot be used with NaN argmax patterns")
         if self.config.out_dtype is not None:
             self.config.out_dtype = _check_index_dtype(
                 "out_dtype", self.config.out_dtype
@@ -604,6 +664,7 @@ class ArgmaxInputs(NumericsInputGenerator):
         logits, expected = _plant_argmax_maxima(
             logits,
             pattern=self.config.max_pattern,
+            planted_indices=self.config.planted_indices,
             dtype=self.config.dtype,
             seed=_child_seed(metadata_base_seed, 1),
             device=device,
@@ -668,6 +729,7 @@ class ArgmaxPairInputs(NumericsInputGenerator):
         logits, _ = _plant_argmax_maxima(
             logits,
             pattern=self.config.max_pattern,
+            planted_indices=None,
             dtype=self.config.dtype,
             seed=_child_seed(metadata_base_seed, 1),
             device=device,

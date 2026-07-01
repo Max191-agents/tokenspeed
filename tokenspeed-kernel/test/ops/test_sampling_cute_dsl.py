@@ -77,6 +77,7 @@ def _argmax_values(
     dtype: torch.dtype = torch.float32,
     out_dtype: torch.dtype | None = None,
     max_pattern: ArgmaxMaxPattern = "unique",
+    planted_indices: tuple[int, ...] | None = None,
     seed: int = 0,
 ) -> ArgmaxInputValues:
     return ArgmaxInputs(
@@ -86,6 +87,7 @@ def _argmax_values(
             dtype=dtype,
             out_dtype=out_dtype,
             max_pattern=max_pattern,
+            planted_indices=planted_indices,
         )
     ).generate(seed=seed, metadata_seed=seed + 1, device=device)
 
@@ -355,10 +357,9 @@ def test_argmax_mtp_pattern():
     being verified, not the vocab size."""
     _need_cuda()
     N = MODEL_VOCABS["deepseek_v4"]
-    x = torch.full((1, N), -100.0, device="cuda", dtype=torch.float32)
-    x[0, 1] = 0.0
-    out = cute_argmax(x)
-    assert out[0].item() == 1
+    values = _argmax_values(1, N, device="cuda", planted_indices=(1,), seed=N)
+    out = cute_argmax(values.logits)
+    torch.testing.assert_close(out, values.expected_indices, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------

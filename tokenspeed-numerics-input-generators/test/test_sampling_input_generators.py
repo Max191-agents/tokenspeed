@@ -108,6 +108,38 @@ def test_argmax_inputs_generate_tied_maxima() -> None:
     torch.testing.assert_close(argmax_reference(values.logits), values.expected_indices)
 
 
+def test_argmax_inputs_generate_fixed_planted_index() -> None:
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(
+            num_rows=4,
+            vocab_size=17,
+            dtype=torch.float32,
+            planted_indices=(1,),
+        )
+    ).generate(seed=47, metadata_seed=48, device="cpu")
+
+    torch.testing.assert_close(
+        values.expected_indices, torch.full((4,), 1, dtype=torch.int64)
+    )
+    torch.testing.assert_close(argmax_reference(values.logits), values.expected_indices)
+
+
+def test_argmax_inputs_generate_per_row_planted_indices() -> None:
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(
+            num_rows=4,
+            vocab_size=17,
+            dtype=torch.float32,
+            planted_indices=(1, 3, 5, 7),
+        )
+    ).generate(seed=49, metadata_seed=50, device="cpu")
+
+    torch.testing.assert_close(
+        values.expected_indices, torch.tensor([1, 3, 5, 7], dtype=torch.int64)
+    )
+    torch.testing.assert_close(argmax_reference(values.logits), values.expected_indices)
+
+
 def test_argmax_inputs_generate_all_nan_rows() -> None:
     values = ArgmaxInputs(
         ArgmaxInputConfig(
@@ -867,6 +899,57 @@ def test_argmax_rejects_invalid_nan_pattern() -> None:
                 vocab_size=8,
                 dtype=torch.float32,
                 nan_pattern="some",  # type: ignore[arg-type]
+            )
+        )
+
+
+def test_argmax_rejects_invalid_planted_indices() -> None:
+    with pytest.raises(ValueError, match="planted_indices"):
+        ArgmaxInputs(
+            ArgmaxInputConfig(
+                num_rows=2,
+                vocab_size=8,
+                dtype=torch.float32,
+                planted_indices=(1, 2, 3),
+            )
+        )
+    with pytest.raises(ValueError, match="planted_indices"):
+        ArgmaxInputs(
+            ArgmaxInputConfig(
+                num_rows=2,
+                vocab_size=8,
+                dtype=torch.float32,
+                planted_indices=(8,),
+            )
+        )
+    with pytest.raises(ValueError, match="planted_indices"):
+        ArgmaxInputs(
+            ArgmaxInputConfig(
+                num_rows=2,
+                vocab_size=8,
+                dtype=torch.float32,
+                max_pattern="random",
+                planted_indices=(1,),
+            )
+        )
+    with pytest.raises(ValueError, match="NaN argmax"):
+        ArgmaxInputs(
+            ArgmaxInputConfig(
+                num_rows=2,
+                vocab_size=8,
+                dtype=torch.float32,
+                nan_pattern="all",
+                planted_indices=(1,),
+            )
+        )
+    with pytest.raises(ValueError, match="leave a higher index"):
+        ArgmaxInputs(
+            ArgmaxInputConfig(
+                num_rows=2,
+                vocab_size=8,
+                dtype=torch.float32,
+                max_pattern="tied",
+                planted_indices=(7,),
             )
         )
 
