@@ -27,6 +27,8 @@ compressed/cache-specific representations with different per-token shapes.
   K-cache MXFP4 write inputs.
 - `DeepSeekV4IndexerMXFP4CacheGatherInputs`: generates DeepSeek V4 indexer
   K-cache MXFP4 gather inputs.
+- `DeepSeekV4KCacheGatherInputs`: generates DeepSeek V4 sparse-window
+  K-cache gather/dequantization inputs.
 - `DSASparseDecodeKVPackInputs`, `DSATopKSlotInputs`,
   `DeepSeekV4PagedIndexInputs`, and `DeepSeekV4SparsePrefillIndexInputs`:
   generate DeepSeek-style sparse decode/prefill indexing and cache metadata.

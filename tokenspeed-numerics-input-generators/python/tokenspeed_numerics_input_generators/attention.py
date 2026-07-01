@@ -52,6 +52,7 @@ from tokenspeed_numerics_input_generators.core import (
     TensorInput,
     _child_seed,
     _resolve_device,
+    _rng_for_device,
 )
 
 __all__ = [
@@ -91,6 +92,10 @@ __all__ = [
     "DeepSeekV4IndexerMXFP4CacheGatherInputs",
     "DeepSeekV4IndexerMXFP4CacheGatherInputValues",
     "deepseek_v4_indexer_mxfp4_cache_gather_reference",
+    "DeepSeekV4KCacheGatherInputConfig",
+    "DeepSeekV4KCacheGatherInputs",
+    "DeepSeekV4KCacheGatherInputValues",
+    "deepseek_v4_dequantize_and_gather_k_cache_reference",
     "DeepSeekV4PagedIndexInputConfig",
     "DeepSeekV4PagedIndexInputs",
     "DeepSeekV4PagedIndexValues",
@@ -126,6 +131,13 @@ _DSA_SPARSE_DECODE_FP8_SCALE_BYTES = 4
 _DSA_SPARSE_DECODE_BF16_BYTES = 2
 _DSA_SPARSE_DECODE_FP8_E4M3_MAX = 448.0
 _DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
+_DEEPSEEK_V4_HEAD_DIM = 512
+_DEEPSEEK_V4_ROPE_DIM = 64
+_DEEPSEEK_V4_NOPE_DIM = _DEEPSEEK_V4_HEAD_DIM - _DEEPSEEK_V4_ROPE_DIM
+_DEEPSEEK_V4_FP8_QUANT_BLOCK = 64
+_DEEPSEEK_V4_FP8_MAX = 448.0
+_DEEPSEEK_V4_SWA_TOKEN_STRIDE = _DEEPSEEK_V4_NOPE_DIM + (_DEEPSEEK_V4_ROPE_DIM * 2)
+_DEEPSEEK_V4_SWA_SCALE_DIM = _DEEPSEEK_V4_NOPE_DIM // _DEEPSEEK_V4_FP8_QUANT_BLOCK + 1
 _DEEPSEEK_V4_INDEXER_DIM = 128
 _DEEPSEEK_V4_INDEXER_MXFP4_BLOCK_SIZE = 32
 _DEEPSEEK_V4_INDEXER_MXFP4_HALF_BLOCK = _DEEPSEEK_V4_INDEXER_MXFP4_BLOCK_SIZE // 2
@@ -3457,6 +3469,501 @@ def deepseek_v4_indexer_mxfp4_cache_gather_reference(
             :_DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES,
         ] = flat_cache[scale_base : scale_base + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES]
     return values_out.contiguous(), scales_out.contiguous()
+
+
+@dataclass
+class DeepSeekV4KCacheGatherInputValues:
+    """Generated values for DeepSeek V4 sparse K-cache gather/dequantization."""
+
+    out: torch.Tensor
+    cache_2d: torch.Tensor
+    seq_lens: torch.Tensor
+    gather_lens: torch.Tensor | None
+    block_table: torch.Tensor
+    block_size: int
+    offset: int
+    block_table_base_offsets: torch.Tensor | None = None
+
+
+@dataclass
+class DeepSeekV4KCacheGatherInputConfig:
+    """Initialization parameters for DeepSeek V4 K-cache gather/dequantization.
+
+    The represented operation reads paged sparse-window attention K-cache rows.
+    Each cache page stores per-token FP8 NoPE bytes, BF16 RoPE bytes, and UE8M0
+    NoPE scale bytes. The generated metadata selects the suffix of each
+    request to gather into a BF16 output workspace.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of independent request rows.
+    batch_size: int
+
+    # Required: maximum visible K-token sequence length per request.
+    max_seq_len: int
+
+    # Required: number of tokens in each physical cache page.
+    block_size: int
+
+    # ------------------------------------------------------------------
+    # Optional metadata/value generation configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: maximum suffix length gathered for any request. Defaults to
+    # max_seq_len. Actual per-request gather lengths are generated <= seq_len.
+    max_gather_len: int | None = None
+
+    # Optional: output-token offset where gathered rows are written.
+    offset: int = 0
+
+    # Optional: physical cache page count. Defaults to one unique page-table
+    # entry for every generated request/page coordinate.
+    num_cache_blocks: int | None = None
+
+    # Optional: generate explicit gather_lens. When false, the operation
+    # gathers the full generated seq_lens suffix for each request.
+    include_gather_lens: bool = True
+
+    # Optional: include block-table base offsets. Generated offsets are zero so
+    # the metadata remains a valid unsliced page table while exercising the API.
+    include_block_table_base_offsets: bool = False
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DeepSeekV4KCacheGatherInputs(NumericsInputGenerator):
+    """Generator for DeepSeek V4 paged K-cache gather/dequantization inputs."""
+
+    config: DeepSeekV4KCacheGatherInputConfig
+
+    def __init__(self, config: DeepSeekV4KCacheGatherInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+
+    def generate(
+        self,
+        *,
+        seed: int | None = None,
+        metadata_seed: int | None = None,
+        value_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> DeepSeekV4KCacheGatherInputValues:
+        self.__post_init__()
+        metadata_seed, value_seed = _resolve_attention_seeds(
+            seed=seed,
+            metadata_seed=metadata_seed,
+            value_seed=value_seed,
+        )
+        target_device = _resolve_device(self.config.device, device)
+        metadata_generator = _rng_for_device(
+            target_device, _child_seed(metadata_seed, 1)
+        )
+        seq_lens = self._generate_seq_lens(
+            generator=metadata_generator,
+            device=target_device,
+        )
+        gather_lens = self._generate_gather_lens(
+            seq_lens=seq_lens,
+            generator=metadata_generator,
+        )
+        block_table = self._generate_block_table(
+            generator=metadata_generator,
+            device=target_device,
+        )
+        base_offsets = None
+        if self.config.include_block_table_base_offsets:
+            base_offsets = torch.zeros(
+                (self.config.batch_size,),
+                dtype=torch.int32,
+                device=target_device,
+            )
+        out_rows = self.config.offset + self._out_gather_width()
+        values = DeepSeekV4KCacheGatherInputValues(
+            out=self._generate_out(
+                seed=_child_seed(value_seed, 1),
+                out_rows=out_rows,
+                device=target_device,
+            ),
+            cache_2d=self._generate_cache(
+                seed=_child_seed(value_seed, 2),
+                device=target_device,
+            ),
+            seq_lens=seq_lens.contiguous(),
+            gather_lens=None if gather_lens is None else gather_lens.contiguous(),
+            block_table=block_table.contiguous(),
+            block_size=self.config.block_size,
+            offset=self.config.offset,
+            block_table_base_offsets=(
+                None if base_offsets is None else base_offsets.contiguous()
+            ),
+        )
+        _validate_deepseek_v4_k_cache_gather_values(values)
+        return values
+
+    def _normalize_config(self) -> None:
+        self.config.batch_size = _check_nonnegative(
+            "batch_size", self.config.batch_size
+        )
+        self.config.max_seq_len = _check_positive(
+            "max_seq_len", self.config.max_seq_len
+        )
+        self.config.block_size = _check_positive("block_size", self.config.block_size)
+        if self.config.max_gather_len is None:
+            self.config.max_gather_len = self.config.max_seq_len
+        self.config.max_gather_len = _check_positive(
+            "max_gather_len", self.config.max_gather_len
+        )
+        if self.config.max_gather_len > self.config.max_seq_len:
+            raise ValueError(
+                "max_gather_len must be <= max_seq_len; got "
+                f"{self.config.max_gather_len} > {self.config.max_seq_len}"
+            )
+        self.config.offset = _check_nonnegative("offset", self.config.offset)
+        required_pages = self._required_page_table_entries()
+        if self.config.num_cache_blocks is None:
+            self.config.num_cache_blocks = max(1, required_pages)
+        self.config.num_cache_blocks = _check_positive(
+            "num_cache_blocks", self.config.num_cache_blocks
+        )
+        if self.config.num_cache_blocks < required_pages:
+            raise ValueError(
+                "num_cache_blocks must cover generated page-table entries; got "
+                f"{self.config.num_cache_blocks} < {required_pages}"
+            )
+
+    def _max_blocks_per_seq(self) -> int:
+        return math.ceil(self.config.max_seq_len / self.config.block_size)
+
+    def _required_page_table_entries(self) -> int:
+        return self.config.batch_size * self._max_blocks_per_seq()
+
+    def _cache_row_bytes(self) -> int:
+        return self.config.block_size * (
+            _DEEPSEEK_V4_SWA_TOKEN_STRIDE + _DEEPSEEK_V4_SWA_SCALE_DIM
+        )
+
+    def _out_gather_width(self) -> int:
+        if self.config.include_gather_lens:
+            return int(self.config.max_gather_len)
+        return int(self.config.max_seq_len)
+
+    def _generate_seq_lens(
+        self,
+        *,
+        generator: torch.Generator,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if self.config.batch_size == 0:
+            return torch.empty((0,), dtype=torch.int32, device=device)
+        return torch.randint(
+            1,
+            self.config.max_seq_len + 1,
+            (self.config.batch_size,),
+            dtype=torch.int32,
+            device=device,
+            generator=generator,
+        )
+
+    def _generate_gather_lens(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        generator: torch.Generator,
+    ) -> torch.Tensor | None:
+        if not self.config.include_gather_lens:
+            return None
+        gather_lens = torch.empty_like(seq_lens)
+        for row, seq_len in enumerate(seq_lens.tolist()):
+            upper = min(int(seq_len), int(self.config.max_gather_len))
+            if upper <= 1:
+                gather_lens[row] = upper
+            else:
+                gather_lens[row] = torch.randint(
+                    1,
+                    upper + 1,
+                    (),
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                    generator=generator,
+                )
+        return gather_lens
+
+    def _generate_block_table(
+        self,
+        *,
+        generator: torch.Generator,
+        device: torch.device,
+    ) -> torch.Tensor:
+        width = self._max_blocks_per_seq()
+        if self.config.batch_size == 0:
+            return torch.empty((0, width), dtype=torch.int32, device=device)
+        assert self.config.num_cache_blocks is not None
+        page_ids = torch.randperm(
+            self.config.num_cache_blocks,
+            dtype=torch.int64,
+            device=device,
+            generator=generator,
+        )[: self._required_page_table_entries()]
+        return page_ids.reshape(self.config.batch_size, width).to(torch.int32)
+
+    def _generate_out(
+        self,
+        *,
+        seed: int,
+        out_rows: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        generator = _rng_for_device(device, seed)
+        out = torch.randn(
+            (self.config.batch_size, out_rows, _DEEPSEEK_V4_HEAD_DIM),
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        )
+        return out.to(torch.bfloat16).contiguous()
+
+    def _generate_cache(self, *, seed: int, device: torch.device) -> torch.Tensor:
+        assert self.config.num_cache_blocks is not None
+        generator = _rng_for_device(device, seed)
+        cache = torch.empty(
+            (self.config.num_cache_blocks, self._cache_row_bytes()),
+            dtype=torch.uint8,
+            device=device,
+        )
+        token_area = cache[:, : self.config.block_size * _DEEPSEEK_V4_SWA_TOKEN_STRIDE]
+        token_area = token_area.reshape(
+            self.config.num_cache_blocks,
+            self.config.block_size,
+            _DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+        )
+        scale_area = cache[:, self.config.block_size * _DEEPSEEK_V4_SWA_TOKEN_STRIDE :]
+        scale_area = scale_area.reshape(
+            self.config.num_cache_blocks,
+            self.config.block_size,
+            _DEEPSEEK_V4_SWA_SCALE_DIM,
+        )
+        nope_fp8 = (
+            torch.randn(
+                (
+                    self.config.num_cache_blocks,
+                    self.config.block_size,
+                    _DEEPSEEK_V4_NOPE_DIM,
+                ),
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            .clamp(-4.0, 4.0)
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+        )
+        rope_bf16 = (
+            torch.randn(
+                (
+                    self.config.num_cache_blocks,
+                    self.config.block_size,
+                    _DEEPSEEK_V4_ROPE_DIM,
+                ),
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            .to(torch.bfloat16)
+            .view(torch.uint8)
+        )
+        scale_bytes = torch.randint(
+            123,
+            131,
+            (
+                self.config.num_cache_blocks,
+                self.config.block_size,
+                _DEEPSEEK_V4_SWA_SCALE_DIM,
+            ),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+        scale_bytes[..., -1] = 127
+        token_area[..., :_DEEPSEEK_V4_NOPE_DIM] = nope_fp8
+        token_area[
+            ...,
+            _DEEPSEEK_V4_NOPE_DIM:_DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+        ] = rope_bf16
+        scale_area.copy_(scale_bytes)
+        return cache.contiguous()
+
+
+def _validate_deepseek_v4_k_cache_gather_values(
+    values: DeepSeekV4KCacheGatherInputValues,
+) -> None:
+    if values.out.dtype != torch.bfloat16:
+        raise TypeError(f"out must be bfloat16, got {values.out.dtype}")
+    if values.cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {values.cache_2d.dtype}")
+    if values.out.ndim != 3:
+        raise ValueError(f"out must be rank-3, got {values.out.ndim}")
+    if values.out.shape[-1] != _DEEPSEEK_V4_HEAD_DIM:
+        raise ValueError(
+            f"out hidden width must be {_DEEPSEEK_V4_HEAD_DIM}, "
+            f"got {values.out.shape[-1]}"
+        )
+    if values.out.stride(-1) != 1:
+        raise ValueError("out must be contiguous in the hidden dimension")
+    if values.cache_2d.ndim != 2:
+        raise ValueError(f"cache_2d must be rank-2, got {values.cache_2d.ndim}")
+    block_size = _check_positive("block_size", values.block_size)
+    row_bytes = block_size * (
+        _DEEPSEEK_V4_SWA_TOKEN_STRIDE + _DEEPSEEK_V4_SWA_SCALE_DIM
+    )
+    if values.cache_2d.shape[1] < row_bytes:
+        raise ValueError(
+            f"cache_2d row width must be at least {row_bytes}, "
+            f"got {values.cache_2d.shape[1]}"
+        )
+    if values.cache_2d.stride(1) != 1:
+        raise ValueError("cache_2d must be contiguous in the byte dimension")
+    if values.seq_lens.ndim != 1:
+        raise ValueError("seq_lens must be rank-1")
+    if values.seq_lens.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"seq_lens must be integer, got {values.seq_lens.dtype}")
+    if values.gather_lens is not None:
+        if values.gather_lens.ndim != 1:
+            raise ValueError("gather_lens must be rank-1")
+        if values.gather_lens.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                f"gather_lens must be integer, got {values.gather_lens.dtype}"
+            )
+        if values.gather_lens.shape != values.seq_lens.shape:
+            raise ValueError("gather_lens shape must match seq_lens")
+    if values.block_table.ndim != 2:
+        raise ValueError("block_table must be rank-2")
+    batch_size = values.seq_lens.numel()
+    if values.out.shape[0] != batch_size or values.block_table.shape[0] != batch_size:
+        raise ValueError("out, block_table, and seq_lens batch dimensions must match")
+    if values.block_table.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"block_table must be integer, got {values.block_table.dtype}")
+    if values.block_table_base_offsets is not None:
+        if values.block_table_base_offsets.shape != values.seq_lens.shape:
+            raise ValueError("block_table_base_offsets shape must match seq_lens")
+        if values.block_table_base_offsets.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "block_table_base_offsets must be integer, got "
+                f"{values.block_table_base_offsets.dtype}"
+            )
+    if (
+        values.out.device != values.cache_2d.device
+        or values.seq_lens.device != values.cache_2d.device
+        or values.block_table.device != values.cache_2d.device
+        or (
+            values.gather_lens is not None
+            and values.gather_lens.device != values.cache_2d.device
+        )
+        or (
+            values.block_table_base_offsets is not None
+            and values.block_table_base_offsets.device != values.cache_2d.device
+        )
+    ):
+        raise ValueError("K-cache gather values must share a device")
+    offset = _check_nonnegative("offset", values.offset)
+    seq_lens = values.seq_lens.to(torch.int64)
+    gather_lens = (
+        seq_lens if values.gather_lens is None else values.gather_lens.to(torch.int64)
+    )
+    if bool((seq_lens < 0).any().item()):
+        raise ValueError("seq_lens entries must be non-negative")
+    if bool((gather_lens < 0).any().item()):
+        raise ValueError("gather_lens entries must be non-negative")
+    if bool((gather_lens > seq_lens).any().item()):
+        raise ValueError("gather_lens entries must be <= seq_lens")
+    if (
+        gather_lens.numel()
+        and offset + int(gather_lens.max().item()) > values.out.shape[1]
+    ):
+        raise ValueError("out token dimension is too small for offset + gather_lens")
+    if values.block_table.numel():
+        if bool((values.block_table < 0).any().item()):
+            raise ValueError("block_table entries must be non-negative")
+        if int(values.block_table.max().item()) >= values.cache_2d.shape[0]:
+            raise ValueError("block_table entries must index cache_2d rows")
+    base_offsets = (
+        torch.zeros_like(seq_lens)
+        if values.block_table_base_offsets is None
+        else values.block_table_base_offsets.to(torch.int64)
+    )
+    if bool((base_offsets < 0).any().item()):
+        raise ValueError("block_table_base_offsets entries must be non-negative")
+    max_blocks = values.block_table.shape[1]
+    for row in range(batch_size):
+        seq_len = int(seq_lens[row].item())
+        gather_len = int(gather_lens[row].item())
+        start_pos = seq_len - gather_len
+        base = int(base_offsets[row].item())
+        for pos in range(start_pos, seq_len):
+            table_idx = pos // block_size - base
+            if table_idx < 0 or table_idx >= max_blocks:
+                raise ValueError("block_table is too narrow for generated positions")
+
+
+def deepseek_v4_dequantize_and_gather_k_cache_reference(
+    values: DeepSeekV4KCacheGatherInputValues,
+) -> torch.Tensor:
+    """Return BF16 K rows gathered/dequantized from DeepSeek V4 paged cache."""
+
+    _validate_deepseek_v4_k_cache_gather_values(values)
+    out = values.out.clone()
+    block_size = values.block_size
+    seq_lens = values.seq_lens.to(torch.int64)
+    gather_lens = (
+        seq_lens if values.gather_lens is None else values.gather_lens.to(torch.int64)
+    )
+    base_offsets = (
+        torch.zeros_like(seq_lens)
+        if values.block_table_base_offsets is None
+        else values.block_table_base_offsets.to(torch.int64)
+    )
+    n_quant_blocks = _DEEPSEEK_V4_NOPE_DIM // _DEEPSEEK_V4_FP8_QUANT_BLOCK
+    for batch_idx in range(seq_lens.numel()):
+        seq_len = int(seq_lens[batch_idx].item())
+        gather_len = int(gather_lens[batch_idx].item())
+        start_pos = seq_len - gather_len
+        base = int(base_offsets[batch_idx].item())
+        for gather_idx in range(gather_len):
+            pos = start_pos + gather_idx
+            table_idx = pos // block_size - base
+            out_row = out[batch_idx, values.offset + gather_idx]
+            physical = int(values.block_table[batch_idx, table_idx].item())
+            pos_in_block = pos % block_size
+            cache_row = values.cache_2d[physical]
+            token_base = pos_in_block * _DEEPSEEK_V4_SWA_TOKEN_STRIDE
+            scale_base = (
+                block_size * _DEEPSEEK_V4_SWA_TOKEN_STRIDE
+                + pos_in_block * _DEEPSEEK_V4_SWA_SCALE_DIM
+            )
+            for qblock in range(n_quant_blocks):
+                qstart = token_base + qblock * _DEEPSEEK_V4_FP8_QUANT_BLOCK
+                qend = qstart + _DEEPSEEK_V4_FP8_QUANT_BLOCK
+                x_fp8 = cache_row[qstart:qend].view(torch.float8_e4m3fn).float()
+                scale_exp = int(cache_row[scale_base + qblock].item()) - 127
+                scale = math.pow(2.0, scale_exp)
+                out_row[
+                    qblock
+                    * _DEEPSEEK_V4_FP8_QUANT_BLOCK : (qblock + 1)
+                    * _DEEPSEEK_V4_FP8_QUANT_BLOCK
+                ] = (x_fp8 * scale).to(torch.bfloat16)
+            rope_start = token_base + _DEEPSEEK_V4_NOPE_DIM
+            rope_end = rope_start + _DEEPSEEK_V4_ROPE_DIM * 2
+            out_row[_DEEPSEEK_V4_NOPE_DIM:] = cache_row[rope_start:rope_end].view(
+                torch.bfloat16
+            )
+    return out.contiguous()
 
 
 @dataclass

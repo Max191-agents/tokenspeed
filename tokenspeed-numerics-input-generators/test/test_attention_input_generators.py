@@ -31,6 +31,8 @@ from tokenspeed_numerics_input_generators import (
     DeepSeekV4IndexerMXFP4CacheGatherInputs,
     DeepSeekV4IndexerMXFP4CacheWriteInputConfig,
     DeepSeekV4IndexerMXFP4CacheWriteInputs,
+    DeepSeekV4KCacheGatherInputConfig,
+    DeepSeekV4KCacheGatherInputs,
     DeepSeekV4PagedIndexInputConfig,
     DeepSeekV4PagedIndexInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
@@ -66,6 +68,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_compressed_slot_mapping_reference,
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
     deepseek_v4_decode_swa_indices_and_lens_reference,
+    deepseek_v4_dequantize_and_gather_k_cache_reference,
     deepseek_v4_indexer_decode_metadata_reference,
     deepseek_v4_indexer_mxfp4_cache_gather_reference,
     deepseek_v4_indexer_mxfp4_cache_write_reference,
@@ -1321,6 +1324,124 @@ def test_deepseek_v4_indexer_mxfp4_cache_gather_rejects_invalid_configs_and_valu
     values.slot_mapping = torch.tensor([2], dtype=torch.int64)
     with pytest.raises(ValueError, match="slot_mapping entries"):
         deepseek_v4_indexer_mxfp4_cache_gather_reference(values)
+
+
+def test_deepseek_v4_k_cache_gather_inputs_generate_reference() -> None:
+    values = DeepSeekV4KCacheGatherInputs(
+        DeepSeekV4KCacheGatherInputConfig(
+            batch_size=3,
+            max_seq_len=9,
+            block_size=4,
+            max_gather_len=5,
+            offset=2,
+            include_gather_lens=True,
+            include_block_table_base_offsets=True,
+        )
+    ).generate(metadata_seed=191, value_seed=201, device="cpu")
+
+    expected = deepseek_v4_dequantize_and_gather_k_cache_reference(values)
+
+    assert values.out.shape == (3, 7, 512)
+    assert values.cache_2d.shape == (9, 4 * (576 + 8))
+    assert values.seq_lens.shape == (3,)
+    assert values.gather_lens is not None
+    assert values.gather_lens.shape == (3,)
+    assert values.block_table.shape == (3, 3)
+    assert values.block_table_base_offsets is not None
+    torch.testing.assert_close(expected[:, :2], values.out[:, :2], rtol=0, atol=0)
+
+    for batch_idx in range(values.seq_lens.numel()):
+        seq_len = int(values.seq_lens[batch_idx].item())
+        gather_len = int(values.gather_lens[batch_idx].item())
+        start_pos = seq_len - gather_len
+        base_offset = int(values.block_table_base_offsets[batch_idx].item())
+        for gather_idx in range(gather_len):
+            pos = start_pos + gather_idx
+            table_idx = pos // values.block_size - base_offset
+            physical = int(values.block_table[batch_idx, table_idx].item())
+            pos_in_block = pos % values.block_size
+            rope_start = pos_in_block * 576 + 448
+            rope_end = rope_start + 128
+            torch.testing.assert_close(
+                expected[batch_idx, values.offset + gather_idx, 448:],
+                values.cache_2d[physical, rope_start:rope_end].view(torch.bfloat16),
+                rtol=0,
+                atol=0,
+            )
+
+
+def test_deepseek_v4_k_cache_gather_keeps_metadata_seed_independent() -> None:
+    generator = DeepSeekV4KCacheGatherInputs(
+        DeepSeekV4KCacheGatherInputConfig(
+            batch_size=2,
+            max_seq_len=8,
+            block_size=4,
+            max_gather_len=4,
+        )
+    )
+
+    first = generator.generate(metadata_seed=211, value_seed=221, device="cpu")
+    same_metadata = generator.generate(metadata_seed=211, value_seed=222, device="cpu")
+    same_values = generator.generate(metadata_seed=212, value_seed=221, device="cpu")
+
+    torch.testing.assert_close(first.seq_lens, same_metadata.seq_lens)
+    assert first.gather_lens is not None and same_metadata.gather_lens is not None
+    torch.testing.assert_close(first.gather_lens, same_metadata.gather_lens)
+    torch.testing.assert_close(first.block_table, same_metadata.block_table)
+    assert not torch.equal(first.cache_2d, same_metadata.cache_2d)
+    torch.testing.assert_close(first.cache_2d, same_values.cache_2d)
+    torch.testing.assert_close(first.out, same_values.out)
+
+
+def test_deepseek_v4_k_cache_gather_supports_full_sequence_gather() -> None:
+    values = DeepSeekV4KCacheGatherInputs(
+        DeepSeekV4KCacheGatherInputConfig(
+            batch_size=2,
+            max_seq_len=6,
+            block_size=3,
+            include_gather_lens=False,
+        )
+    ).generate(seed=231, device="cpu")
+
+    expected = deepseek_v4_dequantize_and_gather_k_cache_reference(values)
+
+    assert values.gather_lens is None
+    assert expected.shape == values.out.shape
+    assert torch.isfinite(expected.float()).all()
+
+
+def test_deepseek_v4_k_cache_gather_rejects_invalid_configs_and_values() -> None:
+    with pytest.raises(ValueError, match="max_gather_len"):
+        DeepSeekV4KCacheGatherInputs(
+            DeepSeekV4KCacheGatherInputConfig(
+                batch_size=1,
+                max_seq_len=4,
+                block_size=2,
+                max_gather_len=5,
+            )
+        )
+    with pytest.raises(ValueError, match="num_cache_blocks"):
+        DeepSeekV4KCacheGatherInputs(
+            DeepSeekV4KCacheGatherInputConfig(
+                batch_size=2,
+                max_seq_len=4,
+                block_size=2,
+                num_cache_blocks=3,
+            )
+        )
+
+    values = DeepSeekV4KCacheGatherInputs(
+        DeepSeekV4KCacheGatherInputConfig(
+            batch_size=1,
+            max_seq_len=4,
+            block_size=2,
+            max_gather_len=2,
+        )
+    ).generate(seed=241, device="cpu")
+    assert values.gather_lens is not None
+    values.gather_lens = values.seq_lens + 1
+    with pytest.raises(ValueError, match="gather_lens entries"):
+        deepseek_v4_dequantize_and_gather_k_cache_reference(values)
 
 
 def test_deepseek_v4_paged_index_inputs_generate_values_and_refs() -> None:
