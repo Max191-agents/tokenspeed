@@ -25,6 +25,8 @@ import torch
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    DeepSeekV4PagedIndexInputConfig,
+    DeepSeekV4PagedIndexInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
     DeepSeekV4SparsePrefillIndexInputs,
     KVCacheInput,
@@ -42,9 +44,13 @@ from tokenspeed_numerics_input_generators import (
     PageTableInput,
     PageTableInputConfig,
     attention_merge_state_reference,
+    deepseek_v4_compressed_slot_mapping_reference,
+    deepseek_v4_compute_global_topk_indices_and_lens_reference,
+    deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_build_dense_prefill_local_compressed_indices_reference,
     deepseek_v4_combine_dense_swa_indices_reference,
     deepseek_v4_combine_topk_swa_indices_reference,
+    deepseek_v4_indexer_decode_metadata_reference,
     mla_kv_pack_quantize_fp8_reference,
 )
 
@@ -342,6 +348,184 @@ def test_mla_kv_pack_quantize_fp8_reference_rejects_mixed_input_dtypes() -> None
 
     with pytest.raises(ValueError, match="same dtype"):
         mla_kv_pack_quantize_fp8_reference(values)
+
+
+def test_deepseek_v4_paged_index_inputs_generate_values_and_refs() -> None:
+    values = DeepSeekV4PagedIndexInputs(
+        DeepSeekV4PagedIndexInputConfig(
+            batch_size=3,
+            total_cached_tokens=18,
+            total_new_q_tokens=9,
+            block_size=4,
+            compress_ratio=3,
+            window_size=5,
+            topk=4,
+            indexing="identity",
+            include_valid_token_mask=True,
+            invalid_token_probability=0.85,
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=3,
+                total_cached_tokens=18,
+                total_new_q_tokens=9,
+                cache_layout="paged",
+                cached_length_mode="regular",
+                new_q_length_mode="fixed_per_request",
+            ),
+        )
+    ).generate(seed=11, device="cpu")
+
+    assert values.positions.shape == (9,)
+    assert values.token_to_req_indices.shape == (9,)
+    assert values.local_topk_indices.shape == (9, 4)
+    assert values.seq_lens.shape == (3,)
+    assert values.block_table.shape[0] == 3
+    assert values.block_table.shape[1] >= 3
+    assert values.is_valid_token is not None
+    assert values.is_valid_token.shape == (9,)
+
+    global_topk, global_lens = (
+        deepseek_v4_compute_global_topk_indices_and_lens_reference(values)
+    )
+    swa_indices, swa_lens = deepseek_v4_decode_swa_indices_and_lens_reference(values)
+    slot_mapping = deepseek_v4_compressed_slot_mapping_reference(values)
+    context_lens, out_block_tables = deepseek_v4_indexer_decode_metadata_reference(
+        values
+    )
+
+    assert global_topk.shape == values.local_topk_indices.shape
+    assert global_lens.shape == (9,)
+    assert swa_indices.shape == (9, values.window_size)
+    assert swa_lens.shape == (9,)
+    assert slot_mapping.shape == (9,)
+    assert context_lens.shape == (9,)
+    assert out_block_tables.shape == (9, values.max_blocks)
+    assert torch.all(global_lens <= values.topk)
+    assert torch.all(swa_lens <= values.window_size)
+    invalid = ~values.is_valid_token
+    assert torch.all(global_lens[invalid] == 0)
+    assert torch.all(swa_lens[invalid] == 0)
+
+    valid_compressed = [
+        idx
+        for idx, pos in enumerate(values.positions.tolist())
+        if (pos + 1) % values.compress_ratio == 0
+    ]
+    assert valid_compressed
+    assert torch.all(slot_mapping[valid_compressed] >= 0)
+    assert torch.all(context_lens >= 0)
+
+
+def test_deepseek_v4_paged_index_inputs_support_base_offsets() -> None:
+    values = DeepSeekV4PagedIndexInputs(
+        DeepSeekV4PagedIndexInputConfig(
+            batch_size=2,
+            total_cached_tokens=16,
+            total_new_q_tokens=6,
+            block_size=4,
+            compress_ratio=2,
+            window_size=4,
+            topk=3,
+            include_block_table_base_offsets=True,
+            indexing="identity",
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=2,
+                total_cached_tokens=16,
+                total_new_q_tokens=6,
+                cache_layout="paged",
+                cached_length_mode="regular",
+                new_q_length_mode="fixed_per_request",
+            ),
+        )
+    ).generate(seed=12, device="cpu")
+
+    assert values.block_table_base_offsets is not None
+    assert values.block_table_base_offsets.shape == (2,)
+
+    swa_indices, swa_lens = deepseek_v4_decode_swa_indices_and_lens_reference(values)
+    context_lens, out_block_tables = deepseek_v4_indexer_decode_metadata_reference(
+        values
+    )
+
+    assert swa_indices.shape == (6, 4)
+    assert torch.all(swa_lens <= 4)
+    assert context_lens.shape == (6,)
+    assert out_block_tables.shape == (6, values.max_blocks)
+
+
+def test_deepseek_v4_paged_index_inputs_keep_metadata_seeded() -> None:
+    config = DeepSeekV4PagedIndexInputConfig(
+        batch_size=2,
+        total_cached_tokens=13,
+        total_new_q_tokens=7,
+        block_size=4,
+        compress_ratio=2,
+        window_size=4,
+        topk=3,
+        indexing="random",
+    )
+
+    first = DeepSeekV4PagedIndexInputs(config).generate(seed=13, device="cpu")
+    second = DeepSeekV4PagedIndexInputs(config).generate(seed=13, device="cpu")
+    third = DeepSeekV4PagedIndexInputs(config).generate(seed=14, device="cpu")
+
+    assert torch.equal(first.positions, second.positions)
+    assert torch.equal(first.token_to_req_indices, second.token_to_req_indices)
+    assert torch.equal(first.block_table, second.block_table)
+    assert torch.equal(first.local_topk_indices, second.local_topk_indices)
+    assert not torch.equal(first.block_table, third.block_table)
+
+
+def test_deepseek_v4_paged_index_inputs_reject_invalid_configs() -> None:
+    with pytest.raises(ValueError, match="compress_ratio"):
+        DeepSeekV4PagedIndexInputs(
+            DeepSeekV4PagedIndexInputConfig(
+                batch_size=2,
+                total_cached_tokens=8,
+                total_new_q_tokens=4,
+                block_size=4,
+                compress_ratio=1,
+                window_size=4,
+                topk=2,
+            )
+        )
+
+    with pytest.raises(ValueError, match="metadata_input.total_new_kv_tokens"):
+        DeepSeekV4PagedIndexInputs(
+            DeepSeekV4PagedIndexInputConfig(
+                batch_size=2,
+                total_cached_tokens=8,
+                total_new_q_tokens=4,
+                block_size=4,
+                compress_ratio=2,
+                window_size=4,
+                topk=2,
+                metadata_input=MHARequestMetadataInputConfig(
+                    batch_size=2,
+                    total_cached_tokens=8,
+                    total_new_q_tokens=4,
+                    total_new_kv_tokens=3,
+                    cache_layout="paged",
+                    tie_new_kv_to_query=False,
+                ),
+            )
+        )
+
+    with pytest.raises(ValueError, match="page_table_input.batch_size"):
+        DeepSeekV4PagedIndexInputs(
+            DeepSeekV4PagedIndexInputConfig(
+                batch_size=2,
+                total_cached_tokens=8,
+                total_new_q_tokens=4,
+                block_size=4,
+                compress_ratio=2,
+                window_size=4,
+                topk=2,
+                page_table_input=PageTableInputConfig(
+                    batch_size=1,
+                    max_pages_per_request=4,
+                ),
+            )
+        )
 
 
 def test_deepseek_v4_sparse_prefill_indices_generate_values_and_refs() -> None:

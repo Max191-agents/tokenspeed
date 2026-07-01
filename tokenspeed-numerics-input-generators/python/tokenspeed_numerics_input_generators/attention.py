@@ -34,7 +34,9 @@ from tokenspeed_numerics_input_generators.attention_cache import (
     MLAKVCacheInput,
     MLAKVCacheInputConfig,
     MLAKVCacheValues,
+    PageTableInput,
     PageTableInputConfig,
+    PageTableValues,
 )
 from tokenspeed_numerics_input_generators.attention_metadata import (
     CacheLayout,
@@ -57,6 +59,13 @@ __all__ = [
     "AttentionMergeStateInputValues",
     "attention_generate",
     "attention_merge_state_reference",
+    "DeepSeekV4PagedIndexInputConfig",
+    "DeepSeekV4PagedIndexInputs",
+    "DeepSeekV4PagedIndexValues",
+    "deepseek_v4_compressed_slot_mapping_reference",
+    "deepseek_v4_compute_global_topk_indices_and_lens_reference",
+    "deepseek_v4_decode_swa_indices_and_lens_reference",
+    "deepseek_v4_indexer_decode_metadata_reference",
     "DeepSeekV4SparsePrefillIndexInputConfig",
     "DeepSeekV4SparsePrefillIndexInputs",
     "DeepSeekV4SparsePrefillIndexValues",
@@ -732,6 +741,596 @@ def mla_kv_pack_quantize_fp8_reference(
     k_fp8 = (k.float() * values.k_scale_inv).to(fp8_dtype)
     v_fp8 = (values.v.float() * values.v_scale_inv).to(fp8_dtype)
     return k_fp8.contiguous(), v_fp8.contiguous()
+
+
+@dataclass
+class DeepSeekV4PagedIndexValues:
+    """Generated values for DeepSeek V4 paged index metadata operations."""
+
+    metadata: MHARequestMetadataValues
+    positions: torch.Tensor
+    token_to_req_indices: torch.Tensor
+    local_topk_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    block_table_cpu: list[list[int]]
+    block_table_values: PageTableValues
+    block_table_base_offsets: torch.Tensor | None
+    is_valid_token: torch.Tensor | None
+    block_size: int
+    compress_ratio: int
+    window_size: int
+    topk: int
+    max_blocks: int
+
+
+@dataclass
+class DeepSeekV4PagedIndexInputConfig:
+    """Initialization parameters for DeepSeek V4 paged index metadata.
+
+    The represented operation family maps request-local token or compressed
+    token positions through a paged KV cache block table. The generated values
+    are shared by DeepSeek V4 helpers that build global top-k slot ids, decode
+    sliding-window slot ids, compressed KV slot mappings, and decode-indexer
+    block-table/context metadata.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of request sequences represented by generated metadata.
+    batch_size: int
+
+    # Required: total already-resident KV tokens across all requests.
+    total_cached_tokens: int
+
+    # Required: total new query/KV tokens across all requests.
+    total_new_q_tokens: int
+
+    # Required: page/block size used to map logical token positions to slots.
+    block_size: int
+
+    # Required: compression ratio for compressed KV slot/indexer metadata.
+    compress_ratio: int
+
+    # Required: sliding-window token count used by decode SWA metadata.
+    window_size: int
+
+    # Required: number of request-local top-k indices generated per token.
+    topk: int
+
+    # ------------------------------------------------------------------
+    # Optional metadata/page-table configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: output block-table width for decode-indexer metadata. Defaults
+    # to the generated page-table width.
+    max_blocks: int | None = None
+
+    # Optional: physical-page assignment policy for the generated block table.
+    indexing: PageTableIndexing = "random"
+
+    # Optional: generate block-table base offsets for helper APIs that model a
+    # row as starting at a non-zero logical page.
+    include_block_table_base_offsets: bool = False
+
+    # Optional: generate an is_valid_token mask consumed by global-top-k and SWA
+    # helpers. Invalid rows are kept in the tensors but should produce length 0.
+    include_valid_token_mask: bool = False
+
+    # Optional: approximate probability that one generated token is invalid
+    # when include_valid_token_mask is true.
+    invalid_token_probability: float = 0.25
+
+    # Optional: nested request metadata config. If supplied, its batch size and
+    # token totals must match this parent config.
+    metadata_input: MHARequestMetadataInputConfig | None = None
+
+    # Optional: nested page-table config. If supplied, its batch size must match
+    # this parent config; its width is raised as needed during generation.
+    page_table_input: PageTableInputConfig | None = None
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DeepSeekV4PagedIndexInputs(NumericsInputGenerator):
+    """Generator for DeepSeek V4 paged index metadata inputs."""
+
+    config: DeepSeekV4PagedIndexInputConfig
+    metadata_input: MHARequestMetadataInput | None
+    page_table_input: PageTableInput | None
+
+    def __init__(self, config: DeepSeekV4PagedIndexInputConfig) -> None:
+        self.config = config
+        self.metadata_input = None
+        self.page_table_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.metadata_input = self.metadata_input or MHARequestMetadataInput(
+            self.config.metadata_input or self._make_metadata_config()
+        )
+        self._verify_metadata_config_matches_parent()
+        self.config.metadata_input = self.metadata_input.config
+        self.page_table_input = self.page_table_input or PageTableInput(
+            self.config.page_table_input or self._make_page_table_config()
+        )
+        self._verify_page_table_config_matches_parent()
+        self.config.page_table_input = self.page_table_input.config
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> DeepSeekV4PagedIndexValues:
+        self.__post_init__()
+        if self.metadata_input is None or self.page_table_input is None:
+            raise ValueError("metadata/page-table child generators must be initialized")
+        target_device = _resolve_device(self.config.device, device)
+        metadata = self.metadata_input.generate(
+            seed=_child_seed(seed, 1),
+            device=target_device,
+        )
+        if metadata.new_q_lens_cpu != metadata.new_kv_lens_cpu:
+            raise ValueError("DeepSeek V4 paged indices require tied Q/KV lengths")
+
+        max_visible = max(metadata.visible_kv_lens_cpu)
+        required_pages = max(1, math.ceil(max_visible / self.config.block_size))
+        self.page_table_input.config.batch_size = self.config.batch_size
+        self.page_table_input.config.max_pages_per_request = max(
+            self.page_table_input.config.max_pages_per_request,
+            required_pages,
+        )
+        self.page_table_input.config.indexing = self.config.indexing
+        page_table_values = self.page_table_input.generate(
+            seed=_child_seed(seed, 2),
+            device=target_device,
+        )
+        max_blocks = (
+            self.config.max_blocks
+            if self.config.max_blocks is not None
+            else page_table_values.page_table.shape[1]
+        )
+
+        positions_cpu: list[int] = []
+        token_to_req_cpu: list[int] = []
+        for req, (query_len, seq_len) in enumerate(
+            zip(metadata.new_q_lens_cpu, metadata.visible_kv_lens_cpu, strict=True)
+        ):
+            start_pos = seq_len - query_len
+            for offset in range(query_len):
+                positions_cpu.append(start_pos + offset)
+                token_to_req_cpu.append(req)
+
+        local_topk_cpu = self._generate_local_topk_indices(
+            seed=_child_seed(seed, 3),
+            positions=positions_cpu,
+        )
+        is_valid_token = self._generate_valid_token_mask(
+            seed=_child_seed(seed, 4),
+            num_tokens=len(positions_cpu),
+            device=target_device,
+        )
+        block_table_base_offsets = self._generate_block_table_base_offsets(
+            seed=_child_seed(seed, 5),
+            metadata=metadata,
+            page_table_width=page_table_values.page_table.shape[1],
+            device=target_device,
+        )
+
+        return DeepSeekV4PagedIndexValues(
+            metadata=metadata,
+            positions=torch.tensor(
+                positions_cpu,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            token_to_req_indices=torch.tensor(
+                token_to_req_cpu,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            local_topk_indices=local_topk_cpu.to(target_device),
+            seq_lens=torch.tensor(
+                metadata.visible_kv_lens_cpu,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            block_table=page_table_values.page_table,
+            block_table_cpu=page_table_values.page_table_cpu,
+            block_table_values=page_table_values,
+            block_table_base_offsets=block_table_base_offsets,
+            is_valid_token=is_valid_token,
+            block_size=self.config.block_size,
+            compress_ratio=self.config.compress_ratio,
+            window_size=self.config.window_size,
+            topk=self.config.topk,
+            max_blocks=max_blocks,
+        )
+
+    def _normalize_config(self) -> None:
+        self.config.batch_size = _check_positive("batch_size", self.config.batch_size)
+        self.config.total_cached_tokens = _check_nonnegative(
+            "total_cached_tokens",
+            self.config.total_cached_tokens,
+        )
+        self.config.total_new_q_tokens = _check_positive(
+            "total_new_q_tokens",
+            self.config.total_new_q_tokens,
+        )
+        self.config.block_size = _check_positive("block_size", self.config.block_size)
+        self.config.compress_ratio = _check_positive(
+            "compress_ratio", self.config.compress_ratio
+        )
+        if self.config.compress_ratio <= 1:
+            raise ValueError(
+                "compress_ratio must be greater than 1 for compressed KV metadata, "
+                f"got {self.config.compress_ratio}"
+            )
+        self.config.window_size = _check_positive(
+            "window_size", self.config.window_size
+        )
+        self.config.topk = _check_positive("topk", self.config.topk)
+        if self.config.max_blocks is not None:
+            self.config.max_blocks = _check_positive(
+                "max_blocks", self.config.max_blocks
+            )
+        self.config.indexing = _check_page_table_indexing(self.config.indexing)
+        self.config.invalid_token_probability = float(
+            self.config.invalid_token_probability
+        )
+        if not 0.0 <= self.config.invalid_token_probability < 1.0:
+            raise ValueError("invalid_token_probability must be in [0, 1)")
+
+    def _make_metadata_config(self) -> MHARequestMetadataInputConfig:
+        return MHARequestMetadataInputConfig(
+            batch_size=self.config.batch_size,
+            total_cached_tokens=self.config.total_cached_tokens,
+            total_new_q_tokens=self.config.total_new_q_tokens,
+            cache_layout="paged",
+            device=self.config.device,
+        )
+
+    def _make_page_table_config(self) -> PageTableInputConfig:
+        return PageTableInputConfig(
+            batch_size=self.config.batch_size,
+            max_pages_per_request=1,
+            indexing=self.config.indexing,
+            device=self.config.device,
+        )
+
+    def _verify_metadata_config_matches_parent(self) -> None:
+        if self.metadata_input is None:
+            raise ValueError("metadata_input must be initialized")
+        metadata_config = self.metadata_input.config
+        for name in ("batch_size", "total_cached_tokens", "total_new_q_tokens"):
+            _check_matches(
+                parent_name=f"DeepSeekV4PagedIndexInputConfig.{name}",
+                child_name=f"metadata_input.{name}",
+                parent_value=getattr(self.config, name),
+                child_value=getattr(metadata_config, name),
+            )
+        if metadata_config.total_new_kv_tokens is not None:
+            _check_matches(
+                parent_name="DeepSeekV4PagedIndexInputConfig.total_new_q_tokens",
+                child_name="metadata_input.total_new_kv_tokens",
+                parent_value=self.config.total_new_q_tokens,
+                child_value=metadata_config.total_new_kv_tokens,
+            )
+        if not metadata_config.tie_new_kv_to_query:
+            raise ValueError(
+                "metadata_input.tie_new_kv_to_query must be true for paged indices"
+            )
+
+    def _verify_page_table_config_matches_parent(self) -> None:
+        if self.page_table_input is None:
+            raise ValueError("page_table_input must be initialized")
+        _check_matches(
+            parent_name="DeepSeekV4PagedIndexInputConfig.batch_size",
+            child_name="page_table_input.batch_size",
+            parent_value=self.config.batch_size,
+            child_value=self.page_table_input.config.batch_size,
+        )
+
+    def _generate_local_topk_indices(
+        self,
+        *,
+        seed: int,
+        positions: list[int],
+    ) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        local_topk = torch.full(
+            (len(positions), self.config.topk),
+            -1,
+            dtype=torch.int32,
+        )
+        for token_idx, pos in enumerate(positions):
+            available = int(pos) + 1
+            topk_len = min(available, self.config.topk)
+            if topk_len == 0:
+                continue
+            selected = torch.randperm(available, generator=rng)[:topk_len].to(
+                torch.int32
+            )
+            local_topk[token_idx, :topk_len] = selected
+        return local_topk
+
+    def _generate_valid_token_mask(
+        self,
+        *,
+        seed: int,
+        num_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if not self.config.include_valid_token_mask:
+            return None
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        valid_cpu = (
+            torch.rand(num_tokens, generator=rng)
+            >= self.config.invalid_token_probability
+        )
+        if num_tokens:
+            valid_cpu[0] = True
+        return valid_cpu.to(device=device, dtype=torch.bool)
+
+    def _generate_block_table_base_offsets(
+        self,
+        *,
+        seed: int,
+        metadata: MHARequestMetadataValues,
+        page_table_width: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if not self.config.include_block_table_base_offsets:
+            return None
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        offsets: list[int] = []
+        for seq_len in metadata.visible_kv_lens_cpu:
+            max_logical_page = max(0, (seq_len - 1) // self.config.block_size)
+            max_offset = min(max_logical_page, max(0, page_table_width - 1))
+            if max_offset == 0:
+                offsets.append(0)
+            else:
+                offsets.append(
+                    int(torch.randint(0, max_offset + 1, (1,), generator=rng))
+                )
+        return torch.tensor(offsets, dtype=torch.int32, device=device)
+
+
+def _validate_deepseek_v4_paged_index_values(
+    values: DeepSeekV4PagedIndexValues,
+) -> None:
+    if values.positions.dtype != torch.int32:
+        raise TypeError(f"positions must be int32, got {values.positions.dtype}")
+    if values.token_to_req_indices.dtype != torch.int32:
+        raise TypeError(
+            "token_to_req_indices must be int32, "
+            f"got {values.token_to_req_indices.dtype}"
+        )
+    if values.local_topk_indices.dtype != torch.int32:
+        raise TypeError(
+            f"local_topk_indices must be int32, got {values.local_topk_indices.dtype}"
+        )
+    if values.seq_lens.dtype != torch.int32:
+        raise TypeError(f"seq_lens must be int32, got {values.seq_lens.dtype}")
+    if values.block_table.dtype != torch.int32:
+        raise TypeError(f"block_table must be int32, got {values.block_table.dtype}")
+    if values.positions.ndim != 1:
+        raise ValueError("positions must be rank-1")
+    num_tokens = int(values.positions.numel())
+    if values.token_to_req_indices.shape != (num_tokens,):
+        raise ValueError("token_to_req_indices must have shape [num_tokens]")
+    if values.local_topk_indices.shape != (num_tokens, values.topk):
+        raise ValueError("local_topk_indices must have shape [num_tokens, topk]")
+    if values.block_table.ndim != 2:
+        raise ValueError("block_table must be rank-2")
+    batch_size = len(values.metadata.new_q_lens_cpu)
+    if values.seq_lens.shape != (batch_size,):
+        raise ValueError("seq_lens must have one value per request")
+    if values.block_table.shape[0] != batch_size:
+        raise ValueError("block_table must have one row per request")
+    if values.is_valid_token is not None and values.is_valid_token.shape != (
+        num_tokens,
+    ):
+        raise ValueError("is_valid_token must have shape [num_tokens]")
+    if values.block_table_base_offsets is not None and (
+        values.block_table_base_offsets.shape != (batch_size,)
+        or values.block_table_base_offsets.dtype != torch.int32
+    ):
+        raise ValueError("block_table_base_offsets must be int32 [batch_size]")
+    if values.block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if values.compress_ratio <= 1:
+        raise ValueError("compress_ratio must be greater than 1")
+    if values.window_size <= 0:
+        raise ValueError("window_size must be positive")
+    if values.topk <= 0:
+        raise ValueError("topk must be positive")
+    if values.max_blocks <= 0:
+        raise ValueError("max_blocks must be positive")
+
+
+def deepseek_v4_compute_global_topk_indices_and_lens_reference(
+    values: DeepSeekV4PagedIndexValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return global KV slot ids for request-local top-k indices."""
+
+    _validate_deepseek_v4_paged_index_values(values)
+    device = values.local_topk_indices.device
+    topk = values.local_topk_indices
+    num_tokens = int(topk.shape[0])
+    out = torch.full_like(topk, -1)
+    lens = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    reqs = values.token_to_req_indices.cpu().tolist()
+    block_table_cpu = values.block_table.cpu()
+    valid_mask = (
+        [True] * num_tokens
+        if values.is_valid_token is None
+        else values.is_valid_token.cpu().tolist()
+    )
+    rows, cols = values.block_table.shape
+    for token_idx, req in enumerate(reqs):
+        if not valid_mask[token_idx] or req < 0 or req >= rows:
+            continue
+        count = 0
+        for slot in range(values.topk):
+            local_idx = int(topk[token_idx, slot].item())
+            if local_idx < 0:
+                continue
+            block_idx = local_idx // values.block_size
+            if block_idx < 0 or block_idx >= cols:
+                continue
+            block_number = int(block_table_cpu[req, block_idx].item())
+            if block_number < 0:
+                continue
+            out[token_idx, slot] = block_number * values.block_size + (
+                local_idx % values.block_size
+            )
+            count += 1
+        lens[token_idx] = count
+    return out, lens
+
+
+def deepseek_v4_decode_swa_indices_and_lens_reference(
+    values: DeepSeekV4PagedIndexValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return decode sliding-window KV slot ids and row lengths."""
+
+    _validate_deepseek_v4_paged_index_values(values)
+    device = values.positions.device
+    num_tokens = int(values.positions.numel())
+    out = torch.full(
+        (num_tokens, values.window_size),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    lens = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    reqs = values.token_to_req_indices.cpu().tolist()
+    query_offsets = values.metadata.cu_seqlens_q_cpu
+    seq_lens_cpu = values.seq_lens.cpu().tolist()
+    block_table_cpu = values.block_table.cpu()
+    base_offsets = (
+        [0] * len(seq_lens_cpu)
+        if values.block_table_base_offsets is None
+        else values.block_table_base_offsets.cpu().tolist()
+    )
+    valid_mask = (
+        [True] * num_tokens
+        if values.is_valid_token is None
+        else values.is_valid_token.cpu().tolist()
+    )
+    rows, cols = values.block_table.shape
+    for token_idx, req in enumerate(reqs):
+        if not valid_mask[token_idx] or req < 0 or req >= rows:
+            continue
+        query_start = query_offsets[req]
+        query_end = query_offsets[req + 1]
+        query_len = query_end - query_start
+        prefix_len = int(seq_lens_cpu[req]) - query_len
+        pos = prefix_len + token_idx - query_start
+        start_pos = max(pos - values.window_size + 1, 0)
+        swa_len = pos + 1 - start_pos
+        lens[token_idx] = swa_len
+        for offset in range(swa_len):
+            pos_offset = start_pos + offset
+            block_idx = pos_offset // values.block_size - int(base_offsets[req])
+            if block_idx < 0 or block_idx >= cols:
+                continue
+            block_number = int(block_table_cpu[req, block_idx].item())
+            if block_number < 0:
+                continue
+            out[token_idx, offset] = block_number * values.block_size + (
+                pos_offset % values.block_size
+            )
+    return out, lens
+
+
+def deepseek_v4_compressed_slot_mapping_reference(
+    values: DeepSeekV4PagedIndexValues,
+) -> torch.Tensor:
+    """Return compressed KV slot ids for newly materialized compressed tokens."""
+
+    _validate_deepseek_v4_paged_index_values(values)
+    device = values.positions.device
+    num_tokens = int(values.positions.numel())
+    out = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
+    block_table_cpu = values.block_table.cpu()
+    rows, cols = values.block_table.shape
+    for req, seq_len in enumerate(values.metadata.visible_kv_lens_cpu):
+        if req >= rows:
+            continue
+        query_start = values.metadata.cu_seqlens_q_cpu[req]
+        query_end = values.metadata.cu_seqlens_q_cpu[req + 1]
+        query_len = query_end - query_start
+        start_pos = seq_len - query_len
+        for offset, token_idx in enumerate(range(query_start, query_end)):
+            pos = start_pos + offset
+            if (pos + 1) % values.compress_ratio != 0:
+                continue
+            compressed_pos = pos // values.compress_ratio
+            block_id = compressed_pos // values.block_size
+            if block_id < 0 or block_id >= cols:
+                continue
+            block_number = int(block_table_cpu[req, block_id].item())
+            if block_number < 0:
+                continue
+            out[token_idx] = block_number * values.block_size + (
+                compressed_pos % values.block_size
+            )
+    return out
+
+
+def deepseek_v4_indexer_decode_metadata_reference(
+    values: DeepSeekV4PagedIndexValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return decode-indexer context lengths and block tables."""
+
+    _validate_deepseek_v4_paged_index_values(values)
+    device = values.positions.device
+    num_tokens = int(values.positions.numel())
+    out_context_lens = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    out_block_tables = torch.zeros(
+        (num_tokens, values.max_blocks),
+        dtype=torch.int32,
+        device=device,
+    )
+    positions_cpu = values.positions.cpu().tolist()
+    reqs_cpu = values.token_to_req_indices.cpu().tolist()
+    block_table_cpu = values.block_table.cpu()
+    rows, cols = values.block_table.shape
+    base_offsets = (
+        [0] * rows
+        if values.block_table_base_offsets is None
+        else values.block_table_base_offsets.cpu().tolist()
+    )
+    for token_idx, (pos, req) in enumerate(zip(positions_cpu, reqs_cpu, strict=True)):
+        if req < 0 or req >= rows:
+            continue
+        num_valid_pages = 0
+        for col in range(values.max_blocks):
+            if col >= cols:
+                continue
+            block_number = int(block_table_cpu[req, col].item())
+            if block_number < 0:
+                continue
+            out_block_tables[token_idx, col] = block_number
+            num_valid_pages += 1
+        compressed_len = max(
+            (int(pos) + 1) // values.compress_ratio
+            - int(base_offsets[req]) * values.block_size,
+            0,
+        )
+        out_context_lens[token_idx] = min(
+            compressed_len,
+            num_valid_pages * values.block_size,
+        )
+    return out_context_lens, out_block_tables
 
 
 @dataclass

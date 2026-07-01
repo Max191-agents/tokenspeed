@@ -33,8 +33,12 @@ from tokenspeed_kernel import (
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
+    deepseek_v4_compressed_slot_mapping,
     deepseek_v4_combine_dense_swa_indices,
     deepseek_v4_combine_topk_swa_indices,
+    deepseek_v4_compute_global_topk_indices_and_lens,
+    deepseek_v4_decode_swa_indices_and_lens,
+    deepseek_v4_indexer_decode_metadata_compute,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
@@ -47,6 +51,8 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    DeepSeekV4PagedIndexInputConfig,
+    DeepSeekV4PagedIndexInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
     DeepSeekV4SparsePrefillIndexInputs,
     MHAInputConfig,
@@ -57,9 +63,13 @@ from tokenspeed_numerics_input_generators import (
     MLAKVPackQuantizeFP8Inputs,
     MHARequestMetadataInputConfig,
     attention_merge_state_reference,
+    deepseek_v4_compressed_slot_mapping_reference,
+    deepseek_v4_compute_global_topk_indices_and_lens_reference,
+    deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_build_dense_prefill_local_compressed_indices_reference,
     deepseek_v4_combine_dense_swa_indices_reference,
     deepseek_v4_combine_topk_swa_indices_reference,
+    deepseek_v4_indexer_decode_metadata_reference,
     mla_kv_pack_quantize_fp8_reference,
 )
 
@@ -356,6 +366,144 @@ def test_mla_kv_pack_quantize_fp8_generator_runs_tokenspeed_mla_kernel(
 
     assert torch.equal(actual_k.view(torch.uint8), expected_k.view(torch.uint8))
     assert torch.equal(actual_v.view(torch.uint8), expected_v.view(torch.uint8))
+
+
+def test_deepseek_v4_global_topk_generator_runs_tokenspeed_cpu() -> None:
+    values = DeepSeekV4PagedIndexInputs(
+        DeepSeekV4PagedIndexInputConfig(
+            batch_size=3,
+            total_cached_tokens=18,
+            total_new_q_tokens=9,
+            block_size=4,
+            compress_ratio=3,
+            window_size=8,
+            topk=4,
+            include_valid_token_mask=True,
+            invalid_token_probability=0.5,
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=3,
+                total_cached_tokens=18,
+                total_new_q_tokens=9,
+                cache_layout="paged",
+                cached_length_mode="regular",
+                new_q_length_mode="fixed_per_request",
+            ),
+        )
+    ).generate(seed=209, device="cpu")
+    expected_indices, expected_lens = (
+        deepseek_v4_compute_global_topk_indices_and_lens_reference(values)
+    )
+
+    actual_indices, actual_lens = deepseek_v4_compute_global_topk_indices_and_lens(
+        topk_indices=values.local_topk_indices,
+        token_to_req_indices=values.token_to_req_indices,
+        block_table=values.block_table,
+        block_size=values.block_size,
+        is_valid_token=values.is_valid_token,
+    )
+
+    assert torch.equal(actual_indices, expected_indices)
+    assert torch.equal(actual_lens, expected_lens)
+
+
+def test_deepseek_v4_paged_index_generator_runs_tokenspeed_triton(
+    device: str,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm GPU is required for Triton paged-index tests")
+
+    values = DeepSeekV4PagedIndexInputs(
+        DeepSeekV4PagedIndexInputConfig(
+            batch_size=3,
+            total_cached_tokens=18,
+            total_new_q_tokens=9,
+            block_size=4,
+            compress_ratio=3,
+            window_size=8,
+            topk=4,
+            indexing="identity",
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=3,
+                total_cached_tokens=18,
+                total_new_q_tokens=9,
+                cache_layout="paged",
+                cached_length_mode="regular",
+                new_q_length_mode="fixed_per_request",
+            ),
+        )
+    ).generate(seed=210, device=device)
+
+    expected_topk_indices, expected_topk_lens = (
+        deepseek_v4_compute_global_topk_indices_and_lens_reference(values)
+    )
+    actual_topk_indices, actual_topk_lens = (
+        deepseek_v4_compute_global_topk_indices_and_lens(
+            topk_indices=values.local_topk_indices,
+            token_to_req_indices=values.token_to_req_indices,
+            block_table=values.block_table,
+            block_size=values.block_size,
+            is_valid_token=values.is_valid_token,
+        )
+    )
+
+    expected_swa_indices, expected_swa_lens = (
+        deepseek_v4_decode_swa_indices_and_lens_reference(values)
+    )
+    actual_swa_indices, actual_swa_lens = deepseek_v4_decode_swa_indices_and_lens(
+        query_start_loc=values.metadata.cu_seqlens_q,
+        seq_lens=values.seq_lens,
+        token_to_req_indices=values.token_to_req_indices,
+        block_table=values.block_table,
+        window_size=values.window_size,
+        block_size=values.block_size,
+        block_table_base_offsets=values.block_table_base_offsets,
+        is_valid_token=values.is_valid_token,
+    )
+
+    expected_slot_mapping = deepseek_v4_compressed_slot_mapping_reference(values)
+    actual_slot_mapping = deepseek_v4_compressed_slot_mapping(
+        num_tokens=values.positions.numel(),
+        query_start_loc=values.metadata.cu_seqlens_q,
+        seq_lens=values.seq_lens,
+        block_table=values.block_table,
+        block_size=values.block_size,
+        compress_ratio=values.compress_ratio,
+    )
+
+    expected_context_lens, expected_block_tables = (
+        deepseek_v4_indexer_decode_metadata_reference(values)
+    )
+    actual_context_lens = torch.empty(
+        values.positions.numel(),
+        dtype=torch.int32,
+        device=device,
+    )
+    actual_block_tables = torch.empty(
+        values.positions.numel(),
+        values.max_blocks,
+        dtype=torch.int32,
+        device=device,
+    )
+    deepseek_v4_indexer_decode_metadata_compute(
+        positions=values.positions,
+        token_to_req_indices=values.token_to_req_indices,
+        block_table=values.block_table,
+        cache_block_size=values.block_size,
+        compress_ratio=values.compress_ratio,
+        max_blocks=values.max_blocks,
+        out_context_lens=actual_context_lens,
+        out_block_tables=actual_block_tables,
+        block_table_base_offsets=values.block_table_base_offsets,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual_topk_indices, expected_topk_indices)
+    assert torch.equal(actual_topk_lens, expected_topk_lens)
+    assert torch.equal(actual_swa_indices, expected_swa_indices)
+    assert torch.equal(actual_swa_lens, expected_swa_lens)
+    assert torch.equal(actual_slot_mapping, expected_slot_mapping)
+    assert torch.equal(actual_context_lens, expected_context_lens)
+    assert torch.equal(actual_block_tables, expected_block_tables)
 
 
 def test_deepseek_v4_local_compressed_generator_runs_tokenspeed_cpu() -> None:
