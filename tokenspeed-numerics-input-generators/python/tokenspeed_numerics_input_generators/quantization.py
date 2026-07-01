@@ -62,8 +62,13 @@ __all__ = [
     "NVFP4QuantizationInputConfig",
     "NVFP4QuantizationInputs",
     "NVFP4QuantizationInputValues",
+    "GPTQMarlinRepackInputConfig",
+    "GPTQMarlinRepackInputs",
+    "GPTQMarlinRepackInputValues",
     "fp8_quantization_reference",
     "fp8_scale_shape",
+    "gptq_marlin_repack_output_shape",
+    "gptq_marlin_repack_reference",
     "mxfp4_quantization_reference",
     "mxfp4_scale_shape",
     "mxfp8_quantization_reference",
@@ -77,6 +82,10 @@ FP8ScaleGranularity = Literal["none", "tensor", "token", "token_group"]
 FP8ScaleEncoding = Literal["float32", "ue8m0", "packed_ue8m0"]
 MXFP4ScaleLayout = Literal["linear"]
 NVFP4ScaleLayout = Literal["linear"]
+GPTQMarlinNumBits = Literal[4, 8]
+
+_GPTQ_MARLIN_TILE_K = 16
+_GPTQ_MARLIN_TILE_N = 64
 
 _E2M1_NIBBLES = torch.tensor(
     [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15],
@@ -93,6 +102,13 @@ def _check_positive(name: str, value: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be positive, got {value}")
     return value
+
+
+def _check_gptq_marlin_num_bits(num_bits: int) -> int:
+    num_bits = int(num_bits)
+    if num_bits not in (4, 8):
+        raise ValueError(f"num_bits must be 4 or 8, got {num_bits}")
+    return num_bits
 
 
 def _check_optional_positive_float(name: str, value: float | None) -> float | None:
@@ -211,6 +227,29 @@ def nvfp4_scale_shape(
             f"scale_size={scale_size}"
         )
     return shape[:-1] + (shape[-1] // scale_size,)
+
+
+def gptq_marlin_repack_output_shape(
+    *,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+) -> tuple[int, int]:
+    """Return the int32 output shape for GPTQ-to-Marlin repacking."""
+
+    size_k = _check_positive("size_k", size_k)
+    size_n = _check_positive("size_n", size_n)
+    num_bits = _check_gptq_marlin_num_bits(num_bits)
+    if size_k % _GPTQ_MARLIN_TILE_K != 0:
+        raise ValueError(
+            f"size_k must be divisible by {_GPTQ_MARLIN_TILE_K}, got {size_k}"
+        )
+    if size_n % _GPTQ_MARLIN_TILE_N != 0:
+        raise ValueError(
+            f"size_n must be divisible by {_GPTQ_MARLIN_TILE_N}, got {size_n}"
+        )
+    pack_factor = 32 // num_bits
+    return (size_k // _GPTQ_MARLIN_TILE_K, size_n * _GPTQ_MARLIN_TILE_K // pack_factor)
 
 
 def _e2m1_values_from_nibbles(nibbles: torch.Tensor) -> torch.Tensor:
@@ -632,6 +671,17 @@ class NVFP4QuantizationInputValues:
 
 
 @dataclass
+class GPTQMarlinRepackInputValues:
+    """Generated values for ``GPTQMarlinRepackInputs``."""
+
+    b_q_weight: torch.Tensor
+    perm: torch.Tensor
+    size_k: int
+    size_n: int
+    num_bits: int
+
+
+@dataclass
 class NVFP4QuantizationInputConfig:
     """Initialization parameters for ``NVFP4QuantizationInputs``.
 
@@ -659,6 +709,34 @@ class NVFP4QuantizationInputConfig:
     scale_layout: NVFP4ScaleLayout = "linear"
 
     # Optional: generated tensor and scale device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class GPTQMarlinRepackInputConfig:
+    """Initialization parameters for ``GPTQMarlinRepackInputs``.
+
+    The represented operation repacks GPTQ quantized weight codes from packed
+    K-major words into the Marlin 16x64 tiled layout. ``perm`` models optional
+    act-order permutation metadata; an empty tensor represents the no-permute
+    layout.
+    """
+
+    # Required: logical K dimension, divisible by the Marlin K tile size.
+    size_k: int
+
+    # Required: logical N dimension, divisible by the Marlin N tile size.
+    size_n: int
+
+    # Required: quantized code width. Marlin repack supports 4-bit and 8-bit
+    # GPTQ code fields packed into int32 words.
+    num_bits: GPTQMarlinNumBits
+
+    # Optional: generate a full act-order permutation instead of an empty
+    # no-permutation tensor.
+    include_perm: bool = False
+
+    # Optional: generated tensor device override.
     device: DeviceLike = None
 
 
@@ -734,6 +812,76 @@ class NVFP4QuantizationInputs(NumericsInputGenerator):
         )
 
 
+@dataclass(init=False)
+class GPTQMarlinRepackInputs(NumericsInputGenerator):
+    """Generator for GPTQ packed weights consumed by Marlin repacking."""
+
+    config: GPTQMarlinRepackInputConfig
+
+    def __init__(self, config: GPTQMarlinRepackInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.size_k = _check_positive("size_k", self.config.size_k)
+        self.config.size_n = _check_positive("size_n", self.config.size_n)
+        self.config.num_bits = _check_gptq_marlin_num_bits(self.config.num_bits)
+        gptq_marlin_repack_output_shape(
+            size_k=self.config.size_k,
+            size_n=self.config.size_n,
+            num_bits=self.config.num_bits,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> GPTQMarlinRepackInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        generator = _rng_for_device(target_device, seed)
+        pack_factor = 32 // self.config.num_bits
+        codes = torch.randint(
+            0,
+            1 << self.config.num_bits,
+            (self.config.size_k, self.config.size_n),
+            dtype=torch.int64,
+            device=target_device,
+            generator=generator,
+        )
+        shifts = (
+            torch.arange(pack_factor, dtype=torch.int64, device=target_device)
+            * self.config.num_bits
+        )
+        packed_words = (
+            codes.reshape(self.config.size_k // pack_factor, pack_factor, -1)
+            << shifts.reshape(1, pack_factor, 1)
+        ).sum(dim=1)
+        b_q_weight = packed_words.to(torch.int32).reshape(
+            self.config.size_k // pack_factor,
+            self.config.size_n,
+        )
+        if self.config.include_perm:
+            perm = torch.randperm(
+                self.config.size_k,
+                dtype=torch.int64,
+                device=target_device,
+                generator=generator,
+            ).to(torch.int32)
+        else:
+            perm = torch.empty((0,), dtype=torch.int32, device=target_device)
+        values = GPTQMarlinRepackInputValues(
+            b_q_weight=b_q_weight.contiguous(),
+            perm=perm.contiguous(),
+            size_k=self.config.size_k,
+            size_n=self.config.size_n,
+            num_bits=self.config.num_bits,
+        )
+        _validate_gptq_marlin_repack_values(values)
+        return values
+
+
 def _fp8_scale(
     x_fp32: torch.Tensor,
     *,
@@ -758,6 +906,126 @@ def _fp8_scale(
     else:
         raise ValueError(f"unsupported FP8 scale granularity={granularity!r}")
     return (max_abs / fp8_max).clamp(min=1e-10).to(torch.float32)
+
+
+def _to_signed_int32(value: int) -> int:
+    value &= 0xFFFFFFFF
+    if value >= 0x80000000:
+        value -= 0x100000000
+    return value
+
+
+def _validate_gptq_marlin_repack_values(
+    values: GPTQMarlinRepackInputValues,
+) -> None:
+    if values.b_q_weight.dtype != torch.int32:
+        raise TypeError(
+            f"b_q_weight must use torch.int32, got {values.b_q_weight.dtype}"
+        )
+    if values.perm.dtype != torch.int32:
+        raise TypeError(f"perm must use torch.int32, got {values.perm.dtype}")
+    if values.b_q_weight.ndim != 2:
+        raise ValueError("b_q_weight must be rank-2")
+    if values.perm.ndim != 1:
+        raise ValueError("perm must be rank-1")
+    if values.b_q_weight.device != values.perm.device:
+        raise ValueError("b_q_weight and perm must share device")
+    size_k = _check_positive("size_k", values.size_k)
+    size_n = _check_positive("size_n", values.size_n)
+    num_bits = _check_gptq_marlin_num_bits(values.num_bits)
+    gptq_marlin_repack_output_shape(
+        size_k=size_k,
+        size_n=size_n,
+        num_bits=num_bits,
+    )
+    pack_factor = 32 // num_bits
+    expected_b_shape = (size_k // pack_factor, size_n)
+    if tuple(values.b_q_weight.shape) != expected_b_shape:
+        raise ValueError(
+            f"b_q_weight must have shape {expected_b_shape}, "
+            f"got {tuple(values.b_q_weight.shape)}"
+        )
+    if values.perm.numel() not in (0, size_k):
+        raise ValueError("perm must be empty or have length size_k")
+    if values.perm.numel() == size_k:
+        sorted_perm = torch.sort(values.perm.detach().cpu()).values
+        expected_perm = torch.arange(size_k, dtype=torch.int32)
+        if not torch.equal(sorted_perm, expected_perm):
+            raise ValueError("perm must be a permutation of [0, size_k)")
+
+
+def gptq_marlin_repack_reference(
+    values: GPTQMarlinRepackInputValues,
+) -> torch.Tensor:
+    """Return GPTQ packed weights repacked into the Marlin tile layout."""
+
+    _validate_gptq_marlin_repack_values(values)
+    size_k = int(values.size_k)
+    size_n = int(values.size_n)
+    num_bits = int(values.num_bits)
+    pack_factor = 32 // num_bits
+    n_tiles = size_n // _GPTQ_MARLIN_TILE_N
+    out_shape = gptq_marlin_repack_output_shape(
+        size_k=size_k,
+        size_n=size_n,
+        num_bits=num_bits,
+    )
+    tile_words = _GPTQ_MARLIN_TILE_K * _GPTQ_MARLIN_TILE_N // pack_factor
+    out_flat = [0] * (out_shape[0] * out_shape[1])
+    b_q_cpu = values.b_q_weight.detach().cpu()
+    perm_cpu = values.perm.detach().cpu()
+    has_perm = perm_cpu.numel() != 0
+    mask = (1 << num_bits) - 1
+
+    def load_code(logical_k: int, n_idx: int) -> int:
+        src_k = int(perm_cpu[logical_k].item()) if has_perm else logical_k
+        packed_word = int(b_q_cpu[src_k // pack_factor, n_idx].item()) & 0xFFFFFFFF
+        return (packed_word >> ((src_k % pack_factor) * num_bits)) & mask
+
+    for k_tile_id in range(size_k // _GPTQ_MARLIN_TILE_K):
+        k_base = k_tile_id * _GPTQ_MARLIN_TILE_K
+        for n_tile_id in range(n_tiles):
+            n_base = n_tile_id * _GPTQ_MARLIN_TILE_N
+            out_offset = (k_tile_id * n_tiles + n_tile_id) * tile_words
+            for warp_id in range(4):
+                for thread_id in range(32):
+                    tc_col = thread_id // 4
+                    tc_row = (thread_id % 4) * 2
+                    cur_n = n_base + warp_id * 16 + tc_col
+                    local_k = (
+                        tc_row,
+                        tc_row + 1,
+                        tc_row + 8,
+                        tc_row + 9,
+                    )
+                    vals = [load_code(k_base + k_idx, cur_n) for k_idx in local_k]
+                    vals.extend(
+                        load_code(k_base + k_idx, cur_n + 8) for k_idx in local_k
+                    )
+                    if num_bits == 4:
+                        pack_idx = (0, 2, 4, 6, 1, 3, 5, 7)
+                        word = 0
+                        for out_pos, val_idx in enumerate(pack_idx):
+                            word |= vals[val_idx] << (out_pos * 4)
+                        out_flat[out_offset + thread_id * 4 + warp_id] = (
+                            _to_signed_int32(word)
+                        )
+                    else:
+                        pack_idx = (0, 2, 1, 3)
+                        word_1 = 0
+                        word_2 = 0
+                        for out_pos, val_idx in enumerate(pack_idx):
+                            word_1 |= vals[val_idx] << (out_pos * 8)
+                            word_2 |= vals[4 + val_idx] << (out_pos * 8)
+                        out_index = out_offset + thread_id * 8 + warp_id * 2
+                        out_flat[out_index] = _to_signed_int32(word_1)
+                        out_flat[out_index + 1] = _to_signed_int32(word_2)
+
+    return torch.tensor(
+        out_flat,
+        dtype=torch.int32,
+        device=values.b_q_weight.device,
+    ).reshape(out_shape)
 
 
 def fp8_quantization_reference(

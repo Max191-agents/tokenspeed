@@ -2,7 +2,8 @@
 
 Quantization generators produce inputs for storage formats where value ranges,
 scale shapes, and packed layouts are part of the mathematical representation.
-The family covers FP8 casts, dynamic FP8 scaling, MXFP8, MXFP4, and NVFP4.
+The family covers FP8 casts, dynamic FP8 scaling, MXFP8, MXFP4, NVFP4, and
+packed GPTQ-to-Marlin layout repacking.
 
 ## Generators
 
@@ -16,6 +17,9 @@ The family covers FP8 casts, dynamic FP8 scaling, MXFP8, MXFP4, and NVFP4.
   packed E2M1 nibbles with UE8M0 group scales.
 - `NVFP4QuantizationInputs`: generates bf16/fp16 values, global scale, and
   local FP8 scale relationships for packed NVFP4 storage.
+- `GPTQMarlinRepackInputs`: generates int32 packed GPTQ weight words and
+  optional act-order permutation metadata for exact Marlin tiled-layout
+  repacking.
 
 ## Generated Values
 
@@ -26,4 +30,6 @@ quantization.
 
 References return operation-level quantized storage and scale tensors. Backend
 scale swizzles or packed ABI details should be adapter responsibilities unless a
-specific generator explicitly models that representation.
+specific generator explicitly models that representation. Marlin repacking is
+one such explicit layout generator because the layout transform is the
+operation under test.

@@ -29,9 +29,13 @@ from tokenspeed_kernel import (
     quantize_mxfp8,
     quantize_nvfp4,
 )
+from tokenspeed_kernel.ops.quantization.cuda import gptq_marlin_repack
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
     FP8QuantizationInputConfig,
     FP8QuantizationInputs,
+    GPTQMarlinRepackInputConfig,
+    GPTQMarlinRepackInputs,
     MXFP4QuantizationInputConfig,
     MXFP4QuantizationInputs,
     MXFP8QuantizationInputConfig,
@@ -39,6 +43,7 @@ from tokenspeed_numerics_input_generators import (
     NVFP4QuantizationInputConfig,
     NVFP4QuantizationInputs,
     fp8_quantization_reference,
+    gptq_marlin_repack_reference,
     mxfp4_quantization_reference,
     mxfp8_quantization_reference,
     nvfp4_quantization_reference,
@@ -163,6 +168,42 @@ def test_nvfp4_quantization_generator_runs_kernel(
     assert scales.shape == expected_scales.shape
     assert _uint8_equal(out, expected_out)
     assert _bitwise_equal(scales, expected_scales)
+
+
+@pytest.mark.skipif(
+    not current_platform().is_nvidia,
+    reason="GPTQ Marlin repack helper requires NVIDIA CUDA.",
+)
+@pytest.mark.parametrize("num_bits,include_perm", [(4, False), (8, True)])
+def test_gptq_marlin_repack_generator_runs_cuda_helper(
+    num_bits: int,
+    include_perm: bool,
+) -> None:
+    values = GPTQMarlinRepackInputs(
+        GPTQMarlinRepackInputConfig(
+            size_k=256,
+            size_n=64,
+            num_bits=num_bits,  # type: ignore[arg-type]
+            include_perm=include_perm,
+        )
+    ).generate(seed=58 + num_bits + int(include_perm), device="cuda")
+    expected = gptq_marlin_repack_reference(values)
+
+    try:
+        out = gptq_marlin_repack(
+            values.b_q_weight,
+            values.perm,
+            values.size_k,
+            values.size_n,
+            values.num_bits,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"CUDA Marlin repack extension unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    assert out.shape == expected.shape
+    assert out.dtype == torch.int32
+    assert torch.equal(out, expected)
 
 
 @pytest.mark.parametrize("solution", ["triton"])

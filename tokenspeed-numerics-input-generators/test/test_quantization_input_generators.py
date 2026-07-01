@@ -25,6 +25,8 @@ import torch
 from tokenspeed_numerics_input_generators import (
     FP8QuantizationInputConfig,
     FP8QuantizationInputs,
+    GPTQMarlinRepackInputConfig,
+    GPTQMarlinRepackInputs,
     MXFP4QuantizationInputConfig,
     MXFP4QuantizationInputs,
     MXFP8QuantizationInputConfig,
@@ -33,6 +35,8 @@ from tokenspeed_numerics_input_generators import (
     NVFP4QuantizationInputs,
     fp8_quantization_reference,
     fp8_scale_shape,
+    gptq_marlin_repack_output_shape,
+    gptq_marlin_repack_reference,
     mxfp4_quantization_reference,
     mxfp4_scale_shape,
     mxfp8_quantization_reference,
@@ -87,6 +91,16 @@ def _dequantize_nvfp4(
     )
 
 
+def _pack_gptq_codes(codes: torch.Tensor, *, num_bits: int) -> torch.Tensor:
+    pack_factor = 32 // num_bits
+    shifts = torch.arange(pack_factor, dtype=torch.int64) * num_bits
+    words = (
+        codes.to(torch.int64).reshape(codes.shape[0] // pack_factor, pack_factor, -1)
+        << shifts.reshape(1, pack_factor, 1)
+    ).sum(dim=1)
+    return words.to(torch.int32).reshape(codes.shape[0] // pack_factor, codes.shape[1])
+
+
 def test_fp8_scale_shape_matches_granularity() -> None:
     shape = (5, 256)
 
@@ -106,6 +120,67 @@ def test_mxfp8_scale_shape_matches_scale_groups() -> None:
 
 def test_nvfp4_scale_shape_matches_scale_groups() -> None:
     assert nvfp4_scale_shape((5, 256)) == (5, 16)
+
+
+@pytest.mark.parametrize("num_bits", [4, 8])
+def test_gptq_marlin_repack_output_shape_matches_layout(num_bits: int) -> None:
+    pack_factor = 32 // num_bits
+
+    assert gptq_marlin_repack_output_shape(
+        size_k=256,
+        size_n=64,
+        num_bits=num_bits,
+    ) == (16, 64 * 16 // pack_factor)
+
+
+@pytest.mark.parametrize("num_bits", [4, 8])
+@pytest.mark.parametrize("include_perm", [False, True])
+def test_gptq_marlin_repack_inputs_generate_values_and_reference(
+    num_bits: int,
+    include_perm: bool,
+) -> None:
+    values = GPTQMarlinRepackInputs(
+        GPTQMarlinRepackInputConfig(
+            size_k=32,
+            size_n=64,
+            num_bits=num_bits,  # type: ignore[arg-type]
+            include_perm=include_perm,
+        )
+    ).generate(seed=48 + num_bits + int(include_perm), device="cpu")
+    pack_factor = 32 // num_bits
+    expected_shape = gptq_marlin_repack_output_shape(
+        size_k=values.size_k,
+        size_n=values.size_n,
+        num_bits=values.num_bits,
+    )
+
+    ref = gptq_marlin_repack_reference(values)
+
+    assert values.b_q_weight.shape == (32 // pack_factor, 64)
+    assert values.b_q_weight.dtype == torch.int32
+    assert values.perm.dtype == torch.int32
+    assert values.perm.shape == ((32,) if include_perm else (0,))
+    if include_perm:
+        assert torch.equal(torch.sort(values.perm).values, torch.arange(32))
+    assert ref.shape == expected_shape
+    assert ref.dtype == torch.int32
+    assert torch.equal(ref, gptq_marlin_repack_reference(values))
+
+
+def test_gptq_marlin_repack_reference_matches_known_4bit_word() -> None:
+    codes = torch.zeros((16, 64), dtype=torch.int64)
+    codes[:, 0] = torch.arange(16, dtype=torch.int64)
+    codes[:, 8] = torch.arange(16, dtype=torch.int64)
+    values = GPTQMarlinRepackInputs(
+        GPTQMarlinRepackInputConfig(size_k=16, size_n=64, num_bits=4)
+    ).generate(seed=49, device="cpu")
+    values.b_q_weight = _pack_gptq_codes(codes, num_bits=4)
+
+    ref = gptq_marlin_repack_reference(values)
+
+    # thread 0, warp 0 packs K lanes [0, 8, 0, 8, 1, 9, 1, 9].
+    expected_word = 0x91918080 - 0x100000000
+    assert int(ref.flatten()[0].item()) == expected_word
 
 
 @pytest.mark.parametrize("granularity", ["none", "tensor", "token", "token_group"])
@@ -465,3 +540,26 @@ def test_fp8_quantization_rejects_invalid_fixed_scale(scale: float) -> None:
                 scale=scale,
             )
         )
+
+
+def test_gptq_marlin_repack_rejects_invalid_configs_and_values() -> None:
+    with pytest.raises(ValueError, match="num_bits"):
+        GPTQMarlinRepackInputs(
+            GPTQMarlinRepackInputConfig(
+                size_k=16,
+                size_n=64,
+                num_bits=3,  # type: ignore[arg-type]
+            )
+        )
+
+    with pytest.raises(ValueError, match="size_n must be divisible"):
+        GPTQMarlinRepackInputs(
+            GPTQMarlinRepackInputConfig(size_k=16, size_n=32, num_bits=4)
+        )
+
+    values = GPTQMarlinRepackInputs(
+        GPTQMarlinRepackInputConfig(size_k=16, size_n=64, num_bits=4)
+    ).generate(seed=50, device="cpu")
+    values.perm = torch.tensor([0, 0] + list(range(2, 16)), dtype=torch.int32)
+    with pytest.raises(ValueError, match="permutation"):
+        gptq_marlin_repack_reference(values)
