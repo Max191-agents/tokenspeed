@@ -3,7 +3,8 @@
 Sampling generators cover row-wise selection and probability filtering used in
 token sampling. The operation semantics include deterministic argmax behavior,
 metadata gather/broadcast, softmax, deterministic speculative greedy
-verification, min-p filtering, and top-k followed by top-p renormalization.
+verification, target-only chain speculative sampling, min-p filtering, and
+top-k followed by top-p renormalization.
 
 ## Generators
 
@@ -16,6 +17,9 @@ verification, min-p filtering, and top-k followed by top-p renormalization.
   values for row-wise softmax.
 - `SpeculativeGreedyVerifyInputs`: generates chain-speculative candidate token
   IDs, target greedy predictions, and verifier output buffers.
+- `SpeculativeChainSamplingInputs`: generates chain-speculative candidate token
+  IDs, target probability rows, optional draft probabilities, acceptance coins,
+  and verifier output buffers.
 - `MinPRenormInputs`: generates normalized probability rows and min-p
   thresholds.
 - `TopKTopPRenormInputs`: generates normalized probability rows, top-k values,

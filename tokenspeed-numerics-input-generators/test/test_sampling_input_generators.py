@@ -33,6 +33,9 @@ from tokenspeed_numerics_input_generators import (
     MinPRenormInputs,
     SoftmaxInputConfig,
     SoftmaxInputs,
+    SpeculativeChainSamplingInputConfig,
+    SpeculativeChainSamplingInputs,
+    SpeculativeChainSamplingInputValues,
     SpeculativeGreedyVerifyInputConfig,
     SpeculativeGreedyVerifyInputs,
     SpeculativeGreedyVerifyInputValues,
@@ -43,6 +46,7 @@ from tokenspeed_numerics_input_generators import (
     gather_expand_scalars_reference,
     min_p_renorm_reference,
     softmax_reference,
+    speculative_chain_sampling_reference,
     speculative_greedy_verify_reference,
     top_k_top_p_renorm_reference,
 )
@@ -209,10 +213,13 @@ def test_speculative_greedy_verify_inputs_generate_values_and_reference() -> Non
     positions = torch.arange(config.num_draft_tokens).unsqueeze(0)
     expected_valid = positions <= refs.accept_token_num.unsqueeze(1)
     assert torch.equal(refs.accept_index >= 0, expected_valid)
+    valid_predicts = refs.accept_index[refs.accept_index >= 0].to(torch.int64)
     torch.testing.assert_close(
-        refs.predicts,
-        values.target_predict.reshape(-1).to(torch.int32),
+        refs.predicts[valid_predicts],
+        values.target_predict.reshape(-1).to(torch.int32)[valid_predicts],
     )
+    invalid_predicts = refs.predicts[refs.predicts < 0]
+    torch.testing.assert_close(invalid_predicts, torch.full_like(invalid_predicts, -1))
 
 
 def test_speculative_greedy_verify_metadata_seed_controls_acceptance() -> None:
@@ -235,7 +242,7 @@ def test_speculative_greedy_verify_metadata_seed_controls_acceptance() -> None:
 
 def test_speculative_greedy_verify_reference_known_prefixes() -> None:
     values = SpeculativeGreedyVerifyInputValues(
-        predicts=torch.empty((8,), dtype=torch.int32),
+        predicts=torch.full((8,), -1, dtype=torch.int32),
         accept_index=torch.full((2, 4), -1, dtype=torch.int32),
         accept_token_num=torch.empty((2,), dtype=torch.int32),
         candidates=torch.tensor(
@@ -252,7 +259,7 @@ def test_speculative_greedy_verify_reference_known_prefixes() -> None:
 
     torch.testing.assert_close(
         refs.predicts,
-        torch.tensor([20, 30, 99, 7, 99, 12, 13, 14], dtype=torch.int32),
+        torch.tensor([20, 30, 99, -1, 99, -1, -1, -1], dtype=torch.int32),
     )
     torch.testing.assert_close(
         refs.accept_token_num,
@@ -262,6 +269,104 @@ def test_speculative_greedy_verify_reference_known_prefixes() -> None:
         refs.accept_index,
         torch.tensor([[0, 1, 2, -1], [4, -1, -1, -1]], dtype=torch.int32),
     )
+
+
+def test_speculative_chain_sampling_inputs_generate_values_and_reference() -> None:
+    config = SpeculativeChainSamplingInputConfig(
+        batch_size=5,
+        num_draft_tokens=4,
+        vocab_size=97,
+        include_draft_probs=False,
+        min_accepted_tokens=0,
+        max_accepted_tokens=3,
+    )
+    values = SpeculativeChainSamplingInputs(config).generate(
+        seed=151,
+        metadata_seed=152,
+        device="cpu",
+    )
+    refs = speculative_chain_sampling_reference(
+        values,
+        threshold_single=config.threshold_single,
+        threshold_acc=config.threshold_acc,
+    )
+
+    assert values.predicts.shape == (20,)
+    assert values.accept_index.shape == (5, 4)
+    assert values.candidates.dtype == torch.int32
+    assert values.target_probs.shape == (5, 4, 97)
+    assert values.draft_probs is None
+    assert torch.all(refs.accept_token_num >= 0)
+    assert torch.all(refs.accept_token_num <= 3)
+    positions = torch.arange(config.num_draft_tokens).unsqueeze(0)
+    assert torch.equal(
+        refs.accept_index >= 0,
+        positions <= refs.accept_token_num.unsqueeze(1),
+    )
+    valid_indices = refs.accept_index[refs.accept_index >= 0].to(torch.int64)
+    assert torch.all(refs.predicts[valid_indices] >= 0)
+
+
+def test_speculative_chain_sampling_metadata_seed_controls_acceptance() -> None:
+    generator = SpeculativeChainSamplingInputs(
+        SpeculativeChainSamplingInputConfig(
+            batch_size=7,
+            num_draft_tokens=5,
+            vocab_size=101,
+        )
+    )
+
+    values1 = generator.generate(seed=153, metadata_seed=901, device="cpu")
+    values2 = generator.generate(seed=154, metadata_seed=901, device="cpu")
+    refs1 = speculative_chain_sampling_reference(
+        values1,
+        threshold_single=generator.config.threshold_single,
+        threshold_acc=generator.config.threshold_acc,
+    )
+    refs2 = speculative_chain_sampling_reference(
+        values2,
+        threshold_single=generator.config.threshold_single,
+        threshold_acc=generator.config.threshold_acc,
+    )
+
+    torch.testing.assert_close(refs1.accept_token_num, refs2.accept_token_num)
+    assert not torch.equal(values1.candidates, values2.candidates)
+
+
+def test_speculative_chain_sampling_reference_known_rejection() -> None:
+    values = SpeculativeChainSamplingInputValues(
+        predicts=torch.full((4,), -1, dtype=torch.int32),
+        accept_index=torch.full((1, 4), -1, dtype=torch.int32),
+        accept_token_num=torch.empty((1,), dtype=torch.int32),
+        candidates=torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
+        uniform_samples=torch.tensor([[0.25, 0.99, 0.25, 0.25]], dtype=torch.float32),
+        uniform_samples_for_final_sampling=torch.tensor([0.0], dtype=torch.float32),
+        target_probs=torch.zeros((1, 4, 16), dtype=torch.float32),
+        draft_probs=torch.zeros((1, 4, 16), dtype=torch.float32),
+    )
+    values.target_probs[0, 0, 11] = 1.0
+    values.target_probs[0, 1, 12] = 0.1
+    values.target_probs[0, 1, 5] = 0.9
+
+    refs = speculative_chain_sampling_reference(
+        values,
+        threshold_single=0.9,
+        threshold_acc=1.0,
+    )
+
+    torch.testing.assert_close(
+        refs.predicts,
+        torch.tensor([11, 5, -1, -1], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        refs.accept_token_num, torch.tensor([1], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        refs.accept_index,
+        torch.tensor([[0, 1, -1, -1]], dtype=torch.int32),
+    )
+    assert refs.draft_probs is not None
+    assert refs.draft_probs[0, 1, 12].item() == pytest.approx(0.1)
 
 
 def test_gather_expand_scalars_inputs_generate_values_and_reference() -> None:
@@ -450,4 +555,44 @@ def test_speculative_greedy_verify_rejects_invalid_accept_range() -> None:
                 min_accepted_tokens=3,
                 max_accepted_tokens=2,
             )
+        )
+
+
+def test_speculative_chain_sampling_rejects_invalid_config() -> None:
+    with pytest.raises(ValueError, match="threshold_acc"):
+        SpeculativeChainSamplingInputs(
+            SpeculativeChainSamplingInputConfig(
+                batch_size=1,
+                num_draft_tokens=4,
+                vocab_size=16,
+                threshold_acc=0.0,
+            )
+        )
+    with pytest.raises(ValueError, match="threshold_single=0"):
+        SpeculativeChainSamplingInputs(
+            SpeculativeChainSamplingInputConfig(
+                batch_size=1,
+                num_draft_tokens=4,
+                vocab_size=16,
+                threshold_single=0.0,
+                min_accepted_tokens=0,
+                max_accepted_tokens=2,
+            )
+        )
+    with pytest.raises(ValueError, match="candidate token IDs"):
+        speculative_chain_sampling_reference(
+            SpeculativeChainSamplingInputValues(
+                predicts=torch.full((1,), -1, dtype=torch.int32),
+                accept_index=torch.full((1, 1), -1, dtype=torch.int32),
+                accept_token_num=torch.empty((1,), dtype=torch.int32),
+                candidates=torch.tensor([[99]], dtype=torch.int32),
+                uniform_samples=torch.zeros((1, 1), dtype=torch.float32),
+                uniform_samples_for_final_sampling=torch.zeros(
+                    (1,), dtype=torch.float32
+                ),
+                target_probs=torch.ones((1, 1, 2), dtype=torch.float32),
+                draft_probs=None,
+            ),
+            threshold_single=0.9,
+            threshold_acc=1.0,
         )

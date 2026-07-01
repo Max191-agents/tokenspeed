@@ -24,6 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.sampling import argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
+    chain_speculative_sampling_target_only,
     fused_topk_topp_renorm,
     verify_chain_greedy,
 )
@@ -51,6 +52,8 @@ from tokenspeed_numerics_input_generators import (
     MinPRenormInputs,
     SoftmaxInputConfig,
     SoftmaxInputs,
+    SpeculativeChainSamplingInputConfig,
+    SpeculativeChainSamplingInputs,
     SpeculativeGreedyVerifyInputConfig,
     SpeculativeGreedyVerifyInputs,
     TopKTopPRenormInputConfig,
@@ -60,6 +63,7 @@ from tokenspeed_numerics_input_generators import (
     gather_expand_scalars_reference,
     min_p_renorm_reference,
     softmax_reference,
+    speculative_chain_sampling_reference,
     speculative_greedy_verify_reference,
     top_k_top_p_renorm_reference,
 )
@@ -271,6 +275,63 @@ def test_speculative_greedy_verify_generator_runs_cuda_kernel(device: str) -> No
         )
     except RuntimeError as exc:
         pytest.skip(f"CUDA verify_chain_greedy unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(values.predicts, expected.predicts, atol=0, rtol=0)
+    torch.testing.assert_close(
+        values.accept_index,
+        expected.accept_index,
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        values.accept_token_num,
+        expected.accept_token_num,
+        atol=0,
+        rtol=0,
+    )
+
+
+@requires_nvidia
+def test_speculative_chain_sampling_generator_runs_cuda_kernel(device: str) -> None:
+    config = SpeculativeChainSamplingInputConfig(
+        batch_size=6,
+        num_draft_tokens=4,
+        vocab_size=64,
+        include_draft_probs=False,
+        min_accepted_tokens=0,
+        max_accepted_tokens=3,
+    )
+    values = SpeculativeChainSamplingInputs(config).generate(
+        seed=103,
+        metadata_seed=104,
+        device=device,
+    )
+    expected = speculative_chain_sampling_reference(
+        values,
+        threshold_single=config.threshold_single,
+        threshold_acc=config.threshold_acc,
+    )
+
+    try:
+        chain_speculative_sampling_target_only(
+            predicts=values.predicts,
+            accept_index=values.accept_index,
+            accept_token_num=values.accept_token_num,
+            candidates=values.candidates,
+            uniform_samples=values.uniform_samples,
+            uniform_samples_for_final_sampling=(
+                values.uniform_samples_for_final_sampling
+            ),
+            target_probs=values.target_probs,
+            draft_probs=values.draft_probs,
+            threshold_single=config.threshold_single,
+            threshold_acc=config.threshold_acc,
+            deterministic=True,
+            enable_pdl=False,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"CUDA chain speculative sampling unavailable: {exc}")
     torch.cuda.synchronize()
 
     torch.testing.assert_close(values.predicts, expected.predicts, atol=0, rtol=0)

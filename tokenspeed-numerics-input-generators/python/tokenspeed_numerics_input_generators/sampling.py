@@ -51,6 +51,10 @@ __all__ = [
     "SoftmaxInputConfig",
     "SoftmaxInputs",
     "SoftmaxInputValues",
+    "SpeculativeChainSamplingInputConfig",
+    "SpeculativeChainSamplingInputs",
+    "SpeculativeChainSamplingInputValues",
+    "SpeculativeChainSamplingReferenceValues",
     "SpeculativeGreedyVerifyInputConfig",
     "SpeculativeGreedyVerifyInputs",
     "SpeculativeGreedyVerifyInputValues",
@@ -63,6 +67,7 @@ __all__ = [
     "gather_expand_scalars_reference",
     "min_p_renorm_reference",
     "softmax_reference",
+    "speculative_chain_sampling_reference",
     "speculative_greedy_verify_reference",
     "top_k_top_p_renorm_reference",
 ]
@@ -199,6 +204,35 @@ class SpeculativeGreedyVerifyReferenceValues:
 
 
 @dataclass
+class SpeculativeChainSamplingInputValues:
+    """Generated values for ``SpeculativeChainSamplingInputs``.
+
+    ``predicts``, ``accept_index``, and ``accept_token_num`` are output buffers.
+    ``draft_probs`` is optional mutable input/output state; when present, the
+    operation writes back the rejected draft token's target probability.
+    """
+
+    predicts: torch.Tensor
+    accept_index: torch.Tensor
+    accept_token_num: torch.Tensor
+    candidates: torch.Tensor
+    uniform_samples: torch.Tensor
+    uniform_samples_for_final_sampling: torch.Tensor
+    target_probs: torch.Tensor
+    draft_probs: torch.Tensor | None
+
+
+@dataclass
+class SpeculativeChainSamplingReferenceValues:
+    """Reference outputs for target-only chain speculative sampling."""
+
+    predicts: torch.Tensor
+    accept_index: torch.Tensor
+    accept_token_num: torch.Tensor
+    draft_probs: torch.Tensor | None
+
+
+@dataclass
 class ArgmaxInputConfig:
     """Initialization parameters for row-wise argmax inputs.
 
@@ -309,6 +343,52 @@ class SpeculativeGreedyVerifyInputConfig:
     # Required: number of possible token IDs. Must be at least 2 so generated
     # rows can force both matching and mismatching prefixes.
     vocab_size: int
+
+    # Optional: minimum generated accepted draft-token count per row.
+    min_accepted_tokens: int = 0
+
+    # Optional: maximum generated accepted draft-token count per row. ``None``
+    # means ``num_draft_tokens - 1``.
+    max_accepted_tokens: int | None = None
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class SpeculativeChainSamplingInputConfig:
+    """Initialization parameters for target-only chain speculative sampling.
+
+    The represented operation verifies a chain of draft token IDs against
+    target-model probabilities. Position 0 is accepted by construction. For
+    later draft positions, ``candidates[row, i]`` is accepted when its target
+    probability at the current target position exceeds ``threshold_single`` or
+    passes the ``uniform <= target_prob / threshold_acc`` coin test. The first
+    rejected slot, or the final bonus slot when all draft tokens are accepted,
+    is sampled from ``relu(target_probs - draft_probs)`` with the rejected
+    token removed.
+    """
+
+    # Required: number of independent speculative requests.
+    batch_size: int
+
+    # Required: number of candidate/output slots per request.
+    num_draft_tokens: int
+
+    # Required: number of possible token IDs. Must be at least 2 so generated
+    # rows can force both matching and sampled replacement tokens.
+    vocab_size: int
+
+    # Optional: accept immediately when the draft token's target probability is
+    # at least this value.
+    threshold_single: float = 0.9
+
+    # Optional: denominator for the stochastic accept test.
+    threshold_acc: float = 1.0
+
+    # Optional: generate mutable draft probabilities. ``None`` models the
+    # target-only runtime path that skips draft-probability traffic.
+    include_draft_probs: bool = False
 
     # Optional: minimum generated accepted draft-token count per row.
     min_accepted_tokens: int = 0
@@ -648,8 +728,9 @@ class SpeculativeGreedyVerifyInputs(NumericsInputGenerator):
                 target_predict[row, accepted] = mismatch
 
         return SpeculativeGreedyVerifyInputValues(
-            predicts=torch.empty(
+            predicts=torch.full(
                 (self.config.batch_size * self.config.num_draft_tokens,),
+                -1,
                 dtype=torch.int32,
                 device=target_device,
             ),
@@ -666,6 +747,169 @@ class SpeculativeGreedyVerifyInputs(NumericsInputGenerator):
             ),
             candidates=candidates.contiguous(),
             target_predict=target_predict.contiguous(),
+        )
+
+
+@dataclass(init=False)
+class SpeculativeChainSamplingInputs(NumericsInputGenerator):
+    """Generator for target-only chain speculative sampling."""
+
+    config: SpeculativeChainSamplingInputConfig
+
+    def __init__(self, config: SpeculativeChainSamplingInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.batch_size = _check_nonnegative(
+            "batch_size", self.config.batch_size
+        )
+        self.config.num_draft_tokens = _check_positive(
+            "num_draft_tokens", self.config.num_draft_tokens
+        )
+        self.config.vocab_size = _check_minimum("vocab_size", self.config.vocab_size, 2)
+        self.config.threshold_single = float(self.config.threshold_single)
+        self.config.threshold_acc = float(self.config.threshold_acc)
+        if not 0.0 <= self.config.threshold_single <= 1.0:
+            raise ValueError(
+                "threshold_single must be in [0, 1], got "
+                f"{self.config.threshold_single}"
+            )
+        if not 0.0 < self.config.threshold_acc <= 1.0:
+            raise ValueError(
+                f"threshold_acc must be in (0, 1], got {self.config.threshold_acc}"
+            )
+        self.config.min_accepted_tokens = _check_nonnegative(
+            "min_accepted_tokens", self.config.min_accepted_tokens
+        )
+        max_allowed = self.config.num_draft_tokens - 1
+        if self.config.max_accepted_tokens is None:
+            self.config.max_accepted_tokens = max_allowed
+        else:
+            self.config.max_accepted_tokens = _check_nonnegative(
+                "max_accepted_tokens", self.config.max_accepted_tokens
+            )
+        if self.config.min_accepted_tokens > self.config.max_accepted_tokens:
+            raise ValueError(
+                "min_accepted_tokens must be <= max_accepted_tokens; got "
+                f"{self.config.min_accepted_tokens} > "
+                f"{self.config.max_accepted_tokens}"
+            )
+        if self.config.max_accepted_tokens > max_allowed:
+            raise ValueError(
+                "max_accepted_tokens must be <= num_draft_tokens - 1; got "
+                f"{self.config.max_accepted_tokens} > {max_allowed}"
+            )
+        if (
+            self.config.threshold_single == 0.0
+            and self.config.min_accepted_tokens != max_allowed
+        ):
+            raise ValueError(
+                "threshold_single=0 forces all draft tokens to be accepted; "
+                "min_accepted_tokens must equal num_draft_tokens - 1"
+            )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> SpeculativeChainSamplingInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        shape = (self.config.batch_size, self.config.num_draft_tokens)
+        candidates = _randint(
+            low=0,
+            high=self.config.vocab_size,
+            shape=shape,
+            dtype=torch.int32,
+            seed=_child_seed(seed, 1),
+            device=device,
+            configured_device=self.config.device,
+        )
+        accept_counts = _randint(
+            low=self.config.min_accepted_tokens,
+            high=self.config.max_accepted_tokens + 1,
+            shape=(self.config.batch_size,),
+            dtype=torch.int32,
+            seed=_child_seed(metadata_base_seed, 1),
+            device=device,
+            configured_device=self.config.device,
+        )
+        target_probs = torch.zeros(
+            self.config.batch_size,
+            self.config.num_draft_tokens,
+            self.config.vocab_size,
+            dtype=torch.float32,
+            device=target_device,
+        )
+        uniform_samples = torch.full(
+            shape,
+            0.25,
+            dtype=torch.float32,
+            device=target_device,
+        )
+        uniform_samples_for_final_sampling = torch.zeros(
+            (self.config.batch_size,),
+            dtype=torch.float32,
+            device=target_device,
+        )
+
+        low_reject_prob = (
+            min(self.config.threshold_single, self.config.threshold_acc) * 0.25
+        )
+        max_allowed = self.config.num_draft_tokens - 1
+        for row in range(self.config.batch_size):
+            accepted = int(accept_counts[row].item())
+            for position in range(self.config.num_draft_tokens):
+                next_candidate = candidates[row, min(position + 1, max_allowed)]
+                sample_id = int(
+                    (int(next_candidate.item()) + 1) % self.config.vocab_size
+                )
+                target_probs[row, position, sample_id] = 1.0
+
+            for position in range(accepted):
+                draft_id = int(candidates[row, position + 1].item())
+                target_probs[row, position].zero_()
+                target_probs[row, position, draft_id] = 1.0
+                uniform_samples[row, position] = 0.25
+
+            if accepted < max_allowed:
+                draft_id = int(candidates[row, accepted + 1].item())
+                sample_id = (draft_id + 1) % self.config.vocab_size
+                target_probs[row, accepted].zero_()
+                target_probs[row, accepted, draft_id] = low_reject_prob
+                target_probs[row, accepted, sample_id] = 1.0 - low_reject_prob
+                uniform_samples[row, accepted] = 0.99
+
+        draft_probs = (
+            torch.zeros_like(target_probs) if self.config.include_draft_probs else None
+        )
+        return SpeculativeChainSamplingInputValues(
+            predicts=torch.full(
+                (self.config.batch_size * self.config.num_draft_tokens,),
+                -1,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            accept_index=torch.full(
+                shape,
+                -1,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            accept_token_num=torch.empty(
+                (self.config.batch_size,),
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            candidates=candidates.contiguous(),
+            uniform_samples=uniform_samples.contiguous(),
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_probs=target_probs.contiguous(),
+            draft_probs=None if draft_probs is None else draft_probs.contiguous(),
         )
 
 
@@ -1061,6 +1305,24 @@ def argmax_pair_reference(logits: torch.Tensor) -> torch.Tensor:
     return torch.cat((max_vals.to(torch.float32), max_indices.to(torch.float32)), dim=1)
 
 
+def _sample_first_from_weights(
+    weights: torch.Tensor, coin: torch.Tensor
+) -> torch.Tensor:
+    total = weights.sum()
+    if total <= 0:
+        return torch.tensor(
+            weights.numel() - 1, dtype=torch.int32, device=weights.device
+        )
+    threshold = coin.to(torch.float32) * total
+    cdf = torch.cumsum(weights.to(torch.float32), dim=0)
+    selected = torch.nonzero(cdf > threshold, as_tuple=False)
+    if selected.numel() == 0:
+        return torch.tensor(
+            weights.numel() - 1, dtype=torch.int32, device=weights.device
+        )
+    return selected[0, 0].to(torch.int32)
+
+
 def speculative_greedy_verify_reference(
     values: SpeculativeGreedyVerifyInputValues,
 ) -> SpeculativeGreedyVerifyReferenceValues:
@@ -1133,12 +1395,153 @@ def speculative_greedy_verify_reference(
         flat_indices,
         torch.full_like(flat_indices, -1),
     )
+    predicts = values.predicts.clone()
+    for row in range(batch_size):
+        accepted_count = int(accepted[row].item())
+        row_offset = row * num_draft_tokens
+        for position in range(accepted_count + 1):
+            predicts[row_offset + position] = target_predict[row, position].to(
+                torch.int32
+            )
     return SpeculativeGreedyVerifyReferenceValues(
-        predicts=target_predict.reshape(-1)
-        .to(torch.int32)
-        .reshape(values.predicts.shape),
+        predicts=predicts,
         accept_index=accept_index,
         accept_token_num=accepted,
+    )
+
+
+def speculative_chain_sampling_reference(
+    values: SpeculativeChainSamplingInputValues,
+    *,
+    threshold_single: float,
+    threshold_acc: float,
+) -> SpeculativeChainSamplingReferenceValues:
+    """Reference for target-only chain speculative sampling."""
+
+    threshold_single = float(threshold_single)
+    threshold_acc = float(threshold_acc)
+    if not 0.0 <= threshold_single <= 1.0:
+        raise ValueError(f"threshold_single must be in [0, 1], got {threshold_single}")
+    if not 0.0 < threshold_acc <= 1.0:
+        raise ValueError(f"threshold_acc must be in (0, 1], got {threshold_acc}")
+
+    candidates = values.candidates
+    target_probs = values.target_probs
+    if candidates.dim() != 2:
+        raise ValueError(f"candidates must be 2D, got {candidates.dim()}D")
+    if target_probs.dim() != 3:
+        raise ValueError(f"target_probs must be 3D, got {target_probs.dim()}D")
+    batch_size, num_draft_tokens = candidates.shape
+    if target_probs.shape[:2] != candidates.shape:
+        raise ValueError(
+            "target_probs leading dimensions must match candidates; got "
+            f"{tuple(target_probs.shape[:2])} vs {tuple(candidates.shape)}"
+        )
+    vocab_size = target_probs.shape[2]
+    if candidates.dtype != torch.int32:
+        raise ValueError(f"candidates must be int32, got {candidates.dtype}")
+    if target_probs.dtype != torch.float32:
+        raise ValueError(f"target_probs must be float32, got {target_probs.dtype}")
+    if values.uniform_samples.shape != candidates.shape:
+        raise ValueError(
+            "uniform_samples must have the same shape as candidates; got "
+            f"{tuple(values.uniform_samples.shape)} vs {tuple(candidates.shape)}"
+        )
+    if values.uniform_samples_for_final_sampling.shape != (batch_size,):
+        raise ValueError(
+            "uniform_samples_for_final_sampling must have shape [batch_size]; got "
+            f"{tuple(values.uniform_samples_for_final_sampling.shape)}"
+        )
+    if values.predicts.numel() != batch_size * num_draft_tokens:
+        raise ValueError(
+            "predicts must have batch_size * num_draft_tokens elements; got "
+            f"{values.predicts.numel()} for {batch_size} * {num_draft_tokens}"
+        )
+    if values.accept_index.shape != candidates.shape:
+        raise ValueError(
+            "accept_index must have the same shape as candidates; got "
+            f"{tuple(values.accept_index.shape)} vs {tuple(candidates.shape)}"
+        )
+    if values.accept_token_num.shape != (batch_size,):
+        raise ValueError(
+            "accept_token_num must have shape [batch_size]; got "
+            f"{tuple(values.accept_token_num.shape)}"
+        )
+    if values.draft_probs is not None:
+        if values.draft_probs.shape != target_probs.shape:
+            raise ValueError(
+                "draft_probs must have the same shape as target_probs; got "
+                f"{tuple(values.draft_probs.shape)} vs {tuple(target_probs.shape)}"
+            )
+        if values.draft_probs.dtype != torch.float32:
+            raise ValueError(
+                f"draft_probs must be float32, got {values.draft_probs.dtype}"
+            )
+    if torch.any(candidates < 0) or torch.any(candidates >= vocab_size):
+        raise ValueError("candidate token IDs must be in [0, vocab_size)")
+    if torch.any(values.uniform_samples < 0) or torch.any(values.uniform_samples >= 1):
+        raise ValueError("uniform_samples entries must be in [0, 1)")
+    final_samples = values.uniform_samples_for_final_sampling
+    if torch.any(final_samples < 0) or torch.any(final_samples >= 1):
+        raise ValueError("uniform_samples_for_final_sampling entries must be in [0, 1)")
+
+    predicts = values.predicts.clone()
+    accept_index = values.accept_index.clone()
+    accept_token_num = values.accept_token_num.clone()
+    draft_probs = None if values.draft_probs is None else values.draft_probs.clone()
+    max_speculative_steps = num_draft_tokens - 1
+
+    for row in range(batch_size):
+        row_offset = row * num_draft_tokens
+        accepted = 0
+        current_prob_position = 0
+        final_position = max_speculative_steps
+        rejected_id = -1
+        coin = values.uniform_samples[row, 0]
+        accept_index[row, 0] = row_offset
+
+        for position in range(1, num_draft_tokens):
+            draft_id = int(candidates[row, position].item())
+            target_prob = target_probs[row, current_prob_position, draft_id]
+            if target_prob >= threshold_single or coin <= target_prob / threshold_acc:
+                predicts[row_offset + position - 1] = draft_id
+                coin = values.uniform_samples[row, position]
+                current_prob_position = position
+                accepted += 1
+                accept_index[row, position] = row_offset + position
+            else:
+                rejected_id = draft_id
+                final_position = position - 1
+                break
+
+        accept_token_num[row] = accepted
+        use_draft_probs = draft_probs is not None and accepted != max_speculative_steps
+        q = target_probs[row, current_prob_position].to(torch.float32)
+        p = (
+            draft_probs[row, current_prob_position].to(torch.float32)
+            if use_draft_probs and draft_probs is not None
+            else torch.zeros_like(q)
+        )
+        weights = torch.clamp(q - p, min=0.0)
+        if rejected_id != -1:
+            weights[rejected_id] = 0.0
+        sampled_id = _sample_first_from_weights(
+            weights,
+            values.uniform_samples_for_final_sampling[row],
+        )
+        predicts[row_offset + final_position] = sampled_id
+        if draft_probs is not None and rejected_id != -1:
+            draft_probs[row, current_prob_position, rejected_id] = target_probs[
+                row,
+                current_prob_position,
+                rejected_id,
+            ]
+
+    return SpeculativeChainSamplingReferenceValues(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        draft_probs=draft_probs,
     )
 
 
