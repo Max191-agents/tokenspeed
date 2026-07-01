@@ -30,12 +30,17 @@ from tokenspeed_numerics_input_generators.core import (
     NumericsInputGenerator,
     TensorInput,
     _child_seed,
+    _resolve_device,
 )
 
 __all__ = [
     "AllGatherInputConfig",
     "AllGatherInputs",
     "AllGatherInputValues",
+    "AllReduceResidualRMSNormInputConfig",
+    "AllReduceResidualRMSNormInputs",
+    "AllReduceResidualRMSNormInputValues",
+    "AllReduceResidualRMSNormReferenceValues",
     "AllReduceInputConfig",
     "AllReduceInputs",
     "AllReduceInputValues",
@@ -43,6 +48,7 @@ __all__ = [
     "ReduceScatterInputs",
     "ReduceScatterInputValues",
     "all_gather_reference",
+    "all_reduce_residual_rmsnorm_reference",
     "all_reduce_sum_reference",
     "reduce_scatter_sum_reference",
 ]
@@ -182,11 +188,58 @@ def _sum_rank_inputs(rank_inputs: list[torch.Tensor]) -> torch.Tensor:
     return acc.to(expected_dtype)
 
 
+def _sum_rank_inputs_for_rmsnorm(rank_inputs: list[torch.Tensor]) -> torch.Tensor:
+    if not rank_inputs:
+        raise ValueError("rank_inputs must be non-empty")
+    expected_shape = rank_inputs[0].shape
+    expected_dtype = rank_inputs[0].dtype
+    expected_device = rank_inputs[0].device
+    acc_dtype = torch.float64 if expected_dtype == torch.float64 else torch.float32
+    acc = torch.zeros_like(rank_inputs[0], dtype=acc_dtype)
+    for rank, tensor in enumerate(rank_inputs):
+        if tensor.shape != expected_shape:
+            raise ValueError(
+                "all rank inputs must have the same shape; "
+                f"rank=0 shape={tuple(expected_shape)}, "
+                f"rank={rank} shape={tuple(tensor.shape)}"
+            )
+        if tensor.dtype != expected_dtype:
+            raise ValueError(
+                "all rank inputs must have the same dtype; "
+                f"rank=0 dtype={expected_dtype}, rank={rank} dtype={tensor.dtype}"
+            )
+        if tensor.device != expected_device:
+            raise ValueError(
+                "all rank inputs must be on the same device; "
+                f"rank=0 device={expected_device}, rank={rank} device={tensor.device}"
+            )
+        acc = acc + tensor.to(acc_dtype)
+    return acc
+
+
 @dataclass
 class AllReduceInputValues:
     """Generated per-rank inputs for a sum all-reduce collective."""
 
     rank_inputs: list[torch.Tensor]
+
+
+@dataclass
+class AllReduceResidualRMSNormInputValues:
+    """Generated values for fused all-reduce, residual add, and RMSNorm."""
+
+    rank_inputs: list[torch.Tensor]
+    residuals: list[torch.Tensor]
+    weight: torch.Tensor
+    eps: float
+
+
+@dataclass
+class AllReduceResidualRMSNormReferenceValues:
+    """Reference outputs for ``AllReduceResidualRMSNormInputs``."""
+
+    norm_outputs: list[torch.Tensor]
+    residual_outputs: list[torch.Tensor]
 
 
 @dataclass
@@ -206,6 +259,43 @@ class AllReduceInputConfig:
 
     # Optional: generated tensor dtype.
     dtype: torch.dtype = torch.bfloat16
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class AllReduceResidualRMSNormInputConfig:
+    """Initialization parameters for fused all-reduce + residual RMSNorm.
+
+    Each rank contributes an input tensor. The inputs are summed across ranks,
+    then each rank adds its local residual tensor and applies RMSNorm with a
+    shared weight vector:
+
+    ``residual_out[rank] = sum(input[peer]) + residual[rank]``
+    ``norm_out[rank] = rmsnorm(residual_out[rank], weight, eps)``
+    """
+
+    # Required: number of ranks participating in the all-reduce.
+    world_size: int
+
+    # Required: number of token rows in each rank-local tensor.
+    num_tokens: int
+
+    # Required: hidden dimension normalized independently for each token row.
+    hidden_size: int
+
+    # Optional: generated all-reduce input dtype.
+    dtype: torch.dtype = torch.bfloat16
+
+    # Optional: generated residual dtype. ``None`` uses ``dtype``.
+    residual_dtype: torch.dtype | None = None
+
+    # Optional: generated RMSNorm weight dtype.
+    weight_dtype: torch.dtype = torch.float32
+
+    # Optional: RMSNorm epsilon.
+    eps: float = 1e-6
 
     # Optional: generated tensor device override.
     device: DeviceLike = None
@@ -259,6 +349,78 @@ class AllReduceInputs(NumericsInputGenerator):
                 ).contiguous()
                 for rank, rank_input in enumerate(self.rank_inputs)
             ]
+        )
+
+
+@dataclass(init=False)
+class AllReduceResidualRMSNormInputs(NumericsInputGenerator):
+    """Generator for fused all-reduce, residual add, and RMSNorm inputs."""
+
+    config: AllReduceResidualRMSNormInputConfig
+
+    def __init__(self, config: AllReduceResidualRMSNormInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.world_size = _check_positive("world_size", self.config.world_size)
+        self.config.num_tokens = _check_positive("num_tokens", self.config.num_tokens)
+        self.config.hidden_size = _check_positive(
+            "hidden_size", self.config.hidden_size
+        )
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        if self.config.residual_dtype is None:
+            self.config.residual_dtype = self.config.dtype
+        self.config.residual_dtype = _check_float_dtype(
+            "residual_dtype", self.config.residual_dtype
+        )
+        self.config.weight_dtype = _check_float_dtype(
+            "weight_dtype", self.config.weight_dtype
+        )
+        self.config.eps = float(self.config.eps)
+        if self.config.eps < 0.0:
+            raise ValueError(f"eps must be non-negative, got {self.config.eps}")
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> AllReduceResidualRMSNormInputValues:
+        del metadata_seed
+        self.__post_init__()
+        tensor_shape = (self.config.num_tokens, self.config.hidden_size)
+        target_device = _resolve_device(self.config.device, device)
+        return AllReduceResidualRMSNormInputValues(
+            rank_inputs=[
+                _generate_tensor(
+                    shape=tensor_shape,
+                    dtype=self.config.dtype,
+                    seed=_child_seed(seed, rank + 1),
+                    device=device,
+                    configured_device=self.config.device,
+                )
+                for rank in range(self.config.world_size)
+            ],
+            residuals=[
+                _generate_tensor(
+                    shape=tensor_shape,
+                    dtype=self.config.residual_dtype,
+                    seed=_child_seed(seed, self.config.world_size + rank + 1),
+                    device=device,
+                    configured_device=self.config.device,
+                )
+                for rank in range(self.config.world_size)
+            ],
+            weight=_generate_tensor(
+                shape=(self.config.hidden_size,),
+                dtype=self.config.weight_dtype,
+                seed=_child_seed(seed, 2 * self.config.world_size + 1),
+                device=target_device,
+                configured_device=self.config.device,
+            ),
+            eps=self.config.eps,
         )
 
 
@@ -451,6 +613,57 @@ def all_reduce_sum_reference(values: AllReduceInputValues) -> torch.Tensor:
     """Return the sum all-reduce result shared by every rank."""
 
     return _sum_rank_inputs(values.rank_inputs)
+
+
+def all_reduce_residual_rmsnorm_reference(
+    values: AllReduceResidualRMSNormInputValues,
+) -> AllReduceResidualRMSNormReferenceValues:
+    """Return semantic fused all-reduce + residual RMSNorm outputs per rank."""
+
+    if values.eps < 0.0:
+        raise ValueError(f"eps must be non-negative, got {values.eps}")
+    if len(values.rank_inputs) != len(values.residuals):
+        raise ValueError("rank_inputs must match residuals")
+    reduced = _sum_rank_inputs_for_rmsnorm(values.rank_inputs)
+    if values.weight.dim() != 1:
+        raise ValueError(
+            f"weight must be rank-1, got shape={tuple(values.weight.shape)}"
+        )
+    if values.weight.shape[0] != reduced.shape[-1]:
+        raise ValueError(
+            "weight length must match hidden dimension; "
+            f"weight={tuple(values.weight.shape)}, reduced={tuple(reduced.shape)}"
+        )
+    if values.weight.device != reduced.device:
+        raise ValueError(
+            "weight must be on the same device as rank inputs; "
+            f"weight={values.weight.device}, rank_inputs={reduced.device}"
+        )
+    norm_outputs: list[torch.Tensor] = []
+    residual_outputs: list[torch.Tensor] = []
+    for rank, residual in enumerate(values.residuals):
+        if residual.shape != reduced.shape:
+            raise ValueError(
+                "residual shape must match reduced input shape; "
+                f"rank={rank}, residual={tuple(residual.shape)}, "
+                f"reduced={tuple(reduced.shape)}"
+            )
+        if residual.device != reduced.device:
+            raise ValueError(
+                "residual must be on the same device as rank inputs; "
+                f"rank={rank}, residual={residual.device}, "
+                f"rank_inputs={reduced.device}"
+            )
+        residual_out = reduced + residual.to(reduced.dtype)
+        variance = residual_out.pow(2).mean(dim=-1, keepdim=True)
+        norm = residual_out * torch.rsqrt(variance + values.eps)
+        norm = norm * values.weight.to(reduced.dtype)
+        residual_outputs.append(residual_out.contiguous())
+        norm_outputs.append(norm.contiguous())
+    return AllReduceResidualRMSNormReferenceValues(
+        norm_outputs=norm_outputs,
+        residual_outputs=residual_outputs,
+    )
 
 
 def all_gather_reference(values: AllGatherInputValues) -> torch.Tensor:

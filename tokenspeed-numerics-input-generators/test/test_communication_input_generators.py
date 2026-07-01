@@ -25,11 +25,14 @@ import torch
 from tokenspeed_numerics_input_generators import (
     AllGatherInputConfig,
     AllGatherInputs,
+    AllReduceResidualRMSNormInputConfig,
+    AllReduceResidualRMSNormInputs,
     AllReduceInputConfig,
     AllReduceInputs,
     ReduceScatterInputConfig,
     ReduceScatterInputs,
     all_gather_reference,
+    all_reduce_residual_rmsnorm_reference,
     all_reduce_sum_reference,
     reduce_scatter_sum_reference,
 )
@@ -50,6 +53,63 @@ def test_all_reduce_inputs_generate_values_and_reference() -> None:
     expected = all_reduce_sum_reference(values)
     manual = sum(rank_input for rank_input in values.rank_inputs)
     torch.testing.assert_close(expected, manual)
+
+
+def test_all_reduce_residual_rmsnorm_inputs_generate_values_and_reference() -> None:
+    config = AllReduceResidualRMSNormInputConfig(
+        world_size=3,
+        num_tokens=4,
+        hidden_size=8,
+        dtype=torch.float32,
+        residual_dtype=torch.float32,
+        weight_dtype=torch.float32,
+        eps=1e-5,
+    )
+    values = AllReduceResidualRMSNormInputs(config).generate(seed=111, device="cpu")
+
+    assert len(values.rank_inputs) == 3
+    assert len(values.residuals) == 3
+    assert all(rank_input.shape == (4, 8) for rank_input in values.rank_inputs)
+    assert all(residual.shape == (4, 8) for residual in values.residuals)
+    assert values.weight.shape == (8,)
+    assert values.eps == pytest.approx(1e-5)
+
+    refs = all_reduce_residual_rmsnorm_reference(values)
+    reduced = torch.zeros_like(values.rank_inputs[0], dtype=torch.float32)
+    for rank_input in values.rank_inputs:
+        reduced = reduced + rank_input.float()
+    manual_residual = reduced + values.residuals[1].float()
+    manual_norm = manual_residual * torch.rsqrt(
+        manual_residual.pow(2).mean(dim=-1, keepdim=True) + values.eps
+    )
+    manual_norm = manual_norm * values.weight.float()
+
+    torch.testing.assert_close(refs.residual_outputs[1], manual_residual)
+    torch.testing.assert_close(refs.norm_outputs[1], manual_norm)
+
+
+def test_all_reduce_residual_rmsnorm_supports_bfloat16_inputs() -> None:
+    values = AllReduceResidualRMSNormInputs(
+        AllReduceResidualRMSNormInputConfig(
+            world_size=2,
+            num_tokens=3,
+            hidden_size=16,
+            dtype=torch.bfloat16,
+            residual_dtype=torch.bfloat16,
+            weight_dtype=torch.float32,
+        )
+    ).generate(seed=112, device="cpu")
+
+    refs = all_reduce_residual_rmsnorm_reference(values)
+
+    assert all(rank_input.dtype == torch.bfloat16 for rank_input in values.rank_inputs)
+    assert all(residual.dtype == torch.bfloat16 for residual in values.residuals)
+    assert values.weight.dtype == torch.float32
+    assert [output.shape for output in refs.norm_outputs] == [(3, 16), (3, 16)]
+    assert [output.dtype for output in refs.norm_outputs] == [
+        torch.float32,
+        torch.float32,
+    ]
 
 
 def test_all_gather_inputs_generate_values_and_reference() -> None:
@@ -197,3 +257,30 @@ def test_collectives_reject_nonfloating_dtype() -> None:
                 dtype=torch.int32,
             )
         )
+
+
+def test_all_reduce_residual_rmsnorm_rejects_negative_eps() -> None:
+    with pytest.raises(ValueError, match="eps"):
+        AllReduceResidualRMSNormInputs(
+            AllReduceResidualRMSNormInputConfig(
+                world_size=2,
+                num_tokens=4,
+                hidden_size=8,
+                eps=-1e-6,
+            )
+        )
+
+
+def test_all_reduce_residual_rmsnorm_reference_rejects_bad_residual_shape() -> None:
+    values = AllReduceResidualRMSNormInputs(
+        AllReduceResidualRMSNormInputConfig(
+            world_size=2,
+            num_tokens=4,
+            hidden_size=8,
+            dtype=torch.float32,
+        )
+    ).generate(seed=113, device="cpu")
+    values.residuals[0] = values.residuals[0][:, :-1]
+
+    with pytest.raises(ValueError, match="residual shape"):
+        all_reduce_residual_rmsnorm_reference(values)

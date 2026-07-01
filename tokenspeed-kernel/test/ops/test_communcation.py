@@ -35,6 +35,11 @@ from tokenspeed_kernel.ops.communication.triton import (
     reduce_scatter,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_numerics_input_generators import (
+    AllReduceResidualRMSNormInputConfig,
+    AllReduceResidualRMSNormInputs,
+    all_reduce_residual_rmsnorm_reference,
+)
 
 
 def get_open_port() -> int:
@@ -143,16 +148,26 @@ def check_all_reduce(rank: int, world_size: int, device) -> None:
 def check_allreduce_residual_rmsnorm(rank: int, world_size: int, device) -> None:
     hidden = 2880
     eps = 1e-6
-    weight = torch.linspace(0.5, 1.5, hidden, dtype=torch.float32, device=device)
 
     for tokens in [1, 8, 32]:
-        x = torch.full((tokens, hidden), rank + 1, dtype=torch.bfloat16, device=device)
-        residual = (
-            torch.arange(tokens * hidden, dtype=torch.float32, device=device)
-            .reshape(tokens, hidden)
-            .mul_(0.001)
-            .to(torch.bfloat16)
-        )
+        values = AllReduceResidualRMSNormInputs(
+            AllReduceResidualRMSNormInputConfig(
+                world_size=world_size,
+                num_tokens=tokens,
+                hidden_size=hidden,
+                dtype=torch.bfloat16,
+                residual_dtype=torch.bfloat16,
+                weight_dtype=torch.float32,
+                eps=eps,
+            )
+        ).generate(seed=700 + tokens, device="cpu")
+        refs = all_reduce_residual_rmsnorm_reference(values)
+        x = values.rank_inputs[rank].to(device=device)
+        residual = values.residuals[rank].to(device=device)
+        weight = values.weight.to(device=device)
+
+        ref_residual = refs.residual_outputs[rank].to(device=device)
+        ref_norm = refs.norm_outputs[rank].to(device=device)
 
         norm_out, residual_out, scale, partial = allreduce_residual_rmsnorm(
             input_tensor=x,
@@ -165,13 +180,6 @@ def check_allreduce_residual_rmsnorm(rank: int, world_size: int, device) -> None
         )
         assert scale is None
         assert partial is None
-
-        reduced = torch.full_like(residual.float(), world_size * (world_size + 1) // 2)
-        ref_residual = reduced + residual.float()
-        ref_norm = ref_residual * torch.rsqrt(
-            ref_residual.pow(2).mean(dim=-1, keepdim=True) + eps
-        )
-        ref_norm = ref_norm * weight
 
         torch.testing.assert_close(
             residual_out.float(), ref_residual, atol=2e-2, rtol=2e-2
