@@ -326,6 +326,10 @@ from tokenspeed_numerics_input_generators.sampling import (
     TopKTopPRenormInputConfig,
     TopKTopPRenormInputs,
     TopKTopPRenormInputValues,
+    TopKTopPSamplingInputConfig,
+    TopKTopPSamplingInputs,
+    TopKTopPSamplingInputValues,
+    TopKTopPSamplingReferenceValues,
     TopPRenormInputConfig,
     TopPRenormInputs,
     TopPRenormInputValues,
@@ -338,6 +342,7 @@ from tokenspeed_numerics_input_generators.sampling import (
     speculative_chain_sampling_reference,
     speculative_greedy_verify_reference,
     top_k_top_p_renorm_reference,
+    top_k_top_p_sampling_reference,
     top_p_renorm_reference,
 )
 
@@ -551,6 +556,10 @@ __all__ = [
     "TopKTopPRenormInputConfig",
     "TopKTopPRenormInputValues",
     "TopKTopPRenormInputs",
+    "TopKTopPSamplingInputConfig",
+    "TopKTopPSamplingInputValues",
+    "TopKTopPSamplingInputs",
+    "TopKTopPSamplingReferenceValues",
     "TopPRenormInputConfig",
     "TopPRenormInputValues",
     "TopPRenormInputs",
@@ -628,6 +637,7 @@ __all__ = [
     "softmax_reference",
     "speculative_chain_sampling_reference",
     "speculative_greedy_verify_reference",
-    "top_p_renorm_reference",
     "top_k_top_p_renorm_reference",
+    "top_k_top_p_sampling_reference",
+    "top_p_renorm_reference",
 ]

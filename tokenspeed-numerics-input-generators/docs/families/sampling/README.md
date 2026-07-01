@@ -5,7 +5,7 @@ token sampling. The operation semantics include deterministic argmax behavior,
 metadata gather/broadcast, softmax, deterministic speculative greedy
 verification, target-only chain speculative sampling, min-p filtering, and
 exact-checkable min-p sampling, top-p or top-k followed by top-p
-renormalization.
+renormalization, and exact-checkable top-k/top-p sampling.
 
 ## Generators
 
@@ -29,6 +29,8 @@ renormalization.
   thresholds for standalone nucleus filtering.
 - `TopKTopPRenormInputs`: generates normalized probability rows, top-k values,
   and top-p thresholds.
+- `TopKTopPSamplingInputs`: generates probability rows whose top-k/top-p
+  filtered support has one deterministic sampled token.
 
 ## Generated Values
 

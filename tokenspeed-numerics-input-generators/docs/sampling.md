@@ -6,7 +6,8 @@ they model the tensor transforms that TokenSpeed kernels currently implement:
 row-wise argmax, packed max/index argmax pairs, scalar metadata
 gather/broadcast, softmax, speculative greedy verification, target-only chain
 speculative sampling, min-p renormalization, exact-checkable min-p sampling,
-top-p renormalization, and top-k/top-p renormalization.
+top-p renormalization, top-k/top-p renormalization, and exact-checkable
+top-k/top-p sampling.
 
 ## Operation Semantics
 
@@ -142,6 +143,22 @@ renormalized row is outside this generator's contract.
 and renormalization. Top-k values can include disabled rows by setting `k` equal
 to the vocabulary size.
 
+### Top-K + Top-P Sampling
+
+`TopKTopPSamplingInputs` represents categorical sampling after top-k and top-p
+filtering:
+
+```text
+filtered = apply_top_p(apply_top_k(probs, top_k), top_p)
+sample ~ categorical(filtered / sum(filtered))
+```
+
+As with min-p sampling, the general operation is stochastic. The generator
+currently creates exact-checkable rows where one token survives both filters,
+so the reference can return a deterministic sample and valid mask. This covers
+the operation-level filtering/API contract while leaving full distributional
+sampling validation to a future statistical harness.
+
 ## Validation Contract
 
 The generators reject invalid sampling inputs before values are returned:
@@ -167,6 +184,8 @@ The generators reject invalid sampling inputs before values are returned:
   reference comparison
 - standalone top-p thresholds have one value per probability row and are in
   `(0, 1]`
+- top-k/top-p sampling rows have one survivor after both filters for exact
+  reference comparison
 - planted argmax rows have a unique known maximum
 
 Metadata such as argmax planted indices, scalar gather indices, top-k/top-p
@@ -190,6 +209,8 @@ TokenSpeed exposes sampling kernels through several modules:
 - NVIDIA-only CUDA `chain_speculative_sampling_target_only` consumes
   `SpeculativeChainSamplingInputValues`
 - NVIDIA-only fused top-k/top-p renormalization helpers
+- FlashInfer `top_k_top_p_sampling_from_probs` consumes
+  `TopKTopPSamplingInputValues`
 - FlashInfer `top_p_renorm_probs` consumes `TopPRenormInputValues.probs` and
   `.top_p`
 - FlashInfer `top_k_renorm_prob` followed by deterministic
