@@ -1,13 +1,13 @@
 # Communication Input Generators
 
-Communication generators cover collective operations over a group of ranks. The
-operation semantics are independent of any particular transport or backend:
-each rank contributes one tensor, and the collective defines how rank-local
-inputs are combined and redistributed.
+Communication generators cover collective and routing operations over a group
+of ranks. The operation semantics are independent of any particular transport
+or backend: each rank contributes rank-local tensors or metadata, and the
+communication operation defines how those inputs are combined and redistributed.
 
-This slice covers sum all-reduce, all-gather, sum reduce-scatter, and fused
-sum all-reduce plus residual RMSNorm. It does not yet cover expert all-to-all
-dispatch.
+This slice covers sum all-reduce, all-gather, sum reduce-scatter, fused sum
+all-reduce plus residual RMSNorm, and expert-parallel MoE dispatch/combine
+routing.
 
 ## Operation Semantics
 
@@ -69,6 +69,33 @@ out[rank] = reduced[offset[rank] : offset[rank] + tokens_per_rank[rank]]
 tests can exercise uneven token distributions while preserving a fixed total
 amount of work.
 
+### Expert-Parallel MoE Dispatch/Combine
+
+`ExpertParallelRoutingInputs` represents the routing semantics behind
+expert-parallel MoE all-to-all communication. Each source rank owns a set of
+input token hidden states. Each token has top-k selected expert ids and top-k
+weights. Experts are partitioned evenly and contiguously across ranks:
+
+```text
+owner_rank(expert_id) = expert_id // (num_experts / world_size)
+```
+
+Dispatch sends each token once to every rank that owns at least one of the
+token's selected experts. If two selected experts are on the same target rank,
+the token is still dispatched once to that rank, with metadata identifying the
+local selected expert slots.
+
+Combine returns expert outputs to the token's source rank and computes the
+weighted MoE contribution:
+
+```text
+combined[source_rank, token] =
+  sum(expert_output[source_rank, token, slot] * topk_weight[source_rank, token, slot])
+```
+
+The generator also creates synthetic per-slot expert outputs so combine can be
+tested independently of the expert MLP implementation.
+
 ## Validation Contract
 
 The generators reject invalid collective descriptions before returning values:
@@ -81,20 +108,31 @@ The generators reject invalid collective descriptions before returning values:
 - all rank-local tensors for a collective have compatible shapes and dtypes
 - fused residual RMSNorm requires matching input and residual shapes, a
   rank-1 weight with length `hidden_size`, and non-negative `eps`
+- expert-parallel routing requires an even expert partition across ranks,
+  unique in-range top-k ids per token, normalized top-k weights, and compatible
+  hidden/expert-output shapes
 
 Tensor values are generated from `seed`, while token-shard metadata is generated
 from `metadata_seed`. This allows tests to compare different numerical draws
-with the same rank/token layout.
+with the same rank/token layout. Expert-parallel routing also uses
+`metadata_seed` for token distribution and top-k expert ids; hidden states,
+top-k weights, and synthetic expert outputs come from `seed`.
 
 ## TokenSpeed API Mapping
 
 TokenSpeed provides backend-specific communication implementations for
-all-reduce, all-gather, reduce-scatter, and fused all-reduce residual RMSNorm.
-The generated values map to those APIs through a small rank-local adapter: each
-distributed worker generates the same operation-level values, selects
-`rank_inputs[rank]` and any other rank-local tensors such as
-`residuals[rank]`, invokes the backend kernel, and compares against the
-reference result for that rank.
+all-reduce, all-gather, reduce-scatter, fused all-reduce residual RMSNorm, and
+DeepEP-based expert-parallel dispatch/combine. The generated values map to
+those APIs through a small rank-local adapter: each distributed worker
+generates the same operation-level values, selects `rank_inputs[rank]` and any
+other rank-local tensors such as `residuals[rank]`, invokes the backend kernel,
+and compares against the reference result for that rank.
+
+For DeepEP-style consumers, `rank_hidden_states[rank]`, `topk_ids[rank]`, and
+`topk_weights[rank]` are the rank-local dispatch inputs. The reference
+`dispatch_records`, receive tensors, and per-expert counts provide a semantic
+target for adapter tests without baking a specific DeepEP buffer layout into
+the generator.
 
 The generator does not create process groups, symmetric-memory workspaces, IPC
 handles, or backend state objects. Those details are implementation-specific and

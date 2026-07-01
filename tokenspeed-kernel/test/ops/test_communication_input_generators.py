@@ -39,10 +39,13 @@ from tokenspeed_numerics_input_generators import (
     AllGatherInputs,
     AllReduceInputConfig,
     AllReduceInputs,
+    ExpertParallelRoutingInputConfig,
+    ExpertParallelRoutingInputs,
     ReduceScatterInputConfig,
     ReduceScatterInputs,
     all_gather_reference,
     all_reduce_sum_reference,
+    expert_parallel_routing_reference,
     reduce_scatter_sum_reference,
 )
 
@@ -178,6 +181,34 @@ def _check_reduce_scatter(rank: int, world_size: int, device: torch.device) -> N
         atol=1e-2,
         rtol=1e-2,
     )
+
+
+def test_expert_parallel_generator_maps_to_deepep_dispatch_contract() -> None:
+    values = ExpertParallelRoutingInputs(
+        ExpertParallelRoutingInputConfig(
+            world_size=2,
+            total_tokens=9,
+            hidden_size=16,
+            num_experts=4,
+            top_k=2,
+            max_tokens_per_rank=5,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=96, metadata_seed=97, device="cpu")
+    refs = expert_parallel_routing_reference(values)
+
+    rank = 0
+    local_x = values.rank_hidden_states[rank]
+    local_topk_ids = values.topk_ids[rank].to(torch.int64)
+    local_topk_weights = values.topk_weights[rank].to(torch.float32)
+
+    assert local_x.shape == (values.tokens_per_rank[rank], 16)
+    assert local_topk_ids.shape == (values.tokens_per_rank[rank], 2)
+    assert local_topk_weights.shape == (values.tokens_per_rank[rank], 2)
+    assert refs.recv_hidden_states[rank].shape[1] == 16
+    assert refs.recv_topk_ids[rank].shape[1] == 2
+    assert refs.num_recv_tokens_per_expert[rank].shape == (2,)
+    assert refs.combined_outputs[rank].shape == local_x.shape
 
 
 def test_communication_generators_run_triton_collectives_world2() -> None:
