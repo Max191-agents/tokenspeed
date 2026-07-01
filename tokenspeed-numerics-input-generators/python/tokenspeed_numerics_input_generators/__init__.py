@@ -204,6 +204,7 @@ from tokenspeed_numerics_input_generators.moe import (
     canonicalize_moe_align_block_size,
     moe_align_block_size_buffer_dims,
     moe_align_block_size_reference,
+    moe_reference,
 )
 from tokenspeed_numerics_input_generators.quantization import (
     FP8QuantizationInputConfig,
@@ -436,6 +437,7 @@ __all__ = [
     "mla_kv_pack_quantize_fp8_reference",
     "moe_align_block_size_buffer_dims",
     "moe_align_block_size_reference",
+    "moe_reference",
     "mxfp4_gemm_input_config",
     "mxfp4_quantization_reference",
     "mxfp4_scale_shape",

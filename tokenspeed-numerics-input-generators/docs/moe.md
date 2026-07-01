@@ -18,8 +18,16 @@ that performs routing and expert computation itself.
 - `hidden_states`: token activations with shape `[num_tokens, hidden_size]`.
 - `router_logits`: routing logits with shape `[num_tokens, num_experts]`.
 - `topk_ids`: selected expert ids with shape `[num_tokens, top_k]`.
+- `topk_weights`: normalized selected-expert routing weights with shape
+  `[num_tokens, top_k]`.
 - `w13` and `w2`: nested GEMM values for the gate/up and down expert weights.
 - Optional expert biases.
+
+Generated `topk_ids` and `topk_weights` are derived from `router_logits` by
+softmax, top-k selection, and selected-weight renormalization. This keeps the
+default generated routing metadata consistent with the logits while still
+making the explicit top-k tensors available to consumers that test precomputed
+routing paths.
 
 The nested weight generators reuse the GEMM family so dense, scaled, and MXFP4
 weights share the same dtype and scale handling as standalone GEMMs. Activation
@@ -33,6 +41,13 @@ of `block_size`. The output metadata identifies which flattened token slots are
 processed by each expert-local GEMM block.
 
 ## References
+
+`moe_reference` implements the routed layer computation for generated MoE
+values. For each token and selected expert it applies the expert gate/up
+projection, computes the gated activation, applies the expert down projection,
+scales the result by the selected routing weight, and sums across selected
+experts. Dense weights and generated scaled/MXFP4 weight values are normalized
+through the GEMM operand semantics before the reference matmuls.
 
 `moe_align_block_size_reference` implements the block-alignment metadata
 semantics directly:
@@ -50,7 +65,10 @@ from parallel implementations.
 
 ## Verification
 
-MoE configs verify token counts, expert counts, top-k constraints, block sizes,
-integer routing dtypes, and generated id ranges. The align-block-size reference
+MoE configs verify token counts, hidden/intermediate widths, expert counts,
+top-k constraints, block sizes, integer routing dtypes, and generated id
+ranges. The layer reference checks that selected expert ids and weights are
+rank-2, shape-consistent, finite, non-negative, duplicate-free per token, and
+normalized across each token's selected experts. The align-block-size reference
 also checks that provided top-k ids are rank-2 and within `[0, num_experts)`, so
 invalid routing metadata fails before reaching a kernel adapter.

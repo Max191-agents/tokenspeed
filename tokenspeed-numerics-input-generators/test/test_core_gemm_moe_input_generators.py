@@ -39,6 +39,7 @@ from tokenspeed_numerics_input_generators import (
     gemm_scale_shape,
     moe_align_block_size_buffer_dims,
     moe_align_block_size_reference,
+    moe_reference,
     mxfp4_gemm_input_config,
 )
 
@@ -513,8 +514,25 @@ def test_moe_inputs_compose_dense_weight_gemms() -> None:
     assert inputs.hidden_states.shape == (5, 16)
     assert inputs.router_logits.shape == (5, 4)
     assert inputs.topk_ids.shape == (5, 2)
+    assert inputs.topk_weights.shape == (5, 2)
     assert torch.all(inputs.topk_ids >= 0)
     assert torch.all(inputs.topk_ids < 4)
+    torch.testing.assert_close(
+        inputs.topk_weights.float().sum(dim=-1),
+        torch.ones(5),
+        atol=1.0e-3,
+        rtol=1.0e-3,
+    )
+    scores = torch.softmax(inputs.router_logits.float(), dim=-1)
+    expected_weights, expected_ids = torch.topk(scores, k=2, dim=-1, sorted=False)
+    expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(inputs.topk_ids, expected_ids.to(torch.int32))
+    torch.testing.assert_close(
+        inputs.topk_weights,
+        expected_weights.to(inputs.topk_weights.dtype),
+        atol=0,
+        rtol=0,
+    )
     assert inputs.w13.A is None
     assert inputs.w2.A is None
     assert inputs.w13.B is not None
@@ -620,6 +638,124 @@ def test_moe_inputs_compose_mxfp4_weight_gemms() -> None:
     assert inputs.w2.B_scales.shape == (4, 64, 1)
     assert inputs.w13.B.dtype == torch.uint8
     assert inputs.w13.B_scales.dtype == torch.uint8
+
+
+def test_moe_reference_matches_manual_dense_silu() -> None:
+    values = MoeInputs(
+        MoeInputConfig(
+            num_tokens=4,
+            hidden_size=8,
+            intermediate_size=12,
+            num_experts=3,
+            top_k=2,
+            hidden_dtype=torch.float32,
+            bias_dtype=torch.float32,
+        )
+    ).generate(seed=30, device="cpu")
+
+    ref = moe_reference(values)
+    assert values.hidden_states is not None
+    assert values.w13.B is not None
+    assert values.w2.B is not None
+    assert values.w13_bias is not None
+    assert values.w2_bias is not None
+    manual = torch.zeros(4, 8, dtype=torch.float32)
+    for token in range(values.hidden_states.shape[0]):
+        hidden = values.hidden_states[token].float()
+        for slot in range(values.topk_ids.shape[1]):
+            expert = int(values.topk_ids[token, slot])
+            route_weight = values.topk_weights[token, slot].float()
+            gate_up = hidden @ values.w13.B[expert].float().T
+            gate_up = gate_up + values.w13_bias[expert].float()
+            gate, up = gate_up.chunk(2, dim=-1)
+            activated = torch.nn.functional.silu(gate) * up
+            expert_output = activated @ values.w2.B[expert].float().T
+            expert_output = expert_output + values.w2_bias[expert].float()
+            manual[token] += route_weight * expert_output
+
+    torch.testing.assert_close(ref, manual, atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_moe_reference_handles_mxfp4_weight_values() -> None:
+    values = MoeInputs(
+        MoeInputConfig(
+            num_tokens=5,
+            hidden_size=64,
+            intermediate_size=32,
+            num_experts=4,
+            top_k=2,
+            hidden_dtype=torch.float16,
+            weight_format="mxfp4",
+        )
+    ).generate(seed=32, device="cpu")
+
+    ref = moe_reference(values)
+
+    assert ref.shape == (5, 64)
+    assert ref.dtype == torch.float16
+
+
+def test_moe_reference_rejects_invalid_topk_weights() -> None:
+    values = MoeInputs(
+        MoeInputConfig(
+            num_tokens=4,
+            hidden_size=8,
+            intermediate_size=12,
+            num_experts=3,
+            top_k=2,
+            hidden_dtype=torch.float32,
+        )
+    ).generate(seed=33, device="cpu")
+    bad_values = MoeInputValues(
+        hidden_states=values.hidden_states,
+        router_logits=values.router_logits,
+        topk_ids=values.topk_ids,
+        topk_weights=values.topk_weights * 0.5,
+        w13=values.w13,
+        w2=values.w2,
+        w13_bias=values.w13_bias,
+        w2_bias=values.w2_bias,
+    )
+
+    with pytest.raises(ValueError, match="topk_weights rows must sum to 1"):
+        moe_reference(bad_values)
+
+
+def test_moe_inputs_verify_topk_config() -> None:
+    with pytest.raises(ValueError, match="top_k must be <= num_experts"):
+        MoeInputs(
+            MoeInputConfig(
+                num_tokens=4,
+                hidden_size=8,
+                intermediate_size=12,
+                num_experts=3,
+                top_k=4,
+                hidden_dtype=torch.float32,
+            )
+        )
+
+
+def test_moe_inputs_verify_child_gemm_shapes() -> None:
+    with pytest.raises(ValueError, match="w13 GEMM config must use M/N/K"):
+        MoeInputs(
+            MoeInputConfig(
+                num_tokens=4,
+                hidden_size=8,
+                intermediate_size=12,
+                num_experts=3,
+                top_k=2,
+                hidden_dtype=torch.float32,
+                w13=GemmInputConfig(
+                    M=4,
+                    N=25,
+                    K=8,
+                    a_dtype=None,
+                    b_dtype=torch.float32,
+                    c_dtype=torch.float32,
+                    batch_shape=(3,),
+                ),
+            )
+        )
 
 
 def test_moe_align_block_size_inputs_generate_topk_ids() -> None:
