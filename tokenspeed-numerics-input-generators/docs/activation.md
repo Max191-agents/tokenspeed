@@ -67,6 +67,45 @@ The reference returns `(fp8_out, packed_scales)`. `fp8_out` has shape
 `[num_tokens, ceil(num_groups / 4)]` with dtype int32, where each int32 packs up
 to four UE8M0 biased exponent bytes for consecutive groups.
 
+### Fused SwiGLU FP8 Block Quant
+
+`FusedSwiGLUFP8BlockQuantInputs` represents:
+
+```text
+gate, up = split(gate_up, 2, dim=-1)
+y = silu(gate) * up
+q, scales = fp8_e4m3_block_quantize(y)
+```
+
+The dense variant generates `gate_up[num_tokens, 2 * hidden_dim]` and a
+preallocated float32 `scale_out[num_tokens, hidden_dim / group_size]` buffer.
+The expert-parallel variant generates
+`gate_up[num_experts, max_tokens_per_expert, 2 * hidden_dim]` and
+`scale_out[num_experts, max_tokens_per_expert, hidden_dim / group_size]`.
+`num_tokens_per_expert` marks the valid token prefix for each expert, and
+`num_tokens_hint` records the per-expert token capacity.
+
+The reference returns `(fp8_out, scales)`. `fp8_out` has the same leading
+dimensions as `gate_up` and last dimension `hidden_dim`; `scales` matches
+`scale_out`. Invalid expert-padding rows are zeroed in the reference output.
+
+### Fused SwiGLU NVFP4 Quant
+
+`FusedSwiGLUNVFP4QuantInputs` represents:
+
+```text
+gate, up = split(gate_up, 2, dim=-1)
+y = silu(gate) * up
+packed, scales = nvfp4_quantize(y, global_scale)
+```
+
+The generated `gate_up` tensor has shape `[num_tokens, 2 * hidden_dim]`.
+`global_scale` stores the inverse of the configured input scale because that is
+the representation consumed by the TokenSpeed CUDA helper. The reference
+returns packed E2M1 NVFP4 bytes with shape `[num_tokens, hidden_dim / 2]` and
+linear FP8 E4M3 group scales with shape
+`[num_tokens, hidden_dim / scale_size]`.
+
 ## Validation Contract
 
 The activation generators reject invalid operation inputs before generation:
@@ -80,6 +119,12 @@ The activation generators reject invalid operation inputs before generation:
 - fused SwiGLU FP8/UE8M0 requires `hidden_dim % group_size == 0`
 - fused SwiGLU FP8/UE8M0 references require a 2D `gate_up` tensor with an even
   last dimension and a positive `group_size`
+- fused SwiGLU FP8 block quant requires `hidden_dim % group_size == 0` and a
+  float32 scale buffer matching the generated block layout
+- expert-parallel FP8 block quant requires one valid token count per expert,
+  with counts inside the generated per-expert token capacity
+- fused SwiGLU NVFP4 requires positive input scales, an even hidden dimension
+  for packed output, and `hidden_dim % scale_size == 0`
 - all generated tensor dtypes must be `torch.dtype` values accepted by the core
   tensor generator
 
@@ -99,6 +144,12 @@ the registry numerics harness:
   `FusedGateSigmoidMulAddInputValues`
 - `fused_swiglu_fp8_ue8m0(gate_up, swiglu_limit)` consumes
   `FusedSwiGLUFP8UE8M0InputValues.gate_up` and `.swiglu_limit`
+- `silu_and_mul_fuse_block_quant(gate_up, scale_out, ...)` consumes
+  `FusedSwiGLUFP8BlockQuantInputValues.gate_up`, `.scale_out`, and, for
+  expert-parallel calls, `.num_tokens_per_expert`, `.num_tokens_hint`, and
+  `.num_experts`
+- `silu_and_mul_fuse_nvfp4_quant(gate_up, global_scale)` consumes
+  `FusedSwiGLUNVFP4QuantInputValues.gate_up` and `.global_scale`
 
 Adapters should remain small because the generated values already match the
 operation-level tensor inputs.

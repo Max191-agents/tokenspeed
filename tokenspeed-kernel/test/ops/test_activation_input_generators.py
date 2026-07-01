@@ -234,6 +234,49 @@ def test_fused_swiglu_fp8_block_quant_generator_runs_cuda_kernel() -> None:
 
 @pytest.mark.skipif(
     not platform.is_nvidia,
+    reason="CUDA fused block quantization kernels require NVIDIA CUDA.",
+)
+def test_fused_swiglu_fp8_block_quant_ep_generator_runs_cuda_kernel() -> None:
+    values = FusedSwiGLUFP8BlockQuantInputs(
+        FusedSwiGLUFP8BlockQuantInputConfig(
+            num_tokens=4,
+            hidden_dim=256,
+            dtype=torch.bfloat16,
+            num_experts=3,
+        )
+    ).generate(seed=110, device="cuda")
+    try:
+        actual_q, actual_scales = silu_and_mul_fuse_block_quant(
+            values.gate_up,
+            values.scale_out,
+            enable_pdl=False,
+            num_tokens_per_expert=values.num_tokens_per_expert,
+            num_tokens_hint=values.num_tokens_hint,
+            num_experts=values.num_experts,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"CUDA fused block quantization extension unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    expected_q, expected_scales = fused_swiglu_fp8_block_quant_reference(values)
+    assert actual_q.shape == expected_q.shape
+    assert actual_q.dtype == expected_q.dtype
+    assert actual_scales.shape == expected_scales.shape
+
+    gate, up = values.gate_up.float().chunk(2, dim=-1)
+    ref = torch.nn.functional.silu(gate) * up
+    dequant = (
+        actual_q.float().reshape(3, 4, 2, 128) * actual_scales.unsqueeze(-1)
+    ).reshape(3, 4, 256)
+    cos_sim = torch.nn.functional.cosine_similarity(
+        ref.flatten().unsqueeze(0),
+        dequant.flatten().unsqueeze(0),
+    )
+    assert cos_sim.item() > 0.99
+
+
+@pytest.mark.skipif(
+    not platform.is_nvidia,
     reason="CUDA fused NVFP4 quantization kernels require NVIDIA CUDA.",
 )
 def test_fused_swiglu_nvfp4_quant_generator_runs_cuda_kernel() -> None:
