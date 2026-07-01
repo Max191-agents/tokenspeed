@@ -148,3 +148,53 @@ def test_rope_generator_runs_triton_fused_kv_kernel(
         atol=0,
         rtol=0,
     )
+
+
+def test_rope_generator_runs_cuda_kernel_with_output_buffers(
+    device: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    require("embedding", "rope", "cuda", dtype, "query")
+    config = RopeInputConfig(
+        num_tokens=8,
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_size=64,
+        rotary_dim=64,
+        dtype=dtype,
+        is_neox=True,
+        with_q_output=True,
+        with_k_output=True,
+    )
+    values = RopeInputs(config).generate(seed=75, metadata_seed=76, device=device)
+    query_orig = values.query.clone()
+    key_orig = values.key.clone()
+    q_ref, k_ref = rope_reference(
+        values.query,
+        values.key,
+        values.positions,
+        head_size=config.head_size,
+        cos_sin_cache=values.cos_sin_cache,
+        is_neox=config.is_neox,
+        rotary_dim=config.rotary_dim,
+    )
+
+    q_out, k_out = apply_rope(
+        positions=values.positions,
+        query=values.query,
+        key=values.key,
+        head_size=config.head_size,
+        cos_sin_cache=values.cos_sin_cache,
+        is_neox=config.is_neox,
+        rotary_dim=config.rotary_dim,
+        output_q_rope=values.output_q_rope,
+        output_k_rope=values.output_k_rope,
+        solution="cuda",
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(values.query, query_orig, atol=0, rtol=0)
+    torch.testing.assert_close(values.key, key_orig, atol=0, rtol=0)
+    torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=2e-2)

@@ -60,3 +60,9 @@ TokenSpeed's `embedding.rope` API takes `positions`, `query`, `key`,
 optional fused KV wrapper. `RopeInputValues` maps directly to these arguments.
 Tests can construct the TokenSpeed wrapper from `values.fused_kv` without
 placing that wrapper in the standalone generator package.
+
+The same generated values are valid for the Triton and CUDA RoPE backends when
+the backend supports the requested traits, such as head size, partial-rotary
+mode, layout, fused KV writes, and output buffers. Backend selection is an
+adapter concern; the generator only defines the operation-level Q/K tensors,
+positions, RoPE cache, and optional cache-write values.
