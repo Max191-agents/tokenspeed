@@ -25,6 +25,8 @@ import torch
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    DSATopKSlotInputConfig,
+    DSATopKSlotInputs,
     GDNQKVSplitInputConfig,
     GDNQKVSplitInputs,
     DeepSeekV4PagedIndexInputConfig,
@@ -48,6 +50,8 @@ from tokenspeed_numerics_input_generators import (
     PageTableInput,
     PageTableInputConfig,
     attention_merge_state_reference,
+    dsa_full_context_topk_to_global_slots_reference,
+    dsa_local_topk_to_global_slots_reference,
     deepseek_v4_compressed_slot_mapping_reference,
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
     deepseek_v4_decode_swa_indices_and_lens_reference,
@@ -546,6 +550,123 @@ def test_packed_qkv_complex_rotary_inputs_reject_invalid_configs_and_values() ->
     values.freqs_cis = values.freqs_cis.real
     with pytest.raises(TypeError, match="complex"):
         packed_qkv_complex_rotary_reference(values)
+
+
+def test_dsa_topk_slot_inputs_generate_values_and_references() -> None:
+    values = DSATopKSlotInputs(
+        DSATopKSlotInputConfig(
+            num_tokens=5,
+            topk=4,
+            block_size=8,
+            max_pages_per_token=4,
+            max_seq_len=24,
+            indexing="identity",
+        )
+    ).generate(seed=121, device="cpu")
+
+    local_slots, local_lens = dsa_local_topk_to_global_slots_reference(values)
+    full_slots, full_lens = dsa_full_context_topk_to_global_slots_reference(values)
+
+    assert values.local_topk_offsets.shape == (5, 4)
+    assert values.seq_lens.shape == (5,)
+    assert values.block_table.shape == (5, 4)
+    assert local_slots.shape == (5, 4)
+    assert full_slots.shape == (5, 4)
+    assert local_lens.shape == (5,)
+    assert full_lens.shape == (5,)
+    assert torch.all(local_lens > 0)
+    assert torch.all(local_lens <= 4)
+    assert torch.all(full_lens <= 4)
+
+    for token_idx in range(5):
+        for slot_idx in range(4):
+            local_idx = int(values.local_topk_offsets[token_idx, slot_idx].item())
+            if local_idx < 0:
+                assert int(local_slots[token_idx, slot_idx].item()) == -1
+                continue
+            block = local_idx // values.block_size
+            offset = local_idx % values.block_size
+            expected = int(values.block_table[token_idx, block].item()) * 8 + offset
+            assert int(local_slots[token_idx, slot_idx].item()) == expected
+
+
+def test_dsa_topk_slot_reference_supports_no_seq_lens_local_mode() -> None:
+    values = DSATopKSlotInputs(
+        DSATopKSlotInputConfig(
+            num_tokens=3,
+            topk=5,
+            block_size=4,
+            max_pages_per_token=3,
+            max_seq_len=12,
+            indexing="identity",
+        )
+    ).generate(seed=122, device="cpu")
+
+    slots, lens = dsa_local_topk_to_global_slots_reference(
+        values,
+        use_seq_lens=False,
+    )
+
+    assert slots.shape == (3, 5)
+    assert lens.shape == (3,)
+    assert torch.all(lens > 0)
+
+
+def test_dsa_topk_slot_inputs_support_zero_tokens() -> None:
+    values = DSATopKSlotInputs(
+        DSATopKSlotInputConfig(
+            num_tokens=0,
+            topk=5,
+            block_size=4,
+            max_pages_per_token=3,
+        )
+    ).generate(seed=124, device="cpu")
+
+    slots, lens = dsa_full_context_topk_to_global_slots_reference(values)
+
+    assert values.local_topk_offsets.shape == (0, 5)
+    assert values.seq_lens.shape == (0,)
+    assert values.block_table.shape == (1, 3)
+    assert slots.shape == (0, 5)
+    assert lens.shape == (0,)
+
+
+def test_dsa_topk_slot_inputs_reject_invalid_configs_and_values() -> None:
+    with pytest.raises(ValueError, match="topk"):
+        DSATopKSlotInputs(
+            DSATopKSlotInputConfig(
+                num_tokens=3,
+                topk=0,
+                block_size=8,
+                max_pages_per_token=2,
+            )
+        )
+
+    with pytest.raises(ValueError, match="page_table_input.batch_size"):
+        DSATopKSlotInputs(
+            DSATopKSlotInputConfig(
+                num_tokens=3,
+                topk=4,
+                block_size=8,
+                max_pages_per_token=2,
+                page_table_input=PageTableInputConfig(
+                    batch_size=2,
+                    max_pages_per_request=2,
+                ),
+            )
+        )
+
+    values = DSATopKSlotInputs(
+        DSATopKSlotInputConfig(
+            num_tokens=3,
+            topk=4,
+            block_size=8,
+            max_pages_per_token=2,
+        )
+    ).generate(seed=123, device="cpu")
+    values.seq_lens = values.seq_lens[:-1]
+    with pytest.raises(ValueError, match="seq_lens"):
+        dsa_local_topk_to_global_slots_reference(values)
 
 
 def test_deepseek_v4_paged_index_inputs_generate_values_and_refs() -> None:

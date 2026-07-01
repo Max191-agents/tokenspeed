@@ -59,6 +59,11 @@ __all__ = [
     "AttentionMergeStateInputValues",
     "attention_generate",
     "attention_merge_state_reference",
+    "DSATopKSlotInputConfig",
+    "DSATopKSlotInputs",
+    "DSATopKSlotInputValues",
+    "dsa_full_context_topk_to_global_slots_reference",
+    "dsa_local_topk_to_global_slots_reference",
     "GDNQKVSplitInputConfig",
     "GDNQKVSplitInputs",
     "GDNQKVSplitInputValues",
@@ -1147,6 +1152,304 @@ def packed_qkv_complex_rotary_reference(
     k_out = _apply_complex_rotary(k, values.freqs_cis).contiguous()
     v_out = v.clone().contiguous() if values.copy_v else v
     return q_out, k_out, v_out
+
+
+@dataclass
+class DSATopKSlotInputValues:
+    """Generated values for DSA sparse top-k slot conversion."""
+
+    local_topk_offsets: torch.Tensor
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    block_table_cpu: list[list[int]]
+    block_table_values: PageTableValues
+    block_size: int
+    topk: int
+
+
+@dataclass
+class DSATopKSlotInputConfig:
+    """Initialization parameters for DSA sparse top-k slot conversion.
+
+    The represented metadata operation maps per-token local offsets through a
+    token-row page table. Local offsets address logical positions in the
+    per-token context; global slots address physical cache rows.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of token rows.
+    num_tokens: int
+
+    # Required: number of top-k offsets per token row.
+    topk: int
+
+    # Required: physical page size used for local-offset to page/offset mapping.
+    block_size: int
+
+    # Required: page-table width per token row.
+    max_pages_per_token: int
+
+    # ------------------------------------------------------------------
+    # Optional configuration fields.
+    # ------------------------------------------------------------------
+
+    # Optional: upper bound for generated per-token sequence lengths. Defaults
+    # to max_pages_per_token * block_size.
+    max_seq_len: int | None = None
+
+    # Optional: physical-page assignment policy for the token-row block table.
+    indexing: PageTableIndexing = "random"
+
+    # Optional: nested page-table config. If supplied, its batch size must match
+    # num_tokens; its width is raised as needed during generation.
+    page_table_input: PageTableInputConfig | None = None
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DSATopKSlotInputs(NumericsInputGenerator):
+    """Generator for DSA sparse top-k slot-conversion metadata."""
+
+    config: DSATopKSlotInputConfig
+    page_table_input: PageTableInput | None
+
+    def __init__(self, config: DSATopKSlotInputConfig) -> None:
+        self.config = config
+        self.page_table_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.page_table_input = self.page_table_input or PageTableInput(
+            self.config.page_table_input or self._make_page_table_config()
+        )
+        self._verify_page_table_config_matches_parent()
+        self.config.page_table_input = self.page_table_input.config
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> DSATopKSlotInputValues:
+        self.__post_init__()
+        if self.page_table_input is None:
+            raise ValueError("page_table_input must be initialized")
+        target_device = _resolve_device(self.config.device, device)
+        self.page_table_input.config.batch_size = max(1, self.config.num_tokens)
+        self.page_table_input.config.max_pages_per_request = max(
+            self.page_table_input.config.max_pages_per_request,
+            self.config.max_pages_per_token,
+        )
+        self.page_table_input.config.indexing = self.config.indexing
+        page_table_values = self.page_table_input.generate(
+            seed=_child_seed(seed, 1),
+            device=target_device,
+        )
+        max_context_len = page_table_values.page_table.shape[1] * self.config.block_size
+        max_seq_len = (
+            max_context_len
+            if self.config.max_seq_len is None
+            else min(self.config.max_seq_len, max_context_len)
+        )
+        seq_lens_cpu = self._generate_seq_lens(
+            seed=_child_seed(seed, 2),
+            max_seq_len=max_seq_len,
+        )
+        local_topk_cpu = self._generate_local_topk_offsets(
+            seed=_child_seed(seed, 3),
+            seq_lens=seq_lens_cpu,
+        )
+
+        return DSATopKSlotInputValues(
+            local_topk_offsets=local_topk_cpu.to(target_device),
+            seq_lens=torch.tensor(
+                seq_lens_cpu, dtype=torch.int32, device=target_device
+            ),
+            block_table=page_table_values.page_table,
+            block_table_cpu=page_table_values.page_table_cpu,
+            block_table_values=page_table_values,
+            block_size=self.config.block_size,
+            topk=self.config.topk,
+        )
+
+    def _normalize_config(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.topk = _check_positive("topk", self.config.topk)
+        self.config.block_size = _check_positive("block_size", self.config.block_size)
+        self.config.max_pages_per_token = _check_positive(
+            "max_pages_per_token", self.config.max_pages_per_token
+        )
+        if self.config.max_seq_len is not None:
+            self.config.max_seq_len = _check_positive(
+                "max_seq_len", self.config.max_seq_len
+            )
+        self.config.indexing = _check_page_table_indexing(self.config.indexing)
+
+    def _make_page_table_config(self) -> PageTableInputConfig:
+        return PageTableInputConfig(
+            batch_size=max(1, self.config.num_tokens),
+            max_pages_per_request=self.config.max_pages_per_token,
+            indexing=self.config.indexing,
+            device=self.config.device,
+        )
+
+    def _verify_page_table_config_matches_parent(self) -> None:
+        if self.page_table_input is None:
+            raise ValueError("page_table_input must be initialized")
+        _check_matches(
+            parent_name="DSATopKSlotInputConfig.num_tokens",
+            child_name="page_table_input.batch_size",
+            parent_value=max(1, self.config.num_tokens),
+            child_value=self.page_table_input.config.batch_size,
+        )
+
+    def _generate_seq_lens(self, *, seed: int, max_seq_len: int) -> list[int]:
+        if self.config.num_tokens == 0:
+            return []
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        return torch.randint(
+            1,
+            max_seq_len + 1,
+            (self.config.num_tokens,),
+            dtype=torch.int32,
+            generator=rng,
+        ).tolist()
+
+    def _generate_local_topk_offsets(
+        self,
+        *,
+        seed: int,
+        seq_lens: list[int],
+    ) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        local_topk = torch.full(
+            (self.config.num_tokens, self.config.topk),
+            -1,
+            dtype=torch.int32,
+        )
+        for token_idx, seq_len in enumerate(seq_lens):
+            valid_count = int(
+                torch.randint(
+                    1,
+                    min(int(seq_len), self.config.topk) + 1,
+                    (1,),
+                    generator=rng,
+                ).item()
+            )
+            selected = torch.randperm(int(seq_len), generator=rng)[:valid_count].to(
+                torch.int32
+            )
+            local_topk[token_idx, :valid_count] = selected
+        return local_topk
+
+
+def _validate_dsa_topk_slot_values(values: DSATopKSlotInputValues) -> None:
+    if values.local_topk_offsets.dtype != torch.int32:
+        raise TypeError(
+            f"local_topk_offsets must be int32, got {values.local_topk_offsets.dtype}"
+        )
+    if values.seq_lens.dtype != torch.int32:
+        raise TypeError(f"seq_lens must be int32, got {values.seq_lens.dtype}")
+    if values.block_table.dtype != torch.int32:
+        raise TypeError(f"block_table must be int32, got {values.block_table.dtype}")
+    if values.local_topk_offsets.ndim != 2:
+        raise ValueError("local_topk_offsets must be rank-2")
+    num_tokens, topk = values.local_topk_offsets.shape
+    if values.topk != topk:
+        raise ValueError("topk must match local_topk_offsets width")
+    if values.seq_lens.shape != (num_tokens,):
+        raise ValueError("seq_lens must have shape [num_tokens]")
+    if values.block_table.ndim != 2:
+        raise ValueError("block_table must be rank-2")
+    if values.block_table.shape[0] < num_tokens:
+        raise ValueError("block_table must have at least one row per token")
+    if values.block_table.shape[1] <= 0:
+        raise ValueError("block_table must have at least one page column")
+    if values.block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if values.topk <= 0:
+        raise ValueError("topk must be positive")
+    if (
+        values.local_topk_offsets.device != values.seq_lens.device
+        or values.local_topk_offsets.device != values.block_table.device
+    ):
+        raise ValueError(
+            "local_topk_offsets, seq_lens, and block_table must share device"
+        )
+
+
+def dsa_local_topk_to_global_slots_reference(
+    values: DSATopKSlotInputValues,
+    *,
+    use_seq_lens: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return global cache slots for generated DSA local top-k offsets."""
+
+    _validate_dsa_topk_slot_values(values)
+    local = values.local_topk_offsets
+    device = local.device
+    num_tokens, topk = local.shape
+    global_slots = torch.full_like(local, -1)
+    lens = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    block_table_cpu = values.block_table.cpu()
+    seq_lens_cpu = values.seq_lens.cpu().tolist()
+    max_context_len = values.block_table.shape[1] * values.block_size
+    for token_idx in range(num_tokens):
+        seq_len = int(seq_lens_cpu[token_idx]) if use_seq_lens else max_context_len
+        count = 0
+        for slot in range(topk):
+            local_idx = int(local[token_idx, slot].item())
+            if local_idx < 0 or local_idx >= seq_len:
+                continue
+            block_idx = local_idx // values.block_size
+            if block_idx < 0 or block_idx >= values.block_table.shape[1]:
+                continue
+            block_offset = local_idx % values.block_size
+            page = int(block_table_cpu[token_idx, block_idx].item())
+            global_slots[token_idx, slot] = page * values.block_size + block_offset
+            count += 1
+        lens[token_idx] = count
+    return global_slots, lens
+
+
+def dsa_full_context_topk_to_global_slots_reference(
+    values: DSATopKSlotInputValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return global slots for the first top-k positions of each token context."""
+
+    _validate_dsa_topk_slot_values(values)
+    device = values.seq_lens.device
+    num_tokens = int(values.seq_lens.numel())
+    topk = int(values.topk)
+    global_slots = torch.full(
+        (num_tokens, topk),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    lens = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    block_table_cpu = values.block_table.cpu()
+    seq_lens_cpu = values.seq_lens.cpu().tolist()
+    max_context_len = values.block_table.shape[1] * values.block_size
+    for token_idx, seq_len in enumerate(seq_lens_cpu):
+        capped_seq_len = min(int(seq_len), max_context_len)
+        lens[token_idx] = min(capped_seq_len, topk)
+        for offset in range(topk):
+            block_idx = offset // values.block_size
+            if offset >= int(seq_len) or block_idx >= values.block_table.shape[1]:
+                continue
+            block_offset = offset % values.block_size
+            page = int(block_table_cpu[token_idx, block_idx].item())
+            global_slots[token_idx, offset] = page * values.block_size + block_offset
+    return global_slots, lens
 
 
 @dataclass

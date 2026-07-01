@@ -35,6 +35,10 @@ from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
     fused_qkv_split_gdn_prefill,
 )
 from tokenspeed_kernel.ops.attention.triton.qkv_rotary import packed_qkv_complex_rotary
+from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
+    full_context_topk_to_global_slots,
+    local_topk_to_global_slots,
+)
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_compressed_slot_mapping,
@@ -55,6 +59,8 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    DSATopKSlotInputConfig,
+    DSATopKSlotInputs,
     GDNQKVSplitInputConfig,
     GDNQKVSplitInputs,
     DeepSeekV4PagedIndexInputConfig,
@@ -71,6 +77,8 @@ from tokenspeed_numerics_input_generators import (
     PackedQKVComplexRotaryInputConfig,
     PackedQKVComplexRotaryInputs,
     attention_merge_state_reference,
+    dsa_full_context_topk_to_global_slots_reference,
+    dsa_local_topk_to_global_slots_reference,
     deepseek_v4_compressed_slot_mapping_reference,
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
     deepseek_v4_decode_swa_indices_and_lens_reference,
@@ -461,6 +469,49 @@ def test_packed_qkv_complex_rotary_generator_runs_tokenspeed_triton(
         actual_k.float(), expected_k.float(), rtol=1e-2, atol=1e-2
     )
     torch.testing.assert_close(actual_v.float(), expected_v.float(), rtol=0.0, atol=0.0)
+
+
+def test_dsa_topk_slot_generator_runs_tokenspeed_triton(
+    device: str,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm GPU is required for DSA top-k slot Triton test")
+
+    values = DSATopKSlotInputs(
+        DSATopKSlotInputConfig(
+            num_tokens=7,
+            topk=6,
+            block_size=8,
+            max_pages_per_token=4,
+            max_seq_len=24,
+        )
+    ).generate(seed=212, device=device)
+
+    expected_local_slots, expected_local_lens = (
+        dsa_local_topk_to_global_slots_reference(values)
+    )
+    actual_local_slots, actual_local_lens = local_topk_to_global_slots(
+        local_topk_offsets=values.local_topk_offsets,
+        block_table=values.block_table,
+        block_size=values.block_size,
+        seq_lens=values.seq_lens,
+    )
+
+    expected_full_slots, expected_full_lens = (
+        dsa_full_context_topk_to_global_slots_reference(values)
+    )
+    actual_full_slots, actual_full_lens = full_context_topk_to_global_slots(
+        seq_lens=values.seq_lens,
+        block_table=values.block_table,
+        block_size=values.block_size,
+        topk=values.topk,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual_local_slots, expected_local_slots)
+    assert torch.equal(actual_local_lens, expected_local_lens)
+    assert torch.equal(actual_full_slots, expected_full_slots)
+    assert torch.equal(actual_full_lens, expected_full_lens)
 
 
 def test_deepseek_v4_global_topk_generator_runs_tokenspeed_cpu() -> None:
