@@ -27,11 +27,17 @@ from tokenspeed_numerics_input_generators import (
     GemmInputConfig,
     GemmInputValues,
     GemmInputs,
+    MoeAlignBlockSizeInputConfig,
+    MoeAlignBlockSizeInputs,
+    MoeAlignBlockSizeInputValues,
     MoeInputConfig,
     MoeInputValues,
     MoeInputs,
     TensorInput,
+    canonicalize_moe_align_block_size,
     gemm_scale_shape,
+    moe_align_block_size_buffer_dims,
+    moe_align_block_size_reference,
     mxfp4_gemm_input_config,
 )
 
@@ -514,3 +520,117 @@ def test_moe_inputs_compose_mxfp4_weight_gemms() -> None:
     assert inputs.w2.B_scales.shape == (4, 64, 1)
     assert inputs.w13.B.dtype == torch.uint8
     assert inputs.w13.B_scales.dtype == torch.uint8
+
+
+def test_moe_align_block_size_inputs_generate_topk_ids() -> None:
+    first = MoeAlignBlockSizeInputs(
+        MoeAlignBlockSizeInputConfig(
+            total_tokens=6,
+            top_k=2,
+            num_experts=4,
+            block_size=8,
+        )
+    ).generate(seed=31, device="cpu")
+    second = MoeAlignBlockSizeInputs(
+        MoeAlignBlockSizeInputConfig(
+            total_tokens=6,
+            top_k=2,
+            num_experts=4,
+            block_size=8,
+        )
+    ).generate(seed=31, device="cpu")
+
+    assert isinstance(first, MoeAlignBlockSizeInputValues)
+    assert first.topk_ids.shape == (6, 2)
+    assert first.topk_ids.dtype == torch.int32
+    assert torch.all(first.topk_ids >= 0)
+    assert torch.all(first.topk_ids < 4)
+    assert torch.equal(first.topk_ids, second.topk_ids)
+    assert first.block_size == 8
+    assert first.num_experts == 4
+
+
+def test_moe_align_block_size_inputs_verify_config() -> None:
+    with pytest.raises(ValueError, match="top_k must be <= num_experts"):
+        MoeAlignBlockSizeInputs(
+            MoeAlignBlockSizeInputConfig(
+                total_tokens=4,
+                top_k=5,
+                num_experts=4,
+                block_size=8,
+            )
+        )
+
+    with pytest.raises(ValueError, match="topk_ids_dtype"):
+        MoeAlignBlockSizeInputs(
+            MoeAlignBlockSizeInputConfig(
+                total_tokens=4,
+                top_k=2,
+                num_experts=4,
+                block_size=8,
+                topk_ids_dtype=torch.float32,
+            )
+        )
+
+
+def test_moe_align_block_size_reference_pads_each_expert() -> None:
+    values = MoeAlignBlockSizeInputValues(
+        topk_ids=torch.tensor(
+            [
+                [1, 2, 3],
+                [0, 1, 3],
+                [0, 2, 3],
+                [0, 1, 2],
+            ],
+            dtype=torch.int32,
+        ),
+        block_size=4,
+        num_experts=4,
+    )
+
+    assert moe_align_block_size_buffer_dims(values) == (4, 16)
+    ref = moe_align_block_size_reference(values)
+
+    torch.testing.assert_close(
+        ref.sorted_token_ids,
+        torch.tensor(
+            [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12],
+            dtype=torch.int32,
+        ),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        ref.expert_ids,
+        torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        ref.num_tokens_post_pad,
+        torch.tensor([16], dtype=torch.int32),
+        atol=0,
+        rtol=0,
+    )
+
+    canonical = canonicalize_moe_align_block_size(ref, block_size=4)
+    torch.testing.assert_close(
+        canonical,
+        torch.tensor(
+            [16, 0, 1, 2, 3, 3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12],
+            dtype=torch.int32,
+        ),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_moe_align_block_size_reference_rejects_invalid_ids() -> None:
+    values = MoeAlignBlockSizeInputValues(
+        topk_ids=torch.tensor([[0, 4]], dtype=torch.int32),
+        block_size=4,
+        num_experts=4,
+    )
+
+    with pytest.raises(ValueError, match="less than num_experts"):
+        moe_align_block_size_reference(values)

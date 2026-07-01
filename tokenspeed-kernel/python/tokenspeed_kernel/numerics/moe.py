@@ -32,6 +32,12 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from tokenspeed_numerics_input_generators import (
+    MoeAlignBlockSizeInputConfig,
+    MoeAlignBlockSizeInputs,
+    MoeAlignBlockSizeReferenceValues,
+    canonicalize_moe_align_block_size,
+)
 from tokenspeed_kernel.numerics.inputs import (
     InputGenerator,
     set_benchmark_shapes,
@@ -50,7 +56,7 @@ set_family_tolerance("moe", tolerance)
 
 
 class MoeAlignBlockSizeInputGenerator(InputGenerator):
-    """Generates topk_ids for moe_align_block_size.
+    """Adapter for standalone MoE align-block-size input generation.
 
     Shape kwargs:
         total_tokens: number of input tokens
@@ -67,20 +73,20 @@ class MoeAlignBlockSizeInputGenerator(InputGenerator):
         num_experts: int,
         block_size: int,
     ) -> dict[str, Any]:
-        if num_experts <= 0:
-            raise ValueError("num_experts must be positive")
-        topk_ids = torch.randint(
-            0,
-            num_experts,
-            (total_tokens, top_k),
-            device=self.device,
-            dtype=torch.int32,
-            generator=self.rng,
-        )
+        values = MoeAlignBlockSizeInputs(
+            MoeAlignBlockSizeInputConfig(
+                total_tokens=total_tokens,
+                top_k=top_k,
+                num_experts=num_experts,
+                block_size=block_size,
+                topk_ids_dtype=self.dtype,
+                device=self.device,
+            )
+        ).generate(seed=self.seed, device=self.device)
         return {
-            "topk_ids": topk_ids,
-            "block_size": block_size,
-            "num_experts": num_experts,
+            "topk_ids": values.topk_ids,
+            "block_size": values.block_size,
+            "num_experts": values.num_experts,
         }
 
 
@@ -131,17 +137,11 @@ def canonicalize_align_block_size(
 
     Caller must size ``sorted_ids`` to ``expert_ids.numel() * block_size``.
     """
-    n_blocks = expert_ids.numel()
-    assert sorted_ids.numel() == n_blocks * block_size, (
-        f"sorted_ids size {sorted_ids.numel()} doesn't match "
-        f"expert_ids.numel()={n_blocks} * block_size={block_size}"
-    )
-    blocks = sorted_ids.view(n_blocks, block_size)
-    blocks_sorted, _ = blocks.sort(dim=-1)
-    return torch.cat(
-        [
-            num_tokens_post_pad.flatten().to(torch.int32),
-            expert_ids.to(torch.int32),
-            blocks_sorted.flatten().to(torch.int32),
-        ]
+    return canonicalize_moe_align_block_size(
+        MoeAlignBlockSizeReferenceValues(
+            sorted_token_ids=sorted_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_pad=num_tokens_post_pad,
+        ),
+        block_size=block_size,
     )
