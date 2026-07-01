@@ -98,6 +98,19 @@ generic well-formedness checks. Tests that intentionally need invalid inputs
 should construct those cases outside the normal generator path so the generator
 contract stays clear.
 
+Concretely, each generator should guarantee that:
+
+- Required operation-defining fields are present before generation starts.
+- Shape relationships are internally consistent, including relationships
+  between parent configs and nested child generators.
+- Dtype and custom-format requirements are enforced where the corresponding
+  tensor is generated.
+- Randomly generated metadata cannot describe impossible layouts, out-of-range
+  indices, invalid request lengths, or cache/page state that does not match the
+  generated tensors.
+- Returned values are ready for reference implementations or kernel adapters
+  without requiring each consumer to repeat generic validity checks.
+
 Verification belongs at the same semantic level as generation. It should check
 shape relationships, datatype compatibility, required metadata, cache/page
 constraints, scale requirements, and other invariants that define whether the
