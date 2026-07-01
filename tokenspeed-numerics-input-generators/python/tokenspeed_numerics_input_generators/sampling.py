@@ -72,6 +72,9 @@ __all__ = [
     "TopKTopPSamplingInputConfig",
     "TopKTopPSamplingInputs",
     "TopKTopPSamplingInputValues",
+    "TopKTopPLogitsSamplingInputConfig",
+    "TopKTopPLogitsSamplingInputs",
+    "TopKTopPLogitsSamplingInputValues",
     "TopKTopPSamplingReferenceValues",
     "argmax_pair_reference",
     "argmax_reference",
@@ -83,6 +86,7 @@ __all__ = [
     "speculative_greedy_verify_reference",
     "top_p_renorm_reference",
     "top_k_top_p_renorm_reference",
+    "top_k_top_p_logits_sampling_reference",
     "top_k_top_p_sampling_reference",
 ]
 
@@ -1303,6 +1307,15 @@ class TopKTopPSamplingInputValues:
 
 
 @dataclass
+class TopKTopPLogitsSamplingInputValues:
+    """Generated values for ``TopKTopPLogitsSamplingInputs``."""
+
+    logits: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+
+
+@dataclass
 class TopKTopPSamplingReferenceValues:
     """Exact reference outputs for deterministic-support top-k/top-p sampling."""
 
@@ -1527,6 +1540,129 @@ class TopKTopPSamplingInputs(NumericsInputGenerator):
         )
         return TopKTopPSamplingInputValues(
             probs=probs.to(self.config.dtype).contiguous(),
+            top_k=top_k.contiguous(),
+            top_p=top_p.contiguous(),
+        )
+
+
+@dataclass
+class TopKTopPLogitsSamplingInputConfig:
+    """Initialization parameters for exact-checkable logits sampling.
+
+    The represented operation softmaxes logits, applies top-k/top-p filtering,
+    and samples from the filtered distribution. General categorical sampling
+    needs statistical validation. This generator creates logits where exactly
+    one token has finite support per row, making the sampled token deterministic
+    and suitable for exact kernel smoke tests.
+    """
+
+    # Required: number of sample rows. Zero is valid.
+    num_rows: int
+
+    # Required: vocabulary width.
+    vocab_size: int
+
+    # Optional: dtype for generated logits.
+    dtype: torch.dtype = torch.float32
+
+    # Optional: maximum top-k value sampled per row.
+    max_top_k: int | None = None
+
+    # Optional: lower bound for generated top-p thresholds.
+    min_top_p: float = 0.05
+
+    # Optional: upper bound for generated top-p thresholds.
+    max_top_p: float = 1.0
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class TopKTopPLogitsSamplingInputs(NumericsInputGenerator):
+    """Generator for top-k/top-p logits sampling with deterministic support."""
+
+    config: TopKTopPLogitsSamplingInputConfig
+
+    def __init__(self, config: TopKTopPLogitsSamplingInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_rows = _check_nonnegative("num_rows", self.config.num_rows)
+        self.config.vocab_size = _check_positive("vocab_size", self.config.vocab_size)
+        self.config.dtype = _check_float_dtype(
+            "dtype", self.config.dtype, allowed=_LOGIT_DTYPES
+        )
+        if self.config.max_top_k is None:
+            self.config.max_top_k = self.config.vocab_size
+        self.config.max_top_k = _check_positive("max_top_k", self.config.max_top_k)
+        if self.config.max_top_k > self.config.vocab_size:
+            raise ValueError(
+                "max_top_k must be <= vocab_size; got "
+                f"{self.config.max_top_k} > {self.config.vocab_size}"
+            )
+        self.config.min_top_p = float(self.config.min_top_p)
+        self.config.max_top_p = float(self.config.max_top_p)
+        if not 0.0 < self.config.min_top_p <= self.config.max_top_p <= 1.0:
+            raise ValueError(
+                "top-p bounds must satisfy 0 < min_top_p <= max_top_p <= 1; "
+                f"got min_top_p={self.config.min_top_p}, "
+                f"max_top_p={self.config.max_top_p}"
+            )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> TopKTopPLogitsSamplingInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        selected = _randint(
+            low=0,
+            high=self.config.vocab_size,
+            shape=(self.config.num_rows,),
+            dtype=torch.int64,
+            seed=_child_seed(metadata_base_seed, 1),
+            device=device,
+            configured_device=self.config.device,
+        )
+        logits = torch.full(
+            (self.config.num_rows, self.config.vocab_size),
+            -float("inf"),
+            dtype=self.config.dtype,
+            device=target_device,
+        )
+        if self.config.num_rows > 0:
+            logits.scatter_(1, selected.view(-1, 1), 0.0)
+
+        top_k = _randint(
+            low=1,
+            high=int(self.config.max_top_k) + 1,
+            shape=(self.config.num_rows,),
+            dtype=torch.int32,
+            seed=_child_seed(metadata_base_seed, 2),
+            device=device,
+            configured_device=self.config.device,
+        )
+        top_p_generator = _rng_for_device(
+            target_device, _child_seed(metadata_base_seed, 3)
+        )
+        top_p = torch.rand(
+            self.config.num_rows,
+            dtype=torch.float32,
+            device=target_device,
+            generator=top_p_generator,
+        )
+        top_p = (
+            top_p * (self.config.max_top_p - self.config.min_top_p)
+            + self.config.min_top_p
+        )
+        return TopKTopPLogitsSamplingInputValues(
+            logits=logits.contiguous(),
             top_k=top_k.contiguous(),
             top_p=top_p.contiguous(),
         )
@@ -2081,3 +2217,14 @@ def top_k_top_p_sampling_reference(
         samples=samples,
         valid=torch.ones(probs.shape[0], dtype=torch.bool, device=probs.device),
     )
+
+
+def top_k_top_p_logits_sampling_reference(
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+) -> TopKTopPSamplingReferenceValues:
+    """Exact reference for logits rows with single-token softmax support."""
+
+    probs = torch.softmax(logits.float(), dim=-1)
+    return top_k_top_p_sampling_reference(probs, top_k, top_p)

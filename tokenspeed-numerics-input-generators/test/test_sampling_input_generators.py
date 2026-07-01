@@ -41,6 +41,8 @@ from tokenspeed_numerics_input_generators import (
     SpeculativeGreedyVerifyInputConfig,
     SpeculativeGreedyVerifyInputs,
     SpeculativeGreedyVerifyInputValues,
+    TopKTopPLogitsSamplingInputConfig,
+    TopKTopPLogitsSamplingInputs,
     TopKTopPRenormInputConfig,
     TopKTopPRenormInputs,
     TopKTopPSamplingInputConfig,
@@ -55,6 +57,7 @@ from tokenspeed_numerics_input_generators import (
     softmax_reference,
     speculative_chain_sampling_reference,
     speculative_greedy_verify_reference,
+    top_k_top_p_logits_sampling_reference,
     top_k_top_p_renorm_reference,
     top_k_top_p_sampling_reference,
     top_p_renorm_reference,
@@ -637,6 +640,66 @@ def test_top_k_top_p_sampling_reference_rejects_multi_token_support() -> None:
         top_k_top_p_sampling_reference(probs, top_k, top_p)
 
 
+def test_top_k_top_p_logits_sampling_inputs_generate_deterministic_reference() -> None:
+    values = TopKTopPLogitsSamplingInputs(
+        TopKTopPLogitsSamplingInputConfig(
+            num_rows=5,
+            vocab_size=19,
+            max_top_k=8,
+            min_top_p=0.2,
+            max_top_p=0.9,
+        )
+    ).generate(seed=154, metadata_seed=155, device="cpu")
+
+    assert values.logits.shape == (5, 19)
+    assert values.logits.dtype == torch.float32
+    assert torch.all(torch.isfinite(values.logits).sum(dim=-1) == 1)
+    assert values.top_k.shape == (5,)
+    assert int(values.top_k.min()) >= 1
+    assert int(values.top_k.max()) <= 8
+    assert values.top_p.min() >= 0.2
+    assert values.top_p.max() <= 0.9
+
+    ref = top_k_top_p_logits_sampling_reference(
+        values.logits,
+        values.top_k,
+        values.top_p,
+    )
+    torch.testing.assert_close(
+        ref.samples,
+        torch.argmax(values.logits, dim=-1).to(torch.int32),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(ref.valid, torch.ones(5, dtype=torch.bool))
+
+
+def test_top_k_top_p_logits_sampling_metadata_seed_controls_selected_tokens() -> None:
+    generator = TopKTopPLogitsSamplingInputs(
+        TopKTopPLogitsSamplingInputConfig(
+            num_rows=4,
+            vocab_size=13,
+            max_top_k=4,
+        )
+    )
+
+    values1 = generator.generate(seed=1, metadata_seed=199, device="cpu")
+    values2 = generator.generate(seed=2, metadata_seed=199, device="cpu")
+
+    torch.testing.assert_close(values1.logits, values2.logits)
+    torch.testing.assert_close(values1.top_k, values2.top_k)
+    torch.testing.assert_close(values1.top_p, values2.top_p)
+
+
+def test_top_k_top_p_logits_sampling_reference_rejects_multi_token_support() -> None:
+    logits = torch.tensor([[1.0, 0.0, -float("inf")]], dtype=torch.float32)
+    top_k = torch.tensor([2], dtype=torch.int32)
+    top_p = torch.tensor([1.0], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="one surviving token"):
+        top_k_top_p_logits_sampling_reference(logits, top_k, top_p)
+
+
 @pytest.mark.parametrize("bad_dtype", [torch.float8_e4m3fn, torch.int32])
 def test_argmax_rejects_invalid_dtype(bad_dtype: torch.dtype) -> None:
     with pytest.raises(ValueError, match="dtype"):
@@ -704,6 +767,14 @@ def test_top_k_top_p_rejects_too_large_max_top_k() -> None:
     with pytest.raises(ValueError, match="max_top_k"):
         TopKTopPSamplingInputs(
             TopKTopPSamplingInputConfig(
+                num_rows=1,
+                vocab_size=8,
+                max_top_k=9,
+            )
+        )
+    with pytest.raises(ValueError, match="max_top_k"):
+        TopKTopPLogitsSamplingInputs(
+            TopKTopPLogitsSamplingInputConfig(
                 num_rows=1,
                 vocab_size=8,
                 max_top_k=9,

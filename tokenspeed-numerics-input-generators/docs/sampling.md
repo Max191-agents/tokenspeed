@@ -7,7 +7,7 @@ row-wise argmax, packed max/index argmax pairs, scalar metadata
 gather/broadcast, softmax, speculative greedy verification, target-only chain
 speculative sampling, min-p renormalization, exact-checkable min-p sampling,
 top-p renormalization, top-k/top-p renormalization, and exact-checkable
-top-k/top-p sampling.
+top-k/top-p sampling from probabilities or logits.
 
 ## Operation Semantics
 
@@ -146,17 +146,27 @@ to the vocabulary size.
 ### Top-K + Top-P Sampling
 
 `TopKTopPSamplingInputs` represents categorical sampling after top-k and top-p
-filtering:
+filtering from probability rows:
 
 ```text
 filtered = apply_top_p(apply_top_k(probs, top_k), top_p)
 sample ~ categorical(filtered / sum(filtered))
 ```
 
+`TopKTopPLogitsSamplingInputs` represents the same filtering and sampling after
+first applying row-wise softmax to logits:
+
+```text
+probs = softmax(logits)
+filtered = apply_top_p(apply_top_k(probs, top_k), top_p)
+sample ~ categorical(filtered / sum(filtered))
+```
+
 As with min-p sampling, the general operation is stochastic. The generator
-currently creates exact-checkable rows where one token survives both filters,
-so the reference can return a deterministic sample and valid mask. This covers
-the operation-level filtering/API contract while leaving full distributional
+currently creates exact-checkable rows where one token survives both filters. In
+the logits variant, this is done by generating one finite logit per row. The
+reference can then return a deterministic sample and valid mask. This covers the
+operation-level filtering/API contract while leaving full distributional
 sampling validation to a future statistical harness.
 
 ## Validation Contract
@@ -185,7 +195,8 @@ The generators reject invalid sampling inputs before values are returned:
 - standalone top-p thresholds have one value per probability row and are in
   `(0, 1]`
 - top-k/top-p sampling rows have one survivor after both filters for exact
-  reference comparison
+  reference comparison, with logits rows containing one finite token before
+  softmax
 - planted argmax rows have a unique known maximum
 
 Metadata such as argmax planted indices, scalar gather indices, top-k/top-p
@@ -211,6 +222,8 @@ TokenSpeed exposes sampling kernels through several modules:
 - NVIDIA-only fused top-k/top-p renormalization helpers
 - FlashInfer `top_k_top_p_sampling_from_probs` consumes
   `TopKTopPSamplingInputValues`
+- FlashInfer `top_k_top_p_sampling_from_logits` consumes
+  `TopKTopPLogitsSamplingInputValues`
 - FlashInfer `top_p_renorm_probs` consumes `TopPRenormInputValues.probs` and
   `.top_p`
 - FlashInfer `top_k_renorm_prob` followed by deterministic

@@ -37,6 +37,9 @@ from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_k_renorm_prob as flashinfer_top_k_renorm_prob,
 )
 from tokenspeed_kernel.ops.sampling.flashinfer import (
+    top_k_top_p_sampling_from_logits as flashinfer_top_k_top_p_sampling_from_logits,
+)
+from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_k_top_p_sampling_from_probs as flashinfer_top_k_top_p_sampling_from_probs,
 )
 from tokenspeed_kernel.ops.sampling.flashinfer import (
@@ -67,6 +70,8 @@ from tokenspeed_numerics_input_generators import (
     SpeculativeChainSamplingInputs,
     SpeculativeGreedyVerifyInputConfig,
     SpeculativeGreedyVerifyInputs,
+    TopKTopPLogitsSamplingInputConfig,
+    TopKTopPLogitsSamplingInputs,
     TopKTopPRenormInputConfig,
     TopKTopPRenormInputs,
     TopKTopPSamplingInputConfig,
@@ -81,6 +86,7 @@ from tokenspeed_numerics_input_generators import (
     softmax_reference,
     speculative_chain_sampling_reference,
     speculative_greedy_verify_reference,
+    top_k_top_p_logits_sampling_reference,
     top_k_top_p_renorm_reference,
     top_k_top_p_sampling_reference,
     top_p_renorm_reference,
@@ -327,6 +333,42 @@ def test_top_k_top_p_sampling_generator_runs_flashinfer_kernel(device: str) -> N
 
     torch.testing.assert_close(samples, expected.samples, atol=0, rtol=0)
     torch.testing.assert_close(valid, expected.valid, atol=0, rtol=0)
+
+
+@requires_nvidia
+def test_top_k_top_p_logits_sampling_generator_runs_flashinfer_kernel(
+    device: str,
+) -> None:
+    values = TopKTopPLogitsSamplingInputs(
+        TopKTopPLogitsSamplingInputConfig(
+            num_rows=5,
+            vocab_size=257,
+            max_top_k=32,
+            min_top_p=0.05,
+            max_top_p=0.95,
+        )
+    ).generate(seed=102, metadata_seed=103, device=device)
+    expected = top_k_top_p_logits_sampling_reference(
+        values.logits,
+        values.top_k,
+        values.top_p,
+    )
+
+    try:
+        samples = flashinfer_top_k_top_p_sampling_from_logits(
+            values.logits,
+            values.top_k,
+            values.top_p,
+            filter_apply_order="top_k_first",
+            deterministic=True,
+            seed=123,
+            offset=0,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"FlashInfer top-k/top-p logits sampling unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(samples, expected.samples, atol=0, rtol=0)
 
 
 @requires_nvidia
