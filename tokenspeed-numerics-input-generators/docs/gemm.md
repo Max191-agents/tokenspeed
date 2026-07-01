@@ -48,6 +48,12 @@ the same tensor generator with explicit scale shape and scale dtype. Custom
 dtypes, such as MXFP4 storage with UE8M0 scales, are represented through the
 shared custom dtype enum so the format-specific constraints are centralized.
 
+The dense case is the baseline operation: `A` and `B` are generated as ordinary
+floating-point tensors with no sidecar scales, and `gemm_reference` computes the
+same `A @ B.T` operation. Scaled and quantized modes should preserve that
+operation-level meaning while changing only how the operand values are stored
+and interpreted.
+
 `gemm_scale_shape` provides common scale-shape calculations for tensor,
 channel, and block granularities. `mxfp4_gemm_input_config` builds a GEMM config
 for MXFP4 operands with block scales.

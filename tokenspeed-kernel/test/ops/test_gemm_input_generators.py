@@ -38,6 +38,38 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_dense_gemm_generator_runs_reference_kernel(device: str, require) -> None:
+    require("gemm", "mm", "reference", torch.float32, "a")
+    values = GemmInputs(
+        GemmInputConfig(
+            M=7,
+            N=11,
+            K=13,
+            a_dtype=torch.float32,
+            b_dtype=torch.float32,
+            c_dtype=torch.float32,
+        )
+    ).generate(seed=29, device=device)
+    assert values.A is not None
+    assert values.B is not None
+    assert values.A_scales is None
+    assert values.B_scales is None
+
+    actual = tokenspeed_kernel.mm(
+        values.A,
+        values.B,
+        C=values.C,
+        out_dtype=values.C.dtype,
+        expected_kernel_name="torch_mm",
+    )
+    expected = gemm_reference(values).to(device=device)
+    torch.cuda.synchronize()
+
+    assert actual.shape == values.C.shape
+    assert actual.dtype == values.C.dtype
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_mxfp4_gemm_generator_runs_triton_kernel(device: str, require) -> None:
     require("gemm", "mm", "triton", torch.uint8, "a")
     values = GemmInputs(
