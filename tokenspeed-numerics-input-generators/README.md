@@ -98,13 +98,24 @@ metadata, scale tensors, or cache/page structures. Returned values should be
 ready for reference implementations or kernel adapters without each consumer
 repeating generic validity checks.
 
+Checks should be placed where the invariant is owned:
+
+- A config should validate static operation constraints, such as required
+  dimensions, supported dtype combinations, cache layout choices, and
+  quantized scale requirements.
+- A generator should validate constraints that are only known after defaults,
+  random metadata, nested generators, or device selection have been resolved.
+- A values object should describe already-valid generated inputs, not become a
+  second configuration object that consumers must repair or normalize.
+
 The standard is misuse resistance, not duplicating every kernel assertion.
 Kernel-specific requirements still belong in adapters or tests. The generator
 should instead prevent misuse of the operation-family API itself: missing
 required fields, incompatible shapes, unsupported dtype combinations, invalid
 quantized scale requirements, impossible request lengths, out-of-range metadata,
 and cache or page state that does not match the generated tensors should fail in
-the generator library.
+the generator library. If a generator can produce broken operation inputs for a
+publicly accepted configuration, that is a bug in the generator.
 
 Tests for generators should cover that contract directly. Each family should
 include focused tests for invalid configurations that must be rejected and for
