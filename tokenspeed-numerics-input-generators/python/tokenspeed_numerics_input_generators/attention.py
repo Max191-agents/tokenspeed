@@ -83,6 +83,10 @@ __all__ = [
     "DeepSeekV4CompressorStateInputs",
     "DeepSeekV4CompressorStateInputValues",
     "deepseek_v4_save_compressor_state_reference",
+    "DeepSeekV4IndexerMXFP4CacheWriteInputConfig",
+    "DeepSeekV4IndexerMXFP4CacheWriteInputs",
+    "DeepSeekV4IndexerMXFP4CacheWriteInputValues",
+    "deepseek_v4_indexer_mxfp4_cache_write_reference",
     "DeepSeekV4PagedIndexInputConfig",
     "DeepSeekV4PagedIndexInputs",
     "DeepSeekV4PagedIndexValues",
@@ -118,6 +122,13 @@ _DSA_SPARSE_DECODE_FP8_SCALE_BYTES = 4
 _DSA_SPARSE_DECODE_BF16_BYTES = 2
 _DSA_SPARSE_DECODE_FP8_E4M3_MAX = 448.0
 _DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
+_DEEPSEEK_V4_INDEXER_DIM = 128
+_DEEPSEEK_V4_INDEXER_MXFP4_BLOCK_SIZE = 32
+_DEEPSEEK_V4_INDEXER_MXFP4_HALF_BLOCK = _DEEPSEEK_V4_INDEXER_MXFP4_BLOCK_SIZE // 2
+_DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES = _DEEPSEEK_V4_INDEXER_DIM // 2
+_DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES = (
+    _DEEPSEEK_V4_INDEXER_DIM // _DEEPSEEK_V4_INDEXER_MXFP4_BLOCK_SIZE
+)
 _GDN_CHUNK_SIZE = 64
 
 
@@ -2797,6 +2808,382 @@ def deepseek_v4_save_compressor_state_reference(
         out[block_idx, pos_in_block, state_width:] = (
             values.score[token_idx].float() + ape
         )
+    return out.contiguous()
+
+
+@dataclass
+class DeepSeekV4IndexerMXFP4CacheWriteInputValues:
+    """Generated values for writing DeepSeek V4 indexer K rows to MXFP4 cache."""
+
+    index_k: torch.Tensor
+    cache_2d: torch.Tensor
+    slot_mapping: torch.Tensor
+    valid: torch.Tensor
+    block_size: int
+
+
+@dataclass
+class DeepSeekV4IndexerMXFP4CacheWriteInputConfig:
+    """Initialization parameters for DeepSeek V4 indexer MXFP4 cache writes.
+
+    The represented operation quantizes 128-channel indexer K rows into MXFP4
+    storage and writes them into a paged byte cache. Cache rows are selected by
+    ``slot_mapping``. A row is written only when ``valid`` is true and its slot
+    is non-negative.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of generated indexer K rows.
+    num_rows: int
+
+    # Required: number of physical MXFP4 cache pages.
+    num_cache_blocks: int
+
+    # Required: number of indexer rows in each physical cache page.
+    block_size: int
+
+    # Required: generated dtype for indexer K rows.
+    dtype: torch.dtype
+
+    # ------------------------------------------------------------------
+    # Optional metadata/value generation configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: rows with slot_mapping == -1. These rows are skipped.
+    negative_slot_count: int = 0
+
+    # Optional: rows with valid == False. These rows are skipped even when they
+    # have a non-negative slot.
+    masked_row_count: int = 0
+
+    # Optional: factor applied to generated indexer K rows to keep MXFP4 scales
+    # in a representative range.
+    value_scale: float = 1.0
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DeepSeekV4IndexerMXFP4CacheWriteInputs(NumericsInputGenerator):
+    """Generator for DeepSeek V4 indexer MXFP4 cache-write inputs."""
+
+    config: DeepSeekV4IndexerMXFP4CacheWriteInputConfig
+    index_k_input: TensorInput | None
+
+    def __init__(self, config: DeepSeekV4IndexerMXFP4CacheWriteInputConfig) -> None:
+        self.config = config
+        self.index_k_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.index_k_input = self.index_k_input or TensorInput(
+            self._index_k_shape(),
+            self.config.dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int | None = None,
+        metadata_seed: int | None = None,
+        value_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> DeepSeekV4IndexerMXFP4CacheWriteInputValues:
+        self.__post_init__()
+        if self.index_k_input is None:
+            raise ValueError("index_k_input must be initialized")
+        metadata_seed, value_seed = _resolve_attention_seeds(
+            seed=seed,
+            metadata_seed=metadata_seed,
+            value_seed=value_seed,
+        )
+        target_device = _resolve_device(self.config.device, device)
+        self.index_k_input.shape = self._index_k_shape()
+        self.index_k_input.dtype = self.config.dtype
+        index_k = _require_tensor(
+            self.index_k_input.generate(
+                seed=_child_seed(value_seed, 1),
+                device=target_device,
+            ).values,
+            "index_k",
+        )
+        values = DeepSeekV4IndexerMXFP4CacheWriteInputValues(
+            index_k=(index_k.float() * self.config.value_scale)
+            .to(index_k.dtype)
+            .contiguous(),
+            cache_2d=self._generate_cache(
+                seed=_child_seed(value_seed, 2),
+                device=target_device,
+            ),
+            slot_mapping=self._generate_slot_mapping(
+                seed=_child_seed(metadata_seed, 1),
+                device=target_device,
+            ),
+            valid=self._generate_valid(
+                seed=_child_seed(metadata_seed, 2),
+                device=target_device,
+            ),
+            block_size=self.config.block_size,
+        )
+        _validate_deepseek_v4_indexer_mxfp4_cache_write_values(values)
+        return values
+
+    def _normalize_config(self) -> None:
+        self.config.num_rows = _check_nonnegative("num_rows", self.config.num_rows)
+        self.config.num_cache_blocks = _check_positive(
+            "num_cache_blocks",
+            self.config.num_cache_blocks,
+        )
+        self.config.block_size = _check_positive("block_size", self.config.block_size)
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        self.config.negative_slot_count = _check_nonnegative(
+            "negative_slot_count",
+            self.config.negative_slot_count,
+        )
+        self.config.masked_row_count = _check_nonnegative(
+            "masked_row_count",
+            self.config.masked_row_count,
+        )
+        if self.config.negative_slot_count > self.config.num_rows:
+            raise ValueError("negative_slot_count must be <= num_rows")
+        if self.config.masked_row_count > self.config.num_rows:
+            raise ValueError("masked_row_count must be <= num_rows")
+        non_negative_count = self.config.num_rows - self.config.negative_slot_count
+        total_slots = self.config.num_cache_blocks * self.config.block_size
+        if non_negative_count > total_slots:
+            raise ValueError(
+                "generated non-negative slots must fit in the MXFP4 cache, got "
+                f"non_negative_count={non_negative_count}, total_slots={total_slots}"
+            )
+        self.config.value_scale = float(self.config.value_scale)
+        if self.config.value_scale < 0.0:
+            raise ValueError(
+                f"value_scale must be non-negative, got {self.config.value_scale}"
+            )
+
+    def _index_k_shape(self) -> tuple[int, int]:
+        return (self.config.num_rows, _DEEPSEEK_V4_INDEXER_DIM)
+
+    def _cache_row_bytes(self) -> int:
+        return self.config.block_size * (
+            _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
+            + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+        )
+
+    def _generate_cache(self, *, seed: int, device: torch.device) -> torch.Tensor:
+        rng_device = "cuda" if device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=rng_device).manual_seed(seed)
+        return torch.randint(
+            0,
+            256,
+            (self.config.num_cache_blocks, self._cache_row_bytes()),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+
+    def _generate_slot_mapping(
+        self, *, seed: int, device: torch.device
+    ) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        slots = torch.full((self.config.num_rows,), -1, dtype=torch.int64)
+        if self.config.num_rows == 0:
+            return slots.to(device)
+        order = torch.randperm(self.config.num_rows, generator=rng)
+        non_negative_count = self.config.num_rows - self.config.negative_slot_count
+        if non_negative_count:
+            total_slots = self.config.num_cache_blocks * self.config.block_size
+            slots[order[:non_negative_count]] = torch.randperm(
+                total_slots,
+                generator=rng,
+            )[:non_negative_count].to(torch.int64)
+        return slots.to(device)
+
+    def _generate_valid(self, *, seed: int, device: torch.device) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        valid = torch.ones((self.config.num_rows,), dtype=torch.bool)
+        if self.config.masked_row_count:
+            order = torch.randperm(self.config.num_rows, generator=rng)
+            valid[order[: self.config.masked_row_count]] = False
+        return valid.to(device)
+
+
+def _deepseek_v4_mxfp4_nibble_reference(x: torch.Tensor) -> torch.Tensor:
+    abs_x = torch.minimum(x.abs(), torch.tensor(6.0, device=x.device))
+    code = torch.where(
+        abs_x <= 0.25,
+        torch.zeros_like(abs_x, dtype=torch.uint8),
+        torch.where(
+            abs_x <= 0.75,
+            torch.ones_like(abs_x, dtype=torch.uint8),
+            torch.where(
+                abs_x <= 1.25,
+                torch.full_like(abs_x, 2, dtype=torch.uint8),
+                torch.where(
+                    abs_x <= 1.75,
+                    torch.full_like(abs_x, 3, dtype=torch.uint8),
+                    torch.where(
+                        abs_x <= 2.5,
+                        torch.full_like(abs_x, 4, dtype=torch.uint8),
+                        torch.where(
+                            abs_x <= 3.5,
+                            torch.full_like(abs_x, 5, dtype=torch.uint8),
+                            torch.where(
+                                abs_x <= 5.0,
+                                torch.full_like(abs_x, 6, dtype=torch.uint8),
+                                torch.full_like(abs_x, 7, dtype=torch.uint8),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    sign = ((x < 0) & (code != 0)).to(torch.uint8)
+    return code | (sign << 3)
+
+
+def _deepseek_v4_indexer_mxfp4_row_reference(
+    row: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    row = row.float()
+    packed = torch.empty(
+        (_DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES,),
+        dtype=torch.uint8,
+        device=row.device,
+    )
+    scales = torch.empty(
+        (_DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES,),
+        dtype=torch.uint8,
+        device=row.device,
+    )
+    for block_idx in range(_DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES):
+        block_base = block_idx * _DEEPSEEK_V4_INDEXER_MXFP4_BLOCK_SIZE
+        block = row[block_base : block_base + _DEEPSEEK_V4_INDEXER_MXFP4_BLOCK_SIZE]
+        lo = block[0::2]
+        hi = block[1::2]
+        amax = torch.maximum(
+            torch.maximum(lo.abs().max(), hi.abs().max()),
+            torch.tensor(1.0e-4, dtype=torch.float32, device=row.device),
+        )
+        exponent = torch.ceil(torch.log2(amax / 6.0)).clamp(-127.0, 127.0)
+        inv_scale = torch.exp2(-exponent)
+        lo_nibbles = _deepseek_v4_mxfp4_nibble_reference(lo * inv_scale)
+        hi_nibbles = _deepseek_v4_mxfp4_nibble_reference(hi * inv_scale)
+        start = block_idx * _DEEPSEEK_V4_INDEXER_MXFP4_HALF_BLOCK
+        packed[start : start + _DEEPSEEK_V4_INDEXER_MXFP4_HALF_BLOCK] = lo_nibbles | (
+            hi_nibbles << 4
+        )
+        scales[block_idx] = int(exponent.item()) + 127
+    return packed, scales
+
+
+def _validate_deepseek_v4_indexer_mxfp4_cache_write_values(
+    values: DeepSeekV4IndexerMXFP4CacheWriteInputValues,
+) -> None:
+    if values.index_k.ndim != 2:
+        raise ValueError(f"index_k must be rank-2, got {values.index_k.ndim}")
+    if values.index_k.shape[1] != _DEEPSEEK_V4_INDEXER_DIM:
+        raise ValueError(
+            f"index_k width must be {_DEEPSEEK_V4_INDEXER_DIM}, "
+            f"got {values.index_k.shape[1]}"
+        )
+    if values.cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {values.cache_2d.dtype}")
+    if values.cache_2d.ndim != 2:
+        raise ValueError(f"cache_2d must be rank-2, got {values.cache_2d.ndim}")
+    block_size = _check_positive("block_size", values.block_size)
+    min_row_bytes = block_size * (
+        _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+    )
+    if values.cache_2d.shape[1] < min_row_bytes:
+        raise ValueError(
+            f"cache_2d row width must be at least {min_row_bytes}, "
+            f"got {values.cache_2d.shape[1]}"
+        )
+    if values.slot_mapping.ndim != 1:
+        raise ValueError("slot_mapping must be rank-1")
+    if values.valid.ndim != 1:
+        raise ValueError("valid must be rank-1")
+    if values.slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            f"slot_mapping must be integer, got {values.slot_mapping.dtype}"
+        )
+    if values.valid.dtype != torch.bool:
+        raise TypeError(f"valid must be bool, got {values.valid.dtype}")
+    num_rows = min(
+        values.index_k.shape[0],
+        values.slot_mapping.numel(),
+        values.valid.numel(),
+    )
+    if values.slot_mapping.numel() != values.index_k.shape[0]:
+        raise ValueError("slot_mapping length must match index_k rows")
+    if values.valid.numel() != values.index_k.shape[0]:
+        raise ValueError("valid length must match index_k rows")
+    if not values.index_k.is_floating_point():
+        raise TypeError(f"index_k must be floating point, got {values.index_k.dtype}")
+    if (
+        values.cache_2d.device != values.index_k.device
+        or values.slot_mapping.device != values.index_k.device
+        or values.valid.device != values.index_k.device
+    ):
+        raise ValueError("index_k, cache_2d, slot_mapping, and valid must share device")
+    slots = values.slot_mapping[:num_rows].to(torch.int64)
+    writable = values.valid[:num_rows] & (slots >= 0)
+    if not bool(writable.any().item()):
+        return
+    total_slots = values.cache_2d.shape[0] * block_size
+    write_slots = slots[writable]
+    if int(write_slots.max().item()) >= total_slots:
+        raise ValueError(
+            f"writable slot_mapping entries must be < {total_slots}, "
+            f"got {int(write_slots.max().item())}"
+        )
+    unique_count = int(torch.unique(write_slots).numel())
+    if unique_count != int(write_slots.numel()):
+        raise ValueError("writable slot_mapping entries must be unique")
+
+
+def deepseek_v4_indexer_mxfp4_cache_write_reference(
+    values: DeepSeekV4IndexerMXFP4CacheWriteInputValues,
+) -> torch.Tensor:
+    """Return cache bytes after applying DeepSeek V4 indexer MXFP4 writes."""
+
+    _validate_deepseek_v4_indexer_mxfp4_cache_write_values(values)
+    out = values.cache_2d.clone()
+    num_rows = min(
+        values.index_k.shape[0],
+        values.slot_mapping.numel(),
+        values.valid.numel(),
+    )
+    slots = values.slot_mapping[:num_rows].to(torch.int64)
+    for row_idx in range(num_rows):
+        if not bool(values.valid[row_idx].item()):
+            continue
+        slot = int(slots[row_idx].item())
+        if slot < 0:
+            continue
+        page = slot // values.block_size
+        pos = slot % values.block_size
+        page_base = page * out.stride(0)
+        value_base = page_base + pos * _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
+        scale_base = (
+            page_base
+            + values.block_size * _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
+            + pos * _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+        )
+        packed, scales = _deepseek_v4_indexer_mxfp4_row_reference(
+            values.index_k[row_idx]
+        )
+        flat = out.reshape(-1)
+        flat[value_base : value_base + _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES] = packed
+        flat[scale_base : scale_base + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES] = scales
     return out.contiguous()
 
 

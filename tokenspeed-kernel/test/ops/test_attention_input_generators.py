@@ -50,6 +50,7 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_decode_swa_indices_and_lens,
     deepseek_v4_indexer_decode_metadata_compute,
     deepseek_v4_save_compressor_state,
+    write_deepseek_v4_indexer_mxfp4_cache_cuda,
 )
 from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
     full_context_topk_to_global_slots,
@@ -66,6 +67,8 @@ from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputs,
     DeepSeekV4CompressorStateInputConfig,
     DeepSeekV4CompressorStateInputs,
+    DeepSeekV4IndexerMXFP4CacheWriteInputConfig,
+    DeepSeekV4IndexerMXFP4CacheWriteInputs,
     DeepSeekV4PagedIndexInputConfig,
     DeepSeekV4PagedIndexInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
@@ -95,6 +98,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
     deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_indexer_decode_metadata_reference,
+    deepseek_v4_indexer_mxfp4_cache_write_reference,
     deepseek_v4_save_compressor_state_reference,
     dsa_full_context_topk_to_global_slots_reference,
     dsa_local_topk_to_global_slots_reference,
@@ -689,6 +693,37 @@ def test_deepseek_v4_compressor_state_generator_runs_tokenspeed_triton(
         positions=values.positions,
         block_size=values.block_size,
         compress_ratio=values.compress_ratio,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+def test_deepseek_v4_indexer_mxfp4_cache_write_generator_runs_tokenspeed_triton(
+    device: str,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm GPU is required for Triton MXFP4 cache-write test")
+
+    values = DeepSeekV4IndexerMXFP4CacheWriteInputs(
+        DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
+            num_rows=5,
+            num_cache_blocks=2,
+            block_size=4,
+            dtype=torch.bfloat16,
+            negative_slot_count=1,
+            masked_row_count=1,
+        )
+    ).generate(seed=2092, device=device)
+    expected = deepseek_v4_indexer_mxfp4_cache_write_reference(values)
+    actual = values.cache_2d.clone()
+
+    write_deepseek_v4_indexer_mxfp4_cache_cuda(
+        values.index_k,
+        actual,
+        values.slot_mapping,
+        values.valid,
+        values.block_size,
     )
     torch.cuda.synchronize()
 

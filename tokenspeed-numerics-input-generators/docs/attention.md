@@ -179,6 +179,25 @@ corresponding row in the second half of the flattened APE buffer. The reference
 models this layout explicitly so tests can validate both standard and overlap
 state-cache writes.
 
+### DeepSeek V4 Indexer MXFP4 Cache Write
+
+`DeepSeekV4IndexerMXFP4CacheWriteInputs` represents writing 128-channel indexer
+K rows into a paged MXFP4 byte cache. Each cache page stores all packed value
+bytes for its rows first, followed by one scale byte per 32-channel MXFP4 block:
+
+```text
+value_base = page * page_stride + row * 64
+scale_base = page * page_stride + block_size * 64 + row * 4
+```
+
+For each writable input row, the operation splits the 128 channels into four
+32-channel blocks. Every pair of channels is packed into one E2M1 MXFP4 byte,
+and every block gets one encoded exponent scale byte. A row is writable only
+when `valid[row]` is true and `slot_mapping[row] >= 0`; otherwise the cache
+contents for that row remain unchanged. The generator gives writable rows
+unique in-range slots so generated inputs cannot describe write races or
+out-of-bounds cache accesses.
+
 ### DeepSeek V4 Sparse-Prefill Indices
 
 `DeepSeekV4SparsePrefillIndexInputs` represents the metadata/index construction

@@ -23,6 +23,8 @@ compressed/cache-specific representations with different per-token shapes.
   complex rotary transforms.
 - `DeepSeekV4CompressorStateInputs`: generates DeepSeek V4 compressor-state
   cache write inputs.
+- `DeepSeekV4IndexerMXFP4CacheWriteInputs`: generates DeepSeek V4 indexer
+  K-cache MXFP4 write inputs.
 - `DSASparseDecodeKVPackInputs`, `DSATopKSlotInputs`,
   `DeepSeekV4PagedIndexInputs`, and `DeepSeekV4SparsePrefillIndexInputs`:
   generate DeepSeek-style sparse decode/prefill indexing and cache metadata.
