@@ -101,6 +101,15 @@ are present only in combinations that define a valid computation. Numerical
 validators and kernel tests can then focus on comparing reference and test
 outputs instead of defending against malformed generated inputs.
 
+The scope should be deliberate: add enough verification to make misuse of the
+public generator API fail early, but do not turn input generators into complete
+kernel validators. A generator should reject configurations or generated
+metadata that would make the operation invalid. It does not need to enforce
+every backend-specific precondition, preferred tile size, launch constraint, or
+performance-oriented layout choice. Those checks belong in the consuming
+adapter or test when they are tied to one implementation rather than to the
+operation itself.
+
 That makes the generator library the trust boundary for input validity. The
 goal is confidence by construction: a consumer that uses the public input
 generator API should be able to assume that generated shapes, dtypes, metadata,
