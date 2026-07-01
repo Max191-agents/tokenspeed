@@ -25,6 +25,8 @@ import torch
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    DeepSeekV4CompressorStateInputConfig,
+    DeepSeekV4CompressorStateInputs,
     DeepSeekV4PagedIndexInputConfig,
     DeepSeekV4PagedIndexInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
@@ -61,6 +63,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
     deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_indexer_decode_metadata_reference,
+    deepseek_v4_save_compressor_state_reference,
     dsa_full_context_topk_to_global_slots_reference,
     dsa_local_topk_to_global_slots_reference,
     dsa_sparse_decode_kv_pack_reference,
@@ -932,6 +935,142 @@ def test_dsa_topk_slot_inputs_reject_invalid_configs_and_values() -> None:
     values.seq_lens = values.seq_lens[:-1]
     with pytest.raises(ValueError, match="seq_lens"):
         dsa_local_topk_to_global_slots_reference(values)
+
+
+def test_deepseek_v4_compressor_state_inputs_generate_values_and_reference() -> None:
+    values = DeepSeekV4CompressorStateInputs(
+        DeepSeekV4CompressorStateInputConfig(
+            num_tokens=6,
+            state_width=16,
+            num_cache_blocks=2,
+            block_size=4,
+            compress_ratio=8,
+            dtype=torch.bfloat16,
+            invalid_token_count=2,
+        )
+    ).generate(metadata_seed=23, value_seed=37, device="cpu")
+
+    expected = deepseek_v4_save_compressor_state_reference(values)
+
+    assert values.kv.shape == (6, 16)
+    assert values.score.shape == (6, 16)
+    assert values.ape.shape == (8, 16)
+    assert values.state_cache.shape == (2, 4, 32)
+    assert values.positions.tolist() == list(range(6))
+    assert int((values.slot_mapping < 0).sum().item()) == 2
+    assert expected.shape == values.state_cache.shape
+
+    slots = values.slot_mapping.to(torch.int64)
+    for token_idx, slot in enumerate(slots.tolist()):
+        if slot < 0:
+            continue
+        block_idx = slot // values.block_size
+        pos_in_block = slot % values.block_size
+        ape_row = int(values.positions[token_idx].item()) % values.compress_ratio
+        torch.testing.assert_close(
+            expected[block_idx, pos_in_block, :16],
+            values.kv[token_idx].float(),
+            rtol=0.0,
+            atol=0.0,
+        )
+        torch.testing.assert_close(
+            expected[block_idx, pos_in_block, 16:],
+            values.score[token_idx].float() + values.ape[ape_row],
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    written_slots = {int(slot) for slot in slots.tolist() if slot >= 0}
+    for slot in range(values.state_cache.shape[0] * values.block_size):
+        if slot in written_slots:
+            continue
+        block_idx = slot // values.block_size
+        pos_in_block = slot % values.block_size
+        torch.testing.assert_close(
+            expected[block_idx, pos_in_block],
+            values.state_cache[block_idx, pos_in_block],
+            rtol=0.0,
+            atol=0.0,
+        )
+
+
+def test_deepseek_v4_compressor_state_reference_matches_c4_overlap_ape_layout() -> None:
+    values = DeepSeekV4CompressorStateInputs(
+        DeepSeekV4CompressorStateInputConfig(
+            num_tokens=1,
+            state_width=8,
+            num_cache_blocks=1,
+            block_size=1,
+            compress_ratio=4,
+            dtype=torch.float32,
+        )
+    ).generate(seed=41, device="cpu")
+    values.kv = torch.arange(8, dtype=torch.float32).reshape(1, 8)
+    values.score = torch.zeros((1, 8), dtype=torch.float32)
+    values.ape = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+    values.state_cache = torch.zeros((1, 1, 16), dtype=torch.float32)
+    values.slot_mapping = torch.tensor([0], dtype=torch.int64)
+    values.positions = torch.tensor([1], dtype=torch.int64)
+
+    expected = deepseek_v4_save_compressor_state_reference(values)
+
+    torch.testing.assert_close(expected[0, 0, :8], values.kv[0])
+    torch.testing.assert_close(
+        expected[0, 0, 8:],
+        torch.tensor([4, 5, 6, 7, 20, 21, 22, 23], dtype=torch.float32),
+    )
+
+
+def test_deepseek_v4_compressor_state_inputs_keep_metadata_seed_independent() -> None:
+    generator = DeepSeekV4CompressorStateInputs(
+        DeepSeekV4CompressorStateInputConfig(
+            num_tokens=5,
+            state_width=8,
+            num_cache_blocks=2,
+            block_size=3,
+            compress_ratio=4,
+            dtype=torch.float32,
+            invalid_token_count=1,
+        )
+    )
+
+    first = generator.generate(metadata_seed=51, value_seed=61, device="cpu")
+    same_metadata = generator.generate(metadata_seed=51, value_seed=62, device="cpu")
+    same_values = generator.generate(metadata_seed=52, value_seed=61, device="cpu")
+
+    torch.testing.assert_close(first.slot_mapping, same_metadata.slot_mapping)
+    torch.testing.assert_close(first.positions, same_metadata.positions)
+    assert not torch.equal(first.kv, same_metadata.kv)
+    torch.testing.assert_close(first.kv, same_values.kv)
+    assert not torch.equal(first.slot_mapping, same_values.slot_mapping)
+
+
+def test_deepseek_v4_compressor_state_rejects_invalid_configs_and_values() -> None:
+    with pytest.raises(ValueError, match="valid generated tokens"):
+        DeepSeekV4CompressorStateInputs(
+            DeepSeekV4CompressorStateInputConfig(
+                num_tokens=5,
+                state_width=8,
+                num_cache_blocks=1,
+                block_size=4,
+                compress_ratio=4,
+                dtype=torch.float32,
+            )
+        )
+
+    values = DeepSeekV4CompressorStateInputs(
+        DeepSeekV4CompressorStateInputConfig(
+            num_tokens=2,
+            state_width=8,
+            num_cache_blocks=1,
+            block_size=4,
+            compress_ratio=4,
+            dtype=torch.float32,
+        )
+    ).generate(seed=71, device="cpu")
+    values.slot_mapping = torch.tensor([0, 0], dtype=torch.int64)
+    with pytest.raises(ValueError, match="unique"):
+        deepseek_v4_save_compressor_state_reference(values)
 
 
 def test_deepseek_v4_paged_index_inputs_generate_values_and_refs() -> None:

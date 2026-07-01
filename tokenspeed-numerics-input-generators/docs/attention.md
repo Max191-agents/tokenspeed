@@ -154,6 +154,31 @@ token. Full-context mode ignores `local_topk_offsets` and maps the first `topk`
 logical positions for each token context. In both cases, `seq_lens` bounds the
 valid logical context range and the block table bounds the physical page range.
 
+### DeepSeek V4 Compressor State Save
+
+`DeepSeekV4CompressorStateInputs` represents the write that saves intermediate
+compressor state into a paged DeepSeek V4 state cache. Each valid token row has
+a physical `slot_mapping` entry. The slot selects a cache page and row:
+
+```text
+page = slot // block_size
+row = slot % block_size
+state_cache[page, row, 0:state_width] = kv[token]
+state_cache[page, row, state_width:] = score[token] + ape[position % compress_ratio]
+```
+
+Rows with `slot_mapping == -1` are skipped and leave the generated cache
+unchanged. The generator ensures non-negative slots are unique and in range, so
+generated writes do not race with each other and always address valid cache
+rows.
+
+For the C4 overlap path (`compress_ratio == 4` with an even state width), the
+kernel treats the APE tensor as a flat overlapping layout: the first half of the
+APE vector comes from row `position % 4`, and the second half comes from the
+corresponding row in the second half of the flattened APE buffer. The reference
+models this layout explicitly so tests can validate both standard and overlap
+state-cache writes.
+
 ### DeepSeek V4 Sparse-Prefill Indices
 
 `DeepSeekV4SparsePrefillIndexInputs` represents the metadata/index construction

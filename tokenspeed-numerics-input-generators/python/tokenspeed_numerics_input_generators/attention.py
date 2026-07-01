@@ -79,6 +79,10 @@ __all__ = [
     "GDNChunkPrefillReferenceValues",
     "gdn_chunk_prefill_reference",
     "gdn_qkv_split_reference",
+    "DeepSeekV4CompressorStateInputConfig",
+    "DeepSeekV4CompressorStateInputs",
+    "DeepSeekV4CompressorStateInputValues",
+    "deepseek_v4_save_compressor_state_reference",
     "DeepSeekV4PagedIndexInputConfig",
     "DeepSeekV4PagedIndexInputs",
     "DeepSeekV4PagedIndexValues",
@@ -2397,6 +2401,403 @@ def dsa_full_context_topk_to_global_slots_reference(
             page = int(block_table_cpu[token_idx, block_idx].item())
             global_slots[token_idx, offset] = page * values.block_size + block_offset
     return global_slots, lens
+
+
+@dataclass
+class DeepSeekV4CompressorStateInputValues:
+    """Generated values for saving DeepSeek V4 compressor state rows."""
+
+    kv: torch.Tensor
+    score: torch.Tensor
+    ape: torch.Tensor
+    state_cache: torch.Tensor
+    slot_mapping: torch.Tensor
+    positions: torch.Tensor
+    block_size: int
+    compress_ratio: int
+
+
+@dataclass
+class DeepSeekV4CompressorStateInputConfig:
+    """Initialization parameters for DeepSeek V4 compressor-state writes.
+
+    The represented operation writes one generated token row into a paged
+    compressor-state cache. The first half of the cache row stores the K/V
+    state. The second half stores score state plus the absolute-position
+    embedding row selected by ``position % compress_ratio``.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of token rows that may write compressor state.
+    num_tokens: int
+
+    # Required: width of each generated K/V and score state row.
+    state_width: int
+
+    # Required: number of physical state-cache pages.
+    num_cache_blocks: int
+
+    # Required: number of state rows per physical cache page.
+    block_size: int
+
+    # Required: compression ratio controlling APE row selection.
+    compress_ratio: int
+
+    # Required: generated dtype for K/V and score state rows.
+    dtype: torch.dtype
+
+    # ------------------------------------------------------------------
+    # Optional metadata/value generation configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: number of generated token rows with slot_mapping == -1. These
+    # rows model padded or otherwise skipped tokens and leave cache rows intact.
+    invalid_token_count: int = 0
+
+    # Optional: first absolute token position used for generated positions.
+    position_start: int = 0
+
+    # Optional: factor applied to generated score rows.
+    score_scale: float = 0.1
+
+    # Optional: factor applied to generated APE rows.
+    ape_scale: float = 0.01
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DeepSeekV4CompressorStateInputs(NumericsInputGenerator):
+    """Generator for DeepSeek V4 compressor-state save inputs."""
+
+    config: DeepSeekV4CompressorStateInputConfig
+    kv_input: TensorInput | None
+    score_input: TensorInput | None
+    ape_input: TensorInput | None
+    state_cache_input: TensorInput | None
+
+    def __init__(self, config: DeepSeekV4CompressorStateInputConfig) -> None:
+        self.config = config
+        self.kv_input = None
+        self.score_input = None
+        self.ape_input = None
+        self.state_cache_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.kv_input = self.kv_input or TensorInput(
+            self._state_row_shape(),
+            self.config.dtype,
+            device=self.config.device,
+        )
+        self.score_input = self.score_input or TensorInput(
+            self._state_row_shape(),
+            self.config.dtype,
+            device=self.config.device,
+        )
+        self.ape_input = self.ape_input or TensorInput(
+            self._ape_shape(),
+            torch.float32,
+            device=self.config.device,
+        )
+        self.state_cache_input = self.state_cache_input or TensorInput(
+            self._state_cache_shape(),
+            torch.float32,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int | None = None,
+        metadata_seed: int | None = None,
+        value_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> DeepSeekV4CompressorStateInputValues:
+        self.__post_init__()
+        if (
+            self.kv_input is None
+            or self.score_input is None
+            or self.ape_input is None
+            or self.state_cache_input is None
+        ):
+            raise ValueError(
+                "DeepSeekV4CompressorStateInputs child generators must be initialized"
+            )
+        metadata_seed, value_seed = _resolve_attention_seeds(
+            seed=seed,
+            metadata_seed=metadata_seed,
+            value_seed=value_seed,
+        )
+        target_device = _resolve_device(self.config.device, device)
+        self.kv_input.shape = self._state_row_shape()
+        self.kv_input.dtype = self.config.dtype
+        self.score_input.shape = self._state_row_shape()
+        self.score_input.dtype = self.config.dtype
+        self.ape_input.shape = self._ape_shape()
+        self.ape_input.dtype = torch.float32
+        self.state_cache_input.shape = self._state_cache_shape()
+        self.state_cache_input.dtype = torch.float32
+
+        kv = _require_tensor(
+            self.kv_input.generate(
+                seed=_child_seed(value_seed, 1),
+                device=target_device,
+            ).values,
+            "kv",
+        )
+        score = _require_tensor(
+            self.score_input.generate(
+                seed=_child_seed(value_seed, 2),
+                device=target_device,
+            ).values,
+            "score",
+        )
+        ape = _require_tensor(
+            self.ape_input.generate(
+                seed=_child_seed(value_seed, 3),
+                device=target_device,
+            ).values,
+            "ape",
+        )
+        state_cache = _require_tensor(
+            self.state_cache_input.generate(
+                seed=_child_seed(value_seed, 4),
+                device=target_device,
+            ).values,
+            "state_cache",
+        )
+        values = DeepSeekV4CompressorStateInputValues(
+            kv=kv.contiguous(),
+            score=(score.float() * self.config.score_scale)
+            .to(score.dtype)
+            .contiguous(),
+            ape=(ape.float() * self.config.ape_scale).contiguous(),
+            state_cache=state_cache.contiguous(),
+            slot_mapping=self._generate_slot_mapping(
+                seed=_child_seed(metadata_seed, 1),
+                device=target_device,
+            ),
+            positions=self._generate_positions(device=target_device),
+            block_size=self.config.block_size,
+            compress_ratio=self.config.compress_ratio,
+        )
+        _validate_deepseek_v4_compressor_state_values(values)
+        return values
+
+    def _normalize_config(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens",
+            self.config.num_tokens,
+        )
+        self.config.state_width = _check_positive(
+            "state_width",
+            self.config.state_width,
+        )
+        self.config.num_cache_blocks = _check_positive(
+            "num_cache_blocks",
+            self.config.num_cache_blocks,
+        )
+        self.config.block_size = _check_positive("block_size", self.config.block_size)
+        self.config.compress_ratio = _check_positive(
+            "compress_ratio",
+            self.config.compress_ratio,
+        )
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        self.config.invalid_token_count = _check_nonnegative(
+            "invalid_token_count",
+            self.config.invalid_token_count,
+        )
+        if self.config.invalid_token_count > self.config.num_tokens:
+            raise ValueError("invalid_token_count must be <= num_tokens")
+        valid_count = self.config.num_tokens - self.config.invalid_token_count
+        total_slots = self.config.num_cache_blocks * self.config.block_size
+        if valid_count > total_slots:
+            raise ValueError(
+                "valid generated tokens must fit in the state cache, got "
+                f"valid_count={valid_count}, total_slots={total_slots}"
+            )
+        self.config.position_start = _check_nonnegative(
+            "position_start",
+            self.config.position_start,
+        )
+        self.config.score_scale = float(self.config.score_scale)
+        if self.config.score_scale < 0.0:
+            raise ValueError(
+                f"score_scale must be non-negative, got {self.config.score_scale}"
+            )
+        self.config.ape_scale = float(self.config.ape_scale)
+        if self.config.ape_scale < 0.0:
+            raise ValueError(
+                f"ape_scale must be non-negative, got {self.config.ape_scale}"
+            )
+
+    def _state_row_shape(self) -> tuple[int, int]:
+        return (self.config.num_tokens, self.config.state_width)
+
+    def _ape_shape(self) -> tuple[int, int]:
+        return (self.config.compress_ratio, self.config.state_width)
+
+    def _state_cache_shape(self) -> tuple[int, int, int]:
+        return (
+            self.config.num_cache_blocks,
+            self.config.block_size,
+            self.config.state_width * 2,
+        )
+
+    def _generate_positions(self, *, device: torch.device) -> torch.Tensor:
+        return torch.arange(
+            self.config.position_start,
+            self.config.position_start + self.config.num_tokens,
+            dtype=torch.int64,
+            device=device,
+        )
+
+    def _generate_slot_mapping(
+        self, *, seed: int, device: torch.device
+    ) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        slot_mapping = torch.full(
+            (self.config.num_tokens,),
+            -1,
+            dtype=torch.int64,
+        )
+        if self.config.num_tokens == 0:
+            return slot_mapping.to(device)
+        order = torch.randperm(self.config.num_tokens, generator=rng)
+        valid_count = self.config.num_tokens - self.config.invalid_token_count
+        if valid_count:
+            total_slots = self.config.num_cache_blocks * self.config.block_size
+            slots = torch.randperm(total_slots, generator=rng)[:valid_count]
+            slot_mapping[order[:valid_count]] = slots.to(torch.int64)
+        return slot_mapping.to(device)
+
+
+def _validate_deepseek_v4_compressor_state_values(
+    values: DeepSeekV4CompressorStateInputValues,
+) -> None:
+    if values.kv.shape != values.score.shape:
+        raise ValueError(
+            f"kv and score shapes must match, got {values.kv.shape} vs {values.score.shape}"
+        )
+    if values.kv.ndim != 2:
+        raise ValueError(f"kv/score must be rank-2, got {values.kv.ndim}")
+    if values.state_cache.ndim != 3:
+        raise ValueError(f"state_cache must be rank-3, got {values.state_cache.ndim}")
+    block_size = _check_positive("block_size", values.block_size)
+    compress_ratio = _check_positive("compress_ratio", values.compress_ratio)
+    if values.state_cache.shape[1] != block_size:
+        raise ValueError(
+            f"block_size={block_size} must match state_cache.shape[1]="
+            f"{values.state_cache.shape[1]}"
+        )
+    state_width = values.kv.shape[1]
+    if values.state_cache.shape[-1] != state_width * 2:
+        raise ValueError(
+            f"state_cache last dimension must be {state_width * 2}, "
+            f"got {values.state_cache.shape[-1]}"
+        )
+    if values.ape.shape != (compress_ratio, state_width):
+        raise ValueError(
+            f"ape must have shape {(compress_ratio, state_width)}, "
+            f"got {tuple(values.ape.shape)}"
+        )
+    if values.slot_mapping.ndim != 1:
+        raise ValueError("slot_mapping must be rank-1")
+    if values.positions.ndim != 1:
+        raise ValueError("positions must be rank-1")
+    if values.slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            f"slot_mapping must be integer, got {values.slot_mapping.dtype}"
+        )
+    if values.positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"positions must be integer, got {values.positions.dtype}")
+    if values.slot_mapping.numel() != values.kv.shape[0]:
+        raise ValueError("slot_mapping length must match kv token dimension")
+    if values.positions.numel() < values.kv.shape[0]:
+        raise ValueError("positions length must be at least the kv token dimension")
+    for name, tensor in (
+        ("kv", values.kv),
+        ("score", values.score),
+        ("ape", values.ape),
+        ("state_cache", values.state_cache),
+    ):
+        if not tensor.is_floating_point():
+            raise TypeError(f"{name} must be floating point, got {tensor.dtype}")
+        if tensor.device != values.kv.device:
+            raise ValueError("all generated compressor-state tensors must share device")
+    if (
+        values.slot_mapping.device != values.kv.device
+        or values.positions.device != values.kv.device
+    ):
+        raise ValueError("slot_mapping and positions must share the tensor device")
+
+    slots = values.slot_mapping.to(torch.int64)
+    valid = slots >= 0
+    if not bool(valid.any().item()):
+        return
+    total_slots = values.state_cache.shape[0] * block_size
+    valid_slots = slots[valid]
+    if int(valid_slots.max().item()) >= total_slots:
+        raise ValueError(
+            f"slot_mapping entries must be < {total_slots}, got "
+            f"{int(valid_slots.max().item())}"
+        )
+    unique_count = int(torch.unique(valid_slots).numel())
+    if unique_count != int(valid_slots.numel()):
+        raise ValueError("valid slot_mapping entries must be unique")
+
+
+def _deepseek_v4_compressor_state_ape_row(
+    *,
+    ape: torch.Tensor,
+    ape_row: int,
+    state_width: int,
+    compress_ratio: int,
+) -> torch.Tensor:
+    if compress_ratio == 4 and state_width == ape.shape[1] and state_width % 2 == 0:
+        head_dim = state_width // 2
+        flat = ape.reshape(-1)
+        first = flat[ape_row * head_dim : (ape_row + 1) * head_dim]
+        second_start = (ape_row + compress_ratio) * head_dim
+        second = flat[second_start : second_start + head_dim]
+        return torch.cat((first, second), dim=0)
+    return ape[ape_row]
+
+
+def deepseek_v4_save_compressor_state_reference(
+    values: DeepSeekV4CompressorStateInputValues,
+) -> torch.Tensor:
+    """Return state cache after applying DeepSeek V4 compressor-state writes."""
+
+    _validate_deepseek_v4_compressor_state_values(values)
+    out = values.state_cache.clone()
+    state_width = values.kv.shape[1]
+    slots = values.slot_mapping.to(torch.int64)
+    positions = values.positions.to(torch.int64)
+    for token_idx in range(values.kv.shape[0]):
+        slot = int(slots[token_idx].item())
+        if slot < 0:
+            continue
+        block_idx = slot // values.block_size
+        pos_in_block = slot % values.block_size
+        ape_row = int(positions[token_idx].item()) % values.compress_ratio
+        ape = _deepseek_v4_compressor_state_ape_row(
+            ape=values.ape.float(),
+            ape_row=ape_row,
+            state_width=state_width,
+            compress_ratio=values.compress_ratio,
+        )
+        out[block_idx, pos_in_block, :state_width] = values.kv[token_idx].float()
+        out[block_idx, pos_in_block, state_width:] = (
+            values.score[token_idx].float() + ape
+        )
+    return out.contiguous()
 
 
 @dataclass

@@ -21,6 +21,8 @@ compressed/cache-specific representations with different per-token shapes.
   log-space gates, recurrent state, and sequence metadata.
 - `PackedQKVComplexRotaryInputs`: generates packed QKV and rotary metadata for
   complex rotary transforms.
+- `DeepSeekV4CompressorStateInputs`: generates DeepSeek V4 compressor-state
+  cache write inputs.
 - `DSASparseDecodeKVPackInputs`, `DSATopKSlotInputs`,
   `DeepSeekV4PagedIndexInputs`, and `DeepSeekV4SparsePrefillIndexInputs`:
   generate DeepSeek-style sparse decode/prefill indexing and cache metadata.

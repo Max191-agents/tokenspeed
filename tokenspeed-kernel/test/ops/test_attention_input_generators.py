@@ -49,6 +49,7 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_compute_global_topk_indices_and_lens,
     deepseek_v4_decode_swa_indices_and_lens,
     deepseek_v4_indexer_decode_metadata_compute,
+    deepseek_v4_save_compressor_state,
 )
 from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
     full_context_topk_to_global_slots,
@@ -63,6 +64,8 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    DeepSeekV4CompressorStateInputConfig,
+    DeepSeekV4CompressorStateInputs,
     DeepSeekV4PagedIndexInputConfig,
     DeepSeekV4PagedIndexInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
@@ -92,6 +95,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
     deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_indexer_decode_metadata_reference,
+    deepseek_v4_save_compressor_state_reference,
     dsa_full_context_topk_to_global_slots_reference,
     dsa_local_topk_to_global_slots_reference,
     dsa_sparse_decode_kv_pack_reference,
@@ -654,6 +658,41 @@ def test_deepseek_v4_global_topk_generator_runs_tokenspeed_cpu() -> None:
 
     assert torch.equal(actual_indices, expected_indices)
     assert torch.equal(actual_lens, expected_lens)
+
+
+def test_deepseek_v4_compressor_state_generator_runs_tokenspeed_triton(
+    device: str,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm GPU is required for Triton compressor-state test")
+
+    values = DeepSeekV4CompressorStateInputs(
+        DeepSeekV4CompressorStateInputConfig(
+            num_tokens=6,
+            state_width=16,
+            num_cache_blocks=2,
+            block_size=4,
+            compress_ratio=4,
+            dtype=torch.bfloat16,
+            invalid_token_count=1,
+        )
+    ).generate(seed=2091, device=device)
+    expected = deepseek_v4_save_compressor_state_reference(values)
+    actual = values.state_cache.clone()
+
+    deepseek_v4_save_compressor_state(
+        kv=values.kv,
+        score=values.score,
+        ape=values.ape,
+        state_cache=actual,
+        slot_mapping=values.slot_mapping,
+        positions=values.positions,
+        block_size=values.block_size,
+        compress_ratio=values.compress_ratio,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
 def test_deepseek_v4_paged_index_generator_runs_tokenspeed_triton(
