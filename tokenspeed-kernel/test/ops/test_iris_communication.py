@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 
+import math
 import socket
 import traceback
 from typing import List, Tuple
@@ -27,6 +28,20 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_numerics_input_generators import (
+    AllGatherInputConfig,
+    AllGatherInputs,
+    AllReduceInputConfig,
+    AllReduceInputs,
+    AllReduceResidualRMSNormInputConfig,
+    AllReduceResidualRMSNormInputs,
+    ReduceScatterInputConfig,
+    ReduceScatterInputs,
+    all_gather_reference,
+    all_reduce_residual_rmsnorm_reference,
+    all_reduce_sum_reference,
+    reduce_scatter_sum_reference,
+)
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -120,19 +135,22 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
 def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
     from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
 
-    # Each rank contributes a tensor filled with ``rank + 1``; the reduction
-    # is therefore ``sum(1..world_size) = world_size*(world_size+1)/2``.
-    local = torch.full(shape, rank + 1, dtype=torch.bfloat16, device=device)
+    values = AllReduceInputs(
+        AllReduceInputConfig(
+            world_size=world_size,
+            shape=shape,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=10_000 + math.prod(shape), device="cpu")
+    local = values.rank_inputs[rank].to(device=device)
+    expected = all_reduce_sum_reference(values).to(device=device)
 
     result = iris_all_reduce(state, local)
-
-    expected_value = world_size * (world_size + 1) // 2
-    expected = torch.full(shape, expected_value, dtype=torch.bfloat16, device=device)
 
     assert (
         result.shape == expected.shape
     ), f"shape mismatch: {result.shape} vs {expected.shape}"
-    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+    torch.testing.assert_close(result.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 def _run_ar_test(world_size: int) -> None:
@@ -217,22 +235,20 @@ def _rsag_worker_main(rank: int, world_size: int, port: int, hidden_size: int) -
 
 def _check_all_gather(rsag, rank, world_size, tokens, hidden_size, device, all_gather):
     local_tokens = tokens[rank]
-    local = torch.full(
-        (local_tokens, hidden_size),
-        rank + 1,
-        dtype=torch.bfloat16,
-        device=device,
-    )
+    values = AllGatherInputs(
+        AllGatherInputConfig(
+            world_size=world_size,
+            total_tokens=sum(tokens),
+            hidden_size=hidden_size,
+            max_tokens_per_rank=local_tokens,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=20_000 + local_tokens, metadata_seed=20_001 + local_tokens)
+    assert values.tokens_per_rank == tokens
+    local = values.rank_inputs[rank].to(device=device)
+    expected = all_gather_reference(values).to(device=device)
 
     result = all_gather(rsag, local, token_list_in_group=tokens)
-
-    expected = torch.empty(
-        (sum(tokens), hidden_size), dtype=torch.bfloat16, device=device
-    )
-    offset = 0
-    for peer, peer_tokens in enumerate(tokens):
-        expected[offset : offset + peer_tokens].fill_(peer + 1)
-        offset += peer_tokens
 
     assert result.shape == expected.shape, f"{result.shape} vs {expected.shape}"
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
@@ -241,25 +257,24 @@ def _check_all_gather(rsag, rank, world_size, tokens, hidden_size, device, all_g
 def _check_reduce_scatter(
     rsag, rank, world_size, tokens, hidden_size, device, reduce_scatter
 ):
-    full = torch.full(
-        (sum(tokens), hidden_size),
-        rank + 1,
-        dtype=torch.bfloat16,
-        device=device,
-    )
+    local_tokens = tokens[rank]
+    values = ReduceScatterInputs(
+        ReduceScatterInputConfig(
+            world_size=world_size,
+            total_tokens=sum(tokens),
+            hidden_size=hidden_size,
+            max_tokens_per_rank=local_tokens,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=30_000 + local_tokens, metadata_seed=30_001 + local_tokens)
+    assert values.tokens_per_rank == tokens
+    full = values.rank_inputs[rank].to(device=device)
+    expected = reduce_scatter_sum_reference(values)[rank].to(device=device)
 
     result = reduce_scatter(rsag, full, token_list_in_group=tokens)
 
-    expected_value = world_size * (world_size + 1) // 2
-    expected = torch.full(
-        (tokens[rank], hidden_size),
-        expected_value,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-
     assert result.shape == expected.shape, f"{result.shape} vs {expected.shape}"
-    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+    torch.testing.assert_close(result.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 def _run_rsag_test(world_size: int, hidden_size: int) -> None:
@@ -328,42 +343,40 @@ def _arrms_worker_main(rank: int, world_size: int, port: int, persistent: bool) 
             persistent=persistent,
         )
 
-        # Use a fixed RMSNorm weight that is *not* identity, so a bug in
-        # the weight load path would fail the test.
-        weight = torch.linspace(
-            0.5, 1.5, _ARRMS_HIDDEN_DIM, dtype=torch.bfloat16, device=device
-        )
-
         for tokens in _ARRMS_TOKEN_CASES:
             _check_arrms_one(
                 state,
                 rank=rank,
                 world_size=world_size,
                 tokens=tokens,
-                weight=weight,
                 device=device,
             )
     finally:
         dist.destroy_process_group()
 
 
-def _check_arrms_one(state, rank, world_size, tokens, weight, device) -> None:
+def _check_arrms_one(state, rank, world_size, tokens, device) -> None:
     from tokenspeed_kernel.ops.communication.iris import (
         iris_allreduce_residual_rmsnorm,
     )
 
-    # Each rank contributes ``rank + 1``; sum across ranks is therefore
-    # ``world_size * (world_size + 1) / 2``. Residual is non-uniform
-    # (linspace) so the kernel can't accidentally short-circuit it.
-    x = torch.full(
-        (tokens, _ARRMS_HIDDEN_DIM), rank + 1, dtype=torch.bfloat16, device=device
-    )
-    residual = (
-        torch.arange(tokens * _ARRMS_HIDDEN_DIM, dtype=torch.float32, device=device)
-        .reshape(tokens, _ARRMS_HIDDEN_DIM)
-        .mul_(0.001)
-        .to(torch.bfloat16)
-    )
+    values = AllReduceResidualRMSNormInputs(
+        AllReduceResidualRMSNormInputConfig(
+            world_size=world_size,
+            num_tokens=tokens,
+            hidden_size=_ARRMS_HIDDEN_DIM,
+            dtype=torch.bfloat16,
+            residual_dtype=torch.bfloat16,
+            weight_dtype=torch.bfloat16,
+            eps=_ARRMS_EPS,
+        )
+    ).generate(seed=40_000 + tokens, device="cpu")
+    refs = all_reduce_residual_rmsnorm_reference(values)
+    x = values.rank_inputs[rank].to(device=device)
+    residual = values.residuals[rank].to(device=device)
+    weight = values.weight.to(device=device)
+    ref_residual = refs.residual_outputs[rank].to(device=device)
+    ref_norm = refs.norm_outputs[rank].to(device=device)
 
     norm_out, residual_out = iris_allreduce_residual_rmsnorm(
         state,
@@ -372,21 +385,6 @@ def _check_arrms_one(state, rank, world_size, tokens, weight, device) -> None:
         weight=weight,
         eps=_ARRMS_EPS,
     )
-
-    # Reference: do everything in fp32, mirroring the AMD test exactly so
-    # tolerance differences only reflect implementation noise, not
-    # reference noise.
-    reduced = torch.full(
-        (tokens, _ARRMS_HIDDEN_DIM),
-        world_size * (world_size + 1) // 2,
-        dtype=torch.float32,
-        device=device,
-    )
-    ref_residual = reduced + residual.float()
-    ref_norm = ref_residual * torch.rsqrt(
-        ref_residual.pow(2).mean(dim=-1, keepdim=True) + _ARRMS_EPS
-    )
-    ref_norm = ref_norm * weight.float()
 
     torch.testing.assert_close(residual_out.float(), ref_residual, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(norm_out.float(), ref_norm, atol=2e-2, rtol=2e-2)
