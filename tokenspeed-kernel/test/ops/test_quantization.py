@@ -172,14 +172,16 @@ def test_quantize_fp8_scale_float(
             shape=(2048, 512),
             dtype=dtype,
             output_dtype=current_platform().fp8e4m3fn.dtype,
-            granularity="none",
+            granularity="tensor",
+            scale=scale,
         )
     ).generate(seed=int(scale * 100), device=device)
+    assert values.scale is not None
 
     ref = fp8_quantization_reference(
         values.x,
         granularity="tensor",
-        scale=scale,
+        scale=float(values.scale.item()),
         output_dtype=current_platform().fp8e4m3fn.dtype,
     ).to(current_platform().fp8e4m3fn.dtype)
 
@@ -290,13 +292,15 @@ def test_scaled_cast_e4m3fnuz_matches_reference(device: str, scale: float) -> No
             shape=(2048, 512),
             dtype=torch.bfloat16,
             output_dtype=torch.float8_e4m3fnuz,
-            granularity="none",
+            granularity="tensor",
+            scale=scale,
         )
     ).generate(seed=int(scale * 100) + 14, device=device)
+    assert values.scale is not None
     ref = fp8_quantization_reference(
         values.x,
         granularity="tensor",
-        scale=torch.tensor([scale], dtype=torch.float32, device=device),
+        scale=float(values.scale.item()),
         output_dtype=torch.float8_e4m3fnuz,
     ).to(torch.float8_e4m3fnuz)
     out = fp8_quantize(values.x, scale=scale, fp8_dtype=torch.float8_e4m3fnuz)

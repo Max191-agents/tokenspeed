@@ -157,6 +157,30 @@ def test_fp8_token_group_scale_values_match_generated_input() -> None:
     torch.testing.assert_close(values.scale, expected)
 
 
+def test_fp8_quantization_inputs_generate_fixed_tensor_scale() -> None:
+    values = FP8QuantizationInputs(
+        FP8QuantizationInputConfig(
+            shape=(3, 16),
+            dtype=torch.float32,
+            granularity="tensor",
+            scale=2.0,
+        )
+    ).generate(seed=47, device="cpu")
+
+    assert values.scale is not None
+    torch.testing.assert_close(values.scale, torch.tensor([2.0], dtype=torch.float32))
+    ref = fp8_quantization_reference(
+        values.x,
+        granularity="tensor",
+        scale=values.scale,
+    )
+    manual = (values.x / values.scale).clamp(
+        torch.finfo(torch.float8_e4m3fn).min,
+        torch.finfo(torch.float8_e4m3fn).max,
+    )
+    torch.testing.assert_close(ref, manual.to(torch.float8_e4m3fn).float())
+
+
 def test_fp8_quantization_reference_matches_manual_token_quantization() -> None:
     x = torch.tensor(
         [[0.0, 1.0, -2.0], [4.0, -8.0, 16.0]],
@@ -414,5 +438,30 @@ def test_fp8_quantization_rejects_non_float_encoding_for_tensor_scale() -> None:
                 dtype=torch.float16,
                 granularity="tensor",
                 scale_encoding="ue8m0",
+            )
+        )
+
+
+def test_fp8_quantization_rejects_fixed_scale_without_tensor_granularity() -> None:
+    with pytest.raises(ValueError, match="requires granularity='tensor'"):
+        FP8QuantizationInputs(
+            FP8QuantizationInputConfig(
+                shape=(4, 128),
+                dtype=torch.float16,
+                granularity="none",
+                scale=1.0,
+            )
+        )
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0, float("inf")])
+def test_fp8_quantization_rejects_invalid_fixed_scale(scale: float) -> None:
+    with pytest.raises(ValueError, match="positive and finite"):
+        FP8QuantizationInputs(
+            FP8QuantizationInputConfig(
+                shape=(4, 128),
+                dtype=torch.float16,
+                granularity="tensor",
+                scale=scale,
             )
         )

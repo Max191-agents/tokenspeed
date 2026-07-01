@@ -7,7 +7,9 @@ The family covers FP8 casts, dynamic FP8 scaling, MXFP8, MXFP4, and NVFP4.
 ## Generators
 
 - `FP8QuantizationInputs`: generates floating input tensors and optional tensor,
-  token, or token-group scales for FP8 quantization.
+  token, or token-group scales for FP8 quantization. Tensor-wide scales may be
+  fixed by configuration for static scaled casts, or generated dynamically from
+  the input values.
 - `MXFP8QuantizationInputs`: generates bf16/fp16 values that are valid for
   MXFP8 E4M3 storage with UE8M0 group scales.
 - `MXFP4QuantizationInputs`: generates bf16/fp16 values that quantize cleanly to

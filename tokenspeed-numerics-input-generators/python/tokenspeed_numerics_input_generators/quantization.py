@@ -33,6 +33,7 @@ exercise kernel behavior instead of avoidable rounding ambiguity.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -91,6 +92,15 @@ def _check_positive(name: str, value: int) -> int:
     value = int(value)
     if value <= 0:
         raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _check_optional_positive_float(name: str, value: float | None) -> float | None:
+    if value is None:
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be positive and finite, got {value}")
     return value
 
 
@@ -307,6 +317,10 @@ class FP8QuantizationInputConfig:
     # Optional: semantic scale granularity. "none" represents a pure FP8 cast.
     granularity: FP8ScaleGranularity = "none"
 
+    # Optional: fixed tensor-wide scale for static scaled FP8 casts. When set,
+    # generated values include this scale instead of deriving one from x.
+    scale: float | None = None
+
     # Optional: required for token_group granularity.
     group_size: int | None = None
 
@@ -343,6 +357,11 @@ class FP8QuantizationInputs(NumericsInputGenerator):
             raise ValueError(
                 f"unsupported scale_encoding={self.config.scale_encoding!r}"
             )
+        self.config.scale = _check_optional_positive_float(
+            "FP8 fixed scale", self.config.scale
+        )
+        if self.config.scale is not None and self.config.granularity != "tensor":
+            raise ValueError("FP8 fixed scale requires granularity='tensor'")
         if self.config.scale_encoding != "float32" and (
             self.config.granularity != "token_group"
         ):
@@ -373,12 +392,19 @@ class FP8QuantizationInputs(NumericsInputGenerator):
         x = self.x_input.generate(seed=_child_seed(seed, 1), device=device).values
         if x is None:
             raise ValueError("x generation unexpectedly returned None")
-        scale = _fp8_scale(
-            x.float(),
-            granularity=self.config.granularity,
-            group_size=self.config.group_size,
-            output_dtype=self.config.output_dtype,
-        )
+        if self.config.scale is None:
+            scale = _fp8_scale(
+                x.float(),
+                granularity=self.config.granularity,
+                group_size=self.config.group_size,
+                output_dtype=self.config.output_dtype,
+            )
+        else:
+            scale = torch.tensor(
+                [self.config.scale],
+                dtype=torch.float32,
+                device=x.device,
+            )
         return FP8QuantizationInputValues(x=x, scale=scale)
 
 
