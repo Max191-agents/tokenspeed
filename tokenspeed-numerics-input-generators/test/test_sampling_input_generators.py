@@ -25,12 +25,15 @@ import torch
 from tokenspeed_numerics_input_generators import (
     ArgmaxInputConfig,
     ArgmaxInputs,
+    ArgmaxPairInputConfig,
+    ArgmaxPairInputs,
     GatherExpandScalarsInputConfig,
     GatherExpandScalarsInputs,
     MinPRenormInputConfig,
     MinPRenormInputs,
     TopKTopPRenormInputConfig,
     TopKTopPRenormInputs,
+    argmax_pair_reference,
     argmax_reference,
     gather_expand_scalars_reference,
     min_p_renorm_reference,
@@ -74,6 +77,46 @@ def test_argmax_reference_ignores_nans_and_marks_all_nan_rows() -> None:
     )
     ref = argmax_reference(logits)
     torch.testing.assert_close(ref, torch.tensor([2, -1]))
+
+
+def test_argmax_pair_inputs_generate_planted_maxima() -> None:
+    values = ArgmaxPairInputs(
+        ArgmaxPairInputConfig(
+            num_rows=5,
+            vocab_size=17,
+            dtype=torch.float32,
+            include_out=True,
+        )
+    ).generate(seed=44, metadata_seed=45, device="cpu")
+
+    assert values.logits.shape == (5, 17)
+    assert values.logits.dtype == torch.float32
+    assert values.out is not None
+    assert values.out.shape == (5, 2)
+    assert values.out.dtype == torch.float32
+    torch.testing.assert_close(
+        argmax_pair_reference(values.logits),
+        values.expected_pair,
+    )
+    torch.testing.assert_close(
+        values.expected_pair[:, 0],
+        torch.full((5,), 8.0, dtype=torch.float32),
+    )
+
+
+def test_argmax_pair_reference_returns_first_tied_index() -> None:
+    logits = torch.tensor(
+        [
+            [1.0, 4.0, 4.0, 3.0],
+            [-2.0, -1.0, -1.0, -3.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(
+        argmax_pair_reference(logits),
+        torch.tensor([[4.0, 1.0], [-1.0, 1.0]], dtype=torch.float32),
+    )
 
 
 def test_gather_expand_scalars_inputs_generate_values_and_reference() -> None:
@@ -190,6 +233,11 @@ def test_gather_expand_rejects_invalid_repeat_count() -> None:
                 n=0,
             )
         )
+
+
+def test_argmax_pair_reference_rejects_non_2d_input() -> None:
+    with pytest.raises(ValueError, match="2D"):
+        argmax_pair_reference(torch.randn(4))
 
 
 def test_top_k_top_p_rejects_too_large_max_top_k() -> None:

@@ -24,6 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.sampling.cuda import fused_topk_topp_renorm
 from tokenspeed_kernel.ops.sampling import argmax
+from tokenspeed_kernel.ops.sampling.cute_dsl import argmax_pair
 from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,
     min_p_renorm_prob,
@@ -32,12 +33,15 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
     ArgmaxInputConfig,
     ArgmaxInputs,
+    ArgmaxPairInputConfig,
+    ArgmaxPairInputs,
     GatherExpandScalarsInputConfig,
     GatherExpandScalarsInputs,
     MinPRenormInputConfig,
     MinPRenormInputs,
     TopKTopPRenormInputConfig,
     TopKTopPRenormInputs,
+    argmax_pair_reference,
     argmax_reference,
     gather_expand_scalars_reference,
     min_p_renorm_reference,
@@ -74,6 +78,27 @@ def test_argmax_generator_runs_registered_kernel(
     assert values.out is not None
     assert out.data_ptr() == values.out.data_ptr()
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+
+def test_argmax_pair_generator_runs_direct_kernel(device: str) -> None:
+    values = ArgmaxPairInputs(
+        ArgmaxPairInputConfig(
+            num_rows=8,
+            vocab_size=4096,
+            dtype=torch.float32,
+            include_out=True,
+        )
+    ).generate(seed=92, metadata_seed=93, device=device)
+
+    out = argmax_pair(values.logits, out=values.out)
+    ref = argmax_pair_reference(values.logits)
+    if values.logits.is_cuda:
+        torch.cuda.synchronize()
+
+    assert values.out is not None
+    assert out.data_ptr() == values.out.data_ptr()
+    torch.testing.assert_close(out[:, 0:1], ref[:, 0:1], atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(out[:, 1:2], ref[:, 1:2], atol=0, rtol=0)
 
 
 def test_gather_expand_scalars_generator_runs_triton_kernel(device: str) -> None:

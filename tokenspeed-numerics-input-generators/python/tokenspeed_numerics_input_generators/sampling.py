@@ -38,6 +38,9 @@ __all__ = [
     "ArgmaxInputConfig",
     "ArgmaxInputs",
     "ArgmaxInputValues",
+    "ArgmaxPairInputConfig",
+    "ArgmaxPairInputs",
+    "ArgmaxPairInputValues",
     "GatherExpandScalarsInputConfig",
     "GatherExpandScalarsInputs",
     "GatherExpandScalarsInputValues",
@@ -47,6 +50,7 @@ __all__ = [
     "TopKTopPRenormInputConfig",
     "TopKTopPRenormInputs",
     "TopKTopPRenormInputValues",
+    "argmax_pair_reference",
     "argmax_reference",
     "gather_expand_scalars_reference",
     "min_p_renorm_reference",
@@ -134,6 +138,15 @@ class ArgmaxInputValues:
 
 
 @dataclass
+class ArgmaxPairInputValues:
+    """Generated values for ``ArgmaxPairInputs``."""
+
+    logits: torch.Tensor
+    out: torch.Tensor | None
+    expected_pair: torch.Tensor
+
+
+@dataclass
 class ArgmaxInputConfig:
     """Initialization parameters for row-wise argmax inputs.
 
@@ -153,6 +166,34 @@ class ArgmaxInputConfig:
 
     # Optional: generate an output tensor for APIs that support out=.
     out_dtype: torch.dtype | None = None
+
+    # Optional: ensure each row has a known unique maximum.
+    plant_unique_max: bool = True
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class ArgmaxPairInputConfig:
+    """Initialization parameters for row-wise max/index pair inputs.
+
+    The represented operation returns a float32 tensor with shape
+    ``[num_rows, 2]``. Column 0 stores the row maximum and column 1 stores the
+    lowest column index whose logit equals that maximum.
+    """
+
+    # Required: number of independent rows. Zero is valid.
+    num_rows: int
+
+    # Required: number of logits per row.
+    vocab_size: int
+
+    # Required: generated dtype for logits.
+    dtype: torch.dtype
+
+    # Optional: generate an output tensor for APIs that support out=.
+    include_out: bool = False
 
     # Optional: ensure each row has a known unique maximum.
     plant_unique_max: bool = True
@@ -236,6 +277,81 @@ class ArgmaxInputs(NumericsInputGenerator):
                 device=logits.device,
             )
         return ArgmaxInputValues(logits=logits, out=out, expected_indices=expected)
+
+
+@dataclass(init=False)
+class ArgmaxPairInputs(NumericsInputGenerator):
+    """Generator for row-wise ``(max_value, argmax_index)`` packed outputs."""
+
+    config: ArgmaxPairInputConfig
+    logits_input: TensorInput | None
+
+    def __init__(self, config: ArgmaxPairInputConfig) -> None:
+        self.config = config
+        self.logits_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_rows = _check_nonnegative("num_rows", self.config.num_rows)
+        self.config.vocab_size = _check_positive("vocab_size", self.config.vocab_size)
+        self.config.dtype = _check_float_dtype(
+            "dtype", self.config.dtype, allowed=_LOGIT_DTYPES
+        )
+        self.logits_input = self.logits_input or TensorInput(
+            (self.config.num_rows, self.config.vocab_size),
+            self.config.dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> ArgmaxPairInputValues:
+        self.__post_init__()
+        if self.logits_input is None:
+            raise ValueError("ArgmaxPairInputs child generators must be initialized")
+        logits = _require_tensor(
+            self.logits_input.generate(seed=_child_seed(seed, 1), device=device).values,
+            "logits",
+        ).contiguous()
+        if self.config.plant_unique_max:
+            metadata_base_seed = seed if metadata_seed is None else metadata_seed
+            expected = _randint(
+                low=0,
+                high=self.config.vocab_size,
+                shape=(self.config.num_rows,),
+                dtype=torch.int64,
+                seed=_child_seed(metadata_base_seed, 1),
+                device=device,
+                configured_device=self.config.device,
+            )
+            logits = (logits.float() * 0.25).to(self.config.dtype)
+            if self.config.num_rows > 0:
+                rows = torch.arange(
+                    self.config.num_rows,
+                    dtype=torch.int64,
+                    device=logits.device,
+                )
+                logits[rows, expected] = torch.tensor(
+                    8.0,
+                    dtype=logits.dtype,
+                    device=logits.device,
+                )
+        out = None
+        if self.config.include_out:
+            out = torch.empty(
+                (self.config.num_rows, 2),
+                dtype=torch.float32,
+                device=logits.device,
+            )
+        return ArgmaxPairInputValues(
+            logits=logits,
+            out=out,
+            expected_pair=argmax_pair_reference(logits),
+        )
 
 
 @dataclass
@@ -582,6 +698,15 @@ def argmax_reference(logits: torch.Tensor) -> torch.Tensor:
     out = torch.argmax(masked, dim=-1)
     all_invalid = ~valid.any(dim=-1)
     return torch.where(all_invalid, torch.full_like(out, -1), out)
+
+
+def argmax_pair_reference(logits: torch.Tensor) -> torch.Tensor:
+    """Reference row-wise max/index pair packed into a float32 tensor."""
+
+    if logits.dim() != 2:
+        raise ValueError(f"argmax_pair expects 2D input, got {logits.dim()}D")
+    max_vals, max_indices = torch.max(logits, dim=-1, keepdim=True)
+    return torch.cat((max_vals.to(torch.float32), max_indices.to(torch.float32)), dim=1)
 
 
 def gather_expand_scalars_reference(

@@ -3,8 +3,8 @@
 Sampling generators cover deterministic helper operations used around token
 selection. They do not generate stochastic draws from a distribution. Instead,
 they model the tensor transforms that TokenSpeed kernels currently implement:
-row-wise argmax, scalar metadata gather/broadcast, min-p renormalization, and
-top-k/top-p renormalization.
+row-wise argmax, packed max/index argmax pairs, scalar metadata
+gather/broadcast, min-p renormalization, and top-k/top-p renormalization.
 
 ## Operation Semantics
 
@@ -14,6 +14,20 @@ top-k/top-p renormalization.
 the lowest column index whose value is maximal in each row. By default the
 generator plants a known dominant maximum in every row, so correctness tests do
 not depend on accidental random maxima or ties.
+
+### Argmax Pair
+
+`ArgmaxPairInputs` represents row-wise max plus argmax packed into a float32
+tensor with shape `[rows, 2]`:
+
+```text
+out[row, 0] = max(logits[row])
+out[row, 1] = first argmax index for logits[row]
+```
+
+This models direct helper APIs that need both the selected value and selected
+index. The generator can create the optional caller-provided output buffer used
+by in-place kernel paths.
 
 ### Gather And Expand Scalars
 
@@ -54,6 +68,7 @@ The generators reject invalid sampling inputs before values are returned:
 - logits dtypes must be fp16, bf16, or fp32
 - probability tensors are generated as fp32 normalized rows
 - output/index dtypes must be int32 or int64 where relevant
+- argmax-pair output buffers are float32 with shape `[rows, 2]`
 - min-p and top-p values are generated in valid probability ranges
 - planted argmax rows have a unique known maximum
 
@@ -66,6 +81,7 @@ such as logits and probability distributions are generated from `seed`.
 TokenSpeed exposes sampling kernels through several modules:
 
 - `sampling.argmax` for row-wise argmax
+- `sampling.cute_dsl.argmax_pair` for packed row-wise max/index pairs
 - `sampling.triton.gather_and_expand_scalars`
 - `sampling.triton.min_p_renorm_prob`
 - NVIDIA-only fused top-k/top-p renormalization helpers
