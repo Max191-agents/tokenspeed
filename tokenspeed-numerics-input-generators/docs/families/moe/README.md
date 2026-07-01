@@ -21,6 +21,9 @@ route weights.
 - `MoESoftplusSqrtTopKRoutingInputs`: generates FP32 router logits and either
   correction-bias routing metadata or token-id keyed hash routing metadata for
   normalized `sqrt(softplus(x))` top-k routing.
+- `MoEDeepSeekV4MegaMoEStagingInputs`: generates hidden states, precomputed
+  top-k routing tensors, and staging buffers for FP8 hidden-state quantization
+  and packed scale output.
 
 `MoeInputs` composes the GEMM generator for expert weights. Dense, MXFP4, and
 MXINT4 expert weights are operation-level choices; backend preprocessing such
@@ -53,6 +56,10 @@ the original sigmoid scores.
 Softplus-sqrt top-k routing values describe the DeepSeek-style router that
 uses `sqrt(softplus(logits))` as route weights. Expert selection can come from
 correction-biased top-k scores or from a generated hash table keyed by token id.
+
+DeepSeek V4 MegaMoE staging values describe the preparation step that converts
+hidden-state rows into FP8 E4M3 blocks with packed 32-channel scale exponents
+and copies precomputed routing tensors into GEMM staging buffers.
 
 These generators intentionally describe operation-level routed computations
 rather than any one fused MoE kernel signature.

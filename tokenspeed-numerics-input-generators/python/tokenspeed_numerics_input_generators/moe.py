@@ -58,6 +58,10 @@ __all__ = [
     "MoEBiasedGroupedTopKInputs",
     "MoEBiasedGroupedTopKInputValues",
     "MoEBiasedGroupedTopKReferenceValues",
+    "MoEDeepSeekV4MegaMoEStagingInputConfig",
+    "MoEDeepSeekV4MegaMoEStagingInputs",
+    "MoEDeepSeekV4MegaMoEStagingInputValues",
+    "MoEDeepSeekV4MegaMoEStagingReferenceValues",
     "MoESoftplusSqrtTopKRoutingInputConfig",
     "MoESoftplusSqrtTopKRoutingInputs",
     "MoESoftplusSqrtTopKRoutingInputValues",
@@ -69,6 +73,7 @@ __all__ = [
     "moe_align_block_size_buffer_dims",
     "moe_align_block_size_reference",
     "moe_biased_grouped_topk_reference",
+    "moe_deepseek_v4_mega_moe_staging_reference",
     "moe_reference",
     "moe_softplus_sqrt_topk_routing_reference",
     "moe_softmax_topk_routing_reference",
@@ -82,6 +87,9 @@ _REGULAR_FLOAT_DTYPES = {
     torch.float32,
     torch.float64,
 }
+_DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE = 128
+_DEEPSEEK_V4_MEGAMOE_FP8_GROUP_SIZE = 32
+_DEEPSEEK_V4_MEGAMOE_FP8_MAX = 448.0
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -171,6 +179,30 @@ class MoEBiasedGroupedTopKReferenceValues:
 
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
+
+
+@dataclass
+class MoEDeepSeekV4MegaMoEStagingInputValues:
+    """Generated values for DeepSeek V4 MegaMoE input staging."""
+
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    x_fp8: torch.Tensor
+    x_sf: torch.Tensor
+    topk_idx_out: torch.Tensor
+    topk_weights_out: torch.Tensor
+    num_experts: int
+
+
+@dataclass
+class MoEDeepSeekV4MegaMoEStagingReferenceValues:
+    """Reference outputs for DeepSeek V4 MegaMoE input staging."""
+
+    x_fp8: torch.Tensor
+    x_sf: torch.Tensor
+    topk_idx_out: torch.Tensor
+    topk_weights_out: torch.Tensor
 
 
 @dataclass
@@ -316,6 +348,41 @@ class MoEBiasedGroupedTopKInputConfig:
 
     # Optional: if set, rows at or after this token count get output ids ``-1``.
     num_token_non_padded: int | None = None
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class MoEDeepSeekV4MegaMoEStagingInputConfig:
+    """Initialization parameters for DeepSeek V4 MegaMoE input staging.
+
+    The represented operation prepares routed MoE inputs by quantizing
+    hidden-state rows to FP8 in 128-wide blocks, packing four 32-wide scale
+    exponent groups per block, and copying precomputed top-k routing tensors
+    into staging outputs.
+    """
+
+    # Required: number of token rows to stage.
+    num_tokens: int
+
+    # Required: hidden-state width. Must be a multiple of 128.
+    hidden_size: int
+
+    # Required: total routed experts used to generate valid top-k ids.
+    num_experts: int
+
+    # Required: number of routed experts per token.
+    top_k: int
+
+    # Optional: generated hidden-state dtype.
+    hidden_dtype: torch.dtype = torch.bfloat16
+
+    # Optional: dtype for input and staged top-k ids.
+    topk_ids_dtype: torch.dtype = torch.int32
+
+    # Optional: dtype for staged FP8 hidden states.
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn
 
     # Optional: generated tensor device override.
     device: DeviceLike = None
@@ -644,6 +711,106 @@ class MoEBiasedGroupedTopKInputs(NumericsInputGenerator):
 
 
 @dataclass(init=False)
+class MoEDeepSeekV4MegaMoEStagingInputs(NumericsInputGenerator):
+    """Input generator for DeepSeek V4 MegaMoE input staging."""
+
+    config: MoEDeepSeekV4MegaMoEStagingInputConfig
+    hidden_states_input: TensorInput | None
+
+    def __init__(self, config: MoEDeepSeekV4MegaMoEStagingInputConfig) -> None:
+        self.config = config
+        self.hidden_states_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.hidden_size = int(self.config.hidden_size)
+        self.config.num_experts = int(self.config.num_experts)
+        self.config.top_k = int(self.config.top_k)
+        if self.config.hidden_size <= 0:
+            raise ValueError("hidden_size must be positive")
+        if self.config.hidden_size % _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE != 0:
+            raise ValueError("hidden_size must be a multiple of 128")
+        if self.config.num_experts <= 0:
+            raise ValueError("num_experts must be positive")
+        if self.config.top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if self.config.top_k > self.config.num_experts:
+            raise ValueError("top_k must be <= num_experts")
+        self.config.hidden_dtype = _check_moe_float_dtype(
+            "hidden_dtype", self.config.hidden_dtype
+        )
+        if self.config.topk_ids_dtype not in _TOPK_ID_DTYPES:
+            raise ValueError("topk_ids_dtype must be an integer dtype")
+        if self.config.fp8_dtype != torch.float8_e4m3fn:
+            raise ValueError("fp8_dtype must be torch.float8_e4m3fn")
+        if self.hidden_states_input is None:
+            self.hidden_states_input = TensorInput(
+                (self.config.num_tokens, self.config.hidden_size),
+                self.config.hidden_dtype,
+                device=self.config.device,
+            )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> MoEDeepSeekV4MegaMoEStagingInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        if self.hidden_states_input is None:
+            raise ValueError("hidden_states_input must be initialized")
+        hidden_states = self.hidden_states_input.generate(
+            seed=_child_seed(seed, 1),
+            device=target_device,
+        ).values
+        if hidden_states is None:
+            raise ValueError("hidden_states generation was skipped")
+        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=rng_device).manual_seed(_child_seed(seed, 2))
+        raw_ids = torch.rand(
+            (self.config.num_tokens, self.config.num_experts),
+            dtype=torch.float32,
+            device=target_device,
+            generator=generator,
+        ).argsort(dim=-1)[:, : self.config.top_k]
+        topk_ids = raw_ids.to(self.config.topk_ids_dtype)
+        raw_weights = torch.rand(
+            (self.config.num_tokens, self.config.top_k),
+            dtype=torch.float32,
+            device=target_device,
+            generator=generator,
+        )
+        topk_weights = raw_weights / raw_weights.sum(dim=-1, keepdim=True).clamp_min(
+            1.0e-12
+        )
+        block_count = self.config.hidden_size // _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE
+        values = MoEDeepSeekV4MegaMoEStagingInputValues(
+            hidden_states=hidden_states.contiguous(),
+            topk_ids=topk_ids.contiguous(),
+            topk_weights=topk_weights.contiguous(),
+            x_fp8=torch.empty(
+                (self.config.num_tokens, self.config.hidden_size),
+                dtype=self.config.fp8_dtype,
+                device=target_device,
+            ),
+            x_sf=torch.empty(
+                (self.config.num_tokens, block_count),
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            topk_idx_out=torch.empty_like(topk_ids),
+            topk_weights_out=torch.empty_like(topk_weights),
+            num_experts=self.config.num_experts,
+        )
+        _validate_moe_deepseek_v4_mega_moe_staging_values(values)
+        return values
+
+
+@dataclass(init=False)
 class MoESoftplusSqrtTopKRoutingInputs(NumericsInputGenerator):
     """Input generator for softplus-sqrt top-k MoE routing."""
 
@@ -919,6 +1086,76 @@ def _validate_moe_softplus_sqrt_topk_routing_values(
 
     if not torch.isfinite(values.logits).all():
         raise ValueError("logits must be finite")
+
+
+def _validate_moe_deepseek_v4_mega_moe_staging_values(
+    values: MoEDeepSeekV4MegaMoEStagingInputValues,
+) -> None:
+    if values.hidden_states.ndim != 2:
+        raise ValueError("hidden_states must be rank-2")
+    if not torch.is_floating_point(values.hidden_states):
+        raise TypeError("hidden_states must use a floating dtype")
+    num_tokens, hidden_size = values.hidden_states.shape
+    if hidden_size <= 0 or hidden_size % _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE != 0:
+        raise ValueError("hidden_size must be a positive multiple of 128")
+    if values.num_experts <= 0:
+        raise ValueError("num_experts must be positive")
+    if values.topk_ids.ndim != 2:
+        raise ValueError("topk_ids must be rank-2")
+    if values.topk_weights.ndim != 2:
+        raise ValueError("topk_weights must be rank-2")
+    if values.topk_ids.shape != values.topk_weights.shape:
+        raise ValueError("topk_ids and topk_weights must have matching shapes")
+    if values.topk_ids.shape[0] != num_tokens:
+        raise ValueError("topk rows must match hidden_states rows")
+    if values.topk_ids.shape[1] <= 0:
+        raise ValueError("top_k must be positive")
+    if values.topk_ids.shape[1] > values.num_experts:
+        raise ValueError("top_k must be <= num_experts")
+    if values.topk_ids.dtype not in _TOPK_ID_DTYPES:
+        raise TypeError("topk_ids must use an integer dtype")
+    if values.topk_weights.dtype != torch.float32:
+        raise TypeError("topk_weights must use torch.float32")
+    if values.x_fp8.shape != values.hidden_states.shape:
+        raise ValueError("x_fp8 shape must match hidden_states")
+    if values.x_fp8.dtype != torch.float8_e4m3fn:
+        raise TypeError("x_fp8 must use torch.float8_e4m3fn")
+    if values.x_sf.shape != (
+        num_tokens,
+        hidden_size // _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE,
+    ):
+        raise ValueError("x_sf shape must be [num_tokens, hidden_size // 128]")
+    if values.x_sf.dtype != torch.int32:
+        raise TypeError("x_sf must use torch.int32")
+    if values.topk_idx_out.shape != values.topk_ids.shape:
+        raise ValueError("topk_idx_out shape must match topk_ids")
+    if values.topk_idx_out.dtype != values.topk_ids.dtype:
+        raise TypeError("topk_idx_out dtype must match topk_ids")
+    if values.topk_weights_out.shape != values.topk_weights.shape:
+        raise ValueError("topk_weights_out shape must match topk_weights")
+    if values.topk_weights_out.dtype != values.topk_weights.dtype:
+        raise TypeError("topk_weights_out dtype must match topk_weights")
+    tensors = (
+        values.topk_ids,
+        values.topk_weights,
+        values.x_fp8,
+        values.x_sf,
+        values.topk_idx_out,
+        values.topk_weights_out,
+    )
+    if any(tensor.device != values.hidden_states.device for tensor in tensors):
+        raise ValueError("all staging tensors must share device")
+    if values.topk_ids.numel() > 0:
+        if values.topk_ids.min().item() < 0:
+            raise ValueError("topk_ids must be non-negative")
+        if values.topk_ids.max().item() >= values.num_experts:
+            raise ValueError("topk_ids must be less than num_experts")
+    if not torch.isfinite(values.hidden_states).all():
+        raise ValueError("hidden_states must be finite")
+    if not torch.isfinite(values.topk_weights).all():
+        raise ValueError("topk_weights must be finite")
+    if torch.any(values.topk_weights < 0.0):
+        raise ValueError("topk_weights must be non-negative")
 
 
 def _validate_moe_biased_grouped_topk_values(
@@ -1658,6 +1895,49 @@ def moe_softplus_sqrt_topk_routing_reference(
     return MoESoftplusSqrtTopKRoutingReferenceValues(
         topk_indices=topk_indices.to(torch.int32),
         topk_weights=topk_weights.to(torch.float32),
+    )
+
+
+def moe_deepseek_v4_mega_moe_staging_reference(
+    values: MoEDeepSeekV4MegaMoEStagingInputValues,
+) -> MoEDeepSeekV4MegaMoEStagingReferenceValues:
+    """Reference implementation for DeepSeek V4 MegaMoE input staging."""
+
+    _validate_moe_deepseek_v4_mega_moe_staging_values(values)
+    hidden = values.hidden_states.float()
+    num_tokens, hidden_size = hidden.shape
+    block_size = _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE
+    group_size = _DEEPSEEK_V4_MEGAMOE_FP8_GROUP_SIZE
+    block_count = hidden_size // block_size
+    grouped = hidden.reshape(num_tokens, block_count, block_size)
+    grouped_abs = grouped.abs().reshape(num_tokens, block_count, 4, group_size)
+    amax = grouped_abs.amax(dim=-1).clamp_min(1.0e-4)
+    scale = amax / _DEEPSEEK_V4_MEGAMOE_FP8_MAX
+    scale_bits = scale.contiguous().view(torch.int32)
+    mantissa_nonzero = (scale_bits & 0x7FFFFF) != 0
+    scale_exp = ((scale_bits >> 23) & 0xFF) + mantissa_nonzero.to(torch.int32)
+    scale_exp = scale_exp.clamp(1, 254)
+    rounded_scale = torch.pow(
+        torch.full_like(scale, 2.0),
+        scale_exp.float() - 127.0,
+    )
+    scaled = grouped.reshape(num_tokens, block_count, 4, group_size) / (
+        rounded_scale.unsqueeze(-1)
+    )
+    x_fp8 = scaled.reshape_as(hidden).to(torch.float8_e4m3fn)
+    shifts = torch.arange(
+        0,
+        32,
+        8,
+        dtype=torch.int32,
+        device=values.hidden_states.device,
+    )
+    x_sf = ((scale_exp.to(torch.int32) << shifts).sum(dim=-1)).to(torch.int32)
+    return MoEDeepSeekV4MegaMoEStagingReferenceValues(
+        x_fp8=x_fp8,
+        x_sf=x_sf,
+        topk_idx_out=values.topk_ids.clone(),
+        topk_weights_out=values.topk_weights.clone(),
     )
 
 

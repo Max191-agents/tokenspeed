@@ -33,6 +33,9 @@ from tokenspeed_numerics_input_generators import (
     MoEBiasedGroupedTopKInputConfig,
     MoEBiasedGroupedTopKInputs,
     MoEBiasedGroupedTopKInputValues,
+    MoEDeepSeekV4MegaMoEStagingInputConfig,
+    MoEDeepSeekV4MegaMoEStagingInputs,
+    MoEDeepSeekV4MegaMoEStagingInputValues,
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
@@ -51,6 +54,7 @@ from tokenspeed_numerics_input_generators import (
     moe_align_block_size_buffer_dims,
     moe_align_block_size_reference,
     moe_biased_grouped_topk_reference,
+    moe_deepseek_v4_mega_moe_staging_reference,
     moe_reference,
     moe_softmax_topk_routing_reference,
     moe_softplus_sqrt_topk_routing_reference,
@@ -1439,6 +1443,89 @@ def test_moe_softplus_sqrt_topk_routing_verifies_config_and_values() -> None:
 
     with pytest.raises(ValueError, match="must not repeat experts"):
         moe_softplus_sqrt_topk_routing_reference(values)
+
+
+def test_moe_deepseek_v4_mega_moe_staging_inputs_generate_values() -> None:
+    values = MoEDeepSeekV4MegaMoEStagingInputs(
+        MoEDeepSeekV4MegaMoEStagingInputConfig(
+            num_tokens=3,
+            hidden_size=256,
+            num_experts=8,
+            top_k=3,
+            hidden_dtype=torch.bfloat16,
+        )
+    ).generate(seed=55, device="cpu")
+
+    ref = moe_deepseek_v4_mega_moe_staging_reference(values)
+
+    assert values.hidden_states.shape == (3, 256)
+    assert values.hidden_states.dtype == torch.bfloat16
+    assert values.topk_ids.shape == (3, 3)
+    assert values.topk_ids.dtype == torch.int32
+    assert torch.all(values.topk_ids >= 0)
+    assert torch.all(values.topk_ids < 8)
+    assert values.topk_weights.shape == (3, 3)
+    torch.testing.assert_close(
+        values.topk_weights.sum(dim=-1),
+        torch.ones(3),
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    )
+    assert values.x_fp8.shape == (3, 256)
+    assert values.x_fp8.dtype == torch.float8_e4m3fn
+    assert values.x_sf.shape == (3, 2)
+    assert values.x_sf.dtype == torch.int32
+    assert ref.x_fp8.shape == values.x_fp8.shape
+    assert ref.x_sf.shape == values.x_sf.shape
+    torch.testing.assert_close(ref.topk_idx_out, values.topk_ids)
+    torch.testing.assert_close(ref.topk_weights_out, values.topk_weights)
+
+
+def test_moe_deepseek_v4_mega_moe_staging_reference_packs_scale_exponents() -> None:
+    values = MoEDeepSeekV4MegaMoEStagingInputValues(
+        hidden_states=torch.ones((1, 128), dtype=torch.float32),
+        topk_ids=torch.tensor([[2, 0]], dtype=torch.int32),
+        topk_weights=torch.tensor([[0.25, 0.75]], dtype=torch.float32),
+        x_fp8=torch.empty((1, 128), dtype=torch.float8_e4m3fn),
+        x_sf=torch.empty((1, 1), dtype=torch.int32),
+        topk_idx_out=torch.empty((1, 2), dtype=torch.int32),
+        topk_weights_out=torch.empty((1, 2), dtype=torch.float32),
+        num_experts=4,
+    )
+
+    ref = moe_deepseek_v4_mega_moe_staging_reference(values)
+
+    # For amax=1, the exact scale is 1/448. The staging op rounds that up to
+    # the next power of two, 2^-8, whose biased exponent byte is 119.
+    assert int(ref.x_sf[0, 0].item()) == 0x77777777
+    torch.testing.assert_close(ref.topk_idx_out, values.topk_ids)
+    torch.testing.assert_close(ref.topk_weights_out, values.topk_weights)
+    assert torch.isfinite(ref.x_fp8.float()).all()
+
+
+def test_moe_deepseek_v4_mega_moe_staging_verifies_config_and_values() -> None:
+    with pytest.raises(ValueError, match="multiple of 128"):
+        MoEDeepSeekV4MegaMoEStagingInputs(
+            MoEDeepSeekV4MegaMoEStagingInputConfig(
+                num_tokens=2,
+                hidden_size=192,
+                num_experts=4,
+                top_k=2,
+            )
+        )
+
+    values = MoEDeepSeekV4MegaMoEStagingInputs(
+        MoEDeepSeekV4MegaMoEStagingInputConfig(
+            num_tokens=2,
+            hidden_size=128,
+            num_experts=4,
+            top_k=2,
+        )
+    ).generate(seed=56, device="cpu")
+    values.topk_ids[0, 0] = 4
+
+    with pytest.raises(ValueError, match="less than num_experts"):
+        moe_deepseek_v4_mega_moe_staging_reference(values)
 
 
 def test_moe_align_block_size_inputs_generate_topk_ids() -> None:

@@ -33,6 +33,8 @@ from tokenspeed_numerics_input_generators import (
     MoeAlignBlockSizeInputValues,
     MoEBiasedGroupedTopKInputConfig,
     MoEBiasedGroupedTopKInputs,
+    MoEDeepSeekV4MegaMoEStagingInputConfig,
+    MoEDeepSeekV4MegaMoEStagingInputs,
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
@@ -43,6 +45,7 @@ from tokenspeed_numerics_input_generators import (
     canonicalize_moe_align_block_size,
     moe_align_block_size_reference,
     moe_biased_grouped_topk_reference,
+    moe_deepseek_v4_mega_moe_staging_reference,
     moe_reference,
     moe_softmax_topk_routing_reference,
     moe_softplus_sqrt_topk_routing_reference,
@@ -303,6 +306,48 @@ def test_moe_softplus_sqrt_topk_routing_generator_runs_cuda_helpers() -> None:
         rtol=1.0e-4,
         atol=1.0e-4,
     )
+
+
+def test_moe_deepseek_v4_mega_moe_staging_generator_runs_triton_helper() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("DeepSeek V4 MegaMoE staging compatibility test requires CUDA")
+
+    from tokenspeed_kernel.thirdparty.triton import stage_deepseek_v4_mega_moe_inputs
+
+    values = MoEDeepSeekV4MegaMoEStagingInputs(
+        MoEDeepSeekV4MegaMoEStagingInputConfig(
+            num_tokens=4,
+            hidden_size=128,
+            num_experts=8,
+            top_k=3,
+            hidden_dtype=torch.bfloat16,
+        )
+    ).generate(seed=49, device="cuda")
+    expected = moe_deepseek_v4_mega_moe_staging_reference(values)
+
+    try:
+        stage_deepseek_v4_mega_moe_inputs(
+            values.hidden_states,
+            values.topk_weights,
+            values.topk_ids,
+            values.x_fp8,
+            values.x_sf,
+            values.topk_idx_out,
+            values.topk_weights_out,
+        )
+    except (RuntimeError, ValueError) as exc:
+        pytest.skip(f"stage_deepseek_v4_mega_moe_inputs unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        values.x_fp8.float(),
+        expected.x_fp8.float(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(values.x_sf, expected.x_sf)
+    torch.testing.assert_close(values.topk_idx_out, expected.topk_idx_out)
+    torch.testing.assert_close(values.topk_weights_out, expected.topk_weights_out)
 
 
 def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None:

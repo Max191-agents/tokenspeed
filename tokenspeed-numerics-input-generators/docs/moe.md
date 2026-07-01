@@ -101,6 +101,23 @@ Both modes gather output weights from the un-biased transformed scores,
 normalize the selected weights by their selected sum, and multiply by
 `routed_scaling_factor`.
 
+`MoEDeepSeekV4MegaMoEStagingInputs` generates inputs and output buffers for the
+DeepSeek V4 MegaMoE staging operation. The operation prepares routed expert
+inputs before an FP8/FP4 MegaMoE GEMM:
+
+1. Split each hidden-state row into 128-wide blocks.
+2. Split each block into four 32-wide groups.
+3. For each group, compute `amax = max(abs(group))`, clamped to at least
+   `1e-4`.
+4. Compute `scale = amax / 448`, round it up to the next power-of-two scale by
+   storing the biased FP32 exponent byte, and pack the four exponent bytes into
+   one int32 scale word per 128-wide block.
+5. Divide hidden values by the rounded per-group scale and cast to FP8 E4M3.
+6. Copy precomputed `topk_ids` and `topk_weights` to staged output buffers.
+
+This generator treats top-k routing ids and weights as already-computed routing
+metadata. It does not define how routing was produced.
+
 ## References
 
 `moe_reference` implements the routed layer computation for generated MoE
@@ -137,6 +154,10 @@ logical-to-physical expert id mapping, and padded-token output id masking.
 hash-table softplus-sqrt routing. Non-hash ties are resolved by smaller expert
 id first for deterministic references. Hash-table routing preserves the expert
 order stored in the selected table row.
+
+`moe_deepseek_v4_mega_moe_staging_reference` implements the 128-wide FP8 hidden
+quantization, packed exponent-scale output, and top-k tensor copy semantics
+described above.
 
 ## TokenSpeed API Mapping
 
@@ -194,6 +215,13 @@ and `renormalize`. The hash helper consumes generated `logits`, `input_ids`,
 output ids, `top_k=6`, `renormalize=True`, and 256 or 384 experts; those are
 adapter requirements rather than additional operation semantics.
 
+The Triton `stage_deepseek_v4_mega_moe_inputs` helper maps directly to
+`MoEDeepSeekV4MegaMoEStagingInputs`: generated `hidden_states`, `topk_weights`,
+`topk_ids`, `x_fp8`, `x_sf`, `topk_idx_out`, and `topk_weights_out` become the
+helper arguments. The helper's requirement that hidden size is a multiple of
+128 is an operation invariant because scale words are packed once per 128-wide
+block.
+
 ## Verification
 
 MoE configs verify token counts, hidden/intermediate widths, expert counts,
@@ -225,3 +253,9 @@ int32 output ids, FP32 output weights, positive finite routed scaling, and
 expert. Hash mode requires int32/int64 input ids, an int32 hash table with
 one unique in-range expert id per selected slot, and input ids that index valid
 hash-table rows.
+
+MegaMoE staging verifies finite floating hidden states, hidden width divisible
+by 128, rank-2 matching top-k ids and weights, in-range top-k ids, non-negative
+finite FP32 route weights, FP8 E4M3 hidden output buffers, int32 packed scale
+buffers with one scale word per 128 hidden channels, and staged top-k output
+buffers matching the input top-k tensors.
