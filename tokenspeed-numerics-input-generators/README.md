@@ -98,6 +98,13 @@ kernel. If a public config can produce inputs that do not satisfy the documented
 operation semantics, the generator contract is incomplete and should be fixed at
 the source.
 
+Verification is part of the public API for each generator, not an optional
+debug aid. A generator should reject unsupported or contradictory configurations
+instead of guessing what the caller intended. It should also validate generated
+relationships that depend on inferred defaults, child generators, random
+metadata, or target-device choices. This makes the generator the trusted place
+where operation-specific constraints are encoded.
+
 The useful verification boundary is the point where misuse would create broken
 or meaningless inputs:
 
@@ -119,6 +126,12 @@ This keeps numerical tests focused on implementation correctness. If a test uses
 the generator library, failures should not be caused by malformed inputs unless
 the test deliberately mutates the generated values outside the generator
 contract.
+
+Tests for generators should cover that contract directly. Each family should
+include focused tests for invalid configurations that must be rejected and for
+valid generated values satisfying the documented invariants. Consumer tests can
+then rely on the library to provide well-formed inputs and spend their checks on
+reference agreement or implementation-specific adaptation.
 
 ## Configuration Ownership
 
