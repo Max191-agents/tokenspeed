@@ -38,11 +38,14 @@ from tokenspeed_numerics_input_generators import (
     MoeInputValues,
     MoESoftmaxTopKRoutingInputConfig,
     MoESoftmaxTopKRoutingInputs,
+    MoESoftplusSqrtTopKRoutingInputConfig,
+    MoESoftplusSqrtTopKRoutingInputs,
     canonicalize_moe_align_block_size,
     moe_align_block_size_reference,
     moe_biased_grouped_topk_reference,
     moe_reference,
     moe_softmax_topk_routing_reference,
+    moe_softplus_sqrt_topk_routing_reference,
 )
 
 
@@ -225,6 +228,81 @@ def test_moe_biased_grouped_topk_generator_matches_triton_fallback() -> None:
 
     torch.testing.assert_close(actual_ids, expected.topk_ids)
     torch.testing.assert_close(actual_weights, expected.topk_weights)
+
+
+def test_moe_softplus_sqrt_topk_routing_generator_runs_cuda_helpers() -> None:
+    platform = current_platform()
+    if not torch.cuda.is_available() or not platform.is_nvidia:
+        pytest.skip("softplus-sqrt routing compatibility test requires NVIDIA CUDA")
+
+    from tokenspeed_kernel.thirdparty.cuda import (
+        hash_softplus_sqrt_topk_flash,
+        softplus_sqrt_topk_flash,
+    )
+
+    non_hash = MoESoftplusSqrtTopKRoutingInputs(
+        MoESoftplusSqrtTopKRoutingInputConfig(
+            num_tokens=8,
+            num_experts=256,
+            top_k=6,
+            routed_scaling_factor=1.75,
+        )
+    ).generate(seed=47, device="cuda")
+    non_hash_expected = moe_softplus_sqrt_topk_routing_reference(non_hash)
+    assert non_hash.correction_bias is not None
+    try:
+        softplus_sqrt_topk_flash(
+            non_hash.logits,
+            non_hash.correction_bias,
+            non_hash.topk_indices,
+            non_hash.topk_weights,
+            non_hash.routed_scaling_factor,
+            non_hash.renormalize,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"softplus_sqrt_topk_flash extension unavailable: {exc}")
+
+    hashed = MoESoftplusSqrtTopKRoutingInputs(
+        MoESoftplusSqrtTopKRoutingInputConfig(
+            num_tokens=8,
+            num_experts=256,
+            top_k=6,
+            use_hash_table=True,
+            hash_table_size=16,
+            routed_scaling_factor=2.25,
+        )
+    ).generate(seed=48, device="cuda")
+    hashed_expected = moe_softplus_sqrt_topk_routing_reference(hashed)
+    assert hashed.input_ids is not None
+    assert hashed.hash_indices_table is not None
+    try:
+        hash_softplus_sqrt_topk_flash(
+            hashed.logits,
+            hashed.input_ids,
+            hashed.hash_indices_table,
+            hashed.topk_indices,
+            hashed.topk_weights,
+            hashed.routed_scaling_factor,
+            hashed.renormalize,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"hash_softplus_sqrt_topk_flash extension unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(non_hash.topk_indices, non_hash_expected.topk_indices)
+    torch.testing.assert_close(
+        non_hash.topk_weights,
+        non_hash_expected.topk_weights,
+        rtol=1.0e-4,
+        atol=1.0e-4,
+    )
+    torch.testing.assert_close(hashed.topk_indices, hashed_expected.topk_indices)
+    torch.testing.assert_close(
+        hashed.topk_weights,
+        hashed_expected.topk_weights,
+        rtol=1.0e-4,
+        atol=1.0e-4,
+    )
 
 
 def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None:

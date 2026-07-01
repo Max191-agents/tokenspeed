@@ -86,6 +86,21 @@ the router logits. Its values do not affect the grouped top-k computation, but
 it keeps the generated values aligned with implementation APIs that route a
 hidden-state batch.
 
+`MoESoftplusSqrtTopKRoutingInputs` generates inputs for a DeepSeek-style router
+that transforms each logit with `sqrt(softplus(x))`, normalizes selected
+weights, and applies a routed scaling factor. The generator supports two
+selection modes:
+
+- In correction-bias mode, select top-k experts from
+  `sqrt(softplus(logits)) + correction_bias`.
+- In hash mode, use `input_ids` to gather selected expert ids from
+  `hash_indices_table`; the transformed logits only determine the normalized
+  weights for those selected experts.
+
+Both modes gather output weights from the un-biased transformed scores,
+normalize the selected weights by their selected sum, and multiply by
+`routed_scaling_factor`.
+
 ## References
 
 `moe_reference` implements the routed layer computation for generated MoE
@@ -117,6 +132,11 @@ expert id first so reference output is deterministic.
 `moe_biased_grouped_topk_reference` implements sigmoid scoring, grouped
 candidate filtering, top-k expert selection, optional renormalization/scaling,
 logical-to-physical expert id mapping, and padded-token output id masking.
+
+`moe_softplus_sqrt_topk_routing_reference` implements both correction-bias and
+hash-table softplus-sqrt routing. Non-hash ties are resolved by smaller expert
+id first for deterministic references. Hash-table routing preserves the expert
+order stored in the selected table row.
 
 ## TokenSpeed API Mapping
 
@@ -165,6 +185,15 @@ helper arguments. The generator describes the grouped routing operation; the
 wrapper's fast-path restrictions, such as specific `top_k` and group settings,
 remain implementation-specific details.
 
+The CUDA `softplus_sqrt_topk_flash` and `hash_softplus_sqrt_topk_flash` helpers
+map to `MoESoftplusSqrtTopKRoutingInputs`. The non-hash helper consumes
+generated `logits`, `correction_bias`, output buffers, `routed_scaling_factor`,
+and `renormalize`. The hash helper consumes generated `logits`, `input_ids`,
+`hash_indices_table`, output buffers, `routed_scaling_factor`, and
+`renormalize`. TokenSpeed's CUDA helpers currently require FP32 logits, int32
+output ids, `top_k=6`, `renormalize=True`, and 256 or 384 experts; those are
+adapter requirements rather than additional operation semantics.
+
 ## Verification
 
 MoE configs verify token counts, hidden/intermediate widths, expert counts,
@@ -189,3 +218,10 @@ finite FP32 correction bias, matching token/expert dimensions, equal-size expert
 groups with at least two experts per group, selected-group capacity sufficient
 for `top_k`, positive finite routed scaling, permutation validity for optional
 logical-to-physical maps, and in-range scalar padding cutoffs.
+
+Softplus-sqrt top-k routing verifies finite FP32 logits, rank-2 output buffers,
+int32 output ids, FP32 output weights, positive finite routed scaling, and
+`renormalize=True`. Correction-bias mode requires one finite FP32 bias per
+expert. Hash mode requires int32/int64 input ids, an int32 hash table with
+one unique in-range expert id per selected slot, and input ids that index valid
+hash-table rows.

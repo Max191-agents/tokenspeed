@@ -39,6 +39,9 @@ from tokenspeed_numerics_input_generators import (
     MoESoftmaxTopKRoutingInputConfig,
     MoESoftmaxTopKRoutingInputs,
     MoESoftmaxTopKRoutingInputValues,
+    MoESoftplusSqrtTopKRoutingInputConfig,
+    MoESoftplusSqrtTopKRoutingInputs,
+    MoESoftplusSqrtTopKRoutingInputValues,
     NVFP4GemmSwiGLUNVFP4QuantInputConfig,
     NVFP4GemmSwiGLUNVFP4QuantInputs,
     TensorInput,
@@ -50,6 +53,7 @@ from tokenspeed_numerics_input_generators import (
     moe_biased_grouped_topk_reference,
     moe_reference,
     moe_softmax_topk_routing_reference,
+    moe_softplus_sqrt_topk_routing_reference,
     mxfp4_gemm_input_config,
     mxint4_gemm_input_config,
     nvfp4_dequantization_reference,
@@ -1344,6 +1348,97 @@ def test_moe_biased_grouped_topk_verifies_config_and_values() -> None:
 
     with pytest.raises(ValueError, match="must be a permutation"):
         moe_biased_grouped_topk_reference(values)
+
+
+def test_moe_softplus_sqrt_topk_routing_inputs_generate_non_hash_values() -> None:
+    values = MoESoftplusSqrtTopKRoutingInputs(
+        MoESoftplusSqrtTopKRoutingInputConfig(
+            num_tokens=3,
+            num_experts=8,
+            top_k=4,
+            routed_scaling_factor=2.0,
+        )
+    ).generate(seed=54, device="cpu")
+
+    ref = moe_softplus_sqrt_topk_routing_reference(values)
+
+    assert values.logits.shape == (3, 8)
+    assert values.logits.dtype == torch.float32
+    assert values.correction_bias is not None
+    assert values.correction_bias.shape == (8,)
+    assert values.input_ids is None
+    assert values.hash_indices_table is None
+    assert values.topk_indices.shape == (3, 4)
+    assert values.topk_indices.dtype == torch.int32
+    assert values.topk_weights.shape == (3, 4)
+    assert ref.topk_indices.shape == (3, 4)
+    assert ref.topk_weights.shape == (3, 4)
+    torch.testing.assert_close(
+        ref.topk_weights.sum(dim=-1),
+        torch.full((3,), 2.0),
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    )
+
+
+def test_moe_softplus_sqrt_topk_routing_reference_handles_hash_table() -> None:
+    values = MoESoftplusSqrtTopKRoutingInputValues(
+        logits=torch.tensor(
+            [
+                [0.0, 1.0, -1.0, 0.5],
+                [2.0, -2.0, 0.25, 1.5],
+            ],
+            dtype=torch.float32,
+        ),
+        correction_bias=None,
+        input_ids=torch.tensor([1, 0], dtype=torch.int64),
+        hash_indices_table=torch.tensor(
+            [
+                [3, 1],
+                [0, 2],
+            ],
+            dtype=torch.int32,
+        ),
+        topk_indices=torch.empty((2, 2), dtype=torch.int32),
+        topk_weights=torch.empty((2, 2), dtype=torch.float32),
+        renormalize=True,
+        routed_scaling_factor=3.0,
+    )
+
+    ref = moe_softplus_sqrt_topk_routing_reference(values)
+    transformed = torch.sqrt(torch.nn.functional.softplus(values.logits))
+    expected_ids = torch.tensor([[0, 2], [3, 1]], dtype=torch.int32)
+    expected_weights = transformed.gather(1, expected_ids.to(torch.long))
+    expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
+    expected_weights = expected_weights * 3.0
+
+    torch.testing.assert_close(ref.topk_indices, expected_ids)
+    torch.testing.assert_close(ref.topk_weights, expected_weights)
+
+
+def test_moe_softplus_sqrt_topk_routing_verifies_config_and_values() -> None:
+    with pytest.raises(ValueError, match="renormalize=True"):
+        MoESoftplusSqrtTopKRoutingInputs(
+            MoESoftplusSqrtTopKRoutingInputConfig(
+                num_tokens=2,
+                num_experts=8,
+                renormalize=False,
+            )
+        )
+
+    values = MoESoftplusSqrtTopKRoutingInputValues(
+        logits=torch.zeros((1, 4), dtype=torch.float32),
+        correction_bias=None,
+        input_ids=torch.tensor([0], dtype=torch.int32),
+        hash_indices_table=torch.tensor([[1, 1]], dtype=torch.int32),
+        topk_indices=torch.empty((1, 2), dtype=torch.int32),
+        topk_weights=torch.empty((1, 2), dtype=torch.float32),
+        renormalize=True,
+        routed_scaling_factor=1.0,
+    )
+
+    with pytest.raises(ValueError, match="must not repeat experts"):
+        moe_softplus_sqrt_topk_routing_reference(values)
 
 
 def test_moe_align_block_size_inputs_generate_topk_ids() -> None:

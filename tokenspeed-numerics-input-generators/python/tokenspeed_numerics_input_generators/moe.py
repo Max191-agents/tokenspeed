@@ -58,6 +58,10 @@ __all__ = [
     "MoEBiasedGroupedTopKInputs",
     "MoEBiasedGroupedTopKInputValues",
     "MoEBiasedGroupedTopKReferenceValues",
+    "MoESoftplusSqrtTopKRoutingInputConfig",
+    "MoESoftplusSqrtTopKRoutingInputs",
+    "MoESoftplusSqrtTopKRoutingInputValues",
+    "MoESoftplusSqrtTopKRoutingReferenceValues",
     "MoeInputConfig",
     "MoeInputValues",
     "MoeInputs",
@@ -66,6 +70,7 @@ __all__ = [
     "moe_align_block_size_reference",
     "moe_biased_grouped_topk_reference",
     "moe_reference",
+    "moe_softplus_sqrt_topk_routing_reference",
     "moe_softmax_topk_routing_reference",
 ]
 
@@ -166,6 +171,28 @@ class MoEBiasedGroupedTopKReferenceValues:
 
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
+
+
+@dataclass
+class MoESoftplusSqrtTopKRoutingInputValues:
+    """Generated values for softplus-sqrt top-k MoE routing."""
+
+    logits: torch.Tensor
+    correction_bias: torch.Tensor | None
+    input_ids: torch.Tensor | None
+    hash_indices_table: torch.Tensor | None
+    topk_indices: torch.Tensor
+    topk_weights: torch.Tensor
+    renormalize: bool
+    routed_scaling_factor: float
+
+
+@dataclass
+class MoESoftplusSqrtTopKRoutingReferenceValues:
+    """Reference outputs for softplus-sqrt top-k MoE routing."""
+
+    topk_indices: torch.Tensor
+    topk_weights: torch.Tensor
 
 
 @dataclass
@@ -289,6 +316,46 @@ class MoEBiasedGroupedTopKInputConfig:
 
     # Optional: if set, rows at or after this token count get output ids ``-1``.
     num_token_non_padded: int | None = None
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class MoESoftplusSqrtTopKRoutingInputConfig:
+    """Initialization parameters for softplus-sqrt top-k MoE routing.
+
+    The represented operation transforms router logits with
+    ``sqrt(softplus(x))`` and produces normalized top-k routing weights. In
+    non-hash mode, top-k experts are selected from transformed scores plus a
+    correction bias. In hash mode, selected experts come from an input-id keyed
+    hash table.
+    """
+
+    # Required: number of token rows to route.
+    num_tokens: int
+
+    # Required: number of experts in the router logit row.
+    num_experts: int
+
+    # Optional: number of selected experts per token. TokenSpeed's CUDA helper
+    # is specialized for six, but the operation-level reference is generic.
+    top_k: int = 6
+
+    # Optional: use token-id keyed hash routing instead of correction-bias top-k.
+    use_hash_table: bool = False
+
+    # Optional: hash-table row count when ``use_hash_table`` is enabled.
+    hash_table_size: int | None = None
+
+    # Optional: generated input-id dtype for hash routing.
+    input_ids_dtype: torch.dtype = torch.int64
+
+    # Optional: this operation always normalizes selected weights.
+    renormalize: bool = True
+
+    # Optional: positive scale applied after normalizing selected weights.
+    routed_scaling_factor: float = 1.0
 
     # Optional: generated tensor device override.
     device: DeviceLike = None
@@ -576,6 +643,128 @@ class MoEBiasedGroupedTopKInputs(NumericsInputGenerator):
         return values
 
 
+@dataclass(init=False)
+class MoESoftplusSqrtTopKRoutingInputs(NumericsInputGenerator):
+    """Input generator for softplus-sqrt top-k MoE routing."""
+
+    config: MoESoftplusSqrtTopKRoutingInputConfig
+
+    def __init__(self, config: MoESoftplusSqrtTopKRoutingInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.num_experts = int(self.config.num_experts)
+        self.config.top_k = int(self.config.top_k)
+        if self.config.num_experts <= 0:
+            raise ValueError("num_experts must be positive")
+        if self.config.top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if self.config.top_k > self.config.num_experts:
+            raise ValueError("top_k must be <= num_experts")
+        if not self.config.renormalize:
+            raise ValueError("softplus-sqrt routing requires renormalize=True")
+        self.config.routed_scaling_factor = _check_positive_finite_float(
+            "routed_scaling_factor", self.config.routed_scaling_factor
+        )
+        if self.config.input_ids_dtype not in (torch.int32, torch.int64):
+            raise ValueError("input_ids_dtype must be torch.int32 or torch.int64")
+        if self.config.hash_table_size is not None:
+            self.config.hash_table_size = int(self.config.hash_table_size)
+            if self.config.hash_table_size <= 0:
+                raise ValueError("hash_table_size must be positive when set")
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> MoESoftplusSqrtTopKRoutingInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=rng_device).manual_seed(seed)
+        logits = (
+            torch.randn(
+                (self.config.num_tokens, self.config.num_experts),
+                dtype=torch.float32,
+                device=target_device,
+                generator=generator,
+            )
+            * 0.5
+        )
+        topk_indices = torch.empty(
+            (self.config.num_tokens, self.config.top_k),
+            dtype=torch.int32,
+            device=target_device,
+        )
+        topk_weights = torch.empty(
+            (self.config.num_tokens, self.config.top_k),
+            dtype=torch.float32,
+            device=target_device,
+        )
+        correction_bias = None
+        input_ids = None
+        hash_indices_table = None
+        if self.config.use_hash_table:
+            table_size = self.config.hash_table_size or max(self.config.num_tokens, 1)
+            input_ids = torch.randint(
+                0,
+                table_size,
+                (self.config.num_tokens,),
+                dtype=self.config.input_ids_dtype,
+                device=target_device,
+                generator=generator,
+            )
+            table_rows = [
+                torch.randperm(
+                    self.config.num_experts,
+                    dtype=torch.int32,
+                    device=target_device,
+                    generator=generator,
+                )[: self.config.top_k]
+                for _ in range(table_size)
+            ]
+            hash_indices_table = (
+                torch.stack(table_rows)
+                if table_rows
+                else torch.empty(
+                    (0, self.config.top_k),
+                    dtype=torch.int32,
+                    device=target_device,
+                )
+            )
+        else:
+            correction_bias = (
+                torch.randn(
+                    (self.config.num_experts,),
+                    dtype=torch.float32,
+                    device=target_device,
+                    generator=generator,
+                )
+                * 0.25
+            )
+        values = MoESoftplusSqrtTopKRoutingInputValues(
+            logits=logits.contiguous(),
+            correction_bias=(
+                None if correction_bias is None else correction_bias.contiguous()
+            ),
+            input_ids=None if input_ids is None else input_ids.contiguous(),
+            hash_indices_table=(
+                None if hash_indices_table is None else hash_indices_table.contiguous()
+            ),
+            topk_indices=topk_indices,
+            topk_weights=topk_weights,
+            renormalize=self.config.renormalize,
+            routed_scaling_factor=self.config.routed_scaling_factor,
+        )
+        _validate_moe_softplus_sqrt_topk_routing_values(values)
+        return values
+
+
 def _validate_moe_align_block_size_values(
     values: MoeAlignBlockSizeInputValues,
 ) -> None:
@@ -641,6 +830,95 @@ def _validate_moe_softmax_topk_routing_values(
         raise ValueError("logits must be finite")
     if not torch.isfinite(values.correction_bias).all():
         raise ValueError("correction_bias must be finite")
+
+
+def _validate_moe_softplus_sqrt_topk_routing_values(
+    values: MoESoftplusSqrtTopKRoutingInputValues,
+) -> None:
+    if values.logits.ndim != 2:
+        raise ValueError("logits must be rank-2")
+    if values.logits.dtype != torch.float32:
+        raise TypeError("logits must use torch.float32")
+    num_tokens, num_experts = values.logits.shape
+    if values.topk_indices.ndim != 2:
+        raise ValueError("topk_indices must be rank-2")
+    if values.topk_weights.ndim != 2:
+        raise ValueError("topk_weights must be rank-2")
+    if values.topk_indices.shape != values.topk_weights.shape:
+        raise ValueError("topk_indices and topk_weights must have matching shapes")
+    if values.topk_indices.shape[0] != num_tokens:
+        raise ValueError("topk output rows must match logits rows")
+    top_k = values.topk_indices.shape[1]
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if top_k > num_experts:
+        raise ValueError("top_k must be <= num_experts")
+    if values.topk_indices.dtype != torch.int32:
+        raise TypeError("topk_indices must use torch.int32")
+    if values.topk_weights.dtype != torch.float32:
+        raise TypeError("topk_weights must use torch.float32")
+    if values.topk_indices.device != values.logits.device:
+        raise ValueError("topk_indices must share device with logits")
+    if values.topk_weights.device != values.logits.device:
+        raise ValueError("topk_weights must share device with logits")
+    if not values.renormalize:
+        raise ValueError("softplus-sqrt routing requires renormalize=True")
+    _check_positive_finite_float("routed_scaling_factor", values.routed_scaling_factor)
+
+    has_hash_inputs = (
+        values.input_ids is not None or values.hash_indices_table is not None
+    )
+    if has_hash_inputs:
+        if values.correction_bias is not None:
+            raise ValueError("hash routing must not include correction_bias")
+        if values.input_ids is None or values.hash_indices_table is None:
+            raise ValueError("hash routing requires input_ids and hash_indices_table")
+        if values.input_ids.ndim != 1:
+            raise ValueError("input_ids must be rank-1")
+        if values.input_ids.shape[0] != num_tokens:
+            raise ValueError("input_ids length must match logits rows")
+        if values.input_ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError("input_ids must use torch.int32 or torch.int64")
+        if values.input_ids.device != values.logits.device:
+            raise ValueError("input_ids must share device with logits")
+        table = values.hash_indices_table
+        if table.ndim != 2:
+            raise ValueError("hash_indices_table must be rank-2")
+        if table.shape[1] != top_k:
+            raise ValueError("hash_indices_table width must match top_k")
+        if table.dtype != torch.int32:
+            raise TypeError("hash_indices_table must use torch.int32")
+        if table.device != values.logits.device:
+            raise ValueError("hash_indices_table must share device with logits")
+        if table.shape[0] <= 0:
+            raise ValueError("hash_indices_table must contain at least one row")
+        if num_tokens > 0:
+            if values.input_ids.min().item() < 0:
+                raise ValueError("input_ids must be non-negative")
+            if values.input_ids.max().item() >= table.shape[0]:
+                raise ValueError("input_ids must index hash_indices_table rows")
+        if table.numel() > 0:
+            if table.min().item() < 0 or table.max().item() >= num_experts:
+                raise ValueError("hash_indices_table expert ids must be in range")
+            sorted_rows = table.to(torch.long).sort(dim=-1).values
+            if top_k > 1 and torch.any(sorted_rows[:, 1:] == sorted_rows[:, :-1]):
+                raise ValueError("hash_indices_table rows must not repeat experts")
+    else:
+        if values.correction_bias is None:
+            raise ValueError("non-hash routing requires correction_bias")
+        if values.correction_bias.ndim != 1:
+            raise ValueError("correction_bias must be rank-1")
+        if values.correction_bias.shape != (num_experts,):
+            raise ValueError("correction_bias must have one value per expert")
+        if values.correction_bias.dtype != torch.float32:
+            raise TypeError("correction_bias must use torch.float32")
+        if values.correction_bias.device != values.logits.device:
+            raise ValueError("correction_bias must share device with logits")
+        if not torch.isfinite(values.correction_bias).all():
+            raise ValueError("correction_bias must be finite")
+
+    if not torch.isfinite(values.logits).all():
+        raise ValueError("logits must be finite")
 
 
 def _validate_moe_biased_grouped_topk_values(
@@ -1337,6 +1615,49 @@ def moe_biased_grouped_topk_reference(
     return MoEBiasedGroupedTopKReferenceValues(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
+    )
+
+
+def moe_softplus_sqrt_topk_routing_reference(
+    values: MoESoftplusSqrtTopKRoutingInputValues,
+) -> MoESoftplusSqrtTopKRoutingReferenceValues:
+    """Reference implementation for softplus-sqrt top-k MoE routing."""
+
+    _validate_moe_softplus_sqrt_topk_routing_values(values)
+    transformed = torch.sqrt(torch.nn.functional.softplus(values.logits.float()))
+    has_hash_inputs = values.input_ids is not None
+    if has_hash_inputs:
+        if values.hash_indices_table is None:
+            raise ValueError("hash routing requires hash_indices_table")
+        topk_indices = values.hash_indices_table[values.input_ids.to(torch.long)].to(
+            torch.int32
+        )
+    else:
+        if values.correction_bias is None:
+            raise ValueError("non-hash routing requires correction_bias")
+        selection_scores = transformed + values.correction_bias.reshape(1, -1)
+        scores_cpu = selection_scores.detach().cpu()
+        selected: list[torch.Tensor] = []
+        for row_idx in range(scores_cpu.shape[0]):
+            ordered = sorted(
+                range(scores_cpu.shape[1]),
+                key=lambda expert: (-float(scores_cpu[row_idx, expert]), expert),
+            )[: values.topk_indices.shape[1]]
+            selected.append(
+                torch.tensor(ordered, dtype=torch.int32, device=values.logits.device)
+            )
+        topk_indices = (
+            torch.stack(selected) if selected else torch.empty_like(values.topk_indices)
+        )
+
+    topk_weights = transformed.gather(1, topk_indices.to(torch.long))
+    denom = topk_weights.sum(dim=-1, keepdim=True)
+    denom = torch.where(denom != 0.0, denom, torch.ones_like(denom))
+    topk_weights = topk_weights / denom
+    topk_weights = topk_weights * float(values.routed_scaling_factor)
+    return MoESoftplusSqrtTopKRoutingReferenceValues(
+        topk_indices=topk_indices.to(torch.int32),
+        topk_weights=topk_weights.to(torch.float32),
     )
 
 

@@ -18,6 +18,9 @@ route weights.
 - `MoEBiasedGroupedTopKInputs`: generates hidden-state rows, sigmoid router
   logits, correction bias, optional expert-id maps, and optional padding
   cutoffs for grouped top-k routing.
+- `MoESoftplusSqrtTopKRoutingInputs`: generates FP32 router logits and either
+  correction-bias routing metadata or token-id keyed hash routing metadata for
+  normalized `sqrt(softplus(x))` top-k routing.
 
 `MoeInputs` composes the GEMM generator for expert weights. Dense, MXFP4, and
 MXINT4 expert weights are operation-level choices; backend preprocessing such
@@ -46,6 +49,10 @@ Biased grouped top-k routing values describe the MiniMax/DeepSeek-style router
 that scores experts with `sigmoid(gating_output) + correction_bias`, filters
 candidates by selected expert groups, and returns selected ids plus weights from
 the original sigmoid scores.
+
+Softplus-sqrt top-k routing values describe the DeepSeek-style router that
+uses `sqrt(softplus(logits))` as route weights. Expert selection can come from
+correction-biased top-k scores or from a generated hash table keyed by token id.
 
 These generators intentionally describe operation-level routed computations
 rather than any one fused MoE kernel signature.
