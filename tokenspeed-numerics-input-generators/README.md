@@ -84,6 +84,14 @@ constraints documented for that generator. Correctness tests should get
 well-formed inputs by construction as long as they stay inside the public
 generator API.
 
+This is a misuse-resistance contract. The library should reject invalid
+configuration choices, inconsistent child generator overrides, impossible
+metadata layouts, unsupported dtype/scale combinations, and generated values
+that violate the operation definition. A consumer should not need private
+knowledge of a generator's internals to avoid broken inputs; using the public
+generator API correctly should be enough to get operation-valid tensors and
+metadata.
+
 Verification in this layer is about input validity, not proving numerical
 agreement. It should establish that the generated inputs make sense for the
 operation being represented: shapes line up, dtypes are supported, quantized
