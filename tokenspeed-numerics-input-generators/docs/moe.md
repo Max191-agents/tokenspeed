@@ -22,6 +22,8 @@ that performs routing and expert computation itself.
   `[num_tokens, top_k]`.
 - `w13` and `w2`: nested GEMM values for the gate/up and down expert weights.
 - Optional expert biases.
+- Optional per-expert activation scales for quantized W13 and W2 projection
+  inputs.
 
 Generated `topk_ids` and `topk_weights` are derived from `router_logits` by
 softmax, top-k selection, and selected-weight renormalization. This keeps the
@@ -33,6 +35,13 @@ The nested weight generators reuse the GEMM family so dense, scaled, and MXFP4
 weights share the same dtype and scale handling as standalone GEMMs. Activation
 operands are skipped for the nested weight GEMMs because the layer computation
 produces those intermediate activations.
+
+Quantized MoE implementations may need scale tensors for activations entering
+the gate/up projection and the down projection. `MoeInputs` can generate those
+per-expert positive scale tensors when `activation_scale_dtype` is configured.
+The scales describe quantized projection inputs at the operation boundary;
+packing, precision-config objects, or backend-specific scale layout transforms
+remain adapter concerns.
 
 `MoeAlignBlockSizeInputs` generates inputs for the expert block-alignment
 metadata operation. This operation flattens top-k expert selections, groups the
@@ -68,10 +77,11 @@ from parallel implementations.
 TokenSpeed fused MoE kernels consume a runtime weight module plus a plan created
 by `moe_plan`. That module is a backend adapter concern. `MoeInputs` produces
 the operation-level tensors: hidden states, router logits, explicit top-k
-routing results, and expert weights with optional scale sidecars. Tests that
-exercise TokenSpeed kernels should build a small adapter module from those
-values, call `moe_process_weights` for the selected backend, and then pass the
-generated hidden/routing tensors to `moe_apply`.
+routing results, expert weights with optional scale sidecars, optional biases,
+and optional activation scales. Tests that exercise TokenSpeed kernels should
+build a small adapter module from those values, call `moe_process_weights` for
+the selected backend, and then pass the generated hidden/routing tensors to
+`moe_apply`.
 
 For example, the MXFP4 Triton precomputed-routing path uses `MoeInputs` with
 MXFP4 expert weights and passes generated `topk_ids` and `topk_weights`
@@ -90,8 +100,10 @@ by `moe_process_weights`, not by the generator.
 
 MoE configs verify token counts, hidden/intermediate widths, expert counts,
 top-k constraints, block sizes, integer routing dtypes, and generated id
-ranges. The layer reference checks that selected expert ids and weights are
-rank-2, shape-consistent, finite, non-negative, duplicate-free per token, and
-normalized across each token's selected experts. The align-block-size reference
-also checks that provided top-k ids are rank-2 and within `[0, num_experts)`, so
-invalid routing metadata fails before reaching a kernel adapter.
+ranges. Optional activation scales must use regular floating dtypes and
+positive finite scalar fill values. The layer reference checks that selected
+expert ids and weights are rank-2, shape-consistent, finite, non-negative,
+duplicate-free per token, and normalized across each token's selected experts.
+The align-block-size reference also checks that provided top-k ids are rank-2
+and within `[0, num_experts)`, so invalid routing metadata fails before
+reaching a kernel adapter.

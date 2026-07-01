@@ -780,6 +780,38 @@ def test_moe_inputs_compose_mxfp4_weight_gemms() -> None:
     assert inputs.w13.B_scales.dtype == torch.uint8
 
 
+def test_moe_inputs_generate_optional_activation_scales() -> None:
+    inputs = MoeInputs(
+        MoeInputConfig(
+            num_tokens=5,
+            hidden_size=64,
+            intermediate_size=32,
+            num_experts=4,
+            top_k=2,
+            hidden_dtype=torch.float16,
+            weight_format="mxfp4",
+            activation_scale_dtype=torch.float32,
+            w13_activation_scale=0.25,
+            w2_activation_scale=0.5,
+        )
+    ).generate(seed=31, device="cpu")
+
+    assert inputs.w13_activation_scale is not None
+    assert inputs.w2_activation_scale is not None
+    assert inputs.w13_activation_scale.shape == (4,)
+    assert inputs.w2_activation_scale.shape == (4,)
+    assert inputs.w13_activation_scale.dtype == torch.float32
+    assert inputs.w2_activation_scale.dtype == torch.float32
+    torch.testing.assert_close(
+        inputs.w13_activation_scale,
+        torch.full((4,), 0.25, dtype=torch.float32),
+    )
+    torch.testing.assert_close(
+        inputs.w2_activation_scale,
+        torch.full((4,), 0.5, dtype=torch.float32),
+    )
+
+
 def test_moe_reference_matches_manual_dense_silu() -> None:
     values = MoeInputs(
         MoeInputConfig(
@@ -855,6 +887,8 @@ def test_moe_reference_rejects_invalid_topk_weights() -> None:
         w2=values.w2,
         w13_bias=values.w13_bias,
         w2_bias=values.w2_bias,
+        w13_activation_scale=values.w13_activation_scale,
+        w2_activation_scale=values.w2_activation_scale,
     )
 
     with pytest.raises(ValueError, match="topk_weights rows must sum to 1"):
@@ -871,6 +905,34 @@ def test_moe_inputs_verify_topk_config() -> None:
                 num_experts=3,
                 top_k=4,
                 hidden_dtype=torch.float32,
+            )
+        )
+
+
+def test_moe_inputs_verify_activation_scale_config() -> None:
+    with pytest.raises(ValueError, match="activation_scale_dtype"):
+        MoeInputs(
+            MoeInputConfig(
+                num_tokens=4,
+                hidden_size=8,
+                intermediate_size=12,
+                num_experts=3,
+                top_k=2,
+                hidden_dtype=torch.float32,
+                activation_scale_dtype=torch.int32,
+            )
+        )
+    with pytest.raises(ValueError, match="w13_activation_scale"):
+        MoeInputs(
+            MoeInputConfig(
+                num_tokens=4,
+                hidden_size=8,
+                intermediate_size=12,
+                num_experts=3,
+                top_k=2,
+                hidden_dtype=torch.float32,
+                activation_scale_dtype=torch.float32,
+                w13_activation_scale=0.0,
             )
         )
 

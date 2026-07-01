@@ -263,8 +263,12 @@ requires_gfx950 = pytest.mark.skipif(
 class RawMxfp4Weights:
     w13_weight: torch.Tensor
     w13_scale: torch.Tensor
+    w13_bias: torch.Tensor
+    w13_act_scale: torch.Tensor
     w2_weight: torch.Tensor
     w2_scale: torch.Tensor
+    w2_bias: torch.Tensor
+    w2_act_scale: torch.Tensor
 
 
 @dataclass
@@ -312,6 +316,9 @@ def _make_raw_mxfp4_weights() -> RawMxfp4Weights:
             weight_format="mxfp4",
             weight_scale_dtype=None,
             bias_dtype=torch.float32,
+            activation_scale_dtype=torch.float32,
+            w13_activation_scale=W13_ACT_SCALE,
+            w2_activation_scale=W2_ACT_SCALE,
             device="cuda",
         )
     ).generate(seed=20260610, device="cuda")
@@ -319,12 +326,20 @@ def _make_raw_mxfp4_weights() -> RawMxfp4Weights:
         raise ValueError("generated w13 MXFP4 weights are incomplete")
     if values.w2.B is None or values.w2.B_scales is None:
         raise ValueError("generated w2 MXFP4 weights are incomplete")
+    if values.w13_bias is None or values.w2_bias is None:
+        raise ValueError("generated MXFP4 biases are incomplete")
+    if values.w13_activation_scale is None or values.w2_activation_scale is None:
+        raise ValueError("generated MXFP4 activation scales are incomplete")
 
     return RawMxfp4Weights(
         w13_weight=values.w13.B,
         w13_scale=values.w13.B_scales,
+        w13_bias=values.w13_bias,
+        w13_act_scale=values.w13_activation_scale,
         w2_weight=values.w2.B,
         w2_scale=values.w2.B_scales,
+        w2_bias=values.w2_bias,
+        w2_act_scale=values.w2_activation_scale,
     )
 
 
@@ -341,19 +356,19 @@ def _make_weight_module(raw: RawMxfp4Weights) -> torch.nn.Module:
         raw.w2_scale.clone(), requires_grad=False
     )
     layer.w13_weight_bias = torch.nn.Parameter(
-        torch.zeros(E, 2 * INTERMEDIATE_SIZE, device=raw.w13_weight.device),
+        raw.w13_bias.clone(),
         requires_grad=False,
     )
     layer.w2_weight_bias = torch.nn.Parameter(
-        torch.zeros(E, HIDDEN_SIZE, device=raw.w13_weight.device),
+        raw.w2_bias.clone(),
         requires_grad=False,
     )
     layer.w13_input_scale = torch.nn.Parameter(
-        torch.full((E,), W13_ACT_SCALE, device=raw.w13_weight.device),
+        raw.w13_act_scale.clone(),
         requires_grad=False,
     )
     layer.w2_input_scale = torch.nn.Parameter(
-        torch.full((E,), W2_ACT_SCALE, device=raw.w13_weight.device),
+        raw.w2_act_scale.clone(),
         requires_grad=False,
     )
     return layer

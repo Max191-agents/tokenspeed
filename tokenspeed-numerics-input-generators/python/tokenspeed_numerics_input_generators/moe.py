@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -59,10 +60,31 @@ __all__ = [
 
 
 _TOPK_ID_DTYPES = {torch.int16, torch.int32, torch.int64}
+_REGULAR_FLOAT_DTYPES = {
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+}
 
 
 def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def _check_moe_float_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"{name} must be a torch.dtype")
+    if dtype not in _REGULAR_FLOAT_DTYPES:
+        raise ValueError(f"{name} must be a regular floating torch dtype, got {dtype}")
+    return dtype
+
+
+def _check_positive_finite_float(name: str, value: float) -> float:
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be positive and finite, got {value}")
+    return value
 
 
 @dataclass
@@ -303,6 +325,8 @@ class MoeInputValues:
     w2: GemmInputValues
     w13_bias: torch.Tensor | None
     w2_bias: torch.Tensor | None
+    w13_activation_scale: torch.Tensor | None
+    w2_activation_scale: torch.Tensor | None
 
 
 @dataclass
@@ -354,6 +378,16 @@ class MoeInputConfig:
 
     # Optional: generated bias dtype. ``None`` skips biases.
     bias_dtype: torch.dtype | None = None
+
+    # Optional: dtype for generated per-expert activation scales used by
+    # quantized expert projection paths. ``None`` skips these side inputs.
+    activation_scale_dtype: torch.dtype | None = None
+
+    # Optional: positive scalar used to fill the W13 activation scale tensor.
+    w13_activation_scale: float = 0.125
+
+    # Optional: positive scalar used to fill the W2 activation scale tensor.
+    w2_activation_scale: float = 0.125
 
     # Optional: default generation device.
     device: DeviceLike = None
@@ -433,6 +467,16 @@ class MoeInputs(NumericsInputGenerator):
             raise TypeError("hidden_dtype must be a torch.dtype")
         if not isinstance(self.config.router_dtype, torch.dtype):
             raise TypeError("router_dtype must be a torch.dtype")
+        if self.config.activation_scale_dtype is not None:
+            self.config.activation_scale_dtype = _check_moe_float_dtype(
+                "activation_scale_dtype", self.config.activation_scale_dtype
+            )
+        self.config.w13_activation_scale = _check_positive_finite_float(
+            "w13_activation_scale", self.config.w13_activation_scale
+        )
+        self.config.w2_activation_scale = _check_positive_finite_float(
+            "w2_activation_scale", self.config.w2_activation_scale
+        )
         if self.config.weight_dtype is None:
             self.config.weight_dtype = (
                 CustomDType.MXFP4
@@ -612,6 +656,14 @@ class MoeInputs(NumericsInputGenerator):
             seed=_child_seed(seed, 7),
             device=default_device,
         ).values
+        w13_activation_scale = self._make_activation_scale(
+            self.config.w13_activation_scale,
+            device=default_device,
+        )
+        w2_activation_scale = self._make_activation_scale(
+            self.config.w2_activation_scale,
+            device=default_device,
+        )
         return MoeInputValues(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -621,6 +673,23 @@ class MoeInputs(NumericsInputGenerator):
             w2=w2,
             w13_bias=w13_bias,
             w2_bias=w2_bias,
+            w13_activation_scale=w13_activation_scale,
+            w2_activation_scale=w2_activation_scale,
+        )
+
+    def _make_activation_scale(
+        self,
+        scale: float,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if self.config.activation_scale_dtype is None:
+            return None
+        return torch.full(
+            (self.config.num_experts,),
+            scale,
+            dtype=self.config.activation_scale_dtype,
+            device=device,
         )
 
 

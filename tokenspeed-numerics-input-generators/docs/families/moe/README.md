@@ -8,7 +8,8 @@ route weights.
 ## Generators
 
 - `MoeInputs`: generates hidden states, router logits, top-k routing ids and
-  weights, expert W13/W2 GEMM operands, and optional biases.
+  weights, expert W13/W2 GEMM operands, optional biases, and optional
+  per-expert activation scales for quantized projection inputs.
 - `MoeAlignBlockSizeInputs`: generates top-k expert ids and block-size metadata
   for expert-local token grouping and padding.
 
@@ -21,7 +22,9 @@ preshuffling or registry precision configs belongs in adapters.
 Generated routing uses router logits to derive valid top-k ids and normalized
 route weights. References validate that selected experts are in range, route
 weights are finite and normalized, and expert weight shapes agree with hidden
-and intermediate dimensions.
+and intermediate dimensions. Optional activation scales are generated as
+positive per-expert tensors and are intended for adapters that quantize the
+projection activations before calling a backend kernel.
 
 The generator intentionally describes the layer-level routed computation rather
 than any one fused MoE kernel signature.
