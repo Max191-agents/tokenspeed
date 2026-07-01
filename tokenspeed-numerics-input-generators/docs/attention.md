@@ -259,6 +259,47 @@ Walsh-Hadamard projection, another BF16 rounding step, and MXFP4 quantization
 into four 32-channel blocks. The result is written into the paged MXFP4 indexer
 cache layout used by the standalone indexer cache write/gather generators.
 
+### DeepSeek V4 Sparse-Compress K-Cache Insert
+
+`DeepSeekV4SparseCompressCacheInsertInputs` represents the compressed sparse
+attention K-cache insert path. The operation compresses a window of state-cache
+rows into one 512-channel K row, applies RMSNorm, stores the 448-channel NoPE
+prefix as block-scaled FP8 E4M3 bytes, and stores the 64-channel RoPE suffix as
+BF16 bytes after applying RoPE at the compressed position.
+
+Rows write only when the compressor slot and output KV slot are non-negative
+and `(position + 1) % compress_ratio == 0`. The compression window length is
+`compress_ratio` for the non-overlap path and `2 * compress_ratio` for the
+overlap path:
+
+```text
+window = [position - window_len + 1, ..., position]
+```
+
+For non-overlap compression, every valid window position reads the first
+512-channel state slice. For overlap compression, the older half of the window
+reads the first 512-channel slice and the newer half reads the second
+512-channel slice. Matching score rows from the second half of the state cache
+are softmaxed across the window independently for each channel:
+
+```text
+weights[:, channel] = softmax(score_window[:, channel])
+compressed[channel] = sum(kv_window[:, channel] * weights[:, channel])
+normed = rms_norm(compressed, rms_norm_weight, rms_norm_eps)
+```
+
+The generated output cache uses the same sparse-window byte layout consumed by
+the K-cache gather generator:
+
+```text
+token_base = page * page_stride + row * 576
+scale_base = page * page_stride + block_size * 576 + row * 8
+```
+
+The first 448 token bytes hold NoPE FP8 values with seven UE8M0 scale bytes.
+The final scale byte is reserved and generated as zero. The final 128 token
+bytes hold the 64 BF16 RoPE channels.
+
 ### DeepSeek V4 Indexer MXFP4 Cache Write
 
 `DeepSeekV4IndexerMXFP4CacheWriteInputs` represents writing 128-channel indexer
@@ -431,6 +472,11 @@ values:
   that cover generated positions, unique writable output slots, valid request
   ids, and MXFP4 cache rows large enough for 64 packed value bytes plus 4 scale
   bytes per row
+- DeepSeek V4 sparse-compress K-cache insert inputs require state-cache pages
+  with one or two 512-channel K slices plus matching score slices, block tables
+  that cover generated positions, unique writable output slots, valid request
+  ids, a generated RoPE cache covering compressed positions, and K-cache rows
+  large enough for 448 FP8 NoPE bytes, 128 BF16 RoPE bytes, and 8 scale bytes
 - merge-state outputs must have shape `[total_q, num_heads, head_dim]`
 - merge-state LSE tensors must have shape `[total_q, num_heads]` and use fp32
   generated values

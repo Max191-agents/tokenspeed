@@ -29,6 +29,8 @@ compressed/cache-specific representations with different per-token shapes.
   output-projection FP8 quantization inputs.
 - `DeepSeekV4CSAIndexerMXFP4CacheInsertInputs`: generates DeepSeek V4 CSA
   indexer compression plus MXFP4 cache-insert inputs.
+- `DeepSeekV4SparseCompressCacheInsertInputs`: generates DeepSeek V4 sparse
+  K-cache compression plus FP8/BF16 cache-insert inputs.
 - `DeepSeekV4IndexerMXFP4CacheWriteInputs`: generates DeepSeek V4 indexer
   K-cache MXFP4 write inputs.
 - `DeepSeekV4IndexerMXFP4CacheGatherInputs`: generates DeepSeek V4 indexer

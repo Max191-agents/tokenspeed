@@ -41,6 +41,8 @@ from tokenspeed_numerics_input_generators import (
     DeepSeekV4KCacheGatherInputs,
     DeepSeekV4PagedIndexInputConfig,
     DeepSeekV4PagedIndexInputs,
+    DeepSeekV4SparseCompressCacheInsertInputConfig,
+    DeepSeekV4SparseCompressCacheInsertInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
     DeepSeekV4SparsePrefillIndexInputs,
     DSASparseDecodeKVPackInputConfig,
@@ -82,6 +84,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference,
     deepseek_v4_inv_rope_fp8_quant_reference,
     deepseek_v4_save_compressor_state_reference,
+    deepseek_v4_sparse_compress_cache_insert_reference,
     dsa_full_context_topk_to_global_slots_reference,
     dsa_local_topk_to_global_slots_reference,
     dsa_sparse_decode_kv_pack_reference,
@@ -1477,6 +1480,202 @@ def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_rejects_invalid_values() -> 
     values.positions = torch.tensor([3, 3], dtype=torch.int64)
     with pytest.raises(ValueError, match="unique"):
         deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(values)
+
+
+@pytest.mark.parametrize(
+    ("overlap", "expected_state_width"),
+    [
+        (False, 1024),
+        (True, 2048),
+    ],
+)
+def test_deepseek_v4_sparse_compress_cache_insert_inputs_generate_reference(
+    overlap: bool,
+    expected_state_width: int,
+) -> None:
+    values = DeepSeekV4SparseCompressCacheInsertInputs(
+        DeepSeekV4SparseCompressCacheInsertInputConfig(
+            num_tokens=6,
+            batch_size=2,
+            max_seq_len=8,
+            num_state_cache_blocks=4,
+            compressor_block_size=4,
+            num_kv_cache_blocks=2,
+            kv_cache_block_size=4,
+            compress_ratio=4,
+            overlap=overlap,
+            dtype=torch.bfloat16,
+            non_boundary_token_count=1,
+            include_block_table_base_offsets=True,
+            value_scale=0.25,
+        )
+    ).generate(metadata_seed=231, value_seed=241, device="cpu")
+
+    expected = deepseek_v4_sparse_compress_cache_insert_reference(values)
+
+    assert values.state_cache.shape == (4, 4, expected_state_width)
+    assert values.block_table.shape == (2, 2)
+    assert values.kv_cache_2d.shape == (2, 4 * (576 + 8))
+    assert values.rms_norm_weight.shape == (512,)
+    assert values.cos_sin_cache.shape == (8, 64)
+    assert values.block_table_base_offsets is not None
+    assert expected.shape == values.kv_cache_2d.shape
+
+    writable_slots = []
+    for row_idx in range(values.positions.numel()):
+        slot = int(values.kv_slot_mapping[row_idx].item())
+        writable = (
+            int(values.compressor_slot_mapping[row_idx].item()) >= 0
+            and slot >= 0
+            and (int(values.positions[row_idx].item()) + 1) % values.compress_ratio == 0
+        )
+        if not writable:
+            continue
+        writable_slots.append(slot)
+        page = slot // values.kv_cache_block_size
+        pos = slot % values.kv_cache_block_size
+        token_base = pos * 576
+        scale_base = values.kv_cache_block_size * 576 + pos * 8
+        assert not torch.equal(
+            expected[page, token_base : token_base + 576],
+            values.kv_cache_2d[page, token_base : token_base + 576],
+        )
+        assert not torch.equal(
+            expected[page, scale_base : scale_base + 8],
+            values.kv_cache_2d[page, scale_base : scale_base + 8],
+        )
+    assert writable_slots
+
+
+def test_deepseek_v4_sparse_compress_cache_insert_skips_invalid_rows() -> None:
+    values = DeepSeekV4SparseCompressCacheInsertInputs(
+        DeepSeekV4SparseCompressCacheInsertInputConfig(
+            num_tokens=3,
+            batch_size=1,
+            max_seq_len=4,
+            num_state_cache_blocks=1,
+            compressor_block_size=4,
+            num_kv_cache_blocks=1,
+            kv_cache_block_size=4,
+            compress_ratio=4,
+            overlap=True,
+            dtype=torch.float32,
+            non_boundary_token_count=1,
+            negative_compressor_slot_count=1,
+        )
+    ).generate(seed=251, device="cpu")
+    values.token_to_req_indices.zero_()
+    values.positions = torch.tensor([3, 2, 3], dtype=torch.int64)
+    values.compressor_slot_mapping = torch.tensor([0, 1, -1], dtype=torch.int64)
+    values.kv_slot_mapping = torch.tensor([0, 1, 2], dtype=torch.int64)
+    values.block_table.zero_()
+    values.kv_cache_2d.zero_()
+    values.state_cache.zero_()
+    values.state_cache[:, :, 512:1024] = 1.0
+    values.rms_norm_weight.fill_(1.0)
+
+    expected = deepseek_v4_sparse_compress_cache_insert_reference(values)
+
+    assert not torch.equal(expected[0, :576], values.kv_cache_2d[0, :576])
+    torch.testing.assert_close(
+        expected[0, 576:1152],
+        values.kv_cache_2d[0, 576:1152],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        expected[0, 1152:1728],
+        values.kv_cache_2d[0, 1152:1728],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_deepseek_v4_sparse_compress_cache_insert_keeps_metadata_seed_independent() -> (
+    None
+):
+    generator = DeepSeekV4SparseCompressCacheInsertInputs(
+        DeepSeekV4SparseCompressCacheInsertInputConfig(
+            num_tokens=5,
+            batch_size=2,
+            max_seq_len=8,
+            num_state_cache_blocks=3,
+            compressor_block_size=4,
+            num_kv_cache_blocks=2,
+            kv_cache_block_size=4,
+            compress_ratio=4,
+            overlap=False,
+            dtype=torch.float32,
+            non_boundary_token_count=1,
+        )
+    )
+
+    first = generator.generate(metadata_seed=261, value_seed=271, device="cpu")
+    same_metadata = generator.generate(metadata_seed=261, value_seed=272, device="cpu")
+    same_values = generator.generate(metadata_seed=262, value_seed=271, device="cpu")
+
+    torch.testing.assert_close(first.positions, same_metadata.positions)
+    torch.testing.assert_close(
+        first.compressor_slot_mapping,
+        same_metadata.compressor_slot_mapping,
+    )
+    torch.testing.assert_close(first.kv_slot_mapping, same_metadata.kv_slot_mapping)
+    torch.testing.assert_close(first.block_table, same_metadata.block_table)
+    assert not torch.equal(first.state_cache, same_metadata.state_cache)
+    torch.testing.assert_close(first.state_cache, same_values.state_cache)
+    assert not torch.equal(first.positions, same_values.positions)
+
+
+def test_deepseek_v4_sparse_compress_cache_insert_rejects_invalid_values() -> None:
+    with pytest.raises(ValueError, match="compressor slots"):
+        DeepSeekV4SparseCompressCacheInsertInputs(
+            DeepSeekV4SparseCompressCacheInsertInputConfig(
+                num_tokens=5,
+                batch_size=1,
+                max_seq_len=4,
+                num_state_cache_blocks=1,
+                compressor_block_size=4,
+                num_kv_cache_blocks=2,
+                kv_cache_block_size=4,
+                compress_ratio=4,
+                overlap=False,
+                dtype=torch.float32,
+            )
+        )
+    with pytest.raises(ValueError, match="compression boundary"):
+        DeepSeekV4SparseCompressCacheInsertInputs(
+            DeepSeekV4SparseCompressCacheInsertInputConfig(
+                num_tokens=1,
+                batch_size=1,
+                max_seq_len=3,
+                num_state_cache_blocks=1,
+                compressor_block_size=4,
+                num_kv_cache_blocks=1,
+                kv_cache_block_size=4,
+                compress_ratio=4,
+                overlap=True,
+                dtype=torch.float32,
+            )
+        )
+
+    values = DeepSeekV4SparseCompressCacheInsertInputs(
+        DeepSeekV4SparseCompressCacheInsertInputConfig(
+            num_tokens=2,
+            batch_size=1,
+            max_seq_len=4,
+            num_state_cache_blocks=1,
+            compressor_block_size=4,
+            num_kv_cache_blocks=1,
+            kv_cache_block_size=4,
+            compress_ratio=4,
+            overlap=True,
+            dtype=torch.float32,
+        )
+    ).generate(seed=281, device="cpu")
+    values.kv_slot_mapping = torch.tensor([0, 0], dtype=torch.int64)
+    values.positions = torch.tensor([3, 3], dtype=torch.int64)
+    with pytest.raises(ValueError, match="unique"):
+        deepseek_v4_sparse_compress_cache_insert_reference(values)
 
 
 def test_deepseek_v4_indexer_mxfp4_cache_write_inputs_generate_reference() -> None:
