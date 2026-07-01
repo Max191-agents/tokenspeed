@@ -27,6 +27,8 @@ compressed/cache-specific representations with different per-token shapes.
   Q RoPE/Hadamard/MXFP4 transform inputs.
 - `DeepSeekV4InvRoPEFP8QuantInputs`: generates DeepSeek V4 inverse-RoPE
   output-projection FP8 quantization inputs.
+- `DeepSeekV4CSAIndexerMXFP4CacheInsertInputs`: generates DeepSeek V4 CSA
+  indexer compression plus MXFP4 cache-insert inputs.
 - `DeepSeekV4IndexerMXFP4CacheWriteInputs`: generates DeepSeek V4 indexer
   K-cache MXFP4 write inputs.
 - `DeepSeekV4IndexerMXFP4CacheGatherInputs`: generates DeepSeek V4 indexer

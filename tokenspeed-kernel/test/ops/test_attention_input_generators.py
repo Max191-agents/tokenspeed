@@ -49,6 +49,7 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_compute_global_topk_indices_and_lens,
     deepseek_v4_decode_swa_indices_and_lens,
     deepseek_v4_dequantize_and_gather_k_cache,
+    deepseek_v4_fused_csa_indexer_mxfp4_cache_insert,
     deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4,
     deepseek_v4_fused_inv_rope_fp8_quant,
     deepseek_v4_gather_indexer_mxfp4_cache,
@@ -71,6 +72,8 @@ from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputs,
     DeepSeekV4CompressorStateInputConfig,
     DeepSeekV4CompressorStateInputs,
+    DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig,
+    DeepSeekV4CSAIndexerMXFP4CacheInsertInputs,
     DeepSeekV4IndexerMXFP4CacheGatherInputConfig,
     DeepSeekV4IndexerMXFP4CacheGatherInputs,
     DeepSeekV4IndexerMXFP4CacheWriteInputConfig,
@@ -108,6 +111,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_combine_topk_swa_indices_reference,
     deepseek_v4_compressed_slot_mapping_reference,
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
+    deepseek_v4_csa_indexer_mxfp4_cache_insert_reference,
     deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_dequantize_and_gather_k_cache_reference,
     deepseek_v4_indexer_decode_metadata_reference,
@@ -787,6 +791,57 @@ def test_deepseek_v4_inv_rope_fp8_quant_generator_runs_tokenspeed_triton(
 
     torch.testing.assert_close(actual_fp8.float(), expected_fp8.float(), rtol=0, atol=0)
     torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+
+
+def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_generator_runs_tokenspeed_triton(
+    device: str,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm GPU is required for Triton CSA indexer cache test")
+
+    values = DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+        DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
+            num_tokens=4,
+            batch_size=1,
+            max_seq_len=4,
+            num_state_cache_blocks=1,
+            compressor_block_size=4,
+            num_kv_cache_blocks=1,
+            kv_cache_block_size=4,
+            dtype=torch.bfloat16,
+            value_scale=0.0,
+        )
+    ).generate(seed=2094, device=device)
+    values.token_to_req_indices.zero_()
+    values.positions.fill_(3)
+    values.compressor_slot_mapping = torch.arange(4, dtype=torch.int64, device=device)
+    values.kv_slot_mapping = torch.arange(4, dtype=torch.int64, device=device)
+    values.block_table.zero_()
+    values.state_cache.zero_()
+    values.state_cache[:, :, 128:256] = 1.0
+    values.rms_norm_weight.fill_(1.0)
+    expected = deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(values)
+    actual = values.kv_cache_2d.clone()
+
+    deepseek_v4_fused_csa_indexer_mxfp4_cache_insert(
+        state_cache=values.state_cache,
+        token_to_req_indices=values.token_to_req_indices,
+        positions=values.positions,
+        compressor_slot_mapping=values.compressor_slot_mapping,
+        block_table=values.block_table,
+        compressor_block_size=values.compressor_block_size,
+        rms_norm_weight=values.rms_norm_weight,
+        rms_norm_eps=values.rms_norm_eps,
+        cos_sin_cache=values.cos_sin_cache,
+        kv_cache_2d=actual,
+        kv_slot_mapping=values.kv_slot_mapping,
+        kv_cache_block_size=values.kv_cache_block_size,
+        compress_ratio=values.compress_ratio,
+        block_table_base_offsets=values.block_table_base_offsets,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
 def test_deepseek_v4_indexer_mxfp4_cache_write_generator_runs_tokenspeed_triton(

@@ -27,6 +27,8 @@ from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputs,
     DeepSeekV4CompressorStateInputConfig,
     DeepSeekV4CompressorStateInputs,
+    DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig,
+    DeepSeekV4CSAIndexerMXFP4CacheInsertInputs,
     DeepSeekV4IndexerMXFP4CacheGatherInputConfig,
     DeepSeekV4IndexerMXFP4CacheGatherInputs,
     DeepSeekV4IndexerMXFP4CacheWriteInputConfig,
@@ -71,6 +73,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_combine_topk_swa_indices_reference,
     deepseek_v4_compressed_slot_mapping_reference,
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
+    deepseek_v4_csa_indexer_mxfp4_cache_insert_reference,
     deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_dequantize_and_gather_k_cache_reference,
     deepseek_v4_indexer_decode_metadata_reference,
@@ -1304,6 +1307,176 @@ def test_deepseek_v4_inv_rope_fp8_quant_rejects_invalid_configs_and_values() -> 
     values.positions = torch.tensor([2], dtype=torch.int64)
     with pytest.raises(ValueError, match="positions"):
         deepseek_v4_inv_rope_fp8_quant_reference(values)
+
+
+def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_inputs_generate_reference() -> None:
+    values = DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+        DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
+            num_tokens=6,
+            batch_size=2,
+            max_seq_len=12,
+            num_state_cache_blocks=4,
+            compressor_block_size=4,
+            num_kv_cache_blocks=2,
+            kv_cache_block_size=4,
+            dtype=torch.bfloat16,
+            non_boundary_token_count=1,
+            include_block_table_base_offsets=True,
+            value_scale=0.25,
+        )
+    ).generate(metadata_seed=171, value_seed=181, device="cpu")
+
+    expected = deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(values)
+
+    assert values.state_cache.shape == (4, 4, 512)
+    assert values.block_table.shape == (2, 3)
+    assert values.kv_cache_2d.shape == (2, 4 * 68)
+    assert values.rms_norm_weight.shape == (128,)
+    assert values.cos_sin_cache.shape == (12, 64)
+    assert values.block_table_base_offsets is not None
+    assert expected.shape == values.kv_cache_2d.shape
+
+    writable_slots = []
+    for row_idx in range(values.positions.numel()):
+        slot = int(values.kv_slot_mapping[row_idx].item())
+        writable = (
+            int(values.compressor_slot_mapping[row_idx].item()) >= 0
+            and slot >= 0
+            and (int(values.positions[row_idx].item()) + 1) % values.compress_ratio == 0
+        )
+        if not writable:
+            continue
+        writable_slots.append(slot)
+        page = slot // values.kv_cache_block_size
+        pos = slot % values.kv_cache_block_size
+        value_base = pos * 64
+        scale_base = values.kv_cache_block_size * 64 + pos * 4
+        assert not torch.equal(
+            expected[page, value_base : value_base + 64],
+            values.kv_cache_2d[page, value_base : value_base + 64],
+        )
+        assert not torch.equal(
+            expected[page, scale_base : scale_base + 4],
+            values.kv_cache_2d[page, scale_base : scale_base + 4],
+        )
+    assert writable_slots
+
+
+def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_skips_invalid_rows() -> None:
+    values = DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+        DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
+            num_tokens=3,
+            batch_size=1,
+            max_seq_len=4,
+            num_state_cache_blocks=1,
+            compressor_block_size=4,
+            num_kv_cache_blocks=1,
+            kv_cache_block_size=4,
+            dtype=torch.float32,
+            non_boundary_token_count=1,
+            negative_compressor_slot_count=1,
+            negative_kv_slot_count=1,
+        )
+    ).generate(seed=191, device="cpu")
+    values.positions = torch.tensor([3, 2, 3], dtype=torch.int64)
+    values.compressor_slot_mapping = torch.tensor([0, 1, -1], dtype=torch.int64)
+    values.kv_slot_mapping = torch.tensor([0, -1, 2], dtype=torch.int64)
+
+    expected = deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(values)
+
+    assert not torch.equal(expected[0, :64], values.kv_cache_2d[0, :64])
+    torch.testing.assert_close(
+        expected[0, 64:128],
+        values.kv_cache_2d[0, 64:128],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        expected[0, 128:192],
+        values.kv_cache_2d[0, 128:192],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_keeps_metadata_seed_independent() -> (
+    None
+):
+    generator = DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+        DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
+            num_tokens=5,
+            batch_size=2,
+            max_seq_len=8,
+            num_state_cache_blocks=3,
+            compressor_block_size=4,
+            num_kv_cache_blocks=2,
+            kv_cache_block_size=4,
+            dtype=torch.float32,
+            non_boundary_token_count=1,
+        )
+    )
+
+    first = generator.generate(metadata_seed=201, value_seed=211, device="cpu")
+    same_metadata = generator.generate(metadata_seed=201, value_seed=212, device="cpu")
+    same_values = generator.generate(metadata_seed=202, value_seed=211, device="cpu")
+
+    torch.testing.assert_close(first.positions, same_metadata.positions)
+    torch.testing.assert_close(
+        first.compressor_slot_mapping,
+        same_metadata.compressor_slot_mapping,
+    )
+    torch.testing.assert_close(first.kv_slot_mapping, same_metadata.kv_slot_mapping)
+    torch.testing.assert_close(first.block_table, same_metadata.block_table)
+    assert not torch.equal(first.state_cache, same_metadata.state_cache)
+    torch.testing.assert_close(first.state_cache, same_values.state_cache)
+    assert not torch.equal(first.positions, same_values.positions)
+
+
+def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_rejects_invalid_values() -> None:
+    with pytest.raises(ValueError, match="compressor slots"):
+        DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+            DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
+                num_tokens=5,
+                batch_size=1,
+                max_seq_len=4,
+                num_state_cache_blocks=1,
+                compressor_block_size=4,
+                num_kv_cache_blocks=2,
+                kv_cache_block_size=4,
+                dtype=torch.float32,
+            )
+        )
+    with pytest.raises(ValueError, match="compress_ratio=4"):
+        DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+            DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
+                num_tokens=1,
+                batch_size=1,
+                max_seq_len=4,
+                num_state_cache_blocks=1,
+                compressor_block_size=4,
+                num_kv_cache_blocks=1,
+                kv_cache_block_size=4,
+                dtype=torch.float32,
+                compress_ratio=8,
+            )
+        )
+
+    values = DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+        DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
+            num_tokens=2,
+            batch_size=1,
+            max_seq_len=4,
+            num_state_cache_blocks=1,
+            compressor_block_size=4,
+            num_kv_cache_blocks=1,
+            kv_cache_block_size=4,
+            dtype=torch.float32,
+        )
+    ).generate(seed=221, device="cpu")
+    values.kv_slot_mapping = torch.tensor([0, 0], dtype=torch.int64)
+    values.positions = torch.tensor([3, 3], dtype=torch.int64)
+    with pytest.raises(ValueError, match="unique"):
+        deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(values)
 
 
 def test_deepseek_v4_indexer_mxfp4_cache_write_inputs_generate_reference() -> None:

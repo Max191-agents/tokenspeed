@@ -229,6 +229,36 @@ DeepSeek V4 shape relationship that the rotary suffix fits in the final
 quantization group, and generated positions are always in range for the RoPE
 cache.
 
+### DeepSeek V4 CSA Indexer MXFP4 Cache Insert
+
+`DeepSeekV4CSAIndexerMXFP4CacheInsertInputs` represents the compressed sparse
+attention indexer-cache insert path. For each candidate token row, the
+operation writes only when the compressor slot and output KV slot are
+non-negative and `(position + 1) % 4 == 0`. The compression window spans eight
+token positions:
+
+```text
+window = [position - 7, ..., position]
+```
+
+For the older four window positions, the operation reads the first 128-channel
+indexer slice from the paged state cache. For the newer four positions, it
+reads the second 128-channel indexer slice. Matching score rows from the second
+half of the state cache are softmaxed across the window independently for each
+channel, then used to produce a weighted state vector:
+
+```text
+weights[:, channel] = softmax(score_window[:, channel])
+compressed[channel] = sum(kv_window[:, channel] * weights[:, channel])
+normed = rms_norm(compressed, rms_norm_weight, rms_norm_eps)
+```
+
+The normalized vector then follows the indexer transform: RoPE on the final
+64 channels at the compressed position, BF16 rounding, normalized
+Walsh-Hadamard projection, another BF16 rounding step, and MXFP4 quantization
+into four 32-channel blocks. The result is written into the paged MXFP4 indexer
+cache layout used by the standalone indexer cache write/gather generators.
+
 ### DeepSeek V4 Indexer MXFP4 Cache Write
 
 `DeepSeekV4IndexerMXFP4CacheWriteInputs` represents writing 128-channel indexer
@@ -396,6 +426,11 @@ values:
   matching the attention-output head dimension, an even rotary suffix, a head
   dimension divisible by the quantization group size, and a rotary suffix that
   fits in the final quantization group
+- DeepSeek V4 CSA indexer MXFP4 cache-insert inputs require state-cache pages
+  with two 128-channel indexer slices plus matching score slices, block tables
+  that cover generated positions, unique writable output slots, valid request
+  ids, and MXFP4 cache rows large enough for 64 packed value bytes plus 4 scale
+  bytes per row
 - merge-state outputs must have shape `[total_q, num_heads, head_dim]`
 - merge-state LSE tensors must have shape `[total_q, num_heads]` and use fp32
   generated values
@@ -422,7 +457,9 @@ consumes `DeepSeekV4KCacheGatherInputs` directly, and the DeepSeek V4
 indexer-Q RoPE/Hadamard/MXFP4 helper consumes
 `DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues` directly. The DeepSeek V4
 inverse-RoPE FP8 quantization helper consumes
-`DeepSeekV4InvRoPEFP8QuantInputValues` directly. The generator values are
-operation-level values. Tests or adapters are responsible for converting
-generated values into the exact keyword arguments expected by a selected
-TokenSpeed backend.
+`DeepSeekV4InvRoPEFP8QuantInputValues` directly. The DeepSeek V4 CSA indexer
+MXFP4 cache-insert helper consumes
+`DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues` directly. The generator
+values are operation-level values. Tests or adapters are responsible for
+converting generated values into the exact keyword arguments expected by a
+selected TokenSpeed backend.

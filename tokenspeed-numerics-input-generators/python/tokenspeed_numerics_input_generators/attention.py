@@ -93,6 +93,10 @@ __all__ = [
     "DeepSeekV4InvRoPEFP8QuantInputs",
     "DeepSeekV4InvRoPEFP8QuantInputValues",
     "deepseek_v4_inv_rope_fp8_quant_reference",
+    "DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig",
+    "DeepSeekV4CSAIndexerMXFP4CacheInsertInputs",
+    "DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues",
+    "deepseek_v4_csa_indexer_mxfp4_cache_insert_reference",
     "DeepSeekV4IndexerMXFP4CacheWriteInputConfig",
     "DeepSeekV4IndexerMXFP4CacheWriteInputs",
     "DeepSeekV4IndexerMXFP4CacheWriteInputValues",
@@ -3120,18 +3124,34 @@ def _deepseek_v4_apply_indexer_q_rope(
     values: DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues,
 ) -> torch.Tensor:
     q = values.index_q.float()
+    positions = values.positions.to(torch.int64)
+    positions = positions[:, None].expand(q.shape[0], q.shape[1]).reshape(-1)
+    rotated = _deepseek_v4_apply_indexer_rope_rows(
+        q.reshape(-1, _DEEPSEEK_V4_INDEXER_DIM),
+        positions,
+        values.cos_sin_cache,
+    )
+    return rotated.reshape_as(q)
+
+
+def _deepseek_v4_apply_indexer_rope_rows(
+    rows: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+) -> torch.Tensor:
+    rows = rows.float()
     nope_dim = _DEEPSEEK_V4_INDEXER_DIM - _DEEPSEEK_V4_ROPE_DIM
     half_rope = _DEEPSEEK_V4_ROPE_DIM // 2
-    rope = q[..., nope_dim:]
+    rope = rows[..., nope_dim:]
     rope_even = rope[..., 0::2]
     rope_odd = rope[..., 1::2]
-    cos_sin = values.cos_sin_cache[values.positions.to(torch.int64)]
-    cos_v = cos_sin[:, None, :half_rope].float()
-    sin_v = cos_sin[:, None, half_rope:].float()
+    cos_sin = cos_sin_cache[positions.to(torch.int64)]
+    cos_v = cos_sin[..., :half_rope].float()
+    sin_v = cos_sin[..., half_rope:].float()
     rotated_rope = torch.empty_like(rope)
     rotated_rope[..., 0::2] = rope_even * cos_v - rope_odd * sin_v
     rotated_rope[..., 1::2] = rope_odd * cos_v + rope_even * sin_v
-    rotated = torch.cat((q[..., :nope_dim], rotated_rope), dim=-1)
+    rotated = torch.cat((rows[..., :nope_dim], rotated_rope), dim=-1)
     return rotated.to(torch.bfloat16).to(torch.float32)
 
 
@@ -3586,6 +3606,695 @@ def deepseek_v4_inv_rope_fp8_quant_reference(
         heads_per_group=values.heads_per_group,
         chunks_per_head=values.o.shape[-1] // values.quant_group_size,
     )
+
+
+@dataclass
+class DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues:
+    """Generated values for DeepSeek V4 CSA indexer MXFP4 cache inserts."""
+
+    state_cache: torch.Tensor
+    token_to_req_indices: torch.Tensor
+    positions: torch.Tensor
+    compressor_slot_mapping: torch.Tensor
+    block_table: torch.Tensor
+    compressor_block_size: int
+    rms_norm_weight: torch.Tensor
+    rms_norm_eps: float
+    cos_sin_cache: torch.Tensor
+    kv_cache_2d: torch.Tensor
+    kv_slot_mapping: torch.Tensor
+    kv_cache_block_size: int
+    compress_ratio: int
+    block_table_base_offsets: torch.Tensor | None
+
+
+@dataclass
+class DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig:
+    """Initialization parameters for DeepSeek V4 CSA indexer cache inserts.
+
+    The represented operation compresses an overlapping CSA state window,
+    normalizes it, applies indexer RoPE/Hadamard, quantizes to MXFP4, and writes
+    the result into a paged indexer cache.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of candidate token rows.
+    num_tokens: int
+
+    # Required: number of request rows in the generated block table.
+    batch_size: int
+
+    # Required: maximum generated sequence position plus one.
+    max_seq_len: int
+
+    # Required: number of physical pages in the compressor state cache.
+    num_state_cache_blocks: int
+
+    # Required: number of token rows in each compressor state cache page.
+    compressor_block_size: int
+
+    # Required: number of physical pages in the output MXFP4 indexer cache.
+    num_kv_cache_blocks: int
+
+    # Required: number of indexer rows in each output MXFP4 cache page.
+    kv_cache_block_size: int
+
+    # Required: generated dtype for compressor state and RMSNorm weight values.
+    dtype: torch.dtype
+
+    # ------------------------------------------------------------------
+    # Optional metadata/value generation configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: generated rows whose position is not a compression boundary.
+    non_boundary_token_count: int = 0
+
+    # Optional: rows with compressor_slot_mapping == -1. These rows are skipped.
+    negative_compressor_slot_count: int = 0
+
+    # Optional: rows with kv_slot_mapping == -1. These rows are skipped.
+    negative_kv_slot_count: int = 0
+
+    # Optional: include zero block-table base offsets in generated values.
+    include_block_table_base_offsets: bool = False
+
+    # Optional: CSA indexer compression ratio. DeepSeek V4 CSA indexer uses 4.
+    compress_ratio: int = 4
+
+    # Optional: RMSNorm epsilon.
+    rms_norm_eps: float = 1.0e-5
+
+    # Optional: RoPE frequency base used to build the generated cos/sin cache.
+    rope_base: float = 10000.0
+
+    # Optional: scale applied to generated state-cache values.
+    value_scale: float = 1.0
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(NumericsInputGenerator):
+    """Generator for DeepSeek V4 CSA indexer MXFP4 cache-insert inputs."""
+
+    config: DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig
+    state_cache_input: TensorInput | None
+    rms_norm_weight_input: TensorInput | None
+
+    def __init__(
+        self,
+        config: DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig,
+    ) -> None:
+        self.config = config
+        self.state_cache_input = None
+        self.rms_norm_weight_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.state_cache_input = self.state_cache_input or TensorInput(
+            self._state_cache_shape(),
+            self.config.dtype,
+            device=self.config.device,
+        )
+        self.rms_norm_weight_input = self.rms_norm_weight_input or TensorInput(
+            (_DEEPSEEK_V4_INDEXER_DIM,),
+            self.config.dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int | None = None,
+        metadata_seed: int | None = None,
+        value_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues:
+        self.__post_init__()
+        if self.state_cache_input is None or self.rms_norm_weight_input is None:
+            raise ValueError("CSA indexer child generators must be initialized")
+        metadata_seed, value_seed = _resolve_attention_seeds(
+            seed=seed,
+            metadata_seed=metadata_seed,
+            value_seed=value_seed,
+        )
+        target_device = _resolve_device(self.config.device, device)
+        self.state_cache_input.shape = self._state_cache_shape()
+        self.state_cache_input.dtype = self.config.dtype
+        self.rms_norm_weight_input.shape = (_DEEPSEEK_V4_INDEXER_DIM,)
+        self.rms_norm_weight_input.dtype = self.config.dtype
+        state_cache = _require_tensor(
+            self.state_cache_input.generate(
+                seed=_child_seed(value_seed, 1),
+                device=target_device,
+            ).values,
+            "state_cache",
+        )
+        rms_norm_weight = _require_tensor(
+            self.rms_norm_weight_input.generate(
+                seed=_child_seed(value_seed, 2),
+                device=target_device,
+            ).values,
+            "rms_norm_weight",
+        )
+        values = DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues(
+            state_cache=(state_cache.float() * self.config.value_scale)
+            .to(state_cache.dtype)
+            .contiguous(),
+            token_to_req_indices=self._generate_token_to_req_indices(
+                seed=_child_seed(metadata_seed, 1),
+                device=target_device,
+            ),
+            positions=self._generate_positions(
+                seed=_child_seed(metadata_seed, 2),
+                device=target_device,
+            ),
+            compressor_slot_mapping=self._generate_slot_mapping(
+                seed=_child_seed(metadata_seed, 3),
+                total_slots=self._total_state_slots(),
+                negative_count=self.config.negative_compressor_slot_count,
+                device=target_device,
+            ),
+            block_table=self._generate_block_table(
+                seed=_child_seed(metadata_seed, 4),
+                device=target_device,
+            ),
+            compressor_block_size=self.config.compressor_block_size,
+            rms_norm_weight=rms_norm_weight.contiguous(),
+            rms_norm_eps=self.config.rms_norm_eps,
+            cos_sin_cache=build_rope_cos_sin_cache(
+                rotary_dim=_DEEPSEEK_V4_ROPE_DIM,
+                max_position=self.config.max_seq_len,
+                base=self.config.rope_base,
+                device=target_device,
+            ),
+            kv_cache_2d=self._generate_kv_cache(
+                seed=_child_seed(value_seed, 3),
+                device=target_device,
+            ),
+            kv_slot_mapping=self._generate_slot_mapping(
+                seed=_child_seed(metadata_seed, 5),
+                total_slots=self._total_kv_slots(),
+                negative_count=self.config.negative_kv_slot_count,
+                device=target_device,
+            ),
+            kv_cache_block_size=self.config.kv_cache_block_size,
+            compress_ratio=self.config.compress_ratio,
+            block_table_base_offsets=(
+                torch.zeros(
+                    (self.config.batch_size,),
+                    dtype=torch.int32,
+                    device=target_device,
+                )
+                if self.config.include_block_table_base_offsets
+                else None
+            ),
+        )
+        _validate_deepseek_v4_csa_indexer_mxfp4_cache_insert_values(values)
+        return values
+
+    def _normalize_config(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens",
+            self.config.num_tokens,
+        )
+        self.config.batch_size = _check_positive("batch_size", self.config.batch_size)
+        self.config.max_seq_len = _check_positive(
+            "max_seq_len",
+            self.config.max_seq_len,
+        )
+        self.config.num_state_cache_blocks = _check_positive(
+            "num_state_cache_blocks",
+            self.config.num_state_cache_blocks,
+        )
+        self.config.compressor_block_size = _check_positive(
+            "compressor_block_size",
+            self.config.compressor_block_size,
+        )
+        self.config.num_kv_cache_blocks = _check_positive(
+            "num_kv_cache_blocks",
+            self.config.num_kv_cache_blocks,
+        )
+        self.config.kv_cache_block_size = _check_positive(
+            "kv_cache_block_size",
+            self.config.kv_cache_block_size,
+        )
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        self.config.compress_ratio = _check_positive(
+            "compress_ratio",
+            self.config.compress_ratio,
+        )
+        if self.config.compress_ratio != 4:
+            raise ValueError(
+                f"DeepSeek V4 CSA indexer uses compress_ratio=4, got {self.config.compress_ratio}"
+            )
+        self.config.non_boundary_token_count = _check_nonnegative(
+            "non_boundary_token_count",
+            self.config.non_boundary_token_count,
+        )
+        self.config.negative_compressor_slot_count = _check_nonnegative(
+            "negative_compressor_slot_count",
+            self.config.negative_compressor_slot_count,
+        )
+        self.config.negative_kv_slot_count = _check_nonnegative(
+            "negative_kv_slot_count",
+            self.config.negative_kv_slot_count,
+        )
+        for name, value in (
+            ("non_boundary_token_count", self.config.non_boundary_token_count),
+            (
+                "negative_compressor_slot_count",
+                self.config.negative_compressor_slot_count,
+            ),
+            ("negative_kv_slot_count", self.config.negative_kv_slot_count),
+        ):
+            if value > self.config.num_tokens:
+                raise ValueError(f"{name} must be <= num_tokens")
+        if self.config.num_tokens - self.config.negative_compressor_slot_count > (
+            self._total_state_slots()
+        ):
+            raise ValueError("generated compressor slots must fit in state_cache")
+        if self.config.num_tokens - self.config.negative_kv_slot_count > (
+            self._total_kv_slots()
+        ):
+            raise ValueError("generated kv slots must fit in kv_cache_2d")
+        if not self._boundary_positions().numel() and self.config.num_tokens:
+            raise ValueError(
+                "max_seq_len must contain at least one compression boundary"
+            )
+        if (
+            self.config.non_boundary_token_count
+            and not self._non_boundary_positions().numel()
+        ):
+            raise ValueError(
+                "max_seq_len must contain non-boundary positions when "
+                "non_boundary_token_count is non-zero"
+            )
+        self.config.rms_norm_eps = float(self.config.rms_norm_eps)
+        if self.config.rms_norm_eps <= 0.0 or not math.isfinite(
+            self.config.rms_norm_eps
+        ):
+            raise ValueError(
+                f"rms_norm_eps must be finite and positive, got {self.config.rms_norm_eps}"
+            )
+        self.config.rope_base = float(self.config.rope_base)
+        if self.config.rope_base <= 0.0 or not math.isfinite(self.config.rope_base):
+            raise ValueError(f"rope_base must be positive, got {self.config.rope_base}")
+        self.config.value_scale = float(self.config.value_scale)
+        if self.config.value_scale < 0.0 or not math.isfinite(self.config.value_scale):
+            raise ValueError(
+                f"value_scale must be finite and non-negative, got {self.config.value_scale}"
+            )
+
+    def _state_width(self) -> int:
+        return _DEEPSEEK_V4_INDEXER_DIM * 2
+
+    def _state_cache_shape(self) -> tuple[int, int, int]:
+        return (
+            self.config.num_state_cache_blocks,
+            self.config.compressor_block_size,
+            self._state_width() * 2,
+        )
+
+    def _total_state_slots(self) -> int:
+        return self.config.num_state_cache_blocks * self.config.compressor_block_size
+
+    def _total_kv_slots(self) -> int:
+        return self.config.num_kv_cache_blocks * self.config.kv_cache_block_size
+
+    def _block_table_width(self) -> int:
+        return math.ceil(self.config.max_seq_len / self.config.compressor_block_size)
+
+    def _boundary_positions(self) -> torch.Tensor:
+        return torch.arange(
+            self.config.compress_ratio - 1,
+            self.config.max_seq_len,
+            self.config.compress_ratio,
+            dtype=torch.int64,
+        )
+
+    def _non_boundary_positions(self) -> torch.Tensor:
+        positions = torch.arange(self.config.max_seq_len, dtype=torch.int64)
+        return positions[(positions + 1) % self.config.compress_ratio != 0]
+
+    def _generate_token_to_req_indices(
+        self, *, seed: int, device: torch.device
+    ) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        reqs = torch.randint(
+            0,
+            self.config.batch_size,
+            (self.config.num_tokens,),
+            dtype=torch.int64,
+            generator=rng,
+        )
+        return reqs.to(device)
+
+    def _generate_positions(self, *, seed: int, device: torch.device) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        positions = torch.empty((self.config.num_tokens,), dtype=torch.int64)
+        boundary_count = self.config.num_tokens - self.config.non_boundary_token_count
+        if boundary_count:
+            boundary = self._boundary_positions()
+            choices = torch.randint(
+                0, boundary.numel(), (boundary_count,), generator=rng
+            )
+            positions[:boundary_count] = boundary[choices]
+        if self.config.non_boundary_token_count:
+            non_boundary = self._non_boundary_positions()
+            choices = torch.randint(
+                0,
+                non_boundary.numel(),
+                (self.config.non_boundary_token_count,),
+                generator=rng,
+            )
+            positions[boundary_count:] = non_boundary[choices]
+        if self.config.num_tokens:
+            order = torch.randperm(self.config.num_tokens, generator=rng)
+            positions = positions[order]
+        return positions.to(device)
+
+    def _generate_slot_mapping(
+        self,
+        *,
+        seed: int,
+        total_slots: int,
+        negative_count: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        mapping = torch.full((self.config.num_tokens,), -1, dtype=torch.int64)
+        non_negative_count = self.config.num_tokens - negative_count
+        if non_negative_count:
+            order = torch.randperm(self.config.num_tokens, generator=rng)
+            slots = torch.randperm(total_slots, generator=rng)[:non_negative_count]
+            mapping[order[:non_negative_count]] = slots.to(torch.int64)
+        return mapping.to(device)
+
+    def _generate_block_table(self, *, seed: int, device: torch.device) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        table = torch.randint(
+            0,
+            self.config.num_state_cache_blocks,
+            (self.config.batch_size, self._block_table_width()),
+            dtype=torch.int64,
+            generator=rng,
+        )
+        return table.to(device)
+
+    def _generate_kv_cache(self, *, seed: int, device: torch.device) -> torch.Tensor:
+        generator = _rng_for_device(device, seed)
+        return torch.randint(
+            0,
+            256,
+            (
+                self.config.num_kv_cache_blocks,
+                self.config.kv_cache_block_size
+                * (
+                    _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
+                    + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+                ),
+            ),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+
+
+def _validate_deepseek_v4_csa_indexer_mxfp4_cache_insert_values(
+    values: DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues,
+) -> None:
+    if values.state_cache.ndim != 3:
+        raise ValueError("state_cache must be rank-3")
+    if not values.state_cache.is_floating_point():
+        raise TypeError(
+            f"state_cache must be floating point, got {values.state_cache.dtype}"
+        )
+    state_width = values.state_cache.shape[-1] // 2
+    if values.state_cache.shape[-1] != _DEEPSEEK_V4_INDEXER_DIM * 4:
+        raise ValueError(
+            "CSA indexer state_cache last dimension must be "
+            f"{_DEEPSEEK_V4_INDEXER_DIM * 4}, got {values.state_cache.shape[-1]}"
+        )
+    if state_width != _DEEPSEEK_V4_INDEXER_DIM * 2:
+        raise ValueError("state_cache state width must be two indexer rows")
+    compressor_block_size = _check_positive(
+        "compressor_block_size",
+        values.compressor_block_size,
+    )
+    if values.state_cache.shape[1] != compressor_block_size:
+        raise ValueError("compressor_block_size must match state_cache.shape[1]")
+    if values.compress_ratio != 4:
+        raise ValueError(f"compress_ratio must be 4, got {values.compress_ratio}")
+    if values.kv_cache_2d.dtype != torch.uint8:
+        raise TypeError(f"kv_cache_2d must be uint8, got {values.kv_cache_2d.dtype}")
+    if values.kv_cache_2d.ndim != 2:
+        raise ValueError("kv_cache_2d must be rank-2")
+    kv_cache_block_size = _check_positive(
+        "kv_cache_block_size",
+        values.kv_cache_block_size,
+    )
+    min_row_bytes = kv_cache_block_size * (
+        _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+    )
+    if values.kv_cache_2d.shape[1] < min_row_bytes:
+        raise ValueError(
+            f"kv_cache_2d row width must be at least {min_row_bytes}, "
+            f"got {values.kv_cache_2d.shape[1]}"
+        )
+    for name, tensor in (
+        ("token_to_req_indices", values.token_to_req_indices),
+        ("positions", values.positions),
+        ("compressor_slot_mapping", values.compressor_slot_mapping),
+        ("kv_slot_mapping", values.kv_slot_mapping),
+    ):
+        if tensor.ndim != 1:
+            raise ValueError(f"{name} must be rank-1")
+        if tensor.dtype not in (torch.int32, torch.int64):
+            raise TypeError(f"{name} must be integer, got {tensor.dtype}")
+        if tensor.device != values.state_cache.device:
+            raise ValueError(f"{name} must share the state_cache device")
+    num_actual = min(
+        values.compressor_slot_mapping.numel(),
+        values.positions.numel(),
+        values.kv_slot_mapping.numel(),
+    )
+    if values.token_to_req_indices.numel() < num_actual:
+        raise ValueError("token_to_req_indices length must cover generated rows")
+    if values.block_table.ndim != 2:
+        raise ValueError("block_table must be rank-2")
+    if values.block_table.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"block_table must be integer, got {values.block_table.dtype}")
+    if values.block_table.device != values.state_cache.device:
+        raise ValueError("block_table must share the state_cache device")
+    if values.block_table.numel():
+        if int(values.block_table.min().item()) < 0:
+            raise ValueError("block_table entries must be non-negative")
+        if int(values.block_table.max().item()) >= values.state_cache.shape[0]:
+            raise ValueError("block_table entries must be valid state cache pages")
+    if values.block_table_base_offsets is not None:
+        if values.block_table_base_offsets.ndim != 1:
+            raise ValueError("block_table_base_offsets must be rank-1")
+        if values.block_table_base_offsets.dtype not in (torch.int32, torch.int64):
+            raise TypeError("block_table_base_offsets must be integer")
+        if values.block_table_base_offsets.numel() != values.block_table.shape[0]:
+            raise ValueError("block_table_base_offsets length must match batch size")
+        if values.block_table_base_offsets.device != values.state_cache.device:
+            raise ValueError(
+                "block_table_base_offsets must share the state_cache device"
+            )
+    if values.rms_norm_weight.shape != (_DEEPSEEK_V4_INDEXER_DIM,):
+        raise ValueError(
+            f"rms_norm_weight must have shape {(_DEEPSEEK_V4_INDEXER_DIM,)}, "
+            f"got {tuple(values.rms_norm_weight.shape)}"
+        )
+    if not values.rms_norm_weight.is_floating_point():
+        raise TypeError("rms_norm_weight must be floating point")
+    if values.rms_norm_weight.device != values.state_cache.device:
+        raise ValueError("rms_norm_weight must share the state_cache device")
+    if values.rms_norm_eps <= 0.0 or not math.isfinite(values.rms_norm_eps):
+        raise ValueError("rms_norm_eps must be finite and positive")
+    if values.cos_sin_cache.shape[-1] != _DEEPSEEK_V4_ROPE_DIM:
+        raise ValueError(
+            f"cos_sin_cache width must be {_DEEPSEEK_V4_ROPE_DIM}, "
+            f"got {values.cos_sin_cache.shape[-1]}"
+        )
+    if values.cos_sin_cache.device != values.state_cache.device:
+        raise ValueError("cos_sin_cache must share the state_cache device")
+    if num_actual:
+        reqs = values.token_to_req_indices[:num_actual].to(torch.int64)
+        if (
+            int(reqs.min().item()) < 0
+            or int(reqs.max().item()) >= values.block_table.shape[0]
+        ):
+            raise ValueError("token_to_req_indices entries must be valid request rows")
+        positions = values.positions[:num_actual].to(torch.int64)
+        if int(positions.min().item()) < 0:
+            raise ValueError("positions must be non-negative")
+        if int(positions.max().item()) >= values.cos_sin_cache.shape[0]:
+            raise ValueError("positions must fit in cos_sin_cache")
+        table_idx = positions // compressor_block_size
+        if int(table_idx.max().item()) >= values.block_table.shape[1]:
+            raise ValueError("block_table must cover generated positions")
+        state_slots = values.compressor_slot_mapping[:num_actual].to(torch.int64)
+        valid_state = state_slots >= 0
+        if bool(valid_state.any().item()):
+            if int(state_slots[valid_state].max().item()) >= (
+                values.state_cache.shape[0] * compressor_block_size
+            ):
+                raise ValueError("compressor_slot_mapping entries exceed state cache")
+        kv_slots = values.kv_slot_mapping[:num_actual].to(torch.int64)
+        writable = (
+            valid_state
+            & (kv_slots >= 0)
+            & (torch.remainder(positions + 1, values.compress_ratio) == 0)
+        )
+        if bool(writable.any().item()):
+            write_slots = kv_slots[writable]
+            if int(write_slots.max().item()) >= (
+                values.kv_cache_2d.shape[0] * kv_cache_block_size
+            ):
+                raise ValueError("kv_slot_mapping entries exceed kv cache")
+            if int(torch.unique(write_slots).numel()) != int(write_slots.numel()):
+                raise ValueError("writable kv_slot_mapping entries must be unique")
+
+
+def _deepseek_v4_csa_indexer_compress_rows(
+    values: DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_actual = min(
+        values.compressor_slot_mapping.numel(),
+        values.positions.numel(),
+        values.kv_slot_mapping.numel(),
+    )
+    if num_actual == 0:
+        return (
+            torch.empty(
+                (0, _DEEPSEEK_V4_INDEXER_DIM),
+                dtype=torch.float32,
+                device=values.state_cache.device,
+            ),
+            torch.empty((0,), dtype=torch.bool, device=values.state_cache.device),
+        )
+
+    positions = values.positions[:num_actual].to(torch.int64)
+    state_slots = values.compressor_slot_mapping[:num_actual].to(torch.int64)
+    kv_slots = values.kv_slot_mapping[:num_actual].to(torch.int64)
+    valid_token = (
+        (state_slots >= 0)
+        & (kv_slots >= 0)
+        & (torch.remainder(positions + 1, values.compress_ratio) == 0)
+    )
+    window = values.compress_ratio * 2
+    offsets = torch.arange(window, dtype=torch.int64, device=values.state_cache.device)
+    window_positions = positions[:, None] - window + 1 + offsets[None, :]
+    table_idx_raw = torch.div(
+        window_positions,
+        values.compressor_block_size,
+        rounding_mode="floor",
+    )
+    reqs = values.token_to_req_indices[:num_actual].to(torch.int64)
+    if values.block_table_base_offsets is not None:
+        table_idx_raw = (
+            table_idx_raw
+            - values.block_table_base_offsets.to(torch.int64)[reqs][:, None]
+        )
+    valid_window = (
+        (window_positions >= 0)
+        & (table_idx_raw >= 0)
+        & (table_idx_raw < values.block_table.shape[1])
+    )
+    table_idx = table_idx_raw.clamp(0, max(values.block_table.shape[1] - 1, 0))
+    block_numbers = values.block_table[reqs[:, None], table_idx].to(torch.int64)
+    valid_window = valid_window & (block_numbers >= 0)
+    safe_block = block_numbers.clamp_min(0)
+    pos_in_block = torch.remainder(
+        window_positions.clamp_min(0),
+        values.compressor_block_size,
+    )
+    rows = values.state_cache[safe_block, pos_in_block]
+    state_width = values.state_cache.shape[-1] // 2
+    head_offsets = torch.where(
+        offsets >= values.compress_ratio,
+        torch.full_like(offsets, _DEEPSEEK_V4_INDEXER_DIM),
+        torch.zeros_like(offsets),
+    )
+    dim_indices = (
+        head_offsets[:, None]
+        + torch.arange(
+            _DEEPSEEK_V4_INDEXER_DIM,
+            dtype=torch.int64,
+            device=values.state_cache.device,
+        )[None, :]
+    )
+    dim_indices = dim_indices[None, :, :].expand(num_actual, -1, -1)
+    kv_rows = torch.gather(rows[..., :state_width], -1, dim_indices).float()
+    score_rows = torch.gather(rows[..., state_width:], -1, dim_indices).float()
+    valid_window_f = valid_window.unsqueeze(-1)
+    score_rows = torch.where(
+        valid_window_f,
+        score_rows,
+        score_rows.new_full((), -1.0e30),
+    )
+    weights = torch.softmax(score_rows, dim=1)
+    kv_rows = torch.where(valid_window_f, kv_rows, torch.zeros_like(kv_rows))
+    compressed = torch.sum(kv_rows * weights, dim=1)
+    variance = compressed.square().sum(dim=-1, keepdim=True) / float(
+        _DEEPSEEK_V4_INDEXER_DIM
+    )
+    normed = compressed * torch.rsqrt(variance + values.rms_norm_eps)
+    return normed * values.rms_norm_weight.float(), valid_token
+
+
+def deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(
+    values: DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues,
+) -> torch.Tensor:
+    """Return cache bytes after applying DeepSeek V4 CSA indexer MXFP4 inserts."""
+
+    _validate_deepseek_v4_csa_indexer_mxfp4_cache_insert_values(values)
+    out = values.kv_cache_2d.clone()
+    normed, valid = _deepseek_v4_csa_indexer_compress_rows(values)
+    if normed.numel() == 0:
+        return out.contiguous()
+
+    compressed_positions = (
+        torch.div(
+            values.positions[: normed.shape[0]].to(torch.int64),
+            values.compress_ratio,
+            rounding_mode="floor",
+        )
+        * values.compress_ratio
+    )
+    rotated = _deepseek_v4_apply_indexer_rope_rows(
+        normed,
+        compressed_positions,
+        values.cos_sin_cache,
+    )
+    hadamard = _deepseek_v4_indexer_q_hadamard(rotated)
+    flat = out.reshape(-1)
+    slots = values.kv_slot_mapping[: normed.shape[0]].to(torch.int64)
+    for row_idx, row in enumerate(hadamard):
+        if not bool(valid[row_idx].item()):
+            continue
+        slot = int(slots[row_idx].item())
+        page = slot // values.kv_cache_block_size
+        pos = slot % values.kv_cache_block_size
+        page_base = page * out.stride(0)
+        value_base = page_base + pos * _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
+        scale_base = (
+            page_base
+            + values.kv_cache_block_size * _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
+            + pos * _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+        )
+        packed, scales = _deepseek_v4_indexer_mxfp4_row_reference(row)
+        flat[value_base : value_base + _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES] = packed
+        flat[scale_base : scale_base + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES] = scales
+    return out.contiguous()
 
 
 @dataclass
