@@ -39,11 +39,14 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
+    AttentionMergeStateInputConfig,
+    AttentionMergeStateInputs,
     MHAInputConfig,
     MHAInputs,
     MHARequestMetadataInputConfig,
     MLAInputConfig,
     MLAInputs,
+    attention_merge_state_reference,
     mla_reference,
 )
 
@@ -447,30 +450,26 @@ def test_attn_merge_state(
 ) -> None:
     require("attention", "attn_merge_state", solution, dtype, "out_a")
 
-    total_q = 31
-    out_a = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
-    out_b = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
-    lse_a = torch.randn(total_q, num_heads, device=device, dtype=torch.float32)
-    lse_b = torch.randn(total_q, num_heads, device=device, dtype=torch.float32)
+    values = AttentionMergeStateInputs(
+        AttentionMergeStateInputConfig(
+            total_q=31,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+    ).generate(seed=503, device=device)
+    out_ref, lse_ref = attention_merge_state_reference(values)
 
     out, lse = attn_merge_state(
-        out_a,
-        lse_a,
-        out_b,
-        lse_b,
+        values.out_a,
+        values.lse_a,
+        values.out_b,
+        values.lse_b,
+        lse_scale_log2=values.lse_scale_log2,
         solution=solution,
     )
 
-    lse_ref = torch.maximum(lse_a, lse_b)
-    weight_a = torch.exp(lse_a - lse_ref)
-    weight_b = torch.exp(lse_b - lse_ref)
-    denom = weight_a + weight_b
-    out_ref = (
-        out_a.float() * weight_a[..., None] + out_b.float() * weight_b[..., None]
-    ) / denom[..., None]
-    lse_ref = lse_ref + torch.log(denom)
-
-    assert out.shape == out_a.shape
-    assert lse.shape == lse_a.shape
-    torch.testing.assert_close(out.float(), out_ref, rtol=1e-2, atol=1e-2)
+    assert out.shape == values.out_a.shape
+    assert lse.shape == values.lse_a.shape
+    torch.testing.assert_close(out.float(), out_ref.float(), rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-5, atol=1e-5)
