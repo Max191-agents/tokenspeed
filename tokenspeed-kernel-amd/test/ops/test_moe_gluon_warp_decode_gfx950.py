@@ -25,6 +25,11 @@ if not _is_gfx950():
 from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (  # noqa: E402
     _gluon_mxfp4_fp8_warp_decode_moe,
 )
+from tokenspeed_numerics_input_generators import (  # noqa: E402
+    MoeInputConfig,
+    MoeInputs,
+    MoeInputValues,
+)
 
 try:
     from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import (
@@ -66,19 +71,71 @@ class PrecisionConfig:
     out_dtype: torch.dtype | None = None
 
 
-def _mxfp4_dequant(packed: torch.Tensor) -> torch.Tensor:
+def _mxfp4_dequant(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Decode packed MXFP4 (two e2m1 codes per byte) to float32.
 
     Replaces aiter.utility.fp4_utils.mxfp4_to_f32 so the test carries no
     aiter dependency. The low nibble is the even element along the unpacked
     axis, the high nibble the odd element. Input (..., K // 2) uint8 maps to
-    output (..., K) float32. All weight microscales in these cases are e8m0
-    code 127, i.e. a unit scale, so no scale factor is applied here.
+    output (..., K) float32 and the UE8M0 scale tensor has one scale byte for
+    every 32 unpacked values along the K axis.
     """
     lut = torch.tensor(_E2M1_VALUES, device=packed.device, dtype=torch.float32)
     lo = lut[(packed & 0x0F).long()]
     hi = lut[(packed >> 4).long()]
-    return torch.stack((lo, hi), dim=-1).reshape(*packed.shape[:-1], -1)
+    unpacked = torch.stack((lo, hi), dim=-1).reshape(*packed.shape[:-1], -1)
+    scale_values = torch.pow(2.0, scale.to(torch.int32) - 127).to(torch.float32)
+    return unpacked * scale_values.repeat_interleave(32, dim=-1)
+
+
+def _build_case_from_values(
+    values: MoeInputValues,
+    *,
+    M: int,
+    E: int,
+    D: int,
+    I: int,
+    topk: int,
+    use_bias: bool,
+    device: str,
+) -> dict:
+    """Adapt operation-level MoE values to the kernel's swizzled MXFP4 ABI."""
+    if values.hidden_states is None or values.router_logits is None:
+        raise AssertionError("MoeInputs must generate hidden states and router logits")
+    if (
+        values.w13.B is None
+        or values.w13.B_scales is None
+        or values.w2.B is None
+        or values.w2.B_scales is None
+    ):
+        raise AssertionError("MoeInputs must generate MXFP4 weights and scales")
+    wt13, _w13_flex, st13 = swizzle_mxfp4(values.w13.B, values.w13.B_scales, 8)
+    wt2, _w2_flex, st2 = swizzle_mxfp4(values.w2.B, values.w2.B_scales, 8)
+    scale1 = torch.ones((1,), device=device, dtype=torch.float32)
+    scale2 = torch.ones((1,), device=device, dtype=torch.float32)
+    return {
+        "M": M,
+        "E": E,
+        "D": D,
+        "I": I,
+        "topk": topk,
+        "use_bias": use_bias,
+        "values": values,
+        "hidden": values.hidden_states,
+        "router": values.router_logits,
+        "w13": values.w13.B,
+        "w2": values.w2.B,
+        "w13_scales": values.w13.B_scales,
+        "w2_scales": values.w2.B_scales,
+        "w13_bias": values.w13_bias,
+        "w2_bias": values.w2_bias,
+        "wt13": wt13,
+        "wt2": wt2,
+        "pc1": PrecisionConfig(b_mx_scale=st13, out_dtype=torch.bfloat16),
+        "pc2": PrecisionConfig(b_mx_scale=st2, out_dtype=torch.bfloat16),
+        "scale1": scale1,
+        "scale2": scale2,
+    }
 
 
 def _build_case(
@@ -92,49 +149,29 @@ def _build_case(
     device: str = "cuda",
     seed: int = 123,
 ) -> dict:
-    """Construct kernel inputs plus the raw weights kept for the reference."""
-    torch.manual_seed(seed)
-    hidden = torch.randn((M, D), device=device, dtype=torch.bfloat16)
-    router = torch.randn((M, E), device=device, dtype=torch.float32)
-    w13 = torch.randint(0, 256, (E, 2 * I, D // 2), device=device, dtype=torch.uint8)
-    w2 = torch.randint(0, 256, (E, D, I // 2), device=device, dtype=torch.uint8)
-    s13 = torch.full((E, 2 * I, D // 32), 127, device=device, dtype=torch.uint8)
-    s2 = torch.full((E, D, I // 32), 127, device=device, dtype=torch.uint8)
-    w13_bias = (
-        torch.randn((E, 2 * I), device=device, dtype=torch.float32)
-        if use_bias
-        else None
+    """Construct kernel inputs from operation-level MoE generator values."""
+    values = MoeInputs(
+        MoeInputConfig(
+            num_tokens=M,
+            hidden_size=D,
+            intermediate_size=I,
+            num_experts=E,
+            top_k=topk,
+            hidden_dtype=torch.bfloat16,
+            weight_format="mxfp4",
+            bias_dtype=torch.float32 if use_bias else None,
+        )
+    ).generate(seed=seed, device=device)
+    return _build_case_from_values(
+        values,
+        M=M,
+        E=E,
+        D=D,
+        I=I,
+        topk=topk,
+        use_bias=use_bias,
+        device=device,
     )
-    w2_bias = (
-        torch.randn((E, D), device=device, dtype=torch.float32) if use_bias else None
-    )
-
-    wt13, _w13_flex, st13 = swizzle_mxfp4(w13, s13, 8)
-    wt2, _w2_flex, st2 = swizzle_mxfp4(w2, s2, 8)
-    scale1 = torch.ones((1,), device=device, dtype=torch.float32)
-    scale2 = torch.ones((1,), device=device, dtype=torch.float32)
-    pc1 = PrecisionConfig(b_mx_scale=st13, out_dtype=torch.bfloat16)
-    pc2 = PrecisionConfig(b_mx_scale=st2, out_dtype=torch.bfloat16)
-    return {
-        "M": M,
-        "E": E,
-        "D": D,
-        "I": I,
-        "topk": topk,
-        "use_bias": use_bias,
-        "hidden": hidden,
-        "router": router,
-        "w13": w13,
-        "w2": w2,
-        "w13_bias": w13_bias,
-        "w2_bias": w2_bias,
-        "wt13": wt13,
-        "wt2": wt2,
-        "pc1": pc1,
-        "pc2": pc2,
-        "scale1": scale1,
-        "scale2": scale2,
-    }
 
 
 def _quantize_fp8(
@@ -181,8 +218,8 @@ def _reference(case: dict) -> torch.Tensor:
     def _expert_weights(expert: int) -> tuple[torch.Tensor, torch.Tensor]:
         if expert not in deq_cache:
             deq_cache[expert] = (
-                _mxfp4_dequant(w13[expert]),
-                _mxfp4_dequant(w2[expert]),
+                _mxfp4_dequant(w13[expert], case["w13_scales"][expert]),
+                _mxfp4_dequant(w2[expert], case["w2_scales"][expert]),
             )
         return deq_cache[expert]
 
