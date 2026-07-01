@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.communication.triton import (
     all_gather,
     all_reduce,
     all_reduce_can_run,
+    allreduce_residual_rmsnorm,
     create_state,
     reduce_scatter,
 )
@@ -39,6 +40,8 @@ from tokenspeed_numerics_input_generators import (
     AllGatherInputs,
     AllReduceInputConfig,
     AllReduceInputs,
+    AllReduceResidualRMSNormInputConfig,
+    AllReduceResidualRMSNormInputs,
     DPSamplingInputConfig,
     DPSamplingInputs,
     ExpertParallelRoutingInputConfig,
@@ -46,6 +49,7 @@ from tokenspeed_numerics_input_generators import (
     ReduceScatterInputConfig,
     ReduceScatterInputs,
     all_gather_reference,
+    all_reduce_residual_rmsnorm_reference,
     all_reduce_sum_reference,
     dp_sampling_reference,
     expert_parallel_routing_reference,
@@ -92,6 +96,37 @@ def _worker_main(rank: int, world_size: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+def _ar_rmsnorm_worker_fn(rank: int, world_size: int, port: int, result_dict) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        _check_allreduce_residual_rmsnorm(rank, world_size, device)
+    except RuntimeError:
+        trace = traceback.format_exc()
+        if _is_iris_backend_unavailable(trace):
+            result_dict[rank] = ("skip", trace)
+        else:
+            result_dict[rank] = ("error", trace)
+    except Exception:
+        result_dict[rank] = ("error", traceback.format_exc())
+    finally:
+        dist.destroy_process_group()
+
+
+def _is_iris_backend_unavailable(trace: str) -> bool:
+    return (
+        "iris" in trace.lower()
+        and "export_dmabuf_handle" in trace
+        and "HIP error code 1: invalid argument" in trace
+    )
+
+
 def _check_all_reduce(rank: int, world_size: int, device: torch.device) -> None:
     values = AllReduceInputs(
         AllReduceInputConfig(
@@ -115,6 +150,55 @@ def _check_all_reduce(rank: int, world_size: int, device: torch.device) -> None:
 
     assert result is local
     torch.testing.assert_close(local.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
+
+def _check_allreduce_residual_rmsnorm(
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    config = AllReduceResidualRMSNormInputConfig(
+        world_size=world_size,
+        num_tokens=8,
+        hidden_size=2880,
+        dtype=torch.bfloat16,
+        residual_dtype=torch.bfloat16,
+        weight_dtype=torch.float32,
+        eps=1e-6,
+    )
+    values = AllReduceResidualRMSNormInputs(config).generate(seed=101, device="cpu")
+    refs = all_reduce_residual_rmsnorm_reference(values)
+    local = values.rank_inputs[rank].to(device=device)
+    residual = values.residuals[rank].to(device=device)
+    weight = values.weight.to(device=device)
+
+    norm_out, residual_out, scale, partial = allreduce_residual_rmsnorm(
+        input_tensor=local,
+        residual=residual,
+        weight=weight,
+        rank=rank,
+        group=dist.group.WORLD,
+        eps=config.eps,
+        max_token_num=16,
+    )
+    torch.cuda.synchronize()
+
+    assert scale is None
+    assert partial is None
+    assert norm_out is not None
+    assert residual_out is not None
+    torch.testing.assert_close(
+        residual_out.float(),
+        refs.residual_outputs[rank].to(device=device),
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(
+        norm_out.float(),
+        refs.norm_outputs[rank].to(device=device),
+        atol=2e-2,
+        rtol=2e-2,
+    )
 
 
 def _check_all_gather(rank: int, world_size: int, device: torch.device) -> None:
@@ -283,3 +367,31 @@ def test_communication_generators_run_triton_collectives_world2() -> None:
     )
     if error_dict:
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
+
+
+def test_allreduce_residual_rmsnorm_generator_runs_tokenspeed_kernel() -> None:
+    world_size = 2
+    _skip_if_unsupported(world_size)
+    port = _get_open_port()
+    result_dict = mp.Manager().dict()
+    mp.spawn(
+        _ar_rmsnorm_worker_fn,
+        args=(world_size, port, result_dict),
+        nprocs=world_size,
+        join=True,
+    )
+
+    results = dict(result_dict)
+    errors = {
+        rank: trace for rank, (status, trace) in results.items() if status == "error"
+    }
+    if errors:
+        raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in errors.items()))
+    skips = {
+        rank: trace for rank, (status, trace) in results.items() if status == "skip"
+    }
+    if skips:
+        pytest.skip(
+            "IRIS AR+RMSNorm backend could not create its symmetric heap in this "
+            "environment"
+        )

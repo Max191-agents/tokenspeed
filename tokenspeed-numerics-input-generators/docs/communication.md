@@ -128,6 +128,12 @@ generates the same operation-level values, selects `rank_inputs[rank]` and any
 other rank-local tensors such as `residuals[rank]`, invokes the backend kernel,
 and compares against the reference result for that rank.
 
+For fused all-reduce residual RMSNorm, the adapter passes
+`rank_inputs[rank]`, `residuals[rank]`, the shared `weight`, and `eps` to the
+backend. The semantic comparison checks both returned tensors:
+`residual_out[rank]` after the reduced input is added to the local residual,
+and `norm_out[rank]` after RMSNorm is applied.
+
 For DeepEP-style consumers, `rank_hidden_states[rank]`, `topk_ids[rank]`, and
 `topk_weights[rank]` are the rank-local dispatch inputs. The reference
 `dispatch_records`, receive tensors, and per-expert counts provide a semantic
