@@ -36,6 +36,16 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_numerics_input_generators import (
+    ArgmaxInputConfig,
+    ArgmaxInputs,
+    ArgmaxInputValues,
+    ArgmaxPairInputConfig,
+    ArgmaxPairInputs,
+    ArgmaxPairInputValues,
+    argmax_pair_reference,
+    argmax_reference,
+)
 
 cute_dsl = pytest.importorskip("tokenspeed_kernel.ops.sampling.cute_dsl")
 cute_argmax = cute_dsl.argmax
@@ -58,6 +68,44 @@ def _need_cuda():
         pytest.skip("CUDA is required for the CuTe argmax kernel")
 
 
+def _argmax_values(
+    M: int,
+    N: int,
+    *,
+    device: str,
+    dtype: torch.dtype = torch.float32,
+    out_dtype: torch.dtype | None = None,
+    seed: int = 0,
+) -> ArgmaxInputValues:
+    return ArgmaxInputs(
+        ArgmaxInputConfig(
+            num_rows=M,
+            vocab_size=N,
+            dtype=dtype,
+            out_dtype=out_dtype,
+        )
+    ).generate(seed=seed, metadata_seed=seed + 1, device=device)
+
+
+def _argmax_pair_values(
+    M: int,
+    N: int,
+    *,
+    device: str,
+    dtype: torch.dtype = torch.float32,
+    include_out: bool = False,
+    seed: int = 0,
+) -> ArgmaxPairInputValues:
+    return ArgmaxPairInputs(
+        ArgmaxPairInputConfig(
+            num_rows=M,
+            vocab_size=N,
+            dtype=dtype,
+            include_out=include_out,
+        )
+    ).generate(seed=seed, metadata_seed=seed + 1, device=device)
+
+
 # ---------------------------------------------------------------------------
 # Correctness — kernel path (N >= 256, N % 32 == 0, fp32, supported SM)
 # ---------------------------------------------------------------------------
@@ -78,10 +126,9 @@ _KERNEL_SHAPES = [(m, n) for n in MODEL_VOCABS.values() for m in _KERNEL_M_VALUE
 def test_argmax_matches_torch_for_kernel_shapes(M, N):
     """Parity with ``torch.argmax`` across all served model vocabs."""
     _need_cuda()
-    torch.manual_seed(M * 13 + N)
-    x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
-    out = cute_argmax(x)
-    ref = torch.argmax(x, dim=-1)
+    values = _argmax_values(M, N, device="cuda", seed=M * 13 + N)
+    out = cute_argmax(values.logits)
+    ref = argmax_reference(values.logits)
     assert out.dtype == torch.int64
     assert out.shape == ref.shape
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
@@ -99,27 +146,26 @@ def test_argmax_matches_torch_for_kernel_shapes(M, N):
 )
 def test_argmax_pair_matches_torch_max(M, N):
     _need_cuda()
-    torch.manual_seed(M ^ N)
-    x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
-    pair = cute_argmax_pair(x)
-    ref_max, ref_idx = torch.max(x, dim=-1, keepdim=True)
+    values = _argmax_pair_values(M, N, device="cuda", seed=M ^ N)
+    pair = cute_argmax_pair(values.logits)
+    ref = argmax_pair_reference(values.logits)
     assert pair.shape == (M, 2)
     assert pair.dtype == torch.float32
-    torch.testing.assert_close(pair[:, 0:1], ref_max, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(pair[:, 1:2].long(), ref_idx, atol=0, rtol=0)
+    torch.testing.assert_close(pair[:, 0:1], ref[:, 0:1], atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(pair[:, 1:2], ref[:, 1:2], atol=0, rtol=0)
 
 
 def test_argmax_pair_writes_into_caller_buffer():
     """argmax_pair must populate the caller-provided ``out`` (CUDA graph hot path)."""
     _need_cuda()
     M, N = 4, MODEL_VOCABS["qwen3_5"]
-    x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
-    out = torch.empty((M, 2), dtype=torch.float32, device="cuda")
-    returned = cute_argmax_pair(x, out=out)
-    assert returned.data_ptr() == out.data_ptr()
-    ref_max, ref_idx = torch.max(x, dim=-1, keepdim=True)
-    torch.testing.assert_close(out[:, 0:1], ref_max, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(out[:, 1:2].long(), ref_idx, atol=0, rtol=0)
+    values = _argmax_pair_values(M, N, device="cuda", include_out=True, seed=M ^ N)
+    assert values.out is not None
+    returned = cute_argmax_pair(values.logits, out=values.out)
+    assert returned.data_ptr() == values.out.data_ptr()
+    ref = argmax_pair_reference(values.logits)
+    torch.testing.assert_close(values.out[:, 0:1], ref[:, 0:1], atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(values.out[:, 1:2], ref[:, 1:2], atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -134,25 +180,38 @@ def test_argmax_falls_back_for_small_N(N):
     such N through ``torch.argmax``."""
     _need_cuda()
     M = 4
-    torch.manual_seed(N)
-    x = torch.randn(M, N, device="cuda", dtype=torch.float32)
-    torch.testing.assert_close(cute_argmax(x), torch.argmax(x, dim=-1), atol=0, rtol=0)
+    values = _argmax_values(M, N, device="cuda", seed=N)
+    torch.testing.assert_close(
+        cute_argmax(values.logits),
+        argmax_reference(values.logits),
+        atol=0,
+        rtol=0,
+    )
 
 
 @pytest.mark.parametrize("N", [257, 1023, 1025, 32001])
 def test_argmax_falls_back_for_unaligned_N(N):
     _need_cuda()
     M = 4
-    torch.manual_seed(N)
-    x = torch.randn(M, N, device="cuda", dtype=torch.float32)
-    torch.testing.assert_close(cute_argmax(x), torch.argmax(x, dim=-1), atol=0, rtol=0)
+    values = _argmax_values(M, N, device="cuda", seed=N)
+    torch.testing.assert_close(
+        cute_argmax(values.logits),
+        argmax_reference(values.logits),
+        atol=0,
+        rtol=0,
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_argmax_matches_torch_for_low_precision_dtypes(dtype):
     _need_cuda()
-    x = torch.randn(8, 4096, device="cuda", dtype=dtype)
-    torch.testing.assert_close(cute_argmax(x), torch.argmax(x, dim=-1), atol=0, rtol=0)
+    values = _argmax_values(8, 4096, device="cuda", dtype=dtype, seed=4096)
+    torch.testing.assert_close(
+        cute_argmax(values.logits),
+        argmax_reference(values.logits),
+        atol=0,
+        rtol=0,
+    )
 
 
 def test_argmax_falls_back_for_1d_input():
@@ -164,9 +223,9 @@ def test_argmax_falls_back_for_1d_input():
 
 
 def test_argmax_falls_back_on_cpu():
-    x = torch.randn(4, 4096, dtype=torch.float32)
-    out = cute_argmax(x)
-    torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
+    values = _argmax_values(4, 4096, device="cpu", seed=4097)
+    out = cute_argmax(values.logits)
+    torch.testing.assert_close(out, argmax_reference(values.logits), atol=0, rtol=0)
 
 
 def test_argmax_falls_back_when_cute_unavailable(monkeypatch):
@@ -189,18 +248,26 @@ def test_argmax_falls_back_when_cute_unavailable(monkeypatch):
         (1, MODEL_VOCABS["gpt_oss"]),
         (8, 257),
     ]:
-        x = torch.randn(*shape, device=device, dtype=torch.float32)
+        values = _argmax_values(*shape, device=device, seed=sum(shape))
         torch.testing.assert_close(
-            cute_argmax(x), torch.argmax(x, dim=-1), atol=0, rtol=0
+            cute_argmax(values.logits),
+            argmax_reference(values.logits),
+            atol=0,
+            rtol=0,
         )
 
     # argmax_pair: should still pack (max, idx) via torch fallback when CUDA.
     if torch.cuda.is_available():
-        x = torch.randn(8, MODEL_VOCABS["qwen3_5"], device="cuda", dtype=torch.float32)
-        pair = cute_argmax_pair(x)
-        ref_max, ref_idx = torch.max(x, dim=-1, keepdim=True)
-        torch.testing.assert_close(pair[:, 0:1], ref_max, atol=1e-4, rtol=1e-4)
-        torch.testing.assert_close(pair[:, 1:2].long(), ref_idx, atol=0, rtol=0)
+        values = _argmax_pair_values(
+            8,
+            MODEL_VOCABS["qwen3_5"],
+            device="cuda",
+            seed=95,
+        )
+        pair = cute_argmax_pair(values.logits)
+        ref = argmax_pair_reference(values.logits)
+        torch.testing.assert_close(pair[:, 0:1], ref[:, 0:1], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(pair[:, 1:2], ref[:, 1:2], atol=0, rtol=0)
 
 
 def _fake_platform(vendor: str, major: int, minor: int):
@@ -312,14 +379,19 @@ def test_argmax_writes_into_caller_buffer(out_dtype):
     no post-kernel cast on the hot path."""
     _need_cuda()
     M, N = 8, MODEL_VOCABS["deepseek_v4"]
-    torch.manual_seed(M ^ N ^ 1)
-    x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
-    out = torch.empty(M, dtype=out_dtype, device="cuda")
-    returned = cute_argmax(x, out=out)
-    assert returned.data_ptr() == out.data_ptr()
-    assert out.dtype == out_dtype
-    ref = torch.argmax(x, dim=-1)
-    torch.testing.assert_close(out.long(), ref, atol=0, rtol=0)
+    values = _argmax_values(
+        M,
+        N,
+        device="cuda",
+        out_dtype=out_dtype,
+        seed=M ^ N ^ 1,
+    )
+    assert values.out is not None
+    returned = cute_argmax(values.logits, out=values.out)
+    assert returned.data_ptr() == values.out.data_ptr()
+    assert values.out.dtype == out_dtype
+    ref = argmax_reference(values.logits)
+    torch.testing.assert_close(values.out.long(), ref, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("out_dtype", [torch.int32, torch.int64])
@@ -329,22 +401,35 @@ def test_argmax_caller_buffer_via_fallback(out_dtype):
     fallback's ``out.copy_(result)`` path."""
     _need_cuda()
     M, N = 4, 257  # unaligned N forces fallback.
-    torch.manual_seed(N)
-    x = torch.randn(M, N, device="cuda", dtype=torch.float32)
-    out = torch.empty(M, dtype=out_dtype, device="cuda")
-    cute_argmax(x, out=out)
-    torch.testing.assert_close(out.long(), torch.argmax(x, dim=-1), atol=0, rtol=0)
+    values = _argmax_values(
+        M,
+        N,
+        device="cuda",
+        out_dtype=out_dtype,
+        seed=N,
+    )
+    assert values.out is not None
+    cute_argmax(values.logits, out=values.out)
+    torch.testing.assert_close(
+        values.out.long(),
+        argmax_reference(values.logits),
+        atol=0,
+        rtol=0,
+    )
 
 
 def test_argmax_rejects_invalid_out():
     _need_cuda()
-    x = torch.randn(4, MODEL_VOCABS["deepseek_v4"], device="cuda", dtype=torch.float32)
+    values = _argmax_values(4, MODEL_VOCABS["deepseek_v4"], device="cuda", seed=17)
     with pytest.raises(ValueError, match="shape"):
-        cute_argmax(x, out=torch.empty(5, dtype=torch.int32, device="cuda"))
+        cute_argmax(values.logits, out=torch.empty(5, dtype=torch.int32, device="cuda"))
     with pytest.raises(ValueError, match="int32 or int64"):
-        cute_argmax(x, out=torch.empty(4, dtype=torch.float32, device="cuda"))
+        cute_argmax(
+            values.logits,
+            out=torch.empty(4, dtype=torch.float32, device="cuda"),
+        )
     with pytest.raises(ValueError, match="device"):
-        cute_argmax(x, out=torch.empty(4, dtype=torch.int32, device="cpu"))
+        cute_argmax(values.logits, out=torch.empty(4, dtype=torch.int32, device="cpu"))
 
 
 # ---------------------------------------------------------------------------
@@ -362,8 +447,8 @@ def test_argmax_rejects_invalid_out():
 )
 def test_argmax_under_cuda_graph(M, N):
     _need_cuda()
-    torch.manual_seed(M ^ N ^ 0xC0DE)
-    x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
+    values = _argmax_values(M, N, device="cuda", seed=M ^ N ^ 0xC0DE)
+    x = values.logits
     out = torch.empty(M, dtype=torch.int64, device="cuda")
 
     # Warmup.
@@ -375,11 +460,11 @@ def test_argmax_under_cuda_graph(M, N):
         out.copy_(cute_argmax(x))
 
     # Mutate input, replay — output must reflect the new values.
-    new_x = 0.1 * torch.randn_like(x)
-    x.copy_(new_x)
+    new_values = _argmax_values(M, N, device="cuda", seed=M ^ N ^ 0xC0DF)
+    x.copy_(new_values.logits)
     graph.replay()
     torch.cuda.synchronize()
-    ref = torch.argmax(x, dim=-1)
+    ref = new_values.expected_indices
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
 
 
@@ -394,9 +479,16 @@ def test_argmax_out_buffer_under_cuda_graph(out_dtype):
     """
     _need_cuda()
     M, N = 16, MODEL_VOCABS["deepseek_v4"]
-    torch.manual_seed(M ^ N ^ 0xBEEF)
-    x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
-    buf = torch.empty(M, dtype=out_dtype, device="cuda")
+    values = _argmax_values(
+        M,
+        N,
+        device="cuda",
+        out_dtype=out_dtype,
+        seed=M ^ N ^ 0xBEEF,
+    )
+    assert values.out is not None
+    x = values.logits
+    buf = values.out
 
     # Warmup so cute DSL JIT compiles outside graph capture.
     cute_argmax(x, out=buf)
@@ -406,11 +498,17 @@ def test_argmax_out_buffer_under_cuda_graph(out_dtype):
     with torch.cuda.graph(graph):
         cute_argmax(x, out=buf)
 
-    new_x = 0.1 * torch.randn_like(x)
-    x.copy_(new_x)
+    new_values = _argmax_values(
+        M,
+        N,
+        device="cuda",
+        out_dtype=out_dtype,
+        seed=M ^ N ^ 0xBEF0,
+    )
+    x.copy_(new_values.logits)
     graph.replay()
     torch.cuda.synchronize()
-    ref = torch.argmax(x, dim=-1)
+    ref = new_values.expected_indices
     torch.testing.assert_close(buf.long(), ref, atol=0, rtol=0)
 
 
@@ -420,9 +518,16 @@ def test_argmax_pair_under_cuda_graph():
     internally; we verify the assembly still survives capture/replay."""
     _need_cuda()
     M, N = 8, MODEL_VOCABS["qwen3_5"]
-    torch.manual_seed(0xABCD)
-    x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch.float32)
-    pair = torch.empty((M, 2), dtype=torch.float32, device="cuda")
+    values = _argmax_pair_values(
+        M,
+        N,
+        device="cuda",
+        include_out=True,
+        seed=0xABCD,
+    )
+    assert values.out is not None
+    x = values.logits
+    pair = values.out
 
     cute_argmax_pair(x, out=pair)
     torch.cuda.synchronize()
@@ -431,13 +536,13 @@ def test_argmax_pair_under_cuda_graph():
     with torch.cuda.graph(graph):
         cute_argmax_pair(x, out=pair)
 
-    new_x = 0.1 * torch.randn_like(x)
-    x.copy_(new_x)
+    new_values = _argmax_pair_values(M, N, device="cuda", seed=0xABCE)
+    x.copy_(new_values.logits)
     graph.replay()
     torch.cuda.synchronize()
-    ref_max, ref_idx = torch.max(x, dim=-1, keepdim=True)
-    torch.testing.assert_close(pair[:, 0:1], ref_max, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(pair[:, 1:2].long(), ref_idx, atol=0, rtol=0)
+    ref = new_values.expected_pair
+    torch.testing.assert_close(pair[:, 0:1], ref[:, 0:1], atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(pair[:, 1:2], ref[:, 1:2], atol=0, rtol=0)
 
 
 def test_greedy_sample_pattern_under_cuda_graph():
@@ -447,8 +552,8 @@ def test_greedy_sample_pattern_under_cuda_graph():
     new tokens."""
     _need_cuda()
     max_bs, bs, N = 32, 16, MODEL_VOCABS["kimi_k2_5"]
-    torch.manual_seed(0xCAFE)
-    logits = 0.1 * torch.randn(bs, N, device="cuda", dtype=torch.float32)
+    values = _argmax_values(bs, N, device="cuda", seed=0xCAFE)
+    logits = values.logits
     sample_token_buf = torch.empty((max_bs,), dtype=torch.int32, device="cuda")
 
     tokens = cute_argmax(logits, out=sample_token_buf[:bs])
@@ -458,11 +563,11 @@ def test_greedy_sample_pattern_under_cuda_graph():
     with torch.cuda.graph(graph):
         tokens = cute_argmax(logits, out=sample_token_buf[:bs])
 
-    new_logits = 0.1 * torch.randn_like(logits)
-    logits.copy_(new_logits)
+    new_values = _argmax_values(bs, N, device="cuda", seed=0xCAFF)
+    logits.copy_(new_values.logits)
     graph.replay()
     torch.cuda.synchronize()
-    ref = torch.argmax(logits, dim=-1).to(torch.int32)
+    ref = new_values.expected_indices.to(torch.int32)
     torch.testing.assert_close(tokens, ref, atol=0, rtol=0)
     # Slice view must alias the underlying buffer.
     torch.testing.assert_close(sample_token_buf[:bs], ref, atol=0, rtol=0)
@@ -479,17 +584,28 @@ def test_greedy_sample_pattern_under_cuda_graph():
 
 def test_argmax_torch_fallback_on_cpu_tensor():
     """Pure-torch fallback must handle CPU input — non-CUDA hosts route here."""
-    x = torch.randn(8, 4096, dtype=torch.float32)
-    out = cute_dsl._argmax_torch_fallback(x)
-    torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
+    values = _argmax_values(8, 4096, device="cpu", seed=31)
+    out = cute_dsl._argmax_torch_fallback(values.logits)
+    torch.testing.assert_close(out, values.expected_indices, atol=0, rtol=0)
     assert out.dtype == torch.int64
 
 
 def test_argmax_torch_fallback_with_int32_out():
-    x = torch.randn(8, 4096, dtype=torch.float32)
-    out = torch.empty(8, dtype=torch.int32)
-    cute_dsl._argmax_torch_fallback(x, out=out)
-    torch.testing.assert_close(out.long(), torch.argmax(x, dim=-1), atol=0, rtol=0)
+    values = _argmax_values(
+        8,
+        4096,
+        device="cpu",
+        out_dtype=torch.int32,
+        seed=32,
+    )
+    assert values.out is not None
+    cute_dsl._argmax_torch_fallback(values.logits, out=values.out)
+    torch.testing.assert_close(
+        values.out.long(),
+        values.expected_indices,
+        atol=0,
+        rtol=0,
+    )
 
 
 def test_argmax_pair_torch_fallback_on_cpu_tensor():
@@ -499,13 +615,22 @@ def test_argmax_pair_torch_fallback_on_cpu_tensor():
     short-circuited on ``not logits.is_cuda``; AMD/CPU could not even reach
     the fallback. Keep this test to guard against that regression.
     """
-    x = torch.randn(4, 4096, dtype=torch.float32)
-    pair = cute_dsl._argmax_pair_torch_fallback(x)
+    values = _argmax_pair_values(4, 4096, device="cpu", seed=33)
+    pair = cute_dsl._argmax_pair_torch_fallback(values.logits)
     assert pair.shape == (4, 2)
     assert pair.dtype == torch.float32
-    ref_max, ref_idx = torch.max(x, dim=-1, keepdim=True)
-    torch.testing.assert_close(pair[:, 0:1], ref_max, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(pair[:, 1:2].long(), ref_idx, atol=0, rtol=0)
+    torch.testing.assert_close(
+        pair[:, 0:1],
+        values.expected_pair[:, 0:1],
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    torch.testing.assert_close(
+        pair[:, 1:2],
+        values.expected_pair[:, 1:2],
+        atol=0,
+        rtol=0,
+    )
 
 
 def test_public_binding_dispatch_matches_arch():
