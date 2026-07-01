@@ -24,6 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel import (
     quantize_fp8,
+    quantize_fp8_with_scale,
     quantize_mxfp4,
     quantize_mxfp8,
     quantize_nvfp4,
@@ -190,4 +191,80 @@ def test_fp8_quantization_generator_runs_scaled_cast_kernel(
     torch.cuda.synchronize()
 
     assert out.shape == values.x.shape
+    assert _bitwise_equal(out, ref)
+
+
+@pytest.mark.parametrize("solution", ["trtllm"])
+@pytest.mark.parametrize("granularity", ["tensor", "token"])
+def test_fp8_quantization_generator_runs_dynamic_scale_kernel(
+    device: str,
+    solution: str,
+    granularity: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    require("quantization", "fp8_with_scale", solution, dtype, "x")
+    values = FP8QuantizationInputs(
+        FP8QuantizationInputConfig(
+            shape=(11, 256),
+            dtype=dtype,
+            granularity=granularity,  # type: ignore[arg-type]
+        )
+    ).generate(seed=56, device=device)
+    assert values.scale is not None
+
+    out, scale = quantize_fp8_with_scale(
+        values.x,
+        granularity=granularity,
+        solution=solution,
+    )
+    ref = fp8_quantization_reference(
+        values.x,
+        granularity=granularity,  # type: ignore[arg-type]
+        scale=values.scale,
+    ).to(out.dtype)
+    torch.cuda.synchronize()
+
+    assert out.shape == values.x.shape
+    assert scale.shape == values.scale.shape
+    torch.testing.assert_close(scale, values.scale, atol=1e-6, rtol=1e-5)
+    assert _bitwise_equal(out, ref)
+
+
+@pytest.mark.parametrize("solution", ["trtllm"])
+def test_fp8_quantization_generator_runs_token_group_scale_kernel(
+    device: str,
+    solution: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    require("quantization", "fp8_with_scale", solution, dtype, "x")
+    values = FP8QuantizationInputs(
+        FP8QuantizationInputConfig(
+            shape=(9, 256),
+            dtype=dtype,
+            granularity="token_group",
+            group_size=128,
+        )
+    ).generate(seed=57, device=device)
+    assert values.scale is not None
+
+    out, scale = quantize_fp8_with_scale(
+        values.x,
+        granularity="token_group",
+        group_size=128,
+        scale_encoding="float32",
+        solution=solution,
+    )
+    ref = fp8_quantization_reference(
+        values.x,
+        granularity="token_group",
+        group_size=128,
+        scale=values.scale,
+    ).to(out.dtype)
+    torch.cuda.synchronize()
+
+    assert out.shape == values.x.shape
+    assert scale.shape == values.scale.shape
+    torch.testing.assert_close(scale, values.scale, atol=1e-6, rtol=1e-5)
     assert _bitwise_equal(out, ref)
