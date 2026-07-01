@@ -67,6 +67,7 @@ __all__ = [
     "SpeculativeGreedyVerifyInputs",
     "SpeculativeGreedyVerifyInputValues",
     "SpeculativeGreedyVerifyReferenceValues",
+    "TopKTopPFilterMode",
     "TopKTopPRenormInputConfig",
     "TopKTopPRenormInputs",
     "TopKTopPRenormInputValues",
@@ -93,6 +94,9 @@ __all__ = [
 
 ArgmaxMaxPattern = Literal["unique", "tied", "random"]
 SoftmaxTemperatureMode = Literal["none", "scalar", "per_row"]
+TopKTopPFilterMode = Literal[
+    "random", "top_k_only", "top_p_only", "top_k_top_p", "mixed"
+]
 
 _LOGIT_DTYPES = {
     torch.float16,
@@ -175,6 +179,15 @@ def _randint(
 def _check_argmax_max_pattern(name: str, value: str) -> ArgmaxMaxPattern:
     if value not in ("unique", "tied", "random"):
         raise ValueError(f"{name} must be 'unique', 'tied', or 'random'; got {value!r}")
+    return value  # type: ignore[return-value]
+
+
+def _check_top_k_top_p_filter_mode(name: str, value: str) -> TopKTopPFilterMode:
+    if value not in ("random", "top_k_only", "top_p_only", "top_k_top_p", "mixed"):
+        raise ValueError(
+            f"{name} must be 'random', 'top_k_only', 'top_p_only', "
+            f"'top_k_top_p', or 'mixed'; got {value!r}"
+        )
     return value  # type: ignore[return-value]
 
 
@@ -1712,7 +1725,13 @@ class TopKTopPLogitsSamplingInputs(NumericsInputGenerator):
 
 @dataclass
 class TopKTopPRenormInputConfig:
-    """Initialization parameters for top-k/top-p probability renormalization."""
+    """Initialization parameters for top-k/top-p probability renormalization.
+
+    The represented operation first applies top-k filtering, then applies
+    top-p filtering to the top-k-renormalized row. ``filter_mode`` controls
+    whether generated metadata exercises top-k-only rows, top-p-only rows,
+    rows where both filters are active, or a mixed batch.
+    """
 
     # Required: number of probability rows.
     num_rows: int
@@ -1726,7 +1745,15 @@ class TopKTopPRenormInputConfig:
     # Optional: maximum top-k value sampled per row.
     max_top_k: int | None = None
 
-    # Optional: include rows where top-k is disabled by setting k >= vocab.
+    # Optional: generated metadata pattern for top-k/top-p controls.
+    filter_mode: TopKTopPFilterMode = "random"
+
+    # Optional: representation for disabled top-k. Any value >= vocab_size
+    # is semantically valid. Consumers that use a larger sentinel can set it.
+    disabled_top_k_value: int | None = None
+
+    # Optional: for filter_mode="random", include rows where top-k is disabled
+    # by setting k to disabled_top_k_value.
     include_disabled_top_k: bool = True
 
     # Optional: generated tensor device override.
@@ -1757,6 +1784,24 @@ class TopKTopPRenormInputs(NumericsInputGenerator):
                 "max_top_k must be <= vocab_size; got "
                 f"{self.config.max_top_k} > {self.config.vocab_size}"
             )
+        self.config.filter_mode = _check_top_k_top_p_filter_mode(
+            "filter_mode", self.config.filter_mode
+        )
+        if self.config.disabled_top_k_value is None:
+            self.config.disabled_top_k_value = self.config.vocab_size
+        self.config.disabled_top_k_value = _check_positive(
+            "disabled_top_k_value", self.config.disabled_top_k_value
+        )
+        if self.config.disabled_top_k_value > torch.iinfo(torch.int32).max:
+            raise ValueError(
+                "disabled_top_k_value must fit in int32 top_k storage; got "
+                f"{self.config.disabled_top_k_value}"
+            )
+        if self.config.disabled_top_k_value < self.config.vocab_size:
+            raise ValueError(
+                "disabled_top_k_value must be >= vocab_size; got "
+                f"{self.config.disabled_top_k_value} < {self.config.vocab_size}"
+            )
 
     def generate(
         self,
@@ -1786,8 +1831,6 @@ class TopKTopPRenormInputs(NumericsInputGenerator):
             device=device,
             configured_device=self.config.device,
         )
-        if self.config.include_disabled_top_k and self.config.num_rows > 0:
-            top_k[1::2] = self.config.vocab_size
         top_p_generator = _rng_for_device(
             target_device, _child_seed(metadata_base_seed, 2)
         )
@@ -1798,6 +1841,23 @@ class TopKTopPRenormInputs(NumericsInputGenerator):
             generator=top_p_generator,
         )
         top_p = top_p * 0.5 + 0.5
+        disabled_top_k = int(self.config.disabled_top_k_value)
+
+        if self.config.filter_mode == "top_k_only":
+            top_p.fill_(1.0)
+        elif self.config.filter_mode == "top_p_only":
+            top_k.fill_(disabled_top_k)
+        elif self.config.filter_mode == "mixed":
+            rows = torch.arange(
+                self.config.num_rows, dtype=torch.int64, device=target_device
+            )
+            top_k_only = rows % 3 == 0
+            top_p_only = rows % 3 == 1
+            top_p[top_k_only] = 1.0
+            top_k[top_p_only] = disabled_top_k
+        elif self.config.filter_mode == "random":
+            if self.config.include_disabled_top_k and self.config.num_rows > 0:
+                top_k[1::2] = disabled_top_k
         return TopKTopPRenormInputValues(
             probs=probs.to(self.config.dtype).contiguous(),
             top_k=top_k.contiguous(),

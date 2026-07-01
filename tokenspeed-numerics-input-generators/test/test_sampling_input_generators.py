@@ -617,6 +617,47 @@ def test_top_k_top_p_renorm_inputs_generate_values_and_reference() -> None:
     torch.testing.assert_close(ref.sum(dim=-1), torch.ones(6), atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize(
+    "filter_mode",
+    ["top_k_only", "top_p_only", "top_k_top_p", "mixed"],
+)
+def test_top_k_top_p_renorm_inputs_generate_filter_modes(filter_mode: str) -> None:
+    disabled = 1 << 30
+    values = TopKTopPRenormInputs(
+        TopKTopPRenormInputConfig(
+            num_rows=6,
+            vocab_size=31,
+            max_top_k=8,
+            filter_mode=filter_mode,  # type: ignore[arg-type]
+            disabled_top_k_value=disabled,
+        )
+    ).generate(seed=150, metadata_seed=151, device="cpu")
+
+    assert values.top_k.dtype == torch.int32
+    assert values.top_p.dtype == torch.float32
+    if filter_mode == "top_k_only":
+        torch.testing.assert_close(values.top_p, torch.ones(6))
+        assert int(values.top_k.max()) <= 8
+    elif filter_mode == "top_p_only":
+        torch.testing.assert_close(
+            values.top_k, torch.full((6,), disabled, dtype=torch.int32)
+        )
+        assert bool(torch.all(values.top_p < 1.0))
+    elif filter_mode == "top_k_top_p":
+        assert int(values.top_k.max()) <= 8
+        assert bool(torch.all(values.top_p < 1.0))
+    else:
+        torch.testing.assert_close(values.top_p[0::3], torch.ones(2))
+        torch.testing.assert_close(
+            values.top_k[1::3], torch.full((2,), disabled, dtype=torch.int32)
+        )
+        assert int(values.top_k[2::3].max()) <= 8
+        assert bool(torch.all(values.top_p[2::3] < 1.0))
+
+    ref = top_k_top_p_renorm_reference(values.probs, values.top_k, values.top_p)
+    torch.testing.assert_close(ref.sum(dim=-1), torch.ones(6), atol=1e-6, rtol=1e-6)
+
+
 def test_top_k_top_p_sampling_inputs_generate_deterministic_reference() -> None:
     values = TopKTopPSamplingInputs(
         TopKTopPSamplingInputConfig(
@@ -836,6 +877,31 @@ def test_top_k_top_p_rejects_too_large_max_top_k() -> None:
                 num_rows=1,
                 vocab_size=8,
                 max_top_k=9,
+            )
+        )
+
+
+def test_top_k_top_p_renorm_rejects_invalid_filter_mode() -> None:
+    with pytest.raises(ValueError, match="filter_mode"):
+        TopKTopPRenormInputs(
+            TopKTopPRenormInputConfig(
+                num_rows=1,
+                vocab_size=8,
+                filter_mode="top_a_little",  # type: ignore[arg-type]
+            )
+        )
+
+
+@pytest.mark.parametrize("disabled_top_k_value", [7, torch.iinfo(torch.int32).max + 1])
+def test_top_k_top_p_renorm_rejects_invalid_disabled_top_k(
+    disabled_top_k_value: int,
+) -> None:
+    with pytest.raises(ValueError, match="disabled_top_k_value"):
+        TopKTopPRenormInputs(
+            TopKTopPRenormInputConfig(
+                num_rows=1,
+                vocab_size=8,
+                disabled_top_k_value=disabled_top_k_value,
             )
         )
 

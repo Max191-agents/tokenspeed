@@ -144,7 +144,9 @@ renormalized row is outside this generator's contract.
 
 `TopKTopPRenormInputs` represents top-k filtering followed by top-p filtering
 and renormalization. Top-k values can include disabled rows by setting `k` equal
-to the vocabulary size.
+to the vocabulary size or any larger disabled-top-k sentinel. The generator can
+produce batches where only top-k is active, only top-p is active, both filters
+are active, or different rows use different modes.
 
 ### Top-K + Top-P Sampling
 
@@ -197,6 +199,9 @@ The generators reject invalid sampling inputs before values are returned:
   reference comparison
 - standalone top-p thresholds have one value per probability row and are in
   `(0, 1]`
+- top-k/top-p renormalization metadata uses either finite positive top-k values
+  bounded by the configured maximum or a validated disabled-top-k value greater
+  than or equal to the vocabulary size
 - top-k/top-p sampling rows have one survivor after both filters for exact
   reference comparison, with logits rows containing one finite token before
   softmax

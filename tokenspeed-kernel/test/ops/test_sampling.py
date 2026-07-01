@@ -192,49 +192,30 @@ def test_gather_min_p_only(device: str) -> None:
 
 @requires_nvidia
 @pytest.mark.parametrize(
-    "ks,ps,tag",
+    "filter_mode",
     [
-        # Mode 3.1: top-K only (P=1.0).
-        ([1, 16, 64, 128, 1, 64, 16, 128], [1.0] * 8, "topk-only"),
-        # Mode 3.2: top-P only (K sentinel → radix path).
-        (
-            [_TOP_K_DISABLED] * 8,
-            [0.5, 0.7, 0.9, 0.95, 0.99, 0.5, 0.9, 0.8],
-            "topp-only",
-        ),
-        # Mode 3.3: top-K + top-P together.
-        (
-            [64, 64, 32, 128, 16, 8, 64, 128],
-            [0.9, 0.5, 0.8, 0.7, 0.95, 0.6, 0.9, 0.99],
-            "topk+topp",
-        ),
-        # Mixed batch: different rows take different paths in one launch.
-        (
-            [64, _TOP_K_DISABLED, 1, 128, 32, _TOP_K_DISABLED, 16, 8],
-            [0.9, 0.9, 1.0, 0.7, 0.95, 0.5, 0.8, 0.99],
-            "mixed",
-        ),
+        "top_k_only",
+        "top_p_only",
+        "top_k_top_p",
+        "mixed",
     ],
 )
-def test_fused_topk_topp_matches_pipeline(
-    device: str, ks: list[int], ps: list[float], tag: str
-) -> None:
+def test_fused_topk_topp_matches_pipeline(device: str, filter_mode: str) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA GPU is required for fused_topk_topp_renorm test")
-    bs, V = len(ks), 8192
+    bs, V = 8, 8192
     values = TopKTopPRenormInputs(
         TopKTopPRenormInputConfig(
             num_rows=bs,
             vocab_size=V,
             max_top_k=128,
-            include_disabled_top_k=True,
+            filter_mode=filter_mode,  # type: ignore[arg-type]
+            disabled_top_k_value=_TOP_K_DISABLED,
         )
     ).generate(seed=109, metadata_seed=110, device=device)
-    top_ks = torch.tensor(ks, dtype=torch.int32, device=device)
-    top_ps = torch.tensor(ps, dtype=torch.float32, device=device)
 
-    ref = top_k_top_p_renorm_reference(values.probs, top_ks, top_ps)
-    ours = fused_topk_topp_renorm(values.probs.clone(), top_ks, top_ps)
+    ref = top_k_top_p_renorm_reference(values.probs, values.top_k, values.top_p)
+    ours = fused_topk_topp_renorm(values.probs.clone(), values.top_k, values.top_p)
 
     # Each kept row should renormalize to 1 within fp32 ulp tolerance.
     torch.testing.assert_close(
@@ -246,7 +227,9 @@ def test_fused_topk_topp_matches_pipeline(
     pos_ref = ref > 0
     pos_ours = ours > 0
     pos_diff = (pos_ref != pos_ours).sum(dim=-1).max().item()
-    assert pos_diff <= 1, f"[{tag}] kept-position mismatch up to {pos_diff} per row"
+    assert (
+        pos_diff <= 1
+    ), f"[{filter_mode}] kept-position mismatch up to {pos_diff} per row"
     # Renormalized values: sub-ulp accumulation order differs by row scale,
     # so 1e-5 is the right tolerance (matches the per-row sum bound).
     torch.testing.assert_close(ours, ref, atol=1e-5, rtol=1e-4)

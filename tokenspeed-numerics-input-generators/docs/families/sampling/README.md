@@ -30,7 +30,8 @@ logits.
 - `TopPRenormInputs`: generates normalized probability rows and top-p
   thresholds for standalone nucleus filtering.
 - `TopKTopPRenormInputs`: generates normalized probability rows, top-k values,
-  and top-p thresholds.
+  and top-p thresholds. The generated metadata can exercise top-k-only,
+  top-p-only, combined, random, or mixed filtering modes.
 - `TopKTopPSamplingInputs`: generates probability rows whose top-k/top-p
   filtered support has one deterministic sampled token.
 - `TopKTopPLogitsSamplingInputs`: generates logits whose softmaxed top-k/top-p
