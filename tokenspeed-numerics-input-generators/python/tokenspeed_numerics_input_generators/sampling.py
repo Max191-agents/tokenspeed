@@ -39,6 +39,7 @@ __all__ = [
     "ArgmaxInputConfig",
     "ArgmaxInputs",
     "ArgmaxInputValues",
+    "ArgmaxLogitsRank",
     "ArgmaxMaxPattern",
     "ArgmaxNaNPattern",
     "ArgmaxPairInputConfig",
@@ -94,6 +95,7 @@ __all__ = [
 ]
 
 ArgmaxMaxPattern = Literal["unique", "tied", "random"]
+ArgmaxLogitsRank = Literal[1, 2]
 ArgmaxNaNPattern = Literal["none", "all", "mixed"]
 SoftmaxTemperatureMode = Literal["none", "scalar", "per_row"]
 TopKTopPFilterMode = Literal[
@@ -187,6 +189,13 @@ def _check_argmax_max_pattern(name: str, value: str) -> ArgmaxMaxPattern:
 def _check_argmax_nan_pattern(name: str, value: str) -> ArgmaxNaNPattern:
     if value not in ("none", "all", "mixed"):
         raise ValueError(f"{name} must be 'none', 'all', or 'mixed'; got {value!r}")
+    return value  # type: ignore[return-value]
+
+
+def _check_argmax_logits_rank(name: str, value: int) -> ArgmaxLogitsRank:
+    value = int(value)
+    if value not in (1, 2):
+        raise ValueError(f"{name} must be 1 or 2, got {value}")
     return value  # type: ignore[return-value]
 
 
@@ -410,11 +419,12 @@ class SpeculativeChainSamplingReferenceValues:
 
 @dataclass
 class ArgmaxInputConfig:
-    """Initialization parameters for row-wise argmax inputs.
+    """Initialization parameters for argmax inputs.
 
     The represented operation returns the lowest index whose logit is maximal
-    for each row. The default generation plants one dominant maximum in every
-    row so correctness tests are not accidentally dominated by random maxima.
+    along the last dimension. The default generation plants one dominant
+    maximum in every logical row so correctness tests are not accidentally
+    dominated by random maxima.
     """
 
     # Required: number of independent rows. Zero is valid.
@@ -425,6 +435,11 @@ class ArgmaxInputConfig:
 
     # Required: generated dtype for logits.
     dtype: torch.dtype
+
+    # Optional: generated logits rank. Rank 2 generates shape
+    # [num_rows, vocab_size]. Rank 1 generates one vector with shape
+    # [vocab_size] and therefore requires num_rows=1.
+    logits_rank: ArgmaxLogitsRank = 2
 
     # Optional: generate an output tensor for APIs that support out=.
     out_dtype: torch.dtype | None = None
@@ -594,7 +609,7 @@ class SpeculativeChainSamplingInputConfig:
 
 @dataclass(init=False)
 class ArgmaxInputs(NumericsInputGenerator):
-    """Generator for row-wise argmax logits."""
+    """Generator for argmax logits over the last dimension."""
 
     config: ArgmaxInputConfig
     logits_input: TensorInput | None
@@ -610,6 +625,11 @@ class ArgmaxInputs(NumericsInputGenerator):
         self.config.dtype = _check_float_dtype(
             "dtype", self.config.dtype, allowed=_LOGIT_DTYPES
         )
+        self.config.logits_rank = _check_argmax_logits_rank(
+            "logits_rank", self.config.logits_rank
+        )
+        if self.config.logits_rank == 1 and self.config.num_rows != 1:
+            raise ValueError("logits_rank=1 requires num_rows=1")
         self.config.max_pattern = _check_argmax_max_pattern(
             "max_pattern", self.config.max_pattern
         )
@@ -620,6 +640,8 @@ class ArgmaxInputs(NumericsInputGenerator):
             raise ValueError("max_pattern='tied' requires vocab_size >= 2")
         if self.config.nan_pattern == "mixed" and self.config.vocab_size < 2:
             raise ValueError("nan_pattern='mixed' requires vocab_size >= 2")
+        if self.config.logits_rank == 1 and self.config.nan_pattern != "none":
+            raise ValueError("NaN argmax patterns require logits_rank=2")
         self.config.planted_indices = _normalize_argmax_planted_indices(
             self.config.planted_indices,
             num_rows=self.config.num_rows,
@@ -640,8 +662,13 @@ class ArgmaxInputs(NumericsInputGenerator):
             self.config.out_dtype = _check_index_dtype(
                 "out_dtype", self.config.out_dtype
             )
+        logits_shape = (
+            (self.config.vocab_size,)
+            if self.config.logits_rank == 1
+            else (self.config.num_rows, self.config.vocab_size)
+        )
         self.logits_input = self.logits_input or TensorInput(
-            (self.config.num_rows, self.config.vocab_size),
+            logits_shape,
             self.config.dtype,
             device=self.config.device,
         )
@@ -656,13 +683,24 @@ class ArgmaxInputs(NumericsInputGenerator):
         self.__post_init__()
         if self.logits_input is None:
             raise ValueError("ArgmaxInputs child generators must be initialized")
+        logits_shape = (
+            (self.config.vocab_size,)
+            if self.config.logits_rank == 1
+            else (self.config.num_rows, self.config.vocab_size)
+        )
+        self.logits_input.shape = logits_shape
+        self.logits_input.dtype = self.config.dtype
         logits = _require_tensor(
             self.logits_input.generate(seed=_child_seed(seed, 1), device=device).values,
             "logits",
         ).contiguous()
+        if self.config.logits_rank == 1:
+            logits_for_planting = logits.unsqueeze(0)
+        else:
+            logits_for_planting = logits
         metadata_base_seed = seed if metadata_seed is None else metadata_seed
-        logits, expected = _plant_argmax_maxima(
-            logits,
+        logits_for_planting, _ = _plant_argmax_maxima(
+            logits_for_planting,
             pattern=self.config.max_pattern,
             planted_indices=self.config.planted_indices,
             dtype=self.config.dtype,
@@ -670,12 +708,21 @@ class ArgmaxInputs(NumericsInputGenerator):
             device=device,
             configured_device=self.config.device,
         )
-        logits = _apply_argmax_nan_pattern(logits, pattern=self.config.nan_pattern)
+        logits_for_planting = _apply_argmax_nan_pattern(
+            logits_for_planting,
+            pattern=self.config.nan_pattern,
+        )
+        logits = (
+            logits_for_planting.squeeze(0)
+            if self.config.logits_rank == 1
+            else logits_for_planting
+        )
         expected = argmax_reference(logits)
         out = None
         if self.config.out_dtype is not None:
+            out_shape = () if self.config.logits_rank == 1 else (self.config.num_rows,)
             out = torch.empty(
-                (self.config.num_rows,),
+                out_shape,
                 dtype=self.config.out_dtype,
                 device=logits.device,
             )

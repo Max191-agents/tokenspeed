@@ -13,14 +13,16 @@ top-k/top-p sampling from probabilities or logits.
 
 ### Argmax
 
-`ArgmaxInputs` represents row-wise argmax over logits. The semantic result is
-the lowest column index whose value is maximal in each row. By default the
-generator plants a known dominant maximum in every row, so correctness tests do
-not depend on accidental random maxima or ties. It can also generate rows with
-two equal maxima to exercise the first-index tie rule, or leave random logits
-untouched and derive expected indices from the reference. When a test needs a
-specific winning token id, `planted_indices` can fix the maximum location for
-all rows or provide one maximum location per row.
+`ArgmaxInputs` represents argmax over the last dimension of logits. The common
+rank-2 case is row-wise argmax, where the semantic result is the lowest column
+index whose value is maximal in each row. Rank-1 logits are also supported for
+single-vector fallback paths and produce a scalar selected index. By default
+the generator plants a known dominant maximum in every logical row, so
+correctness tests do not depend on accidental random maxima or ties. It can
+also generate rows with two equal maxima to exercise the first-index tie rule,
+or leave random logits untouched and derive expected indices from the
+reference. When a test needs a specific winning token id, `planted_indices` can
+fix the maximum location for all rows or provide one maximum location per row.
 
 For kernels that define NaN handling, the argmax reference ignores NaN values
 when any non-NaN value is present and returns `-1` for all-NaN rows. The
@@ -215,6 +217,9 @@ The generators reject invalid sampling inputs before values are returned:
   softmax
 - planted argmax rows have either a unique known maximum or two tied known
   maxima whose lower index is the expected result
+- rank-1 argmax logits represent exactly one logical row and return scalar
+  expected/output indices
+- NaN-focused argmax layouts are row-wise and require rank-2 logits
 - planted argmax indices, when supplied, are in range and compatible with the
   selected maximum pattern
 - NaN-focused argmax rows either produce the documented `-1` all-NaN sentinel

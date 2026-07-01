@@ -140,6 +140,26 @@ def test_argmax_inputs_generate_per_row_planted_indices() -> None:
     torch.testing.assert_close(argmax_reference(values.logits), values.expected_indices)
 
 
+def test_argmax_inputs_generate_rank1_vector() -> None:
+    values = ArgmaxInputs(
+        ArgmaxInputConfig(
+            num_rows=1,
+            vocab_size=17,
+            dtype=torch.float32,
+            logits_rank=1,
+            out_dtype=torch.int64,
+            planted_indices=(3,),
+        )
+    ).generate(seed=51, metadata_seed=52, device="cpu")
+
+    assert values.logits.shape == (17,)
+    assert values.expected_indices.shape == ()
+    assert values.out is not None
+    assert values.out.shape == ()
+    torch.testing.assert_close(values.expected_indices, torch.tensor(3))
+    torch.testing.assert_close(argmax_reference(values.logits), values.expected_indices)
+
+
 def test_argmax_inputs_generate_all_nan_rows() -> None:
     values = ArgmaxInputs(
         ArgmaxInputConfig(
@@ -899,6 +919,37 @@ def test_argmax_rejects_invalid_nan_pattern() -> None:
                 vocab_size=8,
                 dtype=torch.float32,
                 nan_pattern="some",  # type: ignore[arg-type]
+            )
+        )
+
+
+def test_argmax_rejects_invalid_logits_rank() -> None:
+    with pytest.raises(ValueError, match="logits_rank"):
+        ArgmaxInputs(
+            ArgmaxInputConfig(
+                num_rows=1,
+                vocab_size=8,
+                dtype=torch.float32,
+                logits_rank=3,  # type: ignore[arg-type]
+            )
+        )
+    with pytest.raises(ValueError, match="requires num_rows=1"):
+        ArgmaxInputs(
+            ArgmaxInputConfig(
+                num_rows=2,
+                vocab_size=8,
+                dtype=torch.float32,
+                logits_rank=1,
+            )
+        )
+    with pytest.raises(ValueError, match="NaN argmax"):
+        ArgmaxInputs(
+            ArgmaxInputConfig(
+                num_rows=1,
+                vocab_size=8,
+                dtype=torch.float32,
+                logits_rank=1,
+                nan_pattern="all",
             )
         )
 

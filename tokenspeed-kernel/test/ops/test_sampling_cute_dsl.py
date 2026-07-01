@@ -75,6 +75,7 @@ def _argmax_values(
     *,
     device: str,
     dtype: torch.dtype = torch.float32,
+    logits_rank: int = 2,
     out_dtype: torch.dtype | None = None,
     max_pattern: ArgmaxMaxPattern = "unique",
     planted_indices: tuple[int, ...] | None = None,
@@ -85,6 +86,7 @@ def _argmax_values(
             num_rows=M,
             vocab_size=N,
             dtype=dtype,
+            logits_rank=logits_rank,  # type: ignore[arg-type]
             out_dtype=out_dtype,
             max_pattern=max_pattern,
             planted_indices=planted_indices,
@@ -221,10 +223,10 @@ def test_argmax_matches_torch_for_low_precision_dtypes(dtype):
 
 def test_argmax_falls_back_for_1d_input():
     _need_cuda()
-    x = torch.randn(4096, device="cuda", dtype=torch.float32)
-    out = cute_argmax(x)
+    values = _argmax_values(1, 4096, device="cuda", logits_rank=1, seed=4096)
+    out = cute_argmax(values.logits)
     assert out.shape == ()
-    assert out.item() == torch.argmax(x, dim=-1).item()
+    torch.testing.assert_close(out, values.expected_indices, atol=0, rtol=0)
 
 
 def test_argmax_falls_back_on_cpu():

@@ -10,9 +10,9 @@ logits.
 
 ## Generators
 
-- `ArgmaxInputs`: generates logits with optional planted unique or tied maxima,
-  optional fixed planted indices, optional NaN-focused rows, and optional
-  output buffers.
+- `ArgmaxInputs`: generates rank-2 row-wise logits or rank-1 single-vector
+  logits with optional planted unique or tied maxima, optional fixed planted
+  indices, optional NaN-focused rows, and optional output buffers.
 - `ArgmaxPairInputs`: generates logits for `(max_value, argmax_index)` outputs
   with the same maximum-pattern controls as `ArgmaxInputs`.
 - `GatherExpandScalarsInputs`: generates scalar pools, request indices, and
