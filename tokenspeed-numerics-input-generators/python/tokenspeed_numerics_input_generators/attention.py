@@ -54,6 +54,7 @@ from tokenspeed_numerics_input_generators.core import (
     _resolve_device,
     _rng_for_device,
 )
+from tokenspeed_numerics_input_generators.rotary import build_rope_cos_sin_cache
 
 __all__ = [
     "AttentionMergeStateInputConfig",
@@ -84,6 +85,10 @@ __all__ = [
     "DeepSeekV4CompressorStateInputs",
     "DeepSeekV4CompressorStateInputValues",
     "deepseek_v4_save_compressor_state_reference",
+    "DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig",
+    "DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs",
+    "DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues",
+    "deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference",
     "DeepSeekV4IndexerMXFP4CacheWriteInputConfig",
     "DeepSeekV4IndexerMXFP4CacheWriteInputs",
     "DeepSeekV4IndexerMXFP4CacheWriteInputValues",
@@ -2825,6 +2830,382 @@ def deepseek_v4_save_compressor_state_reference(
             values.score[token_idx].float() + ape
         )
     return out.contiguous()
+
+
+@dataclass
+class DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues:
+    """Generated values for DeepSeek V4 indexer-Q RoPE/Hadamard/MXFP4."""
+
+    index_q: torch.Tensor
+    positions: torch.Tensor
+    cos_sin_cache: torch.Tensor
+    weights: torch.Tensor
+    softmax_scale: float
+    head_scale: float
+
+
+@dataclass
+class DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig:
+    """Initialization parameters for DeepSeek V4 indexer-Q transforms.
+
+    The represented operation transforms 128-channel per-head indexer Q rows:
+    RoPE is applied to the final 64 channels, the rotated row is projected by a
+    normalized Hadamard sign matrix, and each 32-channel block is quantized into
+    packed MXFP4 bytes with one UE8M0 scale byte.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of packed query-token rows.
+    num_tokens: int
+
+    # Required: number of indexer heads per query token.
+    num_heads: int
+
+    # Required: generated dtype for indexer Q rows.
+    dtype: torch.dtype
+
+    # ------------------------------------------------------------------
+    # Optional metadata/value generation configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: number of RoPE cache rows. Generated positions are in
+    # [0, max_position), so this controls the generated absolute-position range.
+    max_position: int = 1024
+
+    # Optional: RoPE frequency base used to build the generated cos/sin cache.
+    rope_base: float = 10000.0
+
+    # Optional: dtype for generated position metadata.
+    position_dtype: torch.dtype = torch.int64
+
+    # Optional: generated dtype for per-token/per-head weights.
+    weights_dtype: torch.dtype = torch.float32
+
+    # Optional: scale applied to generated indexer Q rows before RoPE.
+    value_scale: float = 1.0
+
+    # Optional: scale applied to generated weights.
+    weights_value_scale: float = 1.0
+
+    # Optional: scalar multiplier applied to weights in the represented op.
+    softmax_scale: float = 1.0
+
+    # Optional: scalar multiplier applied to weights in the represented op.
+    head_scale: float = 1.0
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(NumericsInputGenerator):
+    """Generator for DeepSeek V4 indexer-Q RoPE/Hadamard/MXFP4 inputs."""
+
+    config: DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig
+    index_q_input: TensorInput | None
+    weights_input: TensorInput | None
+
+    def __init__(
+        self,
+        config: DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig,
+    ) -> None:
+        self.config = config
+        self.index_q_input = None
+        self.weights_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.index_q_input = self.index_q_input or TensorInput(
+            self._index_q_shape(),
+            self.config.dtype,
+            device=self.config.device,
+        )
+        self.weights_input = self.weights_input or TensorInput(
+            self._weights_shape(),
+            self.config.weights_dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int | None = None,
+        metadata_seed: int | None = None,
+        value_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues:
+        self.__post_init__()
+        if self.index_q_input is None:
+            raise ValueError("index_q_input must be initialized")
+        if self.weights_input is None:
+            raise ValueError("weights_input must be initialized")
+        metadata_seed, value_seed = _resolve_attention_seeds(
+            seed=seed,
+            metadata_seed=metadata_seed,
+            value_seed=value_seed,
+        )
+        target_device = _resolve_device(self.config.device, device)
+        self.index_q_input.shape = self._index_q_shape()
+        self.index_q_input.dtype = self.config.dtype
+        self.weights_input.shape = self._weights_shape()
+        self.weights_input.dtype = self.config.weights_dtype
+
+        index_q = _require_tensor(
+            self.index_q_input.generate(
+                seed=_child_seed(value_seed, 1),
+                device=target_device,
+            ).values,
+            "index_q",
+        )
+        weights = _require_tensor(
+            self.weights_input.generate(
+                seed=_child_seed(value_seed, 2),
+                device=target_device,
+            ).values,
+            "weights",
+        )
+        values = DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues(
+            index_q=(index_q.float() * self.config.value_scale)
+            .to(index_q.dtype)
+            .contiguous(),
+            positions=self._generate_positions(
+                seed=_child_seed(metadata_seed, 1),
+                device=target_device,
+            ),
+            cos_sin_cache=build_rope_cos_sin_cache(
+                rotary_dim=_DEEPSEEK_V4_ROPE_DIM,
+                max_position=self.config.max_position,
+                base=self.config.rope_base,
+                device=target_device,
+            ),
+            weights=(weights.float() * self.config.weights_value_scale)
+            .to(weights.dtype)
+            .contiguous(),
+            softmax_scale=self.config.softmax_scale,
+            head_scale=self.config.head_scale,
+        )
+        _validate_deepseek_v4_indexer_q_rope_hadamard_mxfp4_values(values)
+        return values
+
+    def _normalize_config(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens",
+            self.config.num_tokens,
+        )
+        self.config.num_heads = _check_positive("num_heads", self.config.num_heads)
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        self.config.max_position = _check_positive(
+            "max_position",
+            self.config.max_position,
+        )
+        self.config.weights_dtype = _check_float_dtype(
+            "weights_dtype",
+            self.config.weights_dtype,
+        )
+        if self.config.position_dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "position_dtype must be torch.int32 or torch.int64, got "
+                f"{self.config.position_dtype}"
+            )
+        self.config.rope_base = float(self.config.rope_base)
+        if self.config.rope_base <= 0.0 or not math.isfinite(self.config.rope_base):
+            raise ValueError(f"rope_base must be positive, got {self.config.rope_base}")
+        self.config.value_scale = float(self.config.value_scale)
+        if self.config.value_scale < 0.0 or not math.isfinite(self.config.value_scale):
+            raise ValueError(
+                f"value_scale must be finite and non-negative, got {self.config.value_scale}"
+            )
+        self.config.weights_value_scale = float(self.config.weights_value_scale)
+        if self.config.weights_value_scale < 0.0 or not math.isfinite(
+            self.config.weights_value_scale
+        ):
+            raise ValueError(
+                "weights_value_scale must be finite and non-negative, got "
+                f"{self.config.weights_value_scale}"
+            )
+        self.config.softmax_scale = float(self.config.softmax_scale)
+        self.config.head_scale = float(self.config.head_scale)
+        if not math.isfinite(self.config.softmax_scale):
+            raise ValueError(
+                f"softmax_scale must be finite, got {self.config.softmax_scale}"
+            )
+        if not math.isfinite(self.config.head_scale):
+            raise ValueError(f"head_scale must be finite, got {self.config.head_scale}")
+
+    def _index_q_shape(self) -> tuple[int, int, int]:
+        return (
+            self.config.num_tokens,
+            self.config.num_heads,
+            _DEEPSEEK_V4_INDEXER_DIM,
+        )
+
+    def _weights_shape(self) -> tuple[int, int]:
+        return (self.config.num_tokens, self.config.num_heads)
+
+    def _generate_positions(self, *, seed: int, device: torch.device) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        positions = torch.randint(
+            0,
+            self.config.max_position,
+            (self.config.num_tokens,),
+            dtype=self.config.position_dtype,
+            generator=rng,
+        )
+        return positions.to(device)
+
+
+def _validate_deepseek_v4_indexer_q_rope_hadamard_mxfp4_values(
+    values: DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues,
+) -> None:
+    if values.index_q.ndim != 3:
+        raise ValueError(f"index_q must be rank-3, got {values.index_q.ndim}")
+    if values.index_q.shape[-1] != _DEEPSEEK_V4_INDEXER_DIM:
+        raise ValueError(
+            f"index_q width must be {_DEEPSEEK_V4_INDEXER_DIM}, "
+            f"got {values.index_q.shape[-1]}"
+        )
+    if not values.index_q.is_floating_point():
+        raise TypeError(f"index_q must be floating point, got {values.index_q.dtype}")
+    if values.positions.ndim != 1:
+        raise ValueError("positions must be rank-1")
+    if values.positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"positions must be integer, got {values.positions.dtype}")
+    if values.positions.numel() != values.index_q.shape[0]:
+        raise ValueError("positions length must match index_q token dimension")
+    if values.cos_sin_cache.ndim != 2:
+        raise ValueError("cos_sin_cache must be rank-2")
+    if values.cos_sin_cache.shape[1] != _DEEPSEEK_V4_ROPE_DIM:
+        raise ValueError(
+            f"cos_sin_cache width must be {_DEEPSEEK_V4_ROPE_DIM}, "
+            f"got {values.cos_sin_cache.shape[1]}"
+        )
+    if values.weights.shape != values.index_q.shape[:2]:
+        raise ValueError(
+            f"weights must have shape {tuple(values.index_q.shape[:2])}, "
+            f"got {tuple(values.weights.shape)}"
+        )
+    if not values.weights.is_floating_point():
+        raise TypeError(f"weights must be floating point, got {values.weights.dtype}")
+    if (
+        values.positions.device != values.index_q.device
+        or values.cos_sin_cache.device != values.index_q.device
+        or values.weights.device != values.index_q.device
+    ):
+        raise ValueError(
+            "index_q, positions, cos_sin_cache, and weights must share device"
+        )
+    if values.positions.numel():
+        min_pos = int(values.positions.min().item())
+        max_pos = int(values.positions.max().item())
+        if min_pos < 0 or max_pos >= values.cos_sin_cache.shape[0]:
+            raise ValueError(
+                "positions must be within cos_sin_cache rows, got range "
+                f"[{min_pos}, {max_pos}] for cache length {values.cos_sin_cache.shape[0]}"
+            )
+    if not math.isfinite(values.softmax_scale):
+        raise ValueError(f"softmax_scale must be finite, got {values.softmax_scale}")
+    if not math.isfinite(values.head_scale):
+        raise ValueError(f"head_scale must be finite, got {values.head_scale}")
+
+
+def _deepseek_v4_apply_indexer_q_rope(
+    values: DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues,
+) -> torch.Tensor:
+    q = values.index_q.float()
+    nope_dim = _DEEPSEEK_V4_INDEXER_DIM - _DEEPSEEK_V4_ROPE_DIM
+    half_rope = _DEEPSEEK_V4_ROPE_DIM // 2
+    rope = q[..., nope_dim:]
+    rope_even = rope[..., 0::2]
+    rope_odd = rope[..., 1::2]
+    cos_sin = values.cos_sin_cache[values.positions.to(torch.int64)]
+    cos_v = cos_sin[:, None, :half_rope].float()
+    sin_v = cos_sin[:, None, half_rope:].float()
+    rotated_rope = torch.empty_like(rope)
+    rotated_rope[..., 0::2] = rope_even * cos_v - rope_odd * sin_v
+    rotated_rope[..., 1::2] = rope_odd * cos_v + rope_even * sin_v
+    rotated = torch.cat((q[..., :nope_dim], rotated_rope), dim=-1)
+    return rotated.to(torch.bfloat16).to(torch.float32)
+
+
+def _deepseek_v4_indexer_hadamard_signs(device: torch.device) -> torch.Tensor:
+    indices = torch.arange(
+        _DEEPSEEK_V4_INDEXER_DIM,
+        dtype=torch.int32,
+        device=device,
+    )
+    bits = indices[:, None] & indices[None, :]
+    parity = bits ^ (bits >> 4)
+    parity = parity ^ (parity >> 2)
+    parity = parity ^ (parity >> 1)
+    parity = parity & 1
+    return torch.where(
+        parity == 0,
+        torch.tensor(1.0, dtype=torch.float32, device=device),
+        torch.tensor(-1.0, dtype=torch.float32, device=device),
+    )
+
+
+def _deepseek_v4_indexer_q_hadamard(
+    rotated: torch.Tensor,
+) -> torch.Tensor:
+    signs = _deepseek_v4_indexer_hadamard_signs(rotated.device)
+    flat = rotated.reshape(-1, _DEEPSEEK_V4_INDEXER_DIM)
+    projected = flat @ signs
+    projected = projected * (_DEEPSEEK_V4_INDEXER_DIM**-0.5)
+    projected = projected.reshape_as(rotated)
+    return projected.to(torch.bfloat16).to(torch.float32)
+
+
+def deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(
+    values: DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Return packed MXFP4 indexer Q and scaled weights for DeepSeek V4."""
+
+    _validate_deepseek_v4_indexer_q_rope_hadamard_mxfp4_values(values)
+    num_tokens, num_heads, _ = values.index_q.shape
+    q_packed = torch.empty(
+        (
+            num_tokens,
+            num_heads,
+            _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES,
+        ),
+        dtype=torch.uint8,
+        device=values.index_q.device,
+    )
+    q_scale_bytes = torch.empty(
+        (
+            num_tokens,
+            num_heads,
+            _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES,
+        ),
+        dtype=torch.uint8,
+        device=values.index_q.device,
+    )
+    weights_out = (
+        values.weights.float() * values.softmax_scale * values.head_scale
+    ).contiguous()
+    if num_tokens == 0:
+        return (
+            q_packed,
+            q_scale_bytes.view(torch.int32).squeeze(-1).contiguous(),
+        ), weights_out
+
+    rotated = _deepseek_v4_apply_indexer_q_rope(values)
+    hadamard = _deepseek_v4_indexer_q_hadamard(rotated)
+    packed_rows = q_packed.reshape(-1, _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES)
+    scale_rows = q_scale_bytes.reshape(-1, _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES)
+    for row_idx, row in enumerate(hadamard.reshape(-1, _DEEPSEEK_V4_INDEXER_DIM)):
+        packed, scales = _deepseek_v4_indexer_mxfp4_row_reference(row)
+        packed_rows[row_idx] = packed
+        scale_rows[row_idx] = scales
+    return (
+        q_packed.contiguous(),
+        q_scale_bytes.view(torch.int32).squeeze(-1).contiguous(),
+    ), weights_out
 
 
 @dataclass

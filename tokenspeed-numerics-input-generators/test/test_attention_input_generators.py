@@ -31,6 +31,8 @@ from tokenspeed_numerics_input_generators import (
     DeepSeekV4IndexerMXFP4CacheGatherInputs,
     DeepSeekV4IndexerMXFP4CacheWriteInputConfig,
     DeepSeekV4IndexerMXFP4CacheWriteInputs,
+    DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig,
+    DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs,
     DeepSeekV4KCacheGatherInputConfig,
     DeepSeekV4KCacheGatherInputs,
     DeepSeekV4PagedIndexInputConfig,
@@ -72,6 +74,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_indexer_decode_metadata_reference,
     deepseek_v4_indexer_mxfp4_cache_gather_reference,
     deepseek_v4_indexer_mxfp4_cache_write_reference,
+    deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference,
     deepseek_v4_save_compressor_state_reference,
     dsa_full_context_topk_to_global_slots_reference,
     dsa_local_topk_to_global_slots_reference,
@@ -1080,6 +1083,116 @@ def test_deepseek_v4_compressor_state_rejects_invalid_configs_and_values() -> No
     values.slot_mapping = torch.tensor([0, 0], dtype=torch.int64)
     with pytest.raises(ValueError, match="unique"):
         deepseek_v4_save_compressor_state_reference(values)
+
+
+def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_generate_reference() -> None:
+    values = DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+        DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
+            num_tokens=4,
+            num_heads=3,
+            dtype=torch.bfloat16,
+            max_position=32,
+            softmax_scale=0.25,
+            head_scale=2.0,
+        )
+    ).generate(metadata_seed=51, value_seed=61, device="cpu")
+
+    (q_packed, q_scale), weights = deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(
+        values
+    )
+
+    assert values.index_q.shape == (4, 3, 128)
+    assert values.positions.shape == (4,)
+    assert values.cos_sin_cache.shape == (32, 64)
+    assert values.weights.shape == (4, 3)
+    assert q_packed.shape == (4, 3, 64)
+    assert q_scale.shape == (4, 3)
+    assert q_packed.dtype == torch.uint8
+    assert q_scale.dtype == torch.int32
+    assert weights.shape == values.weights.shape
+    assert torch.isfinite(weights).all()
+    assert int(values.positions.min().item()) >= 0
+    assert int(values.positions.max().item()) < values.cos_sin_cache.shape[0]
+
+
+def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference_zero_row() -> None:
+    values = DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+        DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
+            num_tokens=1,
+            num_heads=1,
+            dtype=torch.float32,
+            max_position=4,
+        )
+    ).generate(seed=71, device="cpu")
+    values.index_q = torch.zeros_like(values.index_q)
+    values.weights = torch.ones_like(values.weights)
+
+    (q_packed, q_scale), weights = deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(
+        values
+    )
+
+    torch.testing.assert_close(q_packed, torch.zeros_like(q_packed), rtol=0, atol=0)
+    expected_scale = torch.full((1, 1, 4), 112, dtype=torch.uint8).view(torch.int32)
+    torch.testing.assert_close(q_scale, expected_scale.squeeze(-1), rtol=0, atol=0)
+    torch.testing.assert_close(weights, torch.ones_like(weights))
+
+
+def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_keeps_metadata_seed_independent() -> (
+    None
+):
+    generator = DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+        DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
+            num_tokens=4,
+            num_heads=2,
+            dtype=torch.float32,
+            max_position=128,
+        )
+    )
+
+    first = generator.generate(metadata_seed=81, value_seed=91, device="cpu")
+    same_metadata = generator.generate(metadata_seed=81, value_seed=92, device="cpu")
+    same_values = generator.generate(metadata_seed=82, value_seed=91, device="cpu")
+
+    torch.testing.assert_close(first.positions, same_metadata.positions)
+    torch.testing.assert_close(first.cos_sin_cache, same_metadata.cos_sin_cache)
+    assert not torch.equal(first.index_q, same_metadata.index_q)
+    assert not torch.equal(first.weights, same_metadata.weights)
+    torch.testing.assert_close(first.index_q, same_values.index_q)
+    torch.testing.assert_close(first.weights, same_values.weights)
+    assert not torch.equal(first.positions, same_values.positions)
+
+
+def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_rejects_invalid_values() -> None:
+    with pytest.raises(ValueError, match="max_position"):
+        DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+            DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
+                num_tokens=1,
+                num_heads=1,
+                dtype=torch.float32,
+                max_position=0,
+            )
+        )
+    with pytest.raises(TypeError, match="position_dtype"):
+        DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+            DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
+                num_tokens=1,
+                num_heads=1,
+                dtype=torch.float32,
+                position_dtype=torch.float32,
+            )
+        )
+
+    values = DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+        DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
+            num_tokens=1,
+            num_heads=1,
+            dtype=torch.float32,
+            max_position=2,
+        )
+    ).generate(seed=101, device="cpu")
+    values.positions = torch.tensor([2], dtype=torch.int64)
+    with pytest.raises(ValueError, match="positions"):
+        deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(values)
 
 
 def test_deepseek_v4_indexer_mxfp4_cache_write_inputs_generate_reference() -> None:
