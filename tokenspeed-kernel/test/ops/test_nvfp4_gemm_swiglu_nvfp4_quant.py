@@ -28,6 +28,8 @@ from tokenspeed_numerics_input_generators import (
     NVFP4GemmSwiGLUNVFP4QuantInputConfig,
     NVFP4GemmSwiGLUNVFP4QuantInputs,
     TensorInput,
+    nvfp4_dequantization_reference,
+    nvfp4_gemm_swiglu_nvfp4_quant_reference,
 )
 
 
@@ -40,6 +42,23 @@ def _scale_inv_for(tensor: torch.Tensor) -> torch.Tensor:
         min=1e-8
     )
     return (1.0 / scale).view(1)
+
+
+def _unswizzle_blockscale_2d(
+    scales: torch.Tensor,
+    *,
+    logical_shape: tuple[int, int],
+) -> torch.Tensor:
+    rows, cols = scales.shape
+    if rows % 128 != 0 or cols % 4 != 0:
+        raise ValueError(f"swizzled scale shape must be padded, got {scales.shape}")
+    logical_rows, logical_cols = logical_shape
+    linear = (
+        scales.reshape(rows // 128, cols // 4, 32, 4, 4)
+        .permute(0, 3, 2, 1, 4)
+        .reshape(rows, cols)
+    )
+    return linear[:logical_rows, :logical_cols].contiguous()
 
 
 def test_interleave_linear_and_gate_layout() -> None:
@@ -141,6 +160,76 @@ def test_nvfp4_process_weights_releases_normal_weight_scale() -> None:
     assert hasattr(layer, "weight_scale_interleaved")
     assert not hasattr(layer, "weight_swiglu_interleaved")
     assert not hasattr(layer, "weight_scale_swiglu_interleaved")
+
+
+@pytest.mark.skipif(not _has_sm100(), reason="Blackwell SM100 CUDA GPU required")
+def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_generator_reference() -> None:
+    from tokenspeed_kernel.ops.gemm.cute_dsl import (
+        nvfp4_gemm_swiglu_nvfp4_quant,
+    )
+
+    from tokenspeed.runtime.layers.dense.nvfp4 import (
+        interleave_linear_and_gate,
+        swizzle_blockscale_2d,
+    )
+
+    values = NVFP4GemmSwiGLUNVFP4QuantInputs(
+        NVFP4GemmSwiGLUNVFP4QuantInputConfig(
+            M=8,
+            K=256,
+            intermediate_size=128,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=141, device="cuda")
+    expected_fp4, expected_scales = nvfp4_gemm_swiglu_nvfp4_quant_reference(values)
+
+    gate_fp4, linear_fp4 = values.w1_fp4.chunk(2, dim=0)
+    gate_scale, linear_scale = values.w1_scale.chunk(2, dim=0)
+    actual_fp4, actual_scales_swizzled = nvfp4_gemm_swiglu_nvfp4_quant(
+        values.x_fp4,
+        swizzle_blockscale_2d(values.x_scale),
+        interleave_linear_and_gate(
+            torch.cat((linear_fp4, gate_fp4), dim=0),
+            group_size=64,
+            dim=0,
+        ),
+        swizzle_blockscale_2d(
+            interleave_linear_and_gate(
+                torch.cat((linear_scale, gate_scale), dim=0),
+                group_size=64,
+                dim=0,
+            )
+        ),
+        values.fc1_alpha,
+        values.output_global_scale_inv,
+        enable_pdl=False,
+    )
+    torch.cuda.synchronize()
+
+    assert actual_fp4.shape == expected_fp4.shape
+    assert actual_fp4.dtype == expected_fp4.dtype
+    assert actual_scales_swizzled.dtype == expected_scales.dtype
+    actual_scales = _unswizzle_blockscale_2d(
+        actual_scales_swizzled,
+        logical_shape=tuple(expected_scales.shape),
+    )
+    actual = nvfp4_dequantization_reference(
+        actual_fp4,
+        actual_scales,
+        scale=values.output_global_scale,
+    )
+    expected = nvfp4_dequantization_reference(
+        expected_fp4,
+        expected_scales,
+        scale=values.output_global_scale,
+    )
+
+    assert torch.isfinite(actual).all()
+    cos_sim = torch.nn.functional.cosine_similarity(
+        actual.float().flatten().unsqueeze(0),
+        expected.float().flatten().unsqueeze(0),
+    )
+    assert cos_sim.item() > 0.98
 
 
 @pytest.mark.skipif(not _has_sm100(), reason="Blackwell SM100 CUDA GPU required")
