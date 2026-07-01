@@ -25,6 +25,8 @@ import torch
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    DSASparseDecodeKVPackInputConfig,
+    DSASparseDecodeKVPackInputs,
     DSATopKSlotInputConfig,
     DSATopKSlotInputs,
     GDNQKVSplitInputConfig,
@@ -50,6 +52,8 @@ from tokenspeed_numerics_input_generators import (
     PageTableInput,
     PageTableInputConfig,
     attention_merge_state_reference,
+    dsa_sparse_decode_kv_pack_reference,
+    dsa_sparse_decode_row_bytes,
     dsa_full_context_topk_to_global_slots_reference,
     dsa_local_topk_to_global_slots_reference,
     deepseek_v4_compressed_slot_mapping_reference,
@@ -550,6 +554,104 @@ def test_packed_qkv_complex_rotary_inputs_reject_invalid_configs_and_values() ->
     values.freqs_cis = values.freqs_cis.real
     with pytest.raises(TypeError, match="complex"):
         packed_qkv_complex_rotary_reference(values)
+
+
+def test_dsa_sparse_decode_kv_pack_inputs_generate_values_and_reference() -> None:
+    values = DSASparseDecodeKVPackInputs(
+        DSASparseDecodeKVPackInputConfig(
+            num_tokens=5,
+            num_slots=9,
+            nope_dim=128,
+            rope_dim=64,
+        )
+    ).generate(seed=118, metadata_seed=119, device="cpu")
+
+    expected_row_bytes = dsa_sparse_decode_row_bytes(128, 64)
+    packed = dsa_sparse_decode_kv_pack_reference(values)
+    loc = values.loc.to(torch.int64)
+    scale_offset = 128
+    rope_offset = scale_offset + 4
+
+    assert values.out.shape == (9, expected_row_bytes)
+    assert values.loc.shape == (5,)
+    assert torch.unique(values.loc).numel() == values.loc.numel()
+    assert values.cache_k_nope.shape == (5, 128)
+    assert values.cache_k_rope.shape == (5, 64)
+    assert packed.shape == values.out.shape
+    assert packed.dtype == torch.uint8
+
+    written_mask = torch.zeros(values.out.shape[0], dtype=torch.bool)
+    written_mask[loc.cpu()] = True
+    assert torch.equal(packed[~written_mask], values.out[~written_mask])
+
+    scales = packed[loc, scale_offset:rope_offset].contiguous().view(torch.float32)
+    assert scales.shape == (5, 1)
+    assert torch.all(scales > 0)
+    expected_rope_bytes = values.cache_k_rope.contiguous().view(torch.uint8)
+    assert torch.equal(packed[loc, rope_offset:], expected_rope_bytes)
+
+
+def test_dsa_sparse_decode_kv_pack_supports_head_axis_and_zero_tokens() -> None:
+    values = DSASparseDecodeKVPackInputs(
+        DSASparseDecodeKVPackInputConfig(
+            num_tokens=0,
+            num_slots=3,
+            nope_dim=128,
+            rope_dim=32,
+            include_head_axis=True,
+        )
+    ).generate(seed=120, device="cpu")
+
+    packed = dsa_sparse_decode_kv_pack_reference(values)
+
+    assert values.loc.shape == (0,)
+    assert values.cache_k_nope.shape == (0, 1, 128)
+    assert values.cache_k_rope.shape == (0, 1, 32)
+    assert torch.equal(packed, values.out)
+
+
+def test_dsa_sparse_decode_kv_pack_rejects_invalid_configs_and_values() -> None:
+    with pytest.raises(ValueError, match="num_tokens"):
+        DSASparseDecodeKVPackInputs(
+            DSASparseDecodeKVPackInputConfig(
+                num_tokens=4,
+                num_slots=3,
+                nope_dim=128,
+                rope_dim=64,
+            )
+        )
+
+    with pytest.raises(ValueError, match="divisible"):
+        DSASparseDecodeKVPackInputs(
+            DSASparseDecodeKVPackInputConfig(
+                num_tokens=2,
+                num_slots=3,
+                nope_dim=64,
+                rope_dim=64,
+            )
+        )
+
+    with pytest.raises(ValueError, match="power of two"):
+        DSASparseDecodeKVPackInputs(
+            DSASparseDecodeKVPackInputConfig(
+                num_tokens=2,
+                num_slots=3,
+                nope_dim=128,
+                rope_dim=48,
+            )
+        )
+
+    values = DSASparseDecodeKVPackInputs(
+        DSASparseDecodeKVPackInputConfig(
+            num_tokens=3,
+            num_slots=5,
+            nope_dim=128,
+            rope_dim=64,
+        )
+    ).generate(seed=121, device="cpu")
+    values.loc = torch.tensor([0, 0, 1], dtype=torch.int64)
+    with pytest.raises(ValueError, match="unique"):
+        dsa_sparse_decode_kv_pack_reference(values)
 
 
 def test_dsa_topk_slot_inputs_generate_values_and_references() -> None:

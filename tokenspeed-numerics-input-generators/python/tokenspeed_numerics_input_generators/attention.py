@@ -59,9 +59,14 @@ __all__ = [
     "AttentionMergeStateInputValues",
     "attention_generate",
     "attention_merge_state_reference",
+    "DSASparseDecodeKVPackInputConfig",
+    "DSASparseDecodeKVPackInputs",
+    "DSASparseDecodeKVPackInputValues",
     "DSATopKSlotInputConfig",
     "DSATopKSlotInputs",
     "DSATopKSlotInputValues",
+    "dsa_sparse_decode_kv_pack_reference",
+    "dsa_sparse_decode_row_bytes",
     "dsa_full_context_topk_to_global_slots_reference",
     "dsa_local_topk_to_global_slots_reference",
     "GDNQKVSplitInputConfig",
@@ -98,6 +103,10 @@ __all__ = [
 ]
 
 _AttentionCacheT = TypeVar("_AttentionCacheT")
+_DSA_SPARSE_DECODE_FP8_QUANT_BLOCK = 128
+_DSA_SPARSE_DECODE_FP8_SCALE_BYTES = 4
+_DSA_SPARSE_DECODE_BF16_BYTES = 2
+_DSA_SPARSE_DECODE_FP8_E4M3_MAX = 448.0
 _DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 
 
@@ -117,6 +126,17 @@ def _check_nonnegative(name: str, value: int) -> int:
 
 def _align_up(value: int, alignment: int) -> int:
     return (int(value) + alignment - 1) // alignment * alignment
+
+
+def _is_power_of_2(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _check_power_of_2(name: str, value: int) -> int:
+    value = _check_positive(name, value)
+    if not _is_power_of_2(value):
+        raise ValueError(f"{name} must be a power of two, got {value}")
+    return value
 
 
 def _check_float_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
@@ -1152,6 +1172,329 @@ def packed_qkv_complex_rotary_reference(
     k_out = _apply_complex_rotary(k, values.freqs_cis).contiguous()
     v_out = v.clone().contiguous() if values.copy_v else v
     return q_out, k_out, v_out
+
+
+def dsa_sparse_decode_row_bytes(nope_dim: int, rope_dim: int) -> int:
+    """Return bytes per packed sparse-decode KV row."""
+
+    nope_dim = int(nope_dim)
+    rope_dim = int(rope_dim)
+    if nope_dim % _DSA_SPARSE_DECODE_FP8_QUANT_BLOCK != 0:
+        raise ValueError(
+            "DSA sparse decode NoPE dim must be divisible by "
+            f"{_DSA_SPARSE_DECODE_FP8_QUANT_BLOCK}, got {nope_dim}"
+        )
+    return (
+        nope_dim
+        + nope_dim
+        // _DSA_SPARSE_DECODE_FP8_QUANT_BLOCK
+        * _DSA_SPARSE_DECODE_FP8_SCALE_BYTES
+        + rope_dim * _DSA_SPARSE_DECODE_BF16_BYTES
+    )
+
+
+@dataclass
+class DSASparseDecodeKVPackInputValues:
+    """Generated values for DSA sparse decode KV row packing.
+
+    The represented output row layout is:
+
+    ```text
+    [NoPE FP8 E4M3 bytes][FP32 scale bytes per 128 NoPE channels][RoPE BF16 bytes]
+    ```
+    """
+
+    out: torch.Tensor
+    loc: torch.Tensor
+    cache_k_nope: torch.Tensor
+    cache_k_rope: torch.Tensor
+
+
+@dataclass
+class DSASparseDecodeKVPackInputConfig:
+    """Initialization parameters for DSA sparse decode KV row packing.
+
+    The operation packs per-token sparse-decode K-cache rows into physical
+    cache slots. Non-RoPE key channels are dynamically scaled per 128-channel
+    block and stored as FP8 E4M3 bytes. RoPE key channels are copied as raw
+    BF16 bytes after the FP32 scale sidecar.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of token rows to pack.
+    num_tokens: int
+
+    # Required: number of physical output rows available for sparse decode.
+    num_slots: int
+
+    # Required: non-RoPE key width. Must be a power of two and divisible by 128.
+    nope_dim: int
+
+    # Required: RoPE key width. Must be a power of two.
+    rope_dim: int
+
+    # ------------------------------------------------------------------
+    # Optional generation configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: include the singleton KV-head axis accepted by some callers,
+    # generating [tokens, 1, dim] source tensors instead of [tokens, dim].
+    include_head_axis: bool = False
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DSASparseDecodeKVPackInputs(NumericsInputGenerator):
+    """Generator for DSA sparse decode KV row packing."""
+
+    config: DSASparseDecodeKVPackInputConfig
+    cache_k_nope_input: TensorInput | None
+    cache_k_rope_input: TensorInput | None
+
+    def __init__(self, config: DSASparseDecodeKVPackInputConfig) -> None:
+        self.config = config
+        self.cache_k_nope_input = None
+        self.cache_k_rope_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.num_slots = _check_positive("num_slots", self.config.num_slots)
+        if self.config.num_tokens > self.config.num_slots:
+            raise ValueError(
+                "num_tokens must be <= num_slots so generated slot locations "
+                f"are unique, got num_tokens={self.config.num_tokens}, "
+                f"num_slots={self.config.num_slots}"
+            )
+        self.config.nope_dim = _check_power_of_2("nope_dim", self.config.nope_dim)
+        if self.config.nope_dim % _DSA_SPARSE_DECODE_FP8_QUANT_BLOCK != 0:
+            raise ValueError(
+                "nope_dim must be divisible by "
+                f"{_DSA_SPARSE_DECODE_FP8_QUANT_BLOCK}, got {self.config.nope_dim}"
+            )
+        self.config.rope_dim = _check_power_of_2("rope_dim", self.config.rope_dim)
+        self.config.include_head_axis = bool(self.config.include_head_axis)
+        self.cache_k_nope_input = self.cache_k_nope_input or TensorInput(
+            self._source_shape(self.config.nope_dim),
+            torch.bfloat16,
+            device=self.config.device,
+        )
+        self.cache_k_rope_input = self.cache_k_rope_input or TensorInput(
+            self._source_shape(self.config.rope_dim),
+            torch.bfloat16,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> DSASparseDecodeKVPackInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        if self.cache_k_nope_input is None or self.cache_k_rope_input is None:
+            raise ValueError(
+                "DSASparseDecodeKVPackInputs child generators must be initialized"
+            )
+
+        self.cache_k_nope_input.shape = self._source_shape(self.config.nope_dim)
+        self.cache_k_nope_input.dtype = torch.bfloat16
+        self.cache_k_nope_input.device = self.config.device
+        self.cache_k_rope_input.shape = self._source_shape(self.config.rope_dim)
+        self.cache_k_rope_input.dtype = torch.bfloat16
+        self.cache_k_rope_input.device = self.config.device
+
+        cache_k_nope = self.cache_k_nope_input.generate(
+            seed=_child_seed(seed, 1),
+            device=target_device,
+        ).values
+        cache_k_rope = self.cache_k_rope_input.generate(
+            seed=_child_seed(seed, 2),
+            device=target_device,
+        ).values
+        if cache_k_nope is None or cache_k_rope is None:
+            raise ValueError("DSA sparse decode K source tensors must be generated")
+
+        out = self._generate_out(seed=_child_seed(seed, 3), device=target_device)
+        loc_seed = seed if metadata_seed is None else metadata_seed
+        loc = self._generate_loc(seed=_child_seed(loc_seed, 4), device=target_device)
+        values = DSASparseDecodeKVPackInputValues(
+            out=out,
+            loc=loc,
+            cache_k_nope=cache_k_nope,
+            cache_k_rope=cache_k_rope,
+        )
+        _validate_dsa_sparse_decode_kv_pack_values(values)
+        return values
+
+    def _source_shape(self, dim: int) -> tuple[int, ...]:
+        if self.config.include_head_axis:
+            return (self.config.num_tokens, 1, int(dim))
+        return (self.config.num_tokens, int(dim))
+
+    def _generate_out(self, *, seed: int, device: torch.device) -> torch.Tensor:
+        rng_device = "cuda" if device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=rng_device).manual_seed(seed)
+        row_bytes = dsa_sparse_decode_row_bytes(
+            self.config.nope_dim,
+            self.config.rope_dim,
+        )
+        return torch.randint(
+            0,
+            256,
+            (self.config.num_slots, row_bytes),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+
+    def _generate_loc(self, *, seed: int, device: torch.device) -> torch.Tensor:
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        return torch.randperm(
+            self.config.num_slots,
+            dtype=torch.int64,
+            generator=generator,
+        )[: self.config.num_tokens].to(device)
+
+
+def _dsa_sparse_decode_source_2d(
+    name: str,
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    if tensor.ndim == 3:
+        if tensor.shape[1] != 1:
+            raise ValueError(f"{name} rank-3 form must have one KV head")
+        tensor = tensor.squeeze(1)
+    if tensor.ndim != 2:
+        raise ValueError(f"{name} must be rank-2 or rank-3, got {tensor.ndim}")
+    if tensor.dtype != torch.bfloat16:
+        raise TypeError(f"{name} must be bfloat16, got {tensor.dtype}")
+    return tensor.contiguous()
+
+
+def _validate_dsa_sparse_decode_kv_pack_values(
+    values: DSASparseDecodeKVPackInputValues,
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    if values.out.dtype != torch.uint8:
+        raise TypeError(f"out must be uint8, got {values.out.dtype}")
+    if values.out.ndim != 2:
+        raise ValueError(f"out must be rank-2, got {values.out.ndim}")
+    if values.loc.ndim != 1:
+        raise ValueError(f"loc must be rank-1, got {values.loc.ndim}")
+    if values.loc.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"loc must use an integer dtype, got {values.loc.dtype}")
+    if values.loc.device != values.out.device:
+        raise ValueError("loc and out must be on the same device")
+
+    cache_k_nope = _dsa_sparse_decode_source_2d(
+        "cache_k_nope",
+        values.cache_k_nope,
+    )
+    cache_k_rope = _dsa_sparse_decode_source_2d(
+        "cache_k_rope",
+        values.cache_k_rope,
+    )
+    if (
+        cache_k_nope.device != values.out.device
+        or cache_k_rope.device != values.out.device
+    ):
+        raise ValueError("cache_k_nope, cache_k_rope, loc, and out must share device")
+    if cache_k_nope.shape[0] != values.loc.numel():
+        raise ValueError("cache_k_nope token dimension must match loc length")
+    if cache_k_rope.shape[0] != values.loc.numel():
+        raise ValueError("cache_k_rope token dimension must match loc length")
+
+    nope_dim = _check_power_of_2("nope_dim", int(cache_k_nope.shape[1]))
+    if nope_dim % _DSA_SPARSE_DECODE_FP8_QUANT_BLOCK != 0:
+        raise ValueError(
+            "nope_dim must be divisible by "
+            f"{_DSA_SPARSE_DECODE_FP8_QUANT_BLOCK}, got {nope_dim}"
+        )
+    rope_dim = _check_power_of_2("rope_dim", int(cache_k_rope.shape[1]))
+    expected_row_bytes = dsa_sparse_decode_row_bytes(nope_dim, rope_dim)
+    if values.out.shape[1] != expected_row_bytes:
+        raise ValueError(
+            f"out row width must be {expected_row_bytes}, got {values.out.shape[1]}"
+        )
+
+    if values.loc.numel() > 0:
+        loc = values.loc.to(torch.int64)
+        if int(loc.min().item()) < 0 or int(loc.max().item()) >= values.out.shape[0]:
+            raise ValueError("loc entries must be valid output row indices")
+        unique_count = int(torch.unique(loc).numel())
+        if unique_count != values.loc.numel():
+            raise ValueError("loc entries must be unique to avoid output row races")
+
+    return cache_k_nope, cache_k_rope, nope_dim, rope_dim
+
+
+def dsa_sparse_decode_kv_pack_reference(
+    values: DSASparseDecodeKVPackInputValues,
+) -> torch.Tensor:
+    """Return sparse-decode KV rows packed into the generated output buffer."""
+
+    cache_k_nope, cache_k_rope, nope_dim, rope_dim = (
+        _validate_dsa_sparse_decode_kv_pack_values(values)
+    )
+    out = values.out.clone()
+    if values.loc.numel() == 0:
+        return out
+
+    num_nope_blocks = nope_dim // _DSA_SPARSE_DECODE_FP8_QUANT_BLOCK
+    nope_blocks = cache_k_nope.float().reshape(
+        values.loc.numel(),
+        num_nope_blocks,
+        _DSA_SPARSE_DECODE_FP8_QUANT_BLOCK,
+    )
+    scales = nope_blocks.abs().amax(dim=-1) / _DSA_SPARSE_DECODE_FP8_E4M3_MAX
+    scales = torch.clamp(scales, min=1.0e-26)
+    fp8_nope = torch.clamp(
+        nope_blocks / scales.unsqueeze(-1),
+        -_DSA_SPARSE_DECODE_FP8_E4M3_MAX,
+        _DSA_SPARSE_DECODE_FP8_E4M3_MAX,
+    ).to(torch.float8_e4m3fn)
+    fp8_nope_bytes = (
+        fp8_nope.contiguous()
+        .view(torch.uint8)
+        .reshape(
+            values.loc.numel(),
+            nope_dim,
+        )
+    )
+    scale_bytes = (
+        scales.float()
+        .contiguous()
+        .view(torch.uint8)
+        .reshape(
+            values.loc.numel(),
+            num_nope_blocks * _DSA_SPARSE_DECODE_FP8_SCALE_BYTES,
+        )
+    )
+    rope_bytes = (
+        cache_k_rope.contiguous()
+        .view(torch.uint8)
+        .reshape(
+            values.loc.numel(),
+            rope_dim * _DSA_SPARSE_DECODE_BF16_BYTES,
+        )
+    )
+
+    loc = values.loc.to(torch.int64)
+    scale_offset = nope_dim
+    rope_offset = scale_offset + scale_bytes.shape[1]
+    out[loc, :nope_dim] = fp8_nope_bytes
+    out[loc, scale_offset:rope_offset] = scale_bytes
+    out[loc, rope_offset:] = rope_bytes
+    return out
 
 
 @dataclass

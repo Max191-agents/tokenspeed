@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.attention.triton.qkv_rotary import packed_qkv_complex
 from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
     full_context_topk_to_global_slots,
     local_topk_to_global_slots,
+    pack_sparse_decode_kv,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
@@ -59,6 +60,8 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    DSASparseDecodeKVPackInputConfig,
+    DSASparseDecodeKVPackInputs,
     DSATopKSlotInputConfig,
     DSATopKSlotInputs,
     GDNQKVSplitInputConfig,
@@ -77,6 +80,7 @@ from tokenspeed_numerics_input_generators import (
     PackedQKVComplexRotaryInputConfig,
     PackedQKVComplexRotaryInputs,
     attention_merge_state_reference,
+    dsa_sparse_decode_kv_pack_reference,
     dsa_full_context_topk_to_global_slots_reference,
     dsa_local_topk_to_global_slots_reference,
     deepseek_v4_compressed_slot_mapping_reference,
@@ -469,6 +473,55 @@ def test_packed_qkv_complex_rotary_generator_runs_tokenspeed_triton(
         actual_k.float(), expected_k.float(), rtol=1e-2, atol=1e-2
     )
     torch.testing.assert_close(actual_v.float(), expected_v.float(), rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("include_head_axis", [False, True], ids=["rank2", "rank3"])
+def test_dsa_sparse_decode_kv_pack_generator_runs_tokenspeed_triton(
+    device: str,
+    include_head_axis: bool,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm GPU is required for DSA sparse decode pack Triton test")
+
+    values = DSASparseDecodeKVPackInputs(
+        DSASparseDecodeKVPackInputConfig(
+            num_tokens=7,
+            num_slots=11,
+            nope_dim=128,
+            rope_dim=64,
+            include_head_axis=include_head_axis,
+        )
+    ).generate(seed=213, metadata_seed=214, device=device)
+    expected = dsa_sparse_decode_kv_pack_reference(values)
+    actual = values.out.clone()
+
+    pack_sparse_decode_kv(
+        out=actual,
+        loc=values.loc,
+        cache_k_nope=values.cache_k_nope,
+        cache_k_rope=values.cache_k_rope,
+    )
+    torch.cuda.synchronize()
+
+    loc = values.loc.to(torch.int64)
+    nope_dim = values.cache_k_nope.shape[-1]
+    num_nope_blocks = nope_dim // 128
+    scale_offset = nope_dim
+    rope_offset = scale_offset + num_nope_blocks * 4
+
+    written_mask = torch.zeros(actual.shape[0], dtype=torch.bool, device=actual.device)
+    written_mask[loc] = True
+    assert torch.equal(actual[~written_mask], expected[~written_mask])
+    assert torch.equal(actual[loc, :scale_offset], expected[loc, :scale_offset])
+    assert torch.equal(actual[loc, rope_offset:], expected[loc, rope_offset:])
+
+    actual_scales = (
+        actual[loc, scale_offset:rope_offset].contiguous().view(torch.float32)
+    )
+    expected_scales = (
+        expected[loc, scale_offset:rope_offset].contiguous().view(torch.float32)
+    )
+    torch.testing.assert_close(actual_scales, expected_scales, rtol=1e-6, atol=1e-9)
 
 
 def test_dsa_topk_slot_generator_runs_tokenspeed_triton(
