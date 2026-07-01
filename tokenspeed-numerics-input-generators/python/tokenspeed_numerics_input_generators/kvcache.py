@@ -35,6 +35,9 @@ from tokenspeed_numerics_input_generators.core import (
 )
 
 __all__ = [
+    "FP8KVCacheWriteInputConfig",
+    "FP8KVCacheWriteInputs",
+    "FP8KVCacheWriteInputValues",
     "KVCacheStoreInputConfig",
     "KVCacheStoreInputs",
     "KVCacheStoreInputValues",
@@ -47,6 +50,7 @@ __all__ = [
     "PageTableGatherInputConfig",
     "PageTableGatherInputs",
     "PageTableGatherInputValues",
+    "fp8_kv_cache_write_reference",
     "kv_cache_store_reference",
     "kv_cache_transfer_reference",
     "mla_kv_cache_transfer_reference",
@@ -58,6 +62,10 @@ _REGULAR_FLOAT_DTYPES = {
     torch.bfloat16,
     torch.float32,
     torch.float64,
+}
+
+_FP8_CACHE_DTYPES = {
+    torch.float8_e4m3fn,
 }
 
 
@@ -80,6 +88,14 @@ def _check_float_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
         raise TypeError(f"{name} must be a torch.dtype")
     if dtype not in _REGULAR_FLOAT_DTYPES:
         raise ValueError(f"{name} must be a regular floating torch dtype, got {dtype}")
+    return dtype
+
+
+def _check_fp8_cache_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"{name} must be a torch.dtype")
+    if dtype not in _FP8_CACHE_DTYPES:
+        raise ValueError(f"{name} must be a supported FP8 cache dtype, got {dtype}")
     return dtype
 
 
@@ -110,6 +126,13 @@ def _generate_unique_indices(
     generator = _rng_for_device(target_device, seed)
     indices = torch.randperm(num_slots, device=target_device, generator=generator)
     return indices[:num_transfers].to(dtype)
+
+
+def _check_layout(name: str, value: str, valid: set[str]) -> str:
+    if value not in valid:
+        valid_list = ", ".join(sorted(valid))
+        raise ValueError(f"{name} must be one of {valid_list}; got {value!r}")
+    return value
 
 
 def _generate_index_matrix(
@@ -176,6 +199,249 @@ def _generate_tensor_layers(
             ).contiguous()
         )
     return layers
+
+
+@dataclass
+class FP8KVCacheWriteInputValues:
+    """Generated values for FP8 K/V cache writes."""
+
+    k: torch.Tensor
+    v: torch.Tensor
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    cache_loc: torch.Tensor
+    k_scale: torch.Tensor | None
+    v_scale: torch.Tensor | None
+    page_size: int
+
+
+@dataclass
+class FP8KVCacheWriteInputConfig:
+    """Initialization parameters for FP8 K/V cache write inputs.
+
+    The represented operation converts each token's K/V values to FP8, with
+    optional scalar scale division, and scatters the converted rows into cache
+    slots selected by ``cache_loc``.
+    """
+
+    # Required: number of token rows to write. Zero is valid.
+    num_tokens: int
+
+    # Required: total number of logical destination cache slots.
+    num_slots: int
+
+    # Required: number of KV heads in each token/cache slot.
+    num_kv_heads: int
+
+    # Required: per-head dimension.
+    head_dim: int
+
+    # Optional: number of slots in each cache page.
+    page_size: int = 16
+
+    # Optional: generated dtype for input K/V tensors.
+    input_dtype: torch.dtype = torch.bfloat16
+
+    # Optional: generated FP8 dtype for destination caches.
+    cache_dtype: torch.dtype = torch.float8_e4m3fn
+
+    # Optional: "heads" for [tokens, heads, dim] or "flattened" for
+    # [tokens, heads * dim].
+    input_layout: str = "heads"
+
+    # Optional: "paged" for [pages, page_size, heads, dim] or "flat" for
+    # [slots, heads, dim].
+    cache_layout: str = "paged"
+
+    # Optional: scalar K scale. Must be provided together with v_scale.
+    k_scale: float | None = None
+
+    # Optional: scalar V scale. Must be provided together with k_scale.
+    v_scale: float | None = None
+
+    # Optional: dtype for generated cache locations.
+    index_dtype: torch.dtype = torch.int32
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class FP8KVCacheWriteInputs(NumericsInputGenerator):
+    """Generator for FP8 K/V cache write inputs."""
+
+    config: FP8KVCacheWriteInputConfig
+    k_input: TensorInput | None
+    v_input: TensorInput | None
+    k_cache_input: TensorInput | None
+    v_cache_input: TensorInput | None
+
+    def __init__(self, config: FP8KVCacheWriteInputConfig) -> None:
+        self.config = config
+        self.k_input = None
+        self.v_input = None
+        self.k_cache_input = None
+        self.v_cache_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.num_slots = _check_positive("num_slots", self.config.num_slots)
+        if self.config.num_tokens > self.config.num_slots:
+            raise ValueError(
+                "num_tokens must be <= num_slots for unique cache locations; "
+                f"got num_tokens={self.config.num_tokens}, "
+                f"num_slots={self.config.num_slots}"
+            )
+        self.config.num_kv_heads = _check_positive(
+            "num_kv_heads", self.config.num_kv_heads
+        )
+        self.config.head_dim = _check_positive("head_dim", self.config.head_dim)
+        self.config.page_size = _check_positive("page_size", self.config.page_size)
+        if self.config.num_slots % self.config.page_size != 0:
+            raise ValueError(
+                "num_slots must be divisible by page_size; "
+                f"got num_slots={self.config.num_slots}, "
+                f"page_size={self.config.page_size}"
+            )
+        self.config.input_dtype = _check_float_dtype(
+            "input_dtype", self.config.input_dtype
+        )
+        self.config.cache_dtype = _check_fp8_cache_dtype(
+            "cache_dtype", self.config.cache_dtype
+        )
+        self.config.input_layout = _check_layout(
+            "input_layout", self.config.input_layout, {"heads", "flattened"}
+        )
+        self.config.cache_layout = _check_layout(
+            "cache_layout", self.config.cache_layout, {"paged", "flat"}
+        )
+        if (self.config.k_scale is None) != (self.config.v_scale is None):
+            raise ValueError("k_scale and v_scale must either both be set or both None")
+        if self.config.k_scale is not None:
+            if self.config.k_scale <= 0.0:
+                raise ValueError(f"k_scale must be positive, got {self.config.k_scale}")
+            assert self.config.v_scale is not None
+            if self.config.v_scale <= 0.0:
+                raise ValueError(f"v_scale must be positive, got {self.config.v_scale}")
+        self.config.index_dtype = _check_index_dtype(
+            "index_dtype", self.config.index_dtype
+        )
+
+        if self.config.input_layout == "heads":
+            input_shape = (
+                self.config.num_tokens,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+            )
+        else:
+            input_shape = (
+                self.config.num_tokens,
+                self.config.num_kv_heads * self.config.head_dim,
+            )
+        if self.config.cache_layout == "paged":
+            cache_shape = (
+                self.config.num_slots // self.config.page_size,
+                self.config.page_size,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+            )
+        else:
+            cache_shape = (
+                self.config.num_slots,
+                self.config.num_kv_heads,
+                self.config.head_dim,
+            )
+        self.k_input = self.k_input or TensorInput(
+            input_shape,
+            self.config.input_dtype,
+            device=self.config.device,
+        )
+        self.v_input = self.v_input or TensorInput(
+            input_shape,
+            self.config.input_dtype,
+            device=self.config.device,
+        )
+        self.k_cache_input = self.k_cache_input or TensorInput(
+            cache_shape,
+            self.config.cache_dtype,
+            device=self.config.device,
+        )
+        self.v_cache_input = self.v_cache_input or TensorInput(
+            cache_shape,
+            self.config.cache_dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> FP8KVCacheWriteInputValues:
+        self.__post_init__()
+        if (
+            self.k_input is None
+            or self.v_input is None
+            or self.k_cache_input is None
+            or self.v_cache_input is None
+        ):
+            raise ValueError(
+                "FP8KVCacheWriteInputs child generators must be initialized"
+            )
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        target_device = _resolve_device(self.config.device, device)
+        cache_loc = _generate_unique_indices(
+            num_slots=self.config.num_slots,
+            num_transfers=self.config.num_tokens,
+            dtype=self.config.index_dtype,
+            seed=_child_seed(metadata_base_seed, 1),
+            device=device,
+            configured_device=self.config.device,
+        )
+        k_scale = None
+        v_scale = None
+        if self.config.k_scale is not None:
+            assert self.config.v_scale is not None
+            k_scale = torch.tensor(
+                self.config.k_scale,
+                dtype=torch.float32,
+                device=target_device,
+            )
+            v_scale = torch.tensor(
+                self.config.v_scale,
+                dtype=torch.float32,
+                device=target_device,
+            )
+        return FP8KVCacheWriteInputValues(
+            k=_require_tensor(
+                self.k_input.generate(seed=_child_seed(seed, 1), device=device).values,
+                "k",
+            ).contiguous(),
+            v=_require_tensor(
+                self.v_input.generate(seed=_child_seed(seed, 2), device=device).values,
+                "v",
+            ).contiguous(),
+            k_cache=_require_tensor(
+                self.k_cache_input.generate(
+                    seed=_child_seed(seed, 3), device=device
+                ).values,
+                "k_cache",
+            ).contiguous(),
+            v_cache=_require_tensor(
+                self.v_cache_input.generate(
+                    seed=_child_seed(seed, 4), device=device
+                ).values,
+                "v_cache",
+            ).contiguous(),
+            cache_loc=cache_loc.contiguous(),
+            k_scale=k_scale,
+            v_scale=v_scale,
+            page_size=self.config.page_size,
+        )
 
 
 @dataclass
@@ -762,6 +1028,91 @@ class MLAKVCacheTransferInputs(NumericsInputGenerator):
             src_indices=src_indices.contiguous(),
             dst_indices=dst_indices.contiguous(),
         )
+
+
+def fp8_kv_cache_write_reference(
+    values: FP8KVCacheWriteInputValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return expected FP8 K/V caches after quantized cache write."""
+
+    page_size = _check_positive("page_size", values.page_size)
+    if values.k.shape[0] != values.v.shape[0]:
+        raise ValueError(
+            f"k/v token count mismatch: {values.k.shape[0]} vs {values.v.shape[0]}"
+        )
+    if values.k_cache.shape != values.v_cache.shape:
+        raise ValueError("k_cache and v_cache must have matching shapes")
+    if values.k_cache.ndim == 3:
+        num_slots, num_kv_heads, head_dim = values.k_cache.shape
+        if num_slots % page_size != 0:
+            raise ValueError(
+                "flat cache slot count must be divisible by page_size; "
+                f"num_slots={num_slots}, page_size={page_size}"
+            )
+    elif values.k_cache.ndim == 4:
+        _, cache_page_size, num_kv_heads, head_dim = values.k_cache.shape
+        if cache_page_size != page_size:
+            raise ValueError(
+                f"cache page size mismatch: cache={cache_page_size}, page_size={page_size}"
+            )
+        num_slots = values.k_cache.shape[0] * page_size
+    else:
+        raise ValueError(
+            f"unsupported cache rank {values.k_cache.ndim}; expected 3 or 4"
+        )
+    if values.cache_loc.shape[0] != values.k.shape[0]:
+        raise ValueError("cache_loc must have one entry per token")
+    if values.cache_loc.numel() > 0:
+        if (
+            int(values.cache_loc.min().item()) < 0
+            or int(values.cache_loc.max().item()) >= num_slots
+        ):
+            raise ValueError("cache_loc entries must be valid cache slots")
+
+    def _as_3d(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim == 3:
+            if tensor.shape[1:] != (num_kv_heads, head_dim):
+                raise ValueError(
+                    f"{name} shape must match cache heads/dim; "
+                    f"got {tuple(tensor.shape)}, expected (*, {num_kv_heads}, {head_dim})"
+                )
+            return tensor
+        if tensor.ndim == 2:
+            expected_width = num_kv_heads * head_dim
+            if tensor.shape[1] != expected_width:
+                raise ValueError(
+                    f"{name} flattened width must be {expected_width}, got {tensor.shape[1]}"
+                )
+            return tensor.view(tensor.shape[0], num_kv_heads, head_dim)
+        raise ValueError(f"{name} must be rank 2 or 3, got {tensor.ndim}")
+
+    if (values.k_scale is None) != (values.v_scale is None):
+        raise ValueError("k_scale and v_scale must either both be set or both None")
+    k = _as_3d("k", values.k)
+    v = _as_3d("v", values.v)
+    if k.shape[0] != v.shape[0]:
+        raise ValueError(f"k/v token count mismatch: {k.shape[0]} vs {v.shape[0]}")
+    k_fp32 = k.to(torch.float32)
+    v_fp32 = v.to(torch.float32)
+    if values.k_scale is not None:
+        assert values.v_scale is not None
+        k_fp32 = k_fp32 / values.k_scale.to(device=k.device, dtype=torch.float32)
+        v_fp32 = v_fp32 / values.v_scale.to(device=v.device, dtype=torch.float32)
+    k_quant = k_fp32.to(values.k_cache.dtype)
+    v_quant = v_fp32.to(values.v_cache.dtype)
+
+    expected_k = values.k_cache.clone()
+    expected_v = values.v_cache.clone()
+    cache_loc = values.cache_loc.to(torch.int64)
+    if values.k_cache.ndim == 3:
+        expected_k[cache_loc] = k_quant
+        expected_v[cache_loc] = v_quant
+    else:
+        pages = cache_loc // page_size
+        offsets = cache_loc % page_size
+        expected_k[pages, offsets] = k_quant
+        expected_v[pages, offsets] = v_quant
+    return expected_k, expected_v
 
 
 def kv_cache_store_reference(

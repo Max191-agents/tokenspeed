@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
+    fused_fp8_set_kv_buffer,
     gather_page_table_with_padding,
     store_kv_cache,
     transfer_kv_all_layer,
@@ -30,6 +31,8 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_kv_per_layer_mla,
 )
 from tokenspeed_numerics_input_generators import (
+    FP8KVCacheWriteInputConfig,
+    FP8KVCacheWriteInputs,
     KVCacheStoreInputConfig,
     KVCacheStoreInputs,
     KVCacheTransferInputConfig,
@@ -38,6 +41,7 @@ from tokenspeed_numerics_input_generators import (
     MLAKVCacheTransferInputs,
     PageTableGatherInputConfig,
     PageTableGatherInputs,
+    fp8_kv_cache_write_reference,
     kv_cache_store_reference,
     kv_cache_transfer_reference,
     mla_kv_cache_transfer_reference,
@@ -50,6 +54,78 @@ def _ptr_tensor(layers: list[torch.Tensor]) -> torch.Tensor:
         [layer.data_ptr() for layer in layers],
         device=layers[0].device,
         dtype=torch.uint64,
+    )
+
+
+def test_fp8_kv_cache_write_generator_runs_paged_scaled_kernel(device: str) -> None:
+    values = FP8KVCacheWriteInputs(
+        FP8KVCacheWriteInputConfig(
+            num_tokens=5,
+            num_slots=16,
+            num_kv_heads=2,
+            head_dim=32,
+            page_size=4,
+            input_dtype=torch.bfloat16,
+            cache_layout="paged",
+            input_layout="heads",
+            k_scale=1.25,
+            v_scale=1.5,
+        )
+    ).generate(seed=71, metadata_seed=72, device=device)
+    expected_k, expected_v = fp8_kv_cache_write_reference(values)
+
+    fused_fp8_set_kv_buffer(
+        values.k,
+        values.v,
+        values.k_cache,
+        values.v_cache,
+        values.cache_loc,
+        k_scale=values.k_scale,
+        v_scale=values.v_scale,
+        page_size=values.page_size,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        values.k_cache.float(), expected_k.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        values.v_cache.float(), expected_v.float(), atol=0, rtol=0
+    )
+
+
+def test_fp8_kv_cache_write_generator_runs_flat_unscaled_kernel(device: str) -> None:
+    values = FP8KVCacheWriteInputs(
+        FP8KVCacheWriteInputConfig(
+            num_tokens=5,
+            num_slots=16,
+            num_kv_heads=2,
+            head_dim=32,
+            page_size=4,
+            input_dtype=torch.bfloat16,
+            cache_layout="flat",
+            input_layout="flattened",
+        )
+    ).generate(seed=73, metadata_seed=74, device=device)
+    expected_k, expected_v = fp8_kv_cache_write_reference(values)
+
+    fused_fp8_set_kv_buffer(
+        values.k,
+        values.v,
+        values.k_cache,
+        values.v_cache,
+        values.cache_loc,
+        k_scale=values.k_scale,
+        v_scale=values.v_scale,
+        page_size=values.page_size,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        values.k_cache.float(), expected_k.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        values.v_cache.float(), expected_v.float(), atol=0, rtol=0
     )
 
 

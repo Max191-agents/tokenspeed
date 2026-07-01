@@ -1,11 +1,28 @@
 # KV Cache Input Generators
 
 KV-cache generators cover operations that manipulate cache storage for
-attention. This slice models per-token cache store, cache-row transfer, and
-active page-table gather-with-padding. It intentionally does not yet cover every
-TokenSpeed KV-cache kernel, such as FP8 cache writes.
+attention. This slice models FP8 cache writes, per-token cache store, cache-row
+transfer, and active page-table gather-with-padding.
 
 ## Operation Semantics
+
+### FP8 K/V Cache Write
+
+`FP8KVCacheWriteInputs` represents writing newly computed K/V token rows into
+an FP8 cache:
+
+```text
+k_cache[cache_loc[i]] = to_fp8(k[i] / k_scale)
+v_cache[cache_loc[i]] = to_fp8(v[i] / v_scale)
+```
+
+When `k_scale` and `v_scale` are omitted, the inputs are converted directly to
+FP8. The generator can emit token inputs either as `[num_tokens, num_kv_heads,
+head_dim]` or as flattened `[num_tokens, num_kv_heads * head_dim]`. Destination
+caches can be flat `[num_slots, num_kv_heads, head_dim]` or paged
+`[num_pages, page_size, num_kv_heads, head_dim]`. `cache_loc` always contains
+logical slot indices; paged cache coordinates are derived as
+`page = cache_loc // page_size` and `offset = cache_loc % page_size`.
 
 ### K/V Cache Store
 
@@ -75,14 +92,18 @@ The generators reject invalid inputs before values are returned:
 - generated destination locations and indices are unique, so the result is
   deterministic and not affected by write ordering
 - generated source indices are unique for easier debugging and coverage
+- FP8 cache write slot counts must be divisible by page size
+- FP8 cache write scales must be provided as a K/V pair or omitted as a pair
 - page-table gather batch size must fit within the source request table
 - generated sequence lengths imply no more pages than the output can hold
 - cache dtype must be a regular floating torch dtype
+- FP8 cache write cache dtype must be a supported FP8 cache dtype
 - index dtype must be int32 or int64
 
 Locations, indices, and request lengths are generated from `metadata_seed`,
-while cache contents and page table contents are generated from `seed`. This
-allows tests to reuse the same metadata layout across different random values.
+while K/V values, cache contents, and page table contents are generated from
+`seed`. This allows tests to reuse the same metadata layout across different
+random values.
 
 ## TokenSpeed API Mapping
 
@@ -90,7 +111,10 @@ TokenSpeed has per-layer and all-layer transfer kernels for both conventional
 K/V caches and MLA caches. The generated transfer values map directly to the
 per-layer APIs. For all-layer APIs, tests or adapters can convert the generated
 list of layer tensors into pointer tensors. The store and page-table gather
-values map directly to the current TokenSpeed Triton helpers.
+values map directly to the current TokenSpeed Triton helpers. FP8 cache write
+values map to TokenSpeed's fused FP8 set-KV-buffer helper; tests or adapters can
+pass the generated `page_size`, optional scales, and generated cache tensors
+directly.
 
 The generator returns operation-level values only. Pointer tensors and other
 implementation-specific launch arguments are intentionally left to TokenSpeed

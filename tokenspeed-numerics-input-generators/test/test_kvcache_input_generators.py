@@ -23,6 +23,8 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_numerics_input_generators import (
+    FP8KVCacheWriteInputConfig,
+    FP8KVCacheWriteInputs,
     KVCacheStoreInputConfig,
     KVCacheStoreInputs,
     KVCacheTransferInputConfig,
@@ -31,11 +33,115 @@ from tokenspeed_numerics_input_generators import (
     MLAKVCacheTransferInputs,
     PageTableGatherInputConfig,
     PageTableGatherInputs,
+    fp8_kv_cache_write_reference,
     kv_cache_store_reference,
     kv_cache_transfer_reference,
     mla_kv_cache_transfer_reference,
     page_table_gather_reference,
 )
+
+
+def test_fp8_kv_cache_write_inputs_generate_paged_scaled_reference() -> None:
+    config = FP8KVCacheWriteInputConfig(
+        num_tokens=5,
+        num_slots=16,
+        num_kv_heads=2,
+        head_dim=8,
+        page_size=4,
+        input_dtype=torch.float32,
+        cache_layout="paged",
+        input_layout="heads",
+        k_scale=1.25,
+        v_scale=1.5,
+    )
+    values = FP8KVCacheWriteInputs(config).generate(
+        seed=17,
+        metadata_seed=18,
+        device="cpu",
+    )
+
+    assert values.k.shape == (5, 2, 8)
+    assert values.v.shape == (5, 2, 8)
+    assert values.k_cache.shape == (4, 4, 2, 8)
+    assert values.v_cache.shape == (4, 4, 2, 8)
+    assert values.cache_loc.unique().numel() == 5
+    assert values.k_scale is not None
+    assert values.v_scale is not None
+
+    expected_k, expected_v = fp8_kv_cache_write_reference(values)
+    pages = values.cache_loc.to(torch.int64) // values.page_size
+    offsets = values.cache_loc.to(torch.int64) % values.page_size
+    torch.testing.assert_close(
+        expected_k[pages, offsets].float(),
+        (values.k.float() / values.k_scale).to(torch.float8_e4m3fn).float(),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        expected_v[pages, offsets].float(),
+        (values.v.float() / values.v_scale).to(torch.float8_e4m3fn).float(),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_fp8_kv_cache_write_inputs_generate_flat_unscaled_reference() -> None:
+    config = FP8KVCacheWriteInputConfig(
+        num_tokens=5,
+        num_slots=16,
+        num_kv_heads=2,
+        head_dim=8,
+        page_size=4,
+        input_dtype=torch.bfloat16,
+        cache_layout="flat",
+        input_layout="flattened",
+    )
+    values = FP8KVCacheWriteInputs(config).generate(
+        seed=19,
+        metadata_seed=20,
+        device="cpu",
+    )
+
+    assert values.k.shape == (5, 16)
+    assert values.v.shape == (5, 16)
+    assert values.k_cache.shape == (16, 2, 8)
+    assert values.v_cache.shape == (16, 2, 8)
+    assert values.k_scale is None
+    assert values.v_scale is None
+
+    expected_k, expected_v = fp8_kv_cache_write_reference(values)
+    loc = values.cache_loc.to(torch.int64)
+    torch.testing.assert_close(
+        expected_k[loc].float(),
+        values.k.view(5, 2, 8).to(torch.float8_e4m3fn).float(),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        expected_v[loc].float(),
+        values.v.view(5, 2, 8).to(torch.float8_e4m3fn).float(),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_fp8_kv_cache_write_metadata_seed_controls_locations_only() -> None:
+    generator = FP8KVCacheWriteInputs(
+        FP8KVCacheWriteInputConfig(
+            num_tokens=4,
+            num_slots=16,
+            num_kv_heads=2,
+            head_dim=8,
+            page_size=4,
+            input_dtype=torch.float32,
+        )
+    )
+
+    values1 = generator.generate(seed=21, metadata_seed=99, device="cpu")
+    values2 = generator.generate(seed=22, metadata_seed=99, device="cpu")
+
+    torch.testing.assert_close(values1.cache_loc, values2.cache_loc)
+    assert not torch.equal(values1.k, values2.k)
 
 
 def test_kv_cache_store_inputs_generate_values_and_reference() -> None:
@@ -267,6 +373,45 @@ def test_mla_kv_cache_transfer_rejects_invalid_index_dtype() -> None:
                 kv_cache_dim=16,
                 dtype=torch.float16,
                 index_dtype=torch.float32,
+            )
+        )
+
+
+def test_fp8_kv_cache_write_rejects_unpaired_scales() -> None:
+    with pytest.raises(ValueError, match="k_scale and v_scale"):
+        FP8KVCacheWriteInputs(
+            FP8KVCacheWriteInputConfig(
+                num_tokens=4,
+                num_slots=16,
+                num_kv_heads=2,
+                head_dim=8,
+                k_scale=1.25,
+            )
+        )
+
+
+def test_fp8_kv_cache_write_rejects_non_divisible_page_size() -> None:
+    with pytest.raises(ValueError, match="num_slots"):
+        FP8KVCacheWriteInputs(
+            FP8KVCacheWriteInputConfig(
+                num_tokens=4,
+                num_slots=15,
+                num_kv_heads=2,
+                head_dim=8,
+                page_size=4,
+            )
+        )
+
+
+def test_fp8_kv_cache_write_rejects_invalid_cache_dtype() -> None:
+    with pytest.raises(ValueError, match="FP8 cache dtype"):
+        FP8KVCacheWriteInputs(
+            FP8KVCacheWriteInputConfig(
+                num_tokens=4,
+                num_slots=16,
+                num_kv_heads=2,
+                head_dim=8,
+                cache_dtype=torch.float16,
             )
         )
 
