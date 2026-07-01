@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import platform
+from dataclasses import replace
 
 import pytest
 import torch
@@ -30,6 +31,12 @@ from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
     mla_kv_pack_quantize_fp8,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_numerics_input_generators import (
+    MLAKVPackQuantizeFP8InputConfig,
+    MLAKVPackQuantizeFP8Inputs,
+    MLAKVPackQuantizeFP8InputValues,
+    mla_kv_pack_quantize_fp8_reference,
+)
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia,
@@ -61,15 +68,47 @@ def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
-def _make_kv_slice_inputs(device: str, dtype: torch.dtype = torch.bfloat16):
+def _make_mla_kv_pack_values(
+    device: str,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    k_scale_inv: float = 1.0,
+    v_scale_inv: float = 1.0,
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+    k_pe_rank: int = 3,
+    seed: int = 0,
+) -> MLAKVPackQuantizeFP8InputValues:
+    return MLAKVPackQuantizeFP8Inputs(
+        MLAKVPackQuantizeFP8InputConfig(
+            num_tokens=S,
+            num_kv_heads=H,
+            qk_nope_head_dim=QK_NOPE,
+            qk_rope_head_dim=QK_ROPE,
+            v_head_dim=V_HEAD,
+            input_dtype=dtype,
+            k_scale_inv=k_scale_inv,
+            v_scale_inv=v_scale_inv,
+            fp8_dtype=fp8_dtype,
+            k_pe_rank=k_pe_rank,
+        )
+    ).generate(seed=seed, device=device)
+
+
+def _make_kv_slice_inputs(
+    device: str,
+    dtype: torch.dtype = torch.bfloat16,
+) -> MLAKVPackQuantizeFP8InputValues:
     """Mirror the deepseek_v3.py call site: k_nope and v are slice views of
     a packed kv tensor produced by kv_b_proj."""
-    torch.manual_seed(0)
-    kv = torch.randn(S, H, QK_NOPE + V_HEAD, device=device, dtype=dtype)
-    k_nope = kv[..., :QK_NOPE]
-    v = kv[..., QK_NOPE:]
-    k_pe = torch.randn(S, 1, QK_ROPE, device=device, dtype=dtype)
-    return k_nope, k_pe, v
+    values = _make_mla_kv_pack_values(device, dtype=dtype, seed=0)
+    kv = torch.empty(S, H, QK_NOPE + V_HEAD, device=device, dtype=dtype)
+    kv[..., :QK_NOPE].copy_(values.k_nope)
+    kv[..., QK_NOPE:].copy_(values.v)
+    return replace(
+        values,
+        k_nope=kv[..., :QK_NOPE],
+        v=kv[..., QK_NOPE:],
+    )
 
 
 def _host_arch() -> str:
@@ -105,14 +144,29 @@ def _require_mla_binary_prefill():
     return fmha_binary, so_path
 
 
-def _reference(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype):
-    """Pure-PyTorch reference: broadcast k_pe across heads, cat, scale, cast."""
-    k_pe_2d = k_pe.squeeze(1) if k_pe.dim() == 3 else k_pe
-    k_pe_full = k_pe_2d.unsqueeze(1).expand(-1, k_nope.shape[1], -1)
-    k_bf16 = torch.cat([k_nope, k_pe_full], dim=-1)
-    k_fp8 = (k_bf16.float() * k_scale_inv).to(fp8_dtype)
-    v_fp8 = (v.float() * v_scale_inv).to(fp8_dtype)
-    return k_fp8, v_fp8
+def _run_mla_kv_pack_quantize_fp8(
+    values: MLAKVPackQuantizeFP8InputValues,
+    *,
+    k_out: torch.Tensor | None = None,
+    v_out: torch.Tensor | None = None,
+    enable_pdl: bool | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kwargs = {}
+    if k_out is not None:
+        kwargs["k_out"] = k_out
+    if v_out is not None:
+        kwargs["v_out"] = v_out
+    if enable_pdl is not None:
+        kwargs["enable_pdl"] = enable_pdl
+    return mla_kv_pack_quantize_fp8(
+        values.k_nope,
+        values.k_pe,
+        values.v,
+        k_scale_inv=values.k_scale_inv,
+        v_scale_inv=values.v_scale_inv,
+        fp8_dtype=values.fp8_dtype,
+        **kwargs,
+    )
 
 
 def _prefill_reference(
@@ -264,12 +318,12 @@ def test_kernel_tokenspeed_mla_prefill_binary_e2e(
 
 def test_pure_cast_strided_inputs(device: str) -> None:
     """k_nope/v are non-contiguous slices, scale=1.0 — the prefill call site."""
-    k_nope, k_pe, v = _make_kv_slice_inputs(device)
-    assert not k_nope.is_contiguous()
-    assert not v.is_contiguous()
+    values = _make_kv_slice_inputs(device)
+    assert not values.k_nope.is_contiguous()
+    assert not values.v.is_contiguous()
 
-    k_ref, v_ref = _reference(k_nope, k_pe, v, 1.0, 1.0, torch.float8_e4m3fn)
-    k_out, v_out = mla_kv_pack_quantize_fp8(k_nope, k_pe, v)
+    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
+    k_out, v_out = _run_mla_kv_pack_quantize_fp8(values)
     torch.cuda.synchronize()
 
     assert k_out.shape == (S, H, QK_NOPE + QK_ROPE)
@@ -280,15 +334,15 @@ def test_pure_cast_strided_inputs(device: str) -> None:
 
 def test_scaled_independent_k_v(device: str) -> None:
     """k and v use different scales; output reflects each independently."""
-    k_nope, k_pe, v = _make_kv_slice_inputs(device)
-    k_scale_inv, v_scale_inv = 0.5, 1.7
+    values = _make_mla_kv_pack_values(
+        device,
+        k_scale_inv=0.5,
+        v_scale_inv=1.7,
+        seed=1,
+    )
 
-    k_ref, v_ref = _reference(
-        k_nope, k_pe, v, k_scale_inv, v_scale_inv, torch.float8_e4m3fn
-    )
-    k_out, v_out = mla_kv_pack_quantize_fp8(
-        k_nope, k_pe, v, k_scale_inv=k_scale_inv, v_scale_inv=v_scale_inv
-    )
+    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
+    k_out, v_out = _run_mla_kv_pack_quantize_fp8(values)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(k_out, k_ref)
@@ -297,11 +351,11 @@ def test_scaled_independent_k_v(device: str) -> None:
 
 def test_k_pe_2d_and_3d_equivalent(device: str) -> None:
     """k_pe is accepted as both [s, 1, rope] and [s, rope]; same output."""
-    k_nope, k_pe_3d, v = _make_kv_slice_inputs(device)
-    k_pe_2d = k_pe_3d.squeeze(1)
+    values_3d = _make_mla_kv_pack_values(device, seed=2)
+    values_2d = replace(values_3d, k_pe=values_3d.k_pe.squeeze(1))
 
-    k_3d, v_3d = mla_kv_pack_quantize_fp8(k_nope, k_pe_3d, v)
-    k_2d, v_2d = mla_kv_pack_quantize_fp8(k_nope, k_pe_2d, v)
+    k_3d, v_3d = _run_mla_kv_pack_quantize_fp8(values_3d)
+    k_2d, v_2d = _run_mla_kv_pack_quantize_fp8(values_2d)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(k_3d, k_2d)
@@ -310,15 +364,12 @@ def test_k_pe_2d_and_3d_equivalent(device: str) -> None:
 
 def test_contiguous_inputs(device: str) -> None:
     """Standalone (non-slice) k_nope, v inputs also work."""
-    torch.manual_seed(1)
-    k_nope = torch.randn(S, H, QK_NOPE, device=device, dtype=torch.bfloat16)
-    v = torch.randn(S, H, V_HEAD, device=device, dtype=torch.bfloat16)
-    k_pe = torch.randn(S, 1, QK_ROPE, device=device, dtype=torch.bfloat16)
-    assert k_nope.is_contiguous()
-    assert v.is_contiguous()
+    values = _make_mla_kv_pack_values(device, seed=3)
+    assert values.k_nope.is_contiguous()
+    assert values.v.is_contiguous()
 
-    k_ref, v_ref = _reference(k_nope, k_pe, v, 1.0, 1.0, torch.float8_e4m3fn)
-    k_out, v_out = mla_kv_pack_quantize_fp8(k_nope, k_pe, v)
+    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
+    k_out, v_out = _run_mla_kv_pack_quantize_fp8(values)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(k_out, k_ref)
@@ -326,14 +377,10 @@ def test_contiguous_inputs(device: str) -> None:
 
 
 def test_fp16_input(device: str) -> None:
-    torch.manual_seed(2)
-    kv = torch.randn(S, H, QK_NOPE + V_HEAD, device=device, dtype=torch.float16)
-    k_nope = kv[..., :QK_NOPE]
-    v = kv[..., QK_NOPE:]
-    k_pe = torch.randn(S, 1, QK_ROPE, device=device, dtype=torch.float16)
+    values = _make_kv_slice_inputs(device, dtype=torch.float16)
 
-    k_ref, v_ref = _reference(k_nope, k_pe, v, 1.0, 1.0, torch.float8_e4m3fn)
-    k_out, v_out = mla_kv_pack_quantize_fp8(k_nope, k_pe, v)
+    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
+    k_out, v_out = _run_mla_kv_pack_quantize_fp8(values)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(k_out, k_ref)
@@ -341,11 +388,13 @@ def test_fp16_input(device: str) -> None:
 
 
 def test_e5m2_output(device: str) -> None:
-    k_nope, k_pe, v = _make_kv_slice_inputs(device)
-    k_ref, v_ref = _reference(k_nope, k_pe, v, 1.0, 1.0, torch.float8_e5m2)
-    k_out, v_out = mla_kv_pack_quantize_fp8(
-        k_nope, k_pe, v, fp8_dtype=torch.float8_e5m2
+    values = _make_mla_kv_pack_values(
+        device,
+        fp8_dtype=torch.float8_e5m2,
+        seed=4,
     )
+    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
+    k_out, v_out = _run_mla_kv_pack_quantize_fp8(values)
     torch.cuda.synchronize()
 
     assert k_out.dtype == torch.float8_e5m2
@@ -355,19 +404,23 @@ def test_e5m2_output(device: str) -> None:
 
 
 def test_preallocated_outputs(device: str) -> None:
-    k_nope, k_pe, v = _make_kv_slice_inputs(device)
+    values = _make_mla_kv_pack_values(device, seed=5)
     k_out = torch.empty(
         (S, H, QK_NOPE + QK_ROPE), dtype=torch.float8_e4m3fn, device=device
     )
     v_out = torch.empty((S, H, V_HEAD), dtype=torch.float8_e4m3fn, device=device)
 
-    k_ret, v_ret = mla_kv_pack_quantize_fp8(k_nope, k_pe, v, k_out=k_out, v_out=v_out)
+    k_ret, v_ret = _run_mla_kv_pack_quantize_fp8(
+        values,
+        k_out=k_out,
+        v_out=v_out,
+    )
     torch.cuda.synchronize()
 
     assert k_ret.data_ptr() == k_out.data_ptr()
     assert v_ret.data_ptr() == v_out.data_ptr()
 
-    k_ref, v_ref = _reference(k_nope, k_pe, v, 1.0, 1.0, torch.float8_e4m3fn)
+    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
     assert _bitwise_equal(k_out, k_ref)
     assert _bitwise_equal(v_out, v_ref)
 
@@ -381,22 +434,19 @@ def test_pdl_off_matches_pdl_on(
 
     if not current_platform().is_hopper_plus:
         pytest.skip("PDL requires NVIDIA Hopper+ (SM≥90)")
-    k_nope, k_pe, v = _make_kv_slice_inputs(device)
-
-    k_off, v_off = mla_kv_pack_quantize_fp8(
-        k_nope,
-        k_pe,
-        v,
+    values = _make_mla_kv_pack_values(
+        device,
         k_scale_inv=k_scale_inv,
         v_scale_inv=v_scale_inv,
+        seed=6,
+    )
+
+    k_off, v_off = _run_mla_kv_pack_quantize_fp8(
+        values,
         enable_pdl=False,
     )
-    k_on, v_on = mla_kv_pack_quantize_fp8(
-        k_nope,
-        k_pe,
-        v,
-        k_scale_inv=k_scale_inv,
-        v_scale_inv=v_scale_inv,
+    k_on, v_on = _run_mla_kv_pack_quantize_fp8(
+        values,
         enable_pdl=True,
     )
     torch.cuda.synchronize()
