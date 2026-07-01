@@ -92,6 +92,12 @@ without scales, rejecting incompatible scale shapes, ensuring page-table
 metadata is consistent with cache layout, and requiring attention head counts or
 request-length metadata to satisfy the operation contract.
 
+The practical rule is that misuse should fail inside the generator library
+rather than later inside a reference implementation, kernel adapter, or backend
+kernel. If a public config can produce inputs that do not satisfy the documented
+operation semantics, the generator contract is incomplete and should be fixed at
+the source.
+
 The useful verification boundary is the point where misuse would create broken
 or meaningless inputs:
 
