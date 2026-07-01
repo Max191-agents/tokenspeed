@@ -57,6 +57,7 @@ __all__ = [
     "mxfp8_quantization_reference",
     "mxfp8_scale_shape",
     "nvfp4_quantization_reference",
+    "nvfp4_dequantization_reference",
     "nvfp4_scale_shape",
 ]
 
@@ -874,3 +875,47 @@ def nvfp4_quantization_reference(
     nibbles = _nearest_e2m1_nibbles(scaled)
     packed = _pack_e2m1_nibbles(nibbles).reshape(*shape[:-1], shape[-1] // 2)
     return packed.contiguous(), local_scale.contiguous()
+
+
+def nvfp4_dequantization_reference(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    scale: torch.Tensor | float,
+    scale_size: int = 16,
+    scale_layout: NVFP4ScaleLayout = "linear",
+) -> torch.Tensor:
+    """Return the floating-point values represented by packed NVFP4 storage."""
+
+    if scale_layout != "linear":
+        raise ValueError(
+            f"NVFP4 reference currently supports scale_layout='linear', got {scale_layout!r}"
+        )
+    if packed.dtype != torch.uint8:
+        raise ValueError(f"packed NVFP4 values must use torch.uint8, got {packed.dtype}")
+    if scales.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"NVFP4 scale values must use torch.float8_e4m3fn, got {scales.dtype}"
+        )
+    shape = _check_shape((*packed.shape[:-1], packed.shape[-1] * 2))
+    expected_scale_shape = nvfp4_scale_shape(shape, scale_size=scale_size)
+    if tuple(scales.shape) != expected_scale_shape:
+        raise ValueError(
+            "NVFP4 scale shape must match packed value groups; got "
+            f"scales={tuple(scales.shape)}, expected={expected_scale_shape}"
+        )
+    scale_tensor = torch.as_tensor(scale, dtype=torch.float32, device=packed.device)
+    if scale_tensor.numel() != 1:
+        raise ValueError("NVFP4 scale must be scalar")
+    scale_value = scale_tensor.reshape(())
+    if scale_value.item() <= 0.0:
+        raise ValueError("NVFP4 scale must be positive")
+
+    unpacked = packed.new_empty(shape, dtype=torch.float32)
+    unpacked[..., 0::2] = _e2m1_values_from_nibbles(packed & 0xF)
+    unpacked[..., 1::2] = _e2m1_values_from_nibbles(packed >> 4)
+    return (
+        unpacked
+        * scales.float().repeat_interleave(scale_size, dim=-1)
+        * scale_value.reshape((1,) * unpacked.ndim)
+    )

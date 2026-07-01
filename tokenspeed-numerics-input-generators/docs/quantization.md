@@ -123,3 +123,5 @@ encoded-layout expectations. MXFP4 tests can compare both packed values and
 encoded scales directly for the linear layout. MXFP8 and NVFP4 tests can compare
 quantized payload values directly for exactly representable generated inputs and
 can treat backend-specific scale layouts as shape/layout adapter checks.
+`nvfp4_dequantization_reference` provides the matching operation-level inverse
+for linear NVFP4 payloads and scales.

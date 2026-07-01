@@ -33,6 +33,8 @@ from tokenspeed_numerics_input_generators import (
     MoeInputConfig,
     MoeInputValues,
     MoeInputs,
+    NVFP4GemmSwiGLUNVFP4QuantInputConfig,
+    NVFP4GemmSwiGLUNVFP4QuantInputs,
     TensorInput,
     canonicalize_moe_align_block_size,
     gemm_reference,
@@ -41,6 +43,8 @@ from tokenspeed_numerics_input_generators import (
     moe_align_block_size_reference,
     moe_reference,
     mxfp4_gemm_input_config,
+    nvfp4_dequantization_reference,
+    nvfp4_gemm_swiglu_nvfp4_quant_reference,
 )
 
 _fp8_dtype = torch.float8_e4m3fn
@@ -491,6 +495,96 @@ def test_gemm_reference_applies_scaled_operands() -> None:
     ).T
 
     torch.testing.assert_close(ref, manual)
+
+
+def test_nvfp4_gemm_swiglu_inputs_generate_values_and_reference() -> None:
+    values = NVFP4GemmSwiGLUNVFP4QuantInputs(
+        NVFP4GemmSwiGLUNVFP4QuantInputConfig(
+            M=3,
+            K=64,
+            intermediate_size=32,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=23, device="cpu")
+
+    assert values.x.shape == (3, 64)
+    assert values.w1.shape == (64, 64)
+    assert values.x_fp4.shape == (3, 32)
+    assert values.w1_fp4.shape == (64, 32)
+    assert values.x_scale.shape == (3, 4)
+    assert values.w1_scale.shape == (64, 4)
+    assert values.fc1_alpha.shape == (1,)
+    torch.testing.assert_close(
+        values.fc1_alpha,
+        values.x_global_scale * values.w1_global_scale,
+    )
+    assert values.output_global_scale.shape == (1,)
+    torch.testing.assert_close(
+        values.output_global_scale * values.output_global_scale_inv,
+        torch.ones_like(values.output_global_scale),
+    )
+
+    packed, scales = nvfp4_gemm_swiglu_nvfp4_quant_reference(values)
+
+    assert packed.shape == (3, 16)
+    assert scales.shape == (3, 2)
+    assert packed.dtype == torch.uint8
+    assert scales.dtype == torch.float8_e4m3fn
+    dequant = nvfp4_dequantization_reference(
+        packed,
+        scales,
+        scale=values.output_global_scale,
+    )
+    assert dequant.shape == (3, 32)
+    assert torch.isfinite(dequant).all()
+
+
+def test_nvfp4_gemm_swiglu_reference_rejects_bad_shapes() -> None:
+    values = NVFP4GemmSwiGLUNVFP4QuantInputs(
+        NVFP4GemmSwiGLUNVFP4QuantInputConfig(
+            M=3,
+            K=64,
+            intermediate_size=32,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=24, device="cpu")
+    values.w1_fp4 = values.w1_fp4[:-1]
+
+    with pytest.raises(ValueError, match="even gate/up"):
+        nvfp4_gemm_swiglu_nvfp4_quant_reference(values)
+
+
+def test_nvfp4_gemm_swiglu_inputs_verify_dimensions() -> None:
+    with pytest.raises(ValueError, match="K must be divisible"):
+        NVFP4GemmSwiGLUNVFP4QuantInputs(
+            NVFP4GemmSwiGLUNVFP4QuantInputConfig(
+                M=3,
+                K=65,
+                intermediate_size=32,
+                dtype=torch.bfloat16,
+            )
+        )
+
+    with pytest.raises(ValueError, match="intermediate_size must be divisible"):
+        NVFP4GemmSwiGLUNVFP4QuantInputs(
+            NVFP4GemmSwiGLUNVFP4QuantInputConfig(
+                M=3,
+                K=64,
+                intermediate_size=31,
+                dtype=torch.bfloat16,
+            )
+        )
+
+    with pytest.raises(ValueError, match="output_global_scale must be positive"):
+        NVFP4GemmSwiGLUNVFP4QuantInputs(
+            NVFP4GemmSwiGLUNVFP4QuantInputConfig(
+                M=3,
+                K=64,
+                intermediate_size=32,
+                dtype=torch.bfloat16,
+                output_global_scale=0.0,
+            )
+        )
 
 
 def test_moe_inputs_compose_dense_weight_gemms() -> None:

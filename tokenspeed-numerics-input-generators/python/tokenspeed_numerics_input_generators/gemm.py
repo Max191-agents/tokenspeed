@@ -38,20 +38,29 @@ from tokenspeed_numerics_input_generators.core import (
     _normalize_shape,
     _packed_mxfp4_shape,
 )
+from tokenspeed_numerics_input_generators.quantization import (
+    nvfp4_dequantization_reference,
+    nvfp4_quantization_reference,
+)
 
 __all__ = [
     "GemmInputs",
     "GemmInputConfig",
     "GemmInputValues",
+    "NVFP4GemmSwiGLUNVFP4QuantInputConfig",
+    "NVFP4GemmSwiGLUNVFP4QuantInputs",
+    "NVFP4GemmSwiGLUNVFP4QuantInputValues",
     "gemm_reference",
     "gemm_scale_shape",
     "mxfp4_gemm_input_config",
+    "nvfp4_gemm_swiglu_nvfp4_quant_reference",
 ]
 
 GemmLayout = Literal["MK", "KM", "NK", "KN"]
 ScaleGranularity = Literal["tensor", "channel", "block"]
 
 _DEFAULT_MXFP4_BLOCK_SIZE = 32
+_DEFAULT_NVFP4_BLOCK_SIZE = 16
 _GEMM_LAYOUTS = frozenset({"MK", "KM", "NK", "KN"})
 
 
@@ -226,6 +235,24 @@ def _apply_regular_scales(values: torch.Tensor, scales: torch.Tensor) -> torch.T
         "unsupported GEMM scale shape for reference; "
         f"values={tuple(values.shape)}, scales={tuple(scales.shape)}"
     )
+
+
+def _check_nvfp4_source_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"NVFP4 fused GEMM input dtype must be bf16 or fp16, got {dtype}")
+    return dtype
+
+
+def _nvfp4_global_scale_for(tensor: torch.Tensor) -> torch.Tensor:
+    scale = (tensor.detach().abs().amax().to(torch.float32) / (448.0 * 6.0)).clamp(
+        min=1.0e-8
+    )
+    return scale.reshape(1).to(device=tensor.device, dtype=torch.float32)
+
+
+def _silu_and_mul(gate_up: torch.Tensor) -> torch.Tensor:
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    return torch.nn.functional.silu(gate) * up
 
 
 def _logical_operand(
@@ -587,4 +614,193 @@ def mxfp4_gemm_input_config(
                 block_shape=(block_size,),
             )
         ),
+    )
+
+
+@dataclass
+class NVFP4GemmSwiGLUNVFP4QuantInputValues:
+    """Generated values for fused NVFP4 GEMM + SwiGLU + NVFP4 quantization."""
+
+    x: torch.Tensor
+    w1: torch.Tensor
+    x_fp4: torch.Tensor
+    x_scale: torch.Tensor
+    w1_fp4: torch.Tensor
+    w1_scale: torch.Tensor
+    x_global_scale: torch.Tensor
+    w1_global_scale: torch.Tensor
+    fc1_alpha: torch.Tensor
+    output_global_scale: torch.Tensor
+    output_global_scale_inv: torch.Tensor
+    scale_size: int
+
+
+@dataclass
+class NVFP4GemmSwiGLUNVFP4QuantInputConfig:
+    """Initialization parameters for fused NVFP4 GEMM/SwiGLU/quant inputs.
+
+    The represented operation dequantizes packed NVFP4 activations ``x_fp4``
+    and gate/up weights ``w1_fp4``, computes ``x @ w1.T``, applies
+    ``silu(gate) * up`` after splitting the GEMM result in half, then quantizes
+    the activated output back to NVFP4.
+    """
+
+    # Required: logical number of input token rows.
+    M: int
+
+    # Required: logical input/reduction width.
+    K: int
+
+    # Required: hidden width after the gate/up split. The FC1 output width is
+    # 2 * intermediate_size.
+    intermediate_size: int
+
+    # Required: generated floating source dtype before NVFP4 quantization.
+    dtype: torch.dtype
+
+    # Optional: number of values covered by each NVFP4 FP8 scale. TokenSpeed
+    # NVFP4 kernels currently use 16.
+    scale_size: int = _DEFAULT_NVFP4_BLOCK_SIZE
+
+    # Optional: tensor-wide scale used when quantizing the SwiGLU output back
+    # to NVFP4. The default keeps typical generated MLP activations in range
+    # without requiring generation to run the full GEMM.
+    output_global_scale: float = 0.01
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class NVFP4GemmSwiGLUNVFP4QuantInputs(NumericsInputGenerator):
+    """Generator for fused NVFP4 GEMM + SwiGLU + NVFP4 quantization inputs."""
+
+    config: NVFP4GemmSwiGLUNVFP4QuantInputConfig
+    x_input: TensorInput | None
+    w1_input: TensorInput | None
+
+    def __init__(self, config: NVFP4GemmSwiGLUNVFP4QuantInputConfig) -> None:
+        self.config = config
+        self.x_input = None
+        self.w1_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.M = int(self.config.M)
+        self.config.K = int(self.config.K)
+        self.config.intermediate_size = int(self.config.intermediate_size)
+        self.config.scale_size = int(self.config.scale_size)
+        self.config.output_global_scale = float(self.config.output_global_scale)
+        if self.config.M <= 0:
+            raise ValueError("M must be positive")
+        if self.config.K <= 0:
+            raise ValueError("K must be positive")
+        if self.config.intermediate_size <= 0:
+            raise ValueError("intermediate_size must be positive")
+        if self.config.scale_size != _DEFAULT_NVFP4_BLOCK_SIZE:
+            raise ValueError(
+                f"NVFP4 fused GEMM currently requires scale_size={_DEFAULT_NVFP4_BLOCK_SIZE}"
+            )
+        if self.config.K % self.config.scale_size != 0:
+            raise ValueError("K must be divisible by scale_size")
+        if self.config.intermediate_size % self.config.scale_size != 0:
+            raise ValueError("intermediate_size must be divisible by scale_size")
+        if self.config.output_global_scale <= 0.0:
+            raise ValueError("output_global_scale must be positive")
+        self.config.dtype = _check_nvfp4_source_dtype(self.config.dtype)
+        self.x_input = self.x_input or TensorInput(
+            (self.config.M, self.config.K),
+            self.config.dtype,
+            device=self.config.device,
+        )
+        self.w1_input = self.w1_input or TensorInput(
+            (2 * self.config.intermediate_size, self.config.K),
+            self.config.dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> NVFP4GemmSwiGLUNVFP4QuantInputValues:
+        self.__post_init__()
+        if self.x_input is None or self.w1_input is None:
+            raise ValueError(
+                "NVFP4GemmSwiGLUNVFP4QuantInputs child generators must be initialized"
+            )
+        self.x_input.shape = (self.config.M, self.config.K)
+        self.x_input.dtype = self.config.dtype
+        self.w1_input.shape = (2 * self.config.intermediate_size, self.config.K)
+        self.w1_input.dtype = self.config.dtype
+        x = self.x_input.generate(seed=_child_seed(seed, 1), device=device).values
+        w1 = self.w1_input.generate(seed=_child_seed(seed, 2), device=device).values
+        if x is None or w1 is None:
+            raise ValueError("x and w1 generation must not be skipped")
+        x = x.contiguous()
+        w1 = (w1.float() / math.sqrt(self.config.K)).to(self.config.dtype).contiguous()
+        x_global_scale = _nvfp4_global_scale_for(x)
+        w1_global_scale = _nvfp4_global_scale_for(w1)
+        x_fp4, x_scale = nvfp4_quantization_reference(
+            x,
+            scale=x_global_scale,
+            scale_size=self.config.scale_size,
+        )
+        w1_fp4, w1_scale = nvfp4_quantization_reference(
+            w1,
+            scale=w1_global_scale,
+            scale_size=self.config.scale_size,
+        )
+        output_global_scale = torch.tensor(
+            [self.config.output_global_scale],
+            dtype=torch.float32,
+            device=x.device,
+        )
+        return NVFP4GemmSwiGLUNVFP4QuantInputValues(
+            x=x,
+            w1=w1,
+            x_fp4=x_fp4,
+            x_scale=x_scale,
+            w1_fp4=w1_fp4,
+            w1_scale=w1_scale,
+            x_global_scale=x_global_scale,
+            w1_global_scale=w1_global_scale,
+            fc1_alpha=x_global_scale * w1_global_scale,
+            output_global_scale=output_global_scale,
+            output_global_scale_inv=1.0 / output_global_scale,
+            scale_size=self.config.scale_size,
+        )
+
+
+def nvfp4_gemm_swiglu_nvfp4_quant_reference(
+    values: NVFP4GemmSwiGLUNVFP4QuantInputValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return packed NVFP4 output for fused NVFP4 GEMM + SwiGLU."""
+
+    if values.x_fp4.ndim != 2 or values.w1_fp4.ndim != 2:
+        raise ValueError("x_fp4 and w1_fp4 must be rank-2 packed NVFP4 tensors")
+    if values.w1_fp4.shape[0] % 2 != 0:
+        raise ValueError("w1_fp4 must contain an even gate/up row count")
+    if values.x_fp4.shape[1] != values.w1_fp4.shape[1]:
+        raise ValueError("x_fp4 and w1_fp4 packed K dimensions must match")
+    if values.output_global_scale.numel() != 1:
+        raise ValueError("output_global_scale must be scalar")
+    x = nvfp4_dequantization_reference(
+        values.x_fp4,
+        values.x_scale,
+        scale=values.x_global_scale,
+        scale_size=values.scale_size,
+    )
+    w1 = nvfp4_dequantization_reference(
+        values.w1_fp4,
+        values.w1_scale,
+        scale=values.w1_global_scale,
+        scale_size=values.scale_size,
+    )
+    activated = _silu_and_mul(x @ w1.T)
+    return nvfp4_quantization_reference(
+        activated,
+        scale=values.output_global_scale,
+        scale_size=values.scale_size,
     )

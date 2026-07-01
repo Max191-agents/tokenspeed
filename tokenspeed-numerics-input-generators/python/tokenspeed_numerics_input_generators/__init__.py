@@ -150,9 +150,13 @@ from tokenspeed_numerics_input_generators.gemm import (
     GemmInputConfig,
     GemmInputValues,
     GemmInputs,
+    NVFP4GemmSwiGLUNVFP4QuantInputConfig,
+    NVFP4GemmSwiGLUNVFP4QuantInputs,
+    NVFP4GemmSwiGLUNVFP4QuantInputValues,
     gemm_reference,
     gemm_scale_shape,
     mxfp4_gemm_input_config,
+    nvfp4_gemm_swiglu_nvfp4_quant_reference,
 )
 from tokenspeed_numerics_input_generators.kvcache import (
     FP8KVCacheWriteInputConfig,
@@ -226,6 +230,7 @@ from tokenspeed_numerics_input_generators.quantization import (
     mxfp8_quantization_reference,
     mxfp8_scale_shape,
     nvfp4_quantization_reference,
+    nvfp4_dequantization_reference,
     nvfp4_scale_shape,
 )
 from tokenspeed_numerics_input_generators.rotary import build_rope_cos_sin_cache
@@ -368,6 +373,9 @@ __all__ = [
     "NVFP4QuantizationInputConfig",
     "NVFP4QuantizationInputValues",
     "NVFP4QuantizationInputs",
+    "NVFP4GemmSwiGLUNVFP4QuantInputConfig",
+    "NVFP4GemmSwiGLUNVFP4QuantInputValues",
+    "NVFP4GemmSwiGLUNVFP4QuantInputs",
     "NumericsInputGenerator",
     "PageTableInput",
     "PageTableGatherInputConfig",
@@ -444,6 +452,8 @@ __all__ = [
     "mxfp8_quantization_reference",
     "mxfp8_scale_shape",
     "nvfp4_quantization_reference",
+    "nvfp4_dequantization_reference",
+    "nvfp4_gemm_swiglu_nvfp4_quant_reference",
     "nvfp4_scale_shape",
     "qk_rmsnorm_reference",
     "packed_qkv_complex_rotary_reference",

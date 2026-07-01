@@ -44,6 +44,28 @@ shared custom dtype enum so the format-specific constraints are centralized.
 channel, and block granularities. `mxfp4_gemm_input_config` builds a GEMM config
 for MXFP4 operands with block scales.
 
+## Fused NVFP4 GEMM And SwiGLU
+
+`NVFP4GemmSwiGLUNVFP4QuantInputs` represents the fused dense MLP primitive:
+
+```text
+gate_up = dequant_nvfp4(x_fp4) @ dequant_nvfp4(w1_fp4).T
+gate, up = split(gate_up)
+activated = silu(gate) * up
+out_fp4, out_scale = quantize_nvfp4(activated)
+```
+
+The generator produces model-like floating source tensors, quantizes them into
+packed NVFP4 values plus linear FP8 group scales, and returns the global scales
+needed by NVFP4 GEMM adapters. The output NVFP4 global scale is explicit in the
+config so generation does not need to run the full GEMM just to infer a scale.
+TokenSpeed kernels may require backend-specific scale swizzles or gate/up
+weight interleaving; those layouts are adapter concerns.
+
+`nvfp4_gemm_swiglu_nvfp4_quant_reference` implements the operation using the
+same NVFP4 dequantization and quantization semantics as the quantization
+family.
+
 ## Verification
 
 The generator verifies logical dimensions, required output dtype, layout-derived
@@ -53,3 +75,7 @@ without compatible scales. Layout names are validated explicitly. The current
 MXFP4 GEMM definition is the row-major form consumed by the TokenSpeed Triton
 MXFP4 GEMM path, so MXFP4 `A` operands require `MK` layout and MXFP4 `B`
 operands require `NK` layout.
+
+The fused NVFP4 generator also verifies the fixed NVFP4 scale group width,
+source dtype, divisibility of K and intermediate dimensions by the scale group,
+and scalar global-scale relationships.

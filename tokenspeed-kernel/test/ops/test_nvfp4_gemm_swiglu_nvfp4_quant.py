@@ -24,6 +24,11 @@ import math
 
 import pytest
 import torch
+from tokenspeed_numerics_input_generators import (
+    NVFP4GemmSwiGLUNVFP4QuantInputConfig,
+    NVFP4GemmSwiGLUNVFP4QuantInputs,
+    TensorInput,
+)
 
 
 def _has_sm100() -> bool:
@@ -168,71 +173,64 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
 
     load_builtin_kernels()
 
-    torch.manual_seed(1000 + m + i)
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    w1 = (
-        torch.randn(2 * i, k, device="cuda", dtype=torch.bfloat16) / math.sqrt(k)
-    ).contiguous()
-    w2 = (
-        torch.randn(k, i, device="cuda", dtype=torch.bfloat16) / math.sqrt(i)
-    ).contiguous()
-
-    x_scale_inv = _scale_inv_for(x)
-    w1_scale_inv = _scale_inv_for(w1)
+    values = NVFP4GemmSwiGLUNVFP4QuantInputs(
+        NVFP4GemmSwiGLUNVFP4QuantInputConfig(
+            M=m,
+            K=k,
+            intermediate_size=i,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=1000 + m + i, device="cuda")
+    w2_values = TensorInput((k, i), torch.bfloat16).generate(
+        seed=2000 + m + i,
+        device="cuda",
+    )
+    assert w2_values.values is not None
+    w2 = (w2_values.values.float() / math.sqrt(i)).to(torch.bfloat16).contiguous()
     w2_scale_inv = _scale_inv_for(w2)
 
-    x_fp4, x_scale = fp4_quantize(x, x_scale_inv, enable_pdl=True)
-    w1_fp4, w1_scale = fp4_quantize(
-        w1,
-        w1_scale_inv,
-        is_sf_swizzled_layout=False,
-        enable_pdl=True,
-    )
     w2_fp4, w2_scale = fp4_quantize(
         w2,
         w2_scale_inv,
         is_sf_swizzled_layout=False,
         enable_pdl=True,
     )
-    w1_scale_swizzled = swizzle_blockscale_2d(w1_scale)
+    x_scale_swizzled = swizzle_blockscale_2d(values.x_scale)
+    w1_scale_swizzled = swizzle_blockscale_2d(values.w1_scale)
     w2_scale_swizzled = swizzle_blockscale_2d(w2_scale)
 
-    fc1_alpha = (1.0 / x_scale_inv) * (1.0 / w1_scale_inv)
     gate_up = tokenspeed_kernel.mm(
-        x_fp4,
-        w1_fp4.T,
-        A_scales=x_scale,
+        values.x_fp4,
+        values.w1_fp4.T,
+        A_scales=x_scale_swizzled,
         B_scales=w1_scale_swizzled.T,
         out_dtype=torch.bfloat16,
-        alpha=fc1_alpha,
+        alpha=values.fc1_alpha,
         quant="nvfp4",
         enable_pdl=True,
         expected_kernel_name="flashinfer_mm_nvfp4",
     ).view(m, 2 * i)
 
-    silu_out = (
-        torch.nn.functional.silu(gate_up[:, :i].float()) * gate_up[:, i:].float()
-    ).to(torch.bfloat16)
-    down_input_scale_inv = _scale_inv_for(silu_out)
+    down_input_scale_inv = values.output_global_scale_inv
     ref_fp4, ref_scale = silu_and_mul_fuse_nvfp4_quant(
         gate_up,
         down_input_scale_inv,
         enable_pdl=True,
     )
 
-    gate_fp4, linear_fp4 = w1_fp4.chunk(2, dim=0)
+    gate_fp4, linear_fp4 = values.w1_fp4.chunk(2, dim=0)
     linear_gate_fp4 = torch.cat((linear_fp4, gate_fp4), dim=0)
-    gate_scale, linear_scale = w1_scale.chunk(2, dim=0)
+    gate_scale, linear_scale = values.w1_scale.chunk(2, dim=0)
     linear_gate_scale = torch.cat((linear_scale, gate_scale), dim=0)
 
     fused_fp4, fused_scale = nvfp4_gemm_swiglu_nvfp4_quant(
-        x_fp4,
-        x_scale,
+        values.x_fp4,
+        x_scale_swizzled,
         interleave_linear_and_gate(linear_gate_fp4, group_size=64, dim=0),
         swizzle_blockscale_2d(
             interleave_linear_and_gate(linear_gate_scale, group_size=64, dim=0)
         ),
-        fc1_alpha,
+        values.fc1_alpha,
         down_input_scale_inv,
         enable_pdl=True,
     )
