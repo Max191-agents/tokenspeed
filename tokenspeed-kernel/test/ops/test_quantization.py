@@ -31,34 +31,22 @@ from tokenspeed_kernel import (
 )
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import current_platform
-
-FP8_E4M3_FNUZ_MAX = 240.0
+from tokenspeed_numerics_input_generators import (
+    FP8QuantizationInputConfig,
+    FP8QuantizationInputs,
+    MXFP4QuantizationInputConfig,
+    MXFP4QuantizationInputs,
+    MXFP8QuantizationInputConfig,
+    MXFP8QuantizationInputs,
+    NVFP4QuantizationInputConfig,
+    NVFP4QuantizationInputs,
+    fp8_quantization_reference,
+    mxfp4_quantization_reference,
+)
 
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
-
-
-def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
-    magnitude_bits = nibbles & 0x7
-    exponent = (magnitude_bits >> 1).to(torch.float32)
-    mantissa = (magnitude_bits & 0x1).to(torch.float32)
-    normal = (1.0 + 0.5 * mantissa) * torch.exp2(exponent - 1.0)
-    subnormal = 0.5 * mantissa
-    magnitude = torch.where(exponent == 0, subnormal, normal)
-    sign = 1.0 - 2.0 * ((nibbles >> 3) & 0x1).to(torch.float32)
-    return magnitude * sign
-
-
-def _dequantize_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    out = packed.new_empty(
-        (*packed.shape[:-1], packed.shape[-1] * 2),
-        dtype=torch.float32,
-    )
-    out[..., 0::2] = _e2m1_values(packed & 0xF)
-    out[..., 1::2] = _e2m1_values(packed >> 4)
-    scale_values = torch.pow(2.0, scale.to(torch.int32) - 127).to(torch.float32)
-    return out * scale_values.repeat_interleave(32, dim=-1)
 
 
 @pytest.mark.parametrize("solution", ["triton"])
@@ -79,15 +67,24 @@ def test_quantize_fp8_pure_cast_bf16(
     shape: tuple[int, ...],
     require,
 ) -> None:
-    torch.manual_seed(0)
     dtype = torch.bfloat16
     require("quantization", "fp8", solution, dtype, "x")
+    values = FP8QuantizationInputs(
+        FP8QuantizationInputConfig(
+            shape=shape,
+            dtype=dtype,
+            output_dtype=current_platform().fp8e4m3fn.dtype,
+            granularity="none",
+        )
+    ).generate(seed=sum(shape), device=device)
 
-    x = torch.randn(shape, device=device, dtype=dtype) * 50
-    fp8 = current_platform().fp8e4m3fn
-    ref = x.to(fp8.dtype)
+    ref = fp8_quantization_reference(
+        values.x,
+        granularity="none",
+        output_dtype=current_platform().fp8e4m3fn.dtype,
+    ).to(current_platform().fp8e4m3fn.dtype)
 
-    out = quantize_fp8(x, solution=solution)
+    out = quantize_fp8(values.x, solution=solution)
     torch.cuda.synchronize()
 
     assert out.shape == ref.shape
@@ -103,46 +100,28 @@ def test_quantize_mxfp4_dynamic_scales(
 ) -> None:
     dtype = torch.bfloat16
     require("quantization", "mxfp4", solution, dtype, "x")
+    values = MXFP4QuantizationInputs(
+        MXFP4QuantizationInputConfig(
+            shape=(2, 64),
+            dtype=dtype,
+        )
+    ).generate(seed=11, device=device)
+    ref_out, ref_scale = mxfp4_quantization_reference(values.x)
 
-    base = torch.tensor(
-        [
-            0.0,
-            0.5,
-            -0.5,
-            1.0,
-            -1.0,
-            1.5,
-            -1.5,
-            2.0,
-            -2.0,
-            3.0,
-            -3.0,
-            4.0,
-            -4.0,
-            6.0,
-            -6.0,
-            0.0,
-        ],
-        device=device,
-        dtype=dtype,
+    out, scale = quantize_mxfp4(
+        values.x,
+        scale_size=values.scale_size,
+        scale_layout=values.scale_layout,
+        solution=solution,
     )
-    row = torch.cat([base, base, base * 0.25, base * 0.25], dim=0)
-    x = torch.stack([row, row], dim=0)
-
-    out, scale = quantize_mxfp4(x, scale_layout="linear", solution=solution)
     torch.cuda.synchronize()
 
-    assert out.shape == (2, 32)
+    assert out.shape == ref_out.shape
     assert out.dtype == torch.uint8
-    assert scale.shape == (2, 2)
+    assert scale.shape == ref_scale.shape
     assert scale.dtype == torch.uint8
-    torch.testing.assert_close(
-        scale.cpu(),
-        torch.tensor([[127, 125], [127, 125]], dtype=torch.uint8),
-    )
-
-    dequant = _dequantize_mxfp4(out.cpu(), scale.cpu())
-    torch.testing.assert_close(dequant, x.cpu().to(torch.float32), rtol=0, atol=0)
+    assert torch.equal(out.cpu(), ref_out.cpu())
+    assert torch.equal(scale.cpu(), ref_scale.cpu())
 
 
 @pytest.mark.parametrize("solution", ["triton"])
@@ -151,17 +130,26 @@ def test_quantize_fp8_strided_slice(
     solution: str,
     require,
 ) -> None:
-    torch.manual_seed(1)
     dtype = torch.bfloat16
     require("quantization", "fp8", solution, dtype, "x")
 
     s, h, qk_nope, v_head = 4096, 16, 128, 128
-    kv = torch.randn(s, h, qk_nope + v_head, device=device, dtype=dtype) * 50
-    v = kv[..., qk_nope:]
+    values = FP8QuantizationInputs(
+        FP8QuantizationInputConfig(
+            shape=(s, h, qk_nope + v_head),
+            dtype=dtype,
+            output_dtype=current_platform().fp8e4m3fn.dtype,
+            granularity="none",
+        )
+    ).generate(seed=12, device=device)
+    v = values.x[..., qk_nope:]
     assert not v.is_contiguous()
 
-    fp8 = current_platform().fp8e4m3fn
-    ref = v.to(fp8.dtype)
+    ref = fp8_quantization_reference(
+        v,
+        granularity="none",
+        output_dtype=current_platform().fp8e4m3fn.dtype,
+    ).to(current_platform().fp8e4m3fn.dtype)
 
     out = quantize_fp8(v, solution=solution)
     torch.cuda.synchronize()
@@ -177,18 +165,25 @@ def test_quantize_fp8_scale_float(
     scale: float,
     require,
 ) -> None:
-    torch.manual_seed(2)
     dtype = torch.bfloat16
     require("quantization", "fp8", solution, dtype, "x")
+    values = FP8QuantizationInputs(
+        FP8QuantizationInputConfig(
+            shape=(2048, 512),
+            dtype=dtype,
+            output_dtype=current_platform().fp8e4m3fn.dtype,
+            granularity="none",
+        )
+    ).generate(seed=int(scale * 100), device=device)
 
-    x = torch.randn(2048, 512, device=device, dtype=dtype) * 100
-    fp8 = current_platform().fp8e4m3fn
-    inv_scale = 1.0 / scale
-    ref = (
-        (x.to(torch.float32) * inv_scale).clamp(min=fp8.min, max=fp8.max).to(fp8.dtype)
-    )
+    ref = fp8_quantization_reference(
+        values.x,
+        granularity="tensor",
+        scale=scale,
+        output_dtype=current_platform().fp8e4m3fn.dtype,
+    ).to(current_platform().fp8e4m3fn.dtype)
 
-    out = quantize_fp8(x, scale=scale, solution=solution)
+    out = quantize_fp8(values.x, scale=scale, solution=solution)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(out, ref)
@@ -200,19 +195,25 @@ def test_quantize_fp8_scale_tensor(
     solution: str,
     require,
 ) -> None:
-    torch.manual_seed(3)
     dtype = torch.bfloat16
     require("quantization", "fp8", solution, dtype, "x")
+    values = FP8QuantizationInputs(
+        FP8QuantizationInputConfig(
+            shape=(8, 2880),
+            dtype=dtype,
+            output_dtype=current_platform().fp8e4m3fn.dtype,
+            granularity="tensor",
+        )
+    ).generate(seed=13, device=device)
+    assert values.scale is not None
+    ref = fp8_quantization_reference(
+        values.x,
+        granularity="tensor",
+        scale=values.scale,
+        output_dtype=current_platform().fp8e4m3fn.dtype,
+    ).to(current_platform().fp8e4m3fn.dtype)
 
-    x = torch.randn(8, 2880, device=device, dtype=dtype) * 100
-    scale = torch.tensor([0.125], device=device, dtype=torch.float32)
-    fp8 = current_platform().fp8e4m3fn
-    inv_scale = (1.0 / scale.to(torch.float32)).reshape(())
-    ref = (
-        (x.to(torch.float32) * inv_scale).clamp(min=fp8.min, max=fp8.max).to(fp8.dtype)
-    )
-
-    out = quantize_fp8(x, scale=scale, solution=solution)
+    out = quantize_fp8(values.x, scale=values.scale, solution=solution)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(out, ref)
@@ -233,10 +234,20 @@ def test_quantize_fp8_scale_tensor(
     ],
 )
 def test_pure_cast_non_pow2_n(device: str, n: int) -> None:
-    torch.manual_seed(0)
-    x = torch.randn(33, n, device=device, dtype=torch.bfloat16) * 50
-    ref = x.to(torch.float8_e4m3fn)
-    out = fp8_quantize(x)
+    values = FP8QuantizationInputs(
+        FP8QuantizationInputConfig(
+            shape=(33, n),
+            dtype=torch.bfloat16,
+            output_dtype=torch.float8_e4m3fn,
+            granularity="none",
+        )
+    ).generate(seed=n, device=device)
+    ref = fp8_quantization_reference(
+        values.x,
+        granularity="none",
+        output_dtype=torch.float8_e4m3fn,
+    ).to(torch.float8_e4m3fn)
+    out = fp8_quantize(values.x)
     torch.cuda.synchronize()
     assert out.shape == ref.shape
     assert _bitwise_equal(out, ref)
@@ -249,10 +260,20 @@ def test_pure_cast_non_pow2_n(device: str, n: int) -> None:
 def test_pure_cast_e4m3fnuz(device: str) -> None:
     """CDNA3-specific fp8 dtype (bias=8). The Triton cast must saturate to
     ``±240`` to match ``x.to(torch.float8_e4m3fnuz)``."""
-    torch.manual_seed(0)
-    x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 50
-    ref = x.to(torch.float8_e4m3fnuz)
-    out = fp8_quantize(x, fp8_dtype=torch.float8_e4m3fnuz)
+    values = FP8QuantizationInputs(
+        FP8QuantizationInputConfig(
+            shape=(2048, 512),
+            dtype=torch.bfloat16,
+            output_dtype=torch.float8_e4m3fnuz,
+            granularity="none",
+        )
+    ).generate(seed=14, device=device)
+    ref = fp8_quantization_reference(
+        values.x,
+        granularity="none",
+        output_dtype=torch.float8_e4m3fnuz,
+    ).to(torch.float8_e4m3fnuz)
+    out = fp8_quantize(values.x, fp8_dtype=torch.float8_e4m3fnuz)
     torch.cuda.synchronize()
     assert out.dtype == torch.float8_e4m3fnuz
     assert _bitwise_equal(out, ref)
@@ -264,15 +285,21 @@ def test_pure_cast_e4m3fnuz(device: str) -> None:
 )
 @pytest.mark.parametrize("scale", [2.0, 0.5, 7.5])
 def test_scaled_cast_e4m3fnuz_matches_reference(device: str, scale: float) -> None:
-    torch.manual_seed(0)
-    x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 100
-    inv_scale = 1.0 / scale
-    ref = (
-        (x.to(torch.float32) * inv_scale)
-        .clamp(-FP8_E4M3_FNUZ_MAX, FP8_E4M3_FNUZ_MAX)
-        .to(torch.float8_e4m3fnuz)
-    )
-    out = fp8_quantize(x, scale=scale, fp8_dtype=torch.float8_e4m3fnuz)
+    values = FP8QuantizationInputs(
+        FP8QuantizationInputConfig(
+            shape=(2048, 512),
+            dtype=torch.bfloat16,
+            output_dtype=torch.float8_e4m3fnuz,
+            granularity="none",
+        )
+    ).generate(seed=int(scale * 100) + 14, device=device)
+    ref = fp8_quantization_reference(
+        values.x,
+        granularity="tensor",
+        scale=torch.tensor([scale], dtype=torch.float32, device=device),
+        output_dtype=torch.float8_e4m3fnuz,
+    ).to(torch.float8_e4m3fnuz)
+    out = fp8_quantize(values.x, scale=scale, fp8_dtype=torch.float8_e4m3fnuz)
     torch.cuda.synchronize()
     assert _bitwise_equal(out, ref)
 
@@ -285,27 +312,33 @@ def test_quantize_fp8_with_scale_tensor_and_token(
     granularity: str,
     require,
 ) -> None:
-    torch.manual_seed(4)
     dtype = torch.bfloat16
     require("quantization", "fp8_with_scale", solution, dtype, "x")
-
-    x = torch.randn(16, 128, device=device, dtype=dtype) * 10
+    values = FP8QuantizationInputs(
+        FP8QuantizationInputConfig(
+            shape=(16, 128),
+            dtype=dtype,
+            output_dtype=current_platform().fp8e4m3fn.dtype,
+            granularity=granularity,
+        )
+    ).generate(seed=15, device=device)
+    assert values.scale is not None
     fp8 = current_platform().fp8e4m3fn
 
     out, scale = quantize_fp8_with_scale(
-        x,
+        values.x,
         granularity=granularity,
         solution=solution,
     )
     torch.cuda.synchronize()
 
-    assert out.shape == x.shape
+    assert out.shape == values.x.shape
     assert out.dtype == fp8.dtype
     assert scale.dtype == torch.float32
     if granularity == "tensor":
         assert scale.shape == (1,)
     else:
-        assert scale.shape == (x.shape[0], 1)
+        assert scale.shape == (values.x.shape[0], 1)
 
 
 @pytest.mark.parametrize("solution", ["trtllm"])
@@ -314,22 +347,29 @@ def test_quantize_fp8_with_scale_token_group(
     solution: str,
     require,
 ) -> None:
-    torch.manual_seed(5)
     dtype = torch.bfloat16
     require("quantization", "fp8_with_scale", solution, dtype, "x")
-
-    x = torch.randn(16, 256, device=device, dtype=dtype) * 10
+    values = FP8QuantizationInputs(
+        FP8QuantizationInputConfig(
+            shape=(16, 256),
+            dtype=dtype,
+            output_dtype=current_platform().fp8e4m3fn.dtype,
+            granularity="token_group",
+            group_size=128,
+        )
+    ).generate(seed=16, device=device)
+    assert values.scale is not None
     fp8 = current_platform().fp8e4m3fn
 
     out, scale = quantize_fp8_with_scale(
-        x,
+        values.x,
         granularity="token_group",
         group_size=128,
         solution=solution,
     )
     torch.cuda.synchronize()
 
-    assert out.shape == x.shape
+    assert out.shape == values.x.shape
     assert out.dtype == fp8.dtype
     assert scale.dtype == torch.float32
     assert scale.numel() > 0
@@ -341,16 +381,20 @@ def test_quantize_mxfp8_shape_and_scale(
     solution: str,
     require,
 ) -> None:
-    torch.manual_seed(6)
     dtype = torch.bfloat16
     require("quantization", "mxfp8", solution, dtype, "x")
+    values = MXFP8QuantizationInputs(
+        MXFP8QuantizationInputConfig(
+            shape=(17, 2880),
+            dtype=dtype,
+        )
+    ).generate(seed=17, device=device)
 
-    x = torch.randn(17, 2880, device=device, dtype=dtype)
-    out, scale = quantize_mxfp8(x, solution=solution)
+    out, scale = quantize_mxfp8(values.x, solution=solution)
     torch.cuda.synchronize()
 
-    assert out.shape[:-1] == x.shape[:-1]
-    assert out.shape[-1] >= x.shape[-1]
+    assert out.shape[:-1] == values.x.shape[:-1]
+    assert out.shape[-1] >= values.x.shape[-1]
     assert scale.numel() > 0
 
 
@@ -360,18 +404,23 @@ def test_quantize_nvfp4_shape_and_scale(
     solution: str,
     require,
 ) -> None:
-    torch.manual_seed(7)
     dtype = torch.bfloat16
     require("quantization", "nvfp4", solution, dtype, "x")
+    values = NVFP4QuantizationInputs(
+        NVFP4QuantizationInputConfig(
+            shape=(16, 256),
+            dtype=dtype,
+            scale=0.125,
+        )
+    ).generate(seed=18, device=device)
 
-    x = torch.randn(16, 256, device=device, dtype=dtype)
     out, scale = quantize_nvfp4(
-        x,
-        scale=torch.tensor([0.125], device=device, dtype=torch.float32),
+        values.x,
+        scale=values.scale,
         solution=solution,
     )
     torch.cuda.synchronize()
 
-    assert out.shape[:-1] == x.shape[:-1]
-    assert out.shape[-1] == x.shape[-1] // 2
+    assert out.shape[:-1] == values.x.shape[:-1]
+    assert out.shape[-1] == values.x.shape[-1] // 2
     assert scale.numel() > 0

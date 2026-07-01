@@ -18,7 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Quantization-family input generators for numerical correctness tests."""
+"""Quantization-family input generators for numerical correctness tests.
+
+This family covers operation-level quantization formats used by TokenSpeed
+kernels. FP8 quantization casts floating inputs to an FP8 storage dtype,
+optionally after dividing by tensor, token, or token-group scales. MXFP8 and
+MXFP4 use one UE8M0 scale byte for each contiguous group of 32 source values;
+MXFP8 stores FP8 values while MXFP4 stores packed E2M1 nibbles. NVFP4 stores
+packed E2M1 nibbles with one FP8 E4M3 local scale per group of 16 values and
+one tensor-wide FP32 scale. Generators choose values that are valid for these
+formats and, for low-bit packed formats, often exactly representable so tests
+exercise kernel behavior instead of avoidable rounding ambiguity.
+"""
 
 from __future__ import annotations
 
@@ -729,7 +740,7 @@ def fp8_quantization_reference(
     granularity: FP8ScaleGranularity,
     group_size: int | None = None,
     output_dtype: torch.dtype = torch.float8_e4m3fn,
-    scale: torch.Tensor | None = None,
+    scale: torch.Tensor | float | None = None,
 ) -> torch.Tensor:
     """Return FP8 quantized values cast back to float32 for comparison."""
 
@@ -892,7 +903,9 @@ def nvfp4_dequantization_reference(
             f"NVFP4 reference currently supports scale_layout='linear', got {scale_layout!r}"
         )
     if packed.dtype != torch.uint8:
-        raise ValueError(f"packed NVFP4 values must use torch.uint8, got {packed.dtype}")
+        raise ValueError(
+            f"packed NVFP4 values must use torch.uint8, got {packed.dtype}"
+        )
     if scales.dtype != torch.float8_e4m3fn:
         raise ValueError(
             f"NVFP4 scale values must use torch.float8_e4m3fn, got {scales.dtype}"
