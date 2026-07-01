@@ -30,6 +30,8 @@ from tokenspeed_kernel import (
     mla_decode_with_kvcache,
     mla_prefill,
 )
+from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mla_decode_with_kvcache_kwargs,
     mla_prefill_kwargs,
@@ -44,8 +46,11 @@ from tokenspeed_numerics_input_generators import (
     MHAInputs,
     MLAInputConfig,
     MLAInputs,
+    MLAKVPackQuantizeFP8InputConfig,
+    MLAKVPackQuantizeFP8Inputs,
     MHARequestMetadataInputConfig,
     attention_merge_state_reference,
+    mla_kv_pack_quantize_fp8_reference,
 )
 
 
@@ -306,6 +311,41 @@ def test_mla_paged_decode_generator_runs_attention_kernel(
     assert inputs.q is not None
     assert out.shape == (inputs.q.shape[0], inputs.q.shape[1], inputs.q.shape[2], 128)
     assert not torch.isnan(out.float()).any()
+
+
+def test_mla_kv_pack_quantize_fp8_generator_runs_tokenspeed_mla_kernel(
+    device: str,
+) -> None:
+    if not current_platform().is_nvidia:
+        pytest.skip("tokenspeed_mla K/V pack+quantize is NVIDIA-only")
+
+    values = MLAKVPackQuantizeFP8Inputs(
+        MLAKVPackQuantizeFP8InputConfig(
+            num_tokens=32,
+            num_kv_heads=4,
+            qk_nope_head_dim=32,
+            qk_rope_head_dim=16,
+            v_head_dim=24,
+            input_dtype=torch.bfloat16,
+            k_scale_inv=0.5,
+            v_scale_inv=1.7,
+            fp8_dtype=torch.float8_e4m3fn,
+        )
+    ).generate(seed=206, device=device)
+    expected_k, expected_v = mla_kv_pack_quantize_fp8_reference(values)
+
+    actual_k, actual_v = mla_kv_pack_quantize_fp8(
+        values.k_nope,
+        values.k_pe,
+        values.v,
+        k_scale_inv=values.k_scale_inv,
+        v_scale_inv=values.v_scale_inv,
+        fp8_dtype=values.fp8_dtype,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual_k.view(torch.uint8), expected_k.view(torch.uint8))
+    assert torch.equal(actual_v.view(torch.uint8), expected_v.view(torch.uint8))
 
 
 @pytest.mark.parametrize("solution", ["triton", "gluon"])

@@ -57,6 +57,10 @@ __all__ = [
     "AttentionMergeStateInputValues",
     "attention_generate",
     "attention_merge_state_reference",
+    "MLAKVPackQuantizeFP8InputConfig",
+    "MLAKVPackQuantizeFP8Inputs",
+    "MLAKVPackQuantizeFP8InputValues",
+    "mla_kv_pack_quantize_fp8_reference",
     "MHAInputConfig",
     "MHAInputValues",
     "MHAInputs",
@@ -87,6 +91,25 @@ def _check_float_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
         raise TypeError(f"{name} must be a torch.dtype")
     if dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
         raise ValueError(f"{name} must be a regular floating torch dtype, got {dtype}")
+    return dtype
+
+
+def _fp8_dtypes() -> set[torch.dtype]:
+    dtypes = {torch.float8_e4m3fn, torch.float8_e5m2}
+    e4m3fnuz = getattr(torch, "float8_e4m3fnuz", None)
+    e5m2fnuz = getattr(torch, "float8_e5m2fnuz", None)
+    if e4m3fnuz is not None:
+        dtypes.add(e4m3fnuz)
+    if e5m2fnuz is not None:
+        dtypes.add(e5m2fnuz)
+    return dtypes
+
+
+def _check_fp8_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"{name} must be a torch.dtype")
+    if dtype not in _fp8_dtypes():
+        raise ValueError(f"{name} must be an FP8 torch dtype, got {dtype}")
     return dtype
 
 
@@ -444,6 +467,260 @@ def attention_merge_state_reference(
     ) / denom[..., None]
     lse = (lse_max_log2 + torch.log2(denom)) / values.lse_scale_log2
     return out.to(values.out_a.dtype), lse
+
+
+@dataclass
+class MLAKVPackQuantizeFP8InputValues:
+    """Generated values for MLA K/V pack and FP8 quantization."""
+
+    k_nope: torch.Tensor
+    k_pe: torch.Tensor
+    v: torch.Tensor
+    k_scale_inv: float
+    v_scale_inv: float
+    fp8_dtype: torch.dtype
+
+
+@dataclass
+class MLAKVPackQuantizeFP8InputConfig:
+    """Initialization parameters for MLA K/V pack and FP8 quantization.
+
+    The represented operation forms the materialized K tensor used by MLA by
+    broadcasting the RoPE key component across KV heads, concatenating it with
+    the non-RoPE key component, and independently scaling/casting K and V into
+    FP8 storage.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of token rows.
+    num_tokens: int
+
+    # Required: number of KV heads in k_nope and v.
+    num_kv_heads: int
+
+    # Required: non-RoPE key width per KV head.
+    qk_nope_head_dim: int
+
+    # Required: RoPE key width shared across KV heads.
+    qk_rope_head_dim: int
+
+    # Required: value width per KV head.
+    v_head_dim: int
+
+    # Required: generated input dtype for k_nope, k_pe, and v.
+    input_dtype: torch.dtype
+
+    # ------------------------------------------------------------------
+    # Optional generation and quantization configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: shape rank for k_pe. Rank 3 generates [tokens, 1, rope_dim];
+    # rank 2 generates [tokens, rope_dim].
+    k_pe_rank: int = 3
+
+    # Optional: inverse scale applied before casting packed K to FP8.
+    k_scale_inv: float = 1.0
+
+    # Optional: inverse scale applied before casting V to FP8.
+    v_scale_inv: float = 1.0
+
+    # Optional: generated output storage dtype.
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class MLAKVPackQuantizeFP8Inputs(NumericsInputGenerator):
+    """Generator for the MLA K/V pack and FP8 quantization primitive."""
+
+    config: MLAKVPackQuantizeFP8InputConfig
+    k_nope_input: TensorInput | None
+    k_pe_input: TensorInput | None
+    v_input: TensorInput | None
+
+    def __init__(self, config: MLAKVPackQuantizeFP8InputConfig) -> None:
+        self.config = config
+        self.k_nope_input = None
+        self.k_pe_input = None
+        self.v_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.num_kv_heads = _check_positive(
+            "num_kv_heads", self.config.num_kv_heads
+        )
+        self.config.qk_nope_head_dim = _check_positive(
+            "qk_nope_head_dim", self.config.qk_nope_head_dim
+        )
+        self.config.qk_rope_head_dim = _check_positive(
+            "qk_rope_head_dim", self.config.qk_rope_head_dim
+        )
+        self.config.v_head_dim = _check_positive("v_head_dim", self.config.v_head_dim)
+        self.config.input_dtype = _check_float_dtype(
+            "input_dtype", self.config.input_dtype
+        )
+        self.config.k_pe_rank = int(self.config.k_pe_rank)
+        if self.config.k_pe_rank not in (2, 3):
+            raise ValueError(f"k_pe_rank must be 2 or 3, got {self.config.k_pe_rank}")
+        self.config.k_scale_inv = float(self.config.k_scale_inv)
+        self.config.v_scale_inv = float(self.config.v_scale_inv)
+        if self.config.k_scale_inv <= 0.0:
+            raise ValueError(
+                f"k_scale_inv must be positive, got {self.config.k_scale_inv}"
+            )
+        if self.config.v_scale_inv <= 0.0:
+            raise ValueError(
+                f"v_scale_inv must be positive, got {self.config.v_scale_inv}"
+            )
+        self.config.fp8_dtype = _check_fp8_dtype("fp8_dtype", self.config.fp8_dtype)
+        self.k_nope_input = self.k_nope_input or TensorInput(
+            (
+                self.config.num_tokens,
+                self.config.num_kv_heads,
+                self.config.qk_nope_head_dim,
+            ),
+            self.config.input_dtype,
+            device=self.config.device,
+        )
+        k_pe_shape = (
+            (self.config.num_tokens, self.config.qk_rope_head_dim)
+            if self.config.k_pe_rank == 2
+            else (self.config.num_tokens, 1, self.config.qk_rope_head_dim)
+        )
+        self.k_pe_input = self.k_pe_input or TensorInput(
+            k_pe_shape,
+            self.config.input_dtype,
+            device=self.config.device,
+        )
+        self.v_input = self.v_input or TensorInput(
+            (
+                self.config.num_tokens,
+                self.config.num_kv_heads,
+                self.config.v_head_dim,
+            ),
+            self.config.input_dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> MLAKVPackQuantizeFP8InputValues:
+        del metadata_seed
+        self.__post_init__()
+        if self.k_nope_input is None or self.k_pe_input is None or self.v_input is None:
+            raise ValueError(
+                "MLAKVPackQuantizeFP8Inputs child generators must be initialized"
+            )
+        target_device = _resolve_device(self.config.device, device)
+        self.k_nope_input.shape = (
+            self.config.num_tokens,
+            self.config.num_kv_heads,
+            self.config.qk_nope_head_dim,
+        )
+        self.k_nope_input.dtype = self.config.input_dtype
+        self.k_pe_input.shape = (
+            (self.config.num_tokens, self.config.qk_rope_head_dim)
+            if self.config.k_pe_rank == 2
+            else (self.config.num_tokens, 1, self.config.qk_rope_head_dim)
+        )
+        self.k_pe_input.dtype = self.config.input_dtype
+        self.v_input.shape = (
+            self.config.num_tokens,
+            self.config.num_kv_heads,
+            self.config.v_head_dim,
+        )
+        self.v_input.dtype = self.config.input_dtype
+        return MLAKVPackQuantizeFP8InputValues(
+            k_nope=_require_tensor(
+                self.k_nope_input.generate(
+                    seed=_child_seed(seed, 1), device=target_device
+                ).values,
+                "k_nope",
+            ).contiguous(),
+            k_pe=_require_tensor(
+                self.k_pe_input.generate(
+                    seed=_child_seed(seed, 2), device=target_device
+                ).values,
+                "k_pe",
+            ).contiguous(),
+            v=_require_tensor(
+                self.v_input.generate(
+                    seed=_child_seed(seed, 3), device=target_device
+                ).values,
+                "v",
+            ).contiguous(),
+            k_scale_inv=self.config.k_scale_inv,
+            v_scale_inv=self.config.v_scale_inv,
+            fp8_dtype=self.config.fp8_dtype,
+        )
+
+
+def mla_kv_pack_quantize_fp8_reference(
+    values: MLAKVPackQuantizeFP8InputValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return packed K and V tensors after inverse scaling and FP8 cast."""
+
+    if values.k_nope.ndim != 3:
+        raise ValueError(f"k_nope must be rank-3, got {values.k_nope.ndim}")
+    if values.v.ndim != 3:
+        raise ValueError(f"v must be rank-3, got {values.v.ndim}")
+    if values.k_pe.ndim not in (2, 3):
+        raise ValueError(f"k_pe must be rank-2 or rank-3, got {values.k_pe.ndim}")
+    if values.k_nope.shape[:2] != values.v.shape[:2]:
+        raise ValueError(
+            "k_nope and v must have matching token/head dimensions; "
+            f"k_nope={tuple(values.k_nope.shape)}, v={tuple(values.v.shape)}"
+        )
+    if values.k_pe.shape[0] != values.k_nope.shape[0]:
+        raise ValueError(
+            "k_pe token dimension must match k_nope; "
+            f"k_pe={tuple(values.k_pe.shape)}, k_nope={tuple(values.k_nope.shape)}"
+        )
+    if values.k_pe.ndim == 3 and values.k_pe.shape[1] != 1:
+        raise ValueError(
+            "rank-3 k_pe must have singleton head dimension; "
+            f"got {tuple(values.k_pe.shape)}"
+        )
+    if (
+        values.k_nope.device != values.k_pe.device
+        or values.k_nope.device != values.v.device
+    ):
+        raise ValueError("k_nope, k_pe, and v must be on the same device")
+    for name, tensor in (
+        ("k_nope", values.k_nope),
+        ("k_pe", values.k_pe),
+        ("v", values.v),
+    ):
+        _check_float_dtype(f"{name} dtype", tensor.dtype)
+    if (
+        values.k_nope.dtype != values.k_pe.dtype
+        or values.k_nope.dtype != values.v.dtype
+    ):
+        raise ValueError("k_nope, k_pe, and v must have the same dtype")
+    if values.k_scale_inv <= 0.0:
+        raise ValueError(f"k_scale_inv must be positive, got {values.k_scale_inv}")
+    if values.v_scale_inv <= 0.0:
+        raise ValueError(f"v_scale_inv must be positive, got {values.v_scale_inv}")
+    fp8_dtype = _check_fp8_dtype("fp8_dtype", values.fp8_dtype)
+
+    k_pe_2d = values.k_pe.squeeze(1) if values.k_pe.ndim == 3 else values.k_pe
+    k_pe_heads = k_pe_2d.unsqueeze(1).expand(-1, values.k_nope.shape[1], -1)
+    k = torch.cat((values.k_nope, k_pe_heads), dim=-1)
+    k_fp8 = (k.float() * values.k_scale_inv).to(fp8_dtype)
+    v_fp8 = (values.v.float() * values.v_scale_inv).to(fp8_dtype)
+    return k_fp8.contiguous(), v_fp8.contiguous()
 
 
 @dataclass

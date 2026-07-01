@@ -25,6 +25,23 @@ metadata and cache-layout concepts as MHA, but uses MLA-specific operand shapes:
 query-nope, query positional embedding channels, compressed KV cache contents,
 and optional new compressed KV inputs.
 
+### MLA K/V Pack And FP8 Quantize
+
+`MLAKVPackQuantizeFP8Inputs` represents the utility operation that materializes
+MLA K/V tensors for FP8 cache storage. The operation takes non-RoPE key channels
+`k_nope`, RoPE key channels `k_pe`, and value channels `v`:
+
+```text
+k_pe_heads = broadcast(k_pe, across=kv_heads)
+k = concat(k_nope, k_pe_heads, dim=-1)
+k_fp8 = cast_fp8(k * k_scale_inv)
+v_fp8 = cast_fp8(v * v_scale_inv)
+```
+
+`k_nope` and `v` have shape `[num_tokens, num_kv_heads, dim]`. `k_pe` may be
+`[num_tokens, qk_rope_head_dim]` or `[num_tokens, 1, qk_rope_head_dim]`; both
+forms represent the same per-token RoPE key component shared by all KV heads.
+
 ### Merge State
 
 `AttentionMergeStateInputs` represents merging two partial attention outputs and
@@ -54,6 +71,9 @@ values:
 - cache configuration must match the requested cache layout
 - paged caches require consistent page-table configuration
 - MHA query heads must be compatible with KV heads for grouped attention
+- MLA K/V pack inputs require matching token/head dimensions for `k_nope` and
+  `v`, positive inverse scales, a broadcastable RoPE key tensor, and an FP8
+  output dtype
 - merge-state outputs must have shape `[total_q, num_heads, head_dim]`
 - merge-state LSE tensors must have shape `[total_q, num_heads]` and use fp32
   generated values
@@ -67,6 +87,8 @@ can reuse the same request/cache layout across different value draws.
 
 TokenSpeed has several attention registry entry points: MHA prefill, MHA
 extend/decode with KV cache, MLA prefill, MLA decode with KV cache, and
-attention merge-state. The generator values are operation-level values. Tests
-or adapters are responsible for converting generated values into the exact
-keyword arguments expected by a selected TokenSpeed backend.
+attention merge-state. TokenSpeed also exposes an MLA K/V pack+quantize helper
+that maps directly to `MLAKVPackQuantizeFP8InputValues`. The generator values
+are operation-level values. Tests or adapters are responsible for converting
+generated values into the exact keyword arguments expected by a selected
+TokenSpeed backend.
