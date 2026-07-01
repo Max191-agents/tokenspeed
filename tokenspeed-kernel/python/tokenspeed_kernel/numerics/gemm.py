@@ -24,7 +24,7 @@ import math
 from typing import Any, Literal
 
 import torch
-from tokenspeed_kernel.numerics.input_generators import (
+from tokenspeed_numerics_input_generators import (
     CustomDType,
     GemmInputConfig,
     GemmInputs,

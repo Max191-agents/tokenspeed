@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tokenspeed_kernel.numerics.input_generators.attention import (
+from tokenspeed_numerics_input_generators.attention import (
     MHAInputValues,
     MLAInputValues,
 )

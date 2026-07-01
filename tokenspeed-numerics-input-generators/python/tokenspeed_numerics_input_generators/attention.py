@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
 import torch
-from tokenspeed_kernel.numerics.input_generators.attention_cache import (
+from tokenspeed_numerics_input_generators.attention_cache import (
     KVCacheInput,
     KVCacheInputConfig,
     KVCacheValues,
@@ -36,14 +36,14 @@ from tokenspeed_kernel.numerics.input_generators.attention_cache import (
     MLAKVCacheValues,
     PageTableInputConfig,
 )
-from tokenspeed_kernel.numerics.input_generators.attention_metadata import (
+from tokenspeed_numerics_input_generators.attention_metadata import (
     CacheLayout,
     MHARequestMetadataInputConfig,
     MHARequestMetadataInput,
     MHARequestMetadataValues,
     PageTableIndexing,
 )
-from tokenspeed_kernel.numerics.input_generators.core import (
+from tokenspeed_numerics_input_generators.core import (
     DeviceLike,
     NumericsInputGenerator,
     TensorInput,

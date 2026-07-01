@@ -218,7 +218,7 @@ def _read_requirements(path: Path, seen=None) -> list[str]:
 
 def _selected_install_requires() -> list[str]:
     backend = _selected_backend()
-    requirements = []
+    requirements = ["tokenspeed-numerics-input-generators==0.1.0"]
     requirements.extend(
         _read_requirements(REQUIREMENTS_DIR / f"{backend}-thirdparty.txt")
     )

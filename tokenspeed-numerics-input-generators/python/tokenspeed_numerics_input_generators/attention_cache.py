@@ -27,10 +27,10 @@ from dataclasses import dataclass
 from typing import Literal, cast
 
 import torch
-from tokenspeed_kernel.numerics.input_generators.attention_metadata import (
+from tokenspeed_numerics_input_generators.attention_metadata import (
     PageTableIndexing,
 )
-from tokenspeed_kernel.numerics.input_generators.core import (
+from tokenspeed_numerics_input_generators.core import (
     DeviceLike,
     NumericsInputGenerator,
     TensorInput,

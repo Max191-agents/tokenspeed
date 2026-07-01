@@ -26,7 +26,7 @@ core tensor primitives separate from op/layer-family generators.
 
 from __future__ import annotations
 
-from tokenspeed_kernel.numerics.input_generators.attention import (
+from tokenspeed_numerics_input_generators.attention import (
     MHAInputConfig,
     MHAInputs,
     MHAInputValues,
@@ -34,7 +34,7 @@ from tokenspeed_kernel.numerics.input_generators.attention import (
     MLAInputs,
     MLAInputValues,
 )
-from tokenspeed_kernel.numerics.input_generators.attention_cache import (
+from tokenspeed_numerics_input_generators.attention_cache import (
     AttentionCacheInput,
     KVCacheInput,
     KVCacheInputConfig,
@@ -47,12 +47,12 @@ from tokenspeed_kernel.numerics.input_generators.attention_cache import (
     PageTableInputConfig,
     PageTableValues,
 )
-from tokenspeed_kernel.numerics.input_generators.attention_metadata import (
+from tokenspeed_numerics_input_generators.attention_metadata import (
     MHARequestMetadataInputConfig,
     MHARequestMetadataInput,
     MHARequestMetadataValues,
 )
-from tokenspeed_kernel.numerics.input_generators.core import (
+from tokenspeed_numerics_input_generators.core import (
     CustomDType,
     DeviceLike,
     InputDType,
@@ -60,7 +60,7 @@ from tokenspeed_kernel.numerics.input_generators.core import (
     TensorInput,
     TensorValues,
 )
-from tokenspeed_kernel.numerics.input_generators.gemm import (
+from tokenspeed_numerics_input_generators.gemm import (
     GemmInputConfig,
     GemmInputValues,
     GemmInputs,
@@ -70,7 +70,7 @@ from tokenspeed_kernel.numerics.input_generators.gemm import (
     gemm_scale_shape,
     mxfp4_scaled_gemm_input_config,
 )
-from tokenspeed_kernel.numerics.input_generators.moe import (
+from tokenspeed_numerics_input_generators.moe import (
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,

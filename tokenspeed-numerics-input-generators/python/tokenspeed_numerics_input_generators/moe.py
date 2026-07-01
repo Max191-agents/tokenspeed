@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import torch
-from tokenspeed_kernel.numerics.input_generators.core import (
+from tokenspeed_numerics_input_generators.core import (
     CustomDType,
     DeviceLike,
     InputDType,
@@ -33,7 +33,7 @@ from tokenspeed_kernel.numerics.input_generators.core import (
     _child_seed,
     _resolve_device,
 )
-from tokenspeed_kernel.numerics.input_generators.gemm import (
+from tokenspeed_numerics_input_generators.gemm import (
     GemmInputConfig,
     GemmInputValues,
     GemmInputs,

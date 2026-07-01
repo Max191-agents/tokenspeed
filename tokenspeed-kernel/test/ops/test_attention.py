@@ -37,7 +37,7 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mha_extend_with_kvcache_kwargs,
     mha_prefill_kwargs,
 )
-from tokenspeed_kernel.numerics.input_generators import (
+from tokenspeed_numerics_input_generators import (
     MHAInputConfig,
     MHAInputs,
     MHARequestMetadataInputConfig,

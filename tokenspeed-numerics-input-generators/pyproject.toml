@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69.5.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenspeed-numerics-input-generators"
+version = "0.1.0"
+description = "Standalone numerical input generators for TokenSpeed correctness testing."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "torch",
+]
+
+[project.urls]
+Homepage = "https://github.com/lightseekorg/tokenspeed"
+Repository = "https://github.com/lightseekorg/tokenspeed"
+
+[tool.setuptools]
+license-files = ["LICENSE"]
+
+[tool.setuptools.packages.find]
+where = ["python"]

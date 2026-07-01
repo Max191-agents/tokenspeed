@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
     "torch",
+    "tokenspeed-numerics-input-generators==0.1.0",
     "tokenspeed-triton>=3.7.10.post20260531",
 ]
 

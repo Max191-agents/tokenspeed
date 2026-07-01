@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
-from tokenspeed_kernel.numerics.input_generators.core import (
+from tokenspeed_numerics_input_generators.core import (
     CustomDType,
     DeviceLike,
     InputDType,
