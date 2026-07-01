@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_
 from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
     fused_qkv_split_gdn_prefill,
 )
+from tokenspeed_kernel.ops.attention.triton.qkv_rotary import packed_qkv_complex_rotary
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_compressed_slot_mapping,
@@ -67,6 +68,8 @@ from tokenspeed_numerics_input_generators import (
     MLAKVPackQuantizeFP8InputConfig,
     MLAKVPackQuantizeFP8Inputs,
     MHARequestMetadataInputConfig,
+    PackedQKVComplexRotaryInputConfig,
+    PackedQKVComplexRotaryInputs,
     attention_merge_state_reference,
     deepseek_v4_compressed_slot_mapping_reference,
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
@@ -77,6 +80,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_indexer_decode_metadata_reference,
     gdn_qkv_split_reference,
     mla_kv_pack_quantize_fp8_reference,
+    packed_qkv_complex_rotary_reference,
 )
 
 
@@ -406,6 +410,47 @@ def test_gdn_qkv_split_generator_runs_tokenspeed_triton(
         values.head_k,
         values.head_v,
         fuse_l2norm=values.fuse_l2norm,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        actual_q.float(), expected_q.float(), rtol=1e-2, atol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_k.float(), expected_k.float(), rtol=1e-2, atol=1e-2
+    )
+    torch.testing.assert_close(actual_v.float(), expected_v.float(), rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("copy_v", [False, True], ids=["view-v", "copy-v"])
+def test_packed_qkv_complex_rotary_generator_runs_tokenspeed_triton(
+    device: str,
+    copy_v: bool,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm GPU is required for packed QKV rotary Triton test")
+
+    values = PackedQKVComplexRotaryInputs(
+        PackedQKVComplexRotaryInputConfig(
+            num_tokens=17,
+            num_heads=4,
+            head_dim=16,
+            dtype=torch.bfloat16,
+            copy_v=copy_v,
+        )
+    ).generate(seed=211, device=device)
+    expected_q, expected_k, expected_v = packed_qkv_complex_rotary_reference(values)
+    q_size = values.num_heads * values.head_dim
+    kv_size = q_size
+
+    actual_q, actual_k, actual_v = packed_qkv_complex_rotary(
+        values.qkv,
+        q_size,
+        kv_size,
+        values.num_heads,
+        values.head_dim,
+        values.freqs_cis,
+        copy_v=values.copy_v,
     )
     torch.cuda.synchronize()
 

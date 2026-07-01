@@ -86,6 +86,10 @@ __all__ = [
     "MLAInputConfig",
     "MLAInputValues",
     "MLAInputs",
+    "PackedQKVComplexRotaryInputConfig",
+    "PackedQKVComplexRotaryInputs",
+    "PackedQKVComplexRotaryInputValues",
+    "packed_qkv_complex_rotary_reference",
 ]
 
 _AttentionCacheT = TypeVar("_AttentionCacheT")
@@ -949,6 +953,200 @@ def gdn_qkv_split_reference(
         k.unsqueeze(0).contiguous(),
         v.unsqueeze(0).contiguous(),
     )
+
+
+@dataclass
+class PackedQKVComplexRotaryInputValues:
+    """Generated values for packed QKV complex rotary splitting."""
+
+    qkv: torch.Tensor
+    freqs_cis: torch.Tensor
+    num_heads: int
+    head_dim: int
+    copy_v: bool
+
+
+@dataclass
+class PackedQKVComplexRotaryInputConfig:
+    """Initialization parameters for packed QKV complex RoPE.
+
+    The represented operation splits a packed QKV tensor into equal-width Q, K,
+    and V segments. Q and K are interpreted as pairs of real channels and are
+    multiplied by unit complex rotary frequencies. V is not rotated.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of packed token rows.
+    num_tokens: int
+
+    # Required: number of Q/K/V heads. This utility expects all three packed
+    # segments to use the same head count.
+    num_heads: int
+
+    # Required: per-head Q/K/V dimension. Must be even for complex pairs.
+    head_dim: int
+
+    # Required: dtype for generated packed QKV values.
+    dtype: torch.dtype
+
+    # ------------------------------------------------------------------
+    # Optional configuration fields.
+    # ------------------------------------------------------------------
+
+    # Optional: materialize V as an output tensor instead of returning a view of
+    # the packed V segment. The mathematical values are the same either way.
+    copy_v: bool = False
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class PackedQKVComplexRotaryInputs(NumericsInputGenerator):
+    """Generator for packed QKV complex rotary inputs."""
+
+    config: PackedQKVComplexRotaryInputConfig
+    qkv_input: TensorInput | None
+
+    def __init__(self, config: PackedQKVComplexRotaryInputConfig) -> None:
+        self.config = config
+        self.qkv_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.qkv_input = self.qkv_input or TensorInput(
+            (self.config.num_tokens, self._packed_dim()),
+            self.config.dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> PackedQKVComplexRotaryInputValues:
+        self.__post_init__()
+        if self.qkv_input is None:
+            raise ValueError("qkv_input must be initialized")
+        target_device = _resolve_device(self.config.device, device)
+        self.qkv_input.shape = (self.config.num_tokens, self._packed_dim())
+        self.qkv_input.dtype = self.config.dtype
+        qkv = _require_tensor(
+            self.qkv_input.generate(
+                seed=_child_seed(seed, 1), device=target_device
+            ).values,
+            "qkv",
+        )
+        freqs_cis = self._generate_freqs_cis(
+            seed=_child_seed(seed, 2),
+            device=target_device,
+        )
+        return PackedQKVComplexRotaryInputValues(
+            qkv=qkv.contiguous(),
+            freqs_cis=freqs_cis.contiguous(),
+            num_heads=self.config.num_heads,
+            head_dim=self.config.head_dim,
+            copy_v=bool(self.config.copy_v),
+        )
+
+    def _normalize_config(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.num_heads = _check_positive("num_heads", self.config.num_heads)
+        self.config.head_dim = _check_positive("head_dim", self.config.head_dim)
+        if self.config.head_dim % 2 != 0:
+            raise ValueError(f"head_dim must be even, got {self.config.head_dim}")
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+
+    def _packed_dim(self) -> int:
+        return 3 * self.config.num_heads * self.config.head_dim
+
+    def _generate_freqs_cis(
+        self,
+        *,
+        seed: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        rng_device = "cuda" if device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=rng_device).manual_seed(seed)
+        angles = (
+            torch.rand(
+                (self.config.num_tokens, self.config.head_dim // 2),
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            * (2.0 * math.pi)
+            - math.pi
+        )
+        return torch.complex(torch.cos(angles), torch.sin(angles))
+
+
+def _apply_complex_rotary(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> torch.Tensor:
+    x_even = x[..., 0::2].float()
+    x_odd = x[..., 1::2].float()
+    real = freqs_cis.real[:, None, :].float()
+    imag = freqs_cis.imag[:, None, :].float()
+    out = torch.empty_like(x.float())
+    out[..., 0::2] = x_even * real - x_odd * imag
+    out[..., 1::2] = x_odd * real + x_even * imag
+    return out.to(x.dtype)
+
+
+def packed_qkv_complex_rotary_reference(
+    values: PackedQKVComplexRotaryInputValues,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return Q/K after complex RoPE and unrotated V."""
+
+    if values.qkv.ndim != 2:
+        raise ValueError(f"qkv must be rank-2, got {values.qkv.ndim}")
+    _check_positive("num_heads", values.num_heads)
+    _check_positive("head_dim", values.head_dim)
+    if values.head_dim % 2 != 0:
+        raise ValueError(f"head_dim must be even, got {values.head_dim}")
+    if not values.freqs_cis.is_complex():
+        raise TypeError("freqs_cis must be a complex tensor")
+    if values.qkv.device != values.freqs_cis.device:
+        raise ValueError("qkv and freqs_cis must be on the same device")
+    total_tokens = values.qkv.shape[0]
+    q_size = values.num_heads * values.head_dim
+    kv_size = q_size
+    packed_dim = q_size + 2 * kv_size
+    if values.qkv.shape[1] != packed_dim:
+        raise ValueError(
+            f"qkv last dimension must be {packed_dim}, got {values.qkv.shape[1]}"
+        )
+    expected_freqs_shape = (total_tokens, values.head_dim // 2)
+    if values.freqs_cis.shape != expected_freqs_shape:
+        raise ValueError(
+            f"freqs_cis must have shape {expected_freqs_shape}, "
+            f"got {tuple(values.freqs_cis.shape)}"
+        )
+
+    q = values.qkv[:, :q_size].reshape(total_tokens, values.num_heads, values.head_dim)
+    k = values.qkv[:, q_size : q_size + kv_size].reshape(
+        total_tokens,
+        values.num_heads,
+        values.head_dim,
+    )
+    v = values.qkv[:, q_size + kv_size :].reshape(
+        total_tokens,
+        values.num_heads,
+        values.head_dim,
+    )
+    q_out = _apply_complex_rotary(q, values.freqs_cis).contiguous()
+    k_out = _apply_complex_rotary(k, values.freqs_cis).contiguous()
+    v_out = v.clone().contiguous() if values.copy_v else v
+    return q_out, k_out, v_out
 
 
 @dataclass

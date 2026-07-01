@@ -43,6 +43,8 @@ from tokenspeed_numerics_input_generators import (
     MLAKVCacheInput,
     MLAKVCacheInputConfig,
     MHARequestMetadataInputConfig,
+    PackedQKVComplexRotaryInputConfig,
+    PackedQKVComplexRotaryInputs,
     PageTableInput,
     PageTableInputConfig,
     attention_merge_state_reference,
@@ -55,6 +57,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_indexer_decode_metadata_reference,
     gdn_qkv_split_reference,
     mla_kv_pack_quantize_fp8_reference,
+    packed_qkv_complex_rotary_reference,
 )
 
 
@@ -455,6 +458,94 @@ def test_gdn_qkv_split_inputs_reject_invalid_configs_and_values() -> None:
     values.mixed_qkv = values.mixed_qkv[:, :-1]
     with pytest.raises(ValueError, match="last dimension"):
         gdn_qkv_split_reference(values)
+
+
+def test_packed_qkv_complex_rotary_inputs_generate_values_and_reference() -> None:
+    values = PackedQKVComplexRotaryInputs(
+        PackedQKVComplexRotaryInputConfig(
+            num_tokens=5,
+            num_heads=2,
+            head_dim=8,
+            dtype=torch.float32,
+        )
+    ).generate(seed=111, device="cpu")
+
+    q, k, v = packed_qkv_complex_rotary_reference(values)
+
+    assert values.qkv.shape == (5, 48)
+    assert values.freqs_cis.shape == (5, 4)
+    assert values.freqs_cis.dtype == torch.complex64
+    torch.testing.assert_close(
+        torch.abs(values.freqs_cis),
+        torch.ones_like(values.freqs_cis.real),
+    )
+    assert q.shape == (5, 2, 8)
+    assert k.shape == (5, 2, 8)
+    assert v.shape == (5, 2, 8)
+
+    q_raw = values.qkv[:, :16].reshape(5, 2, 8)
+    freqs = values.freqs_cis
+    q_even = q_raw[..., 0::2]
+    q_odd = q_raw[..., 1::2]
+    q_ref = torch.empty_like(q_raw)
+    q_ref[..., 0::2] = q_even * freqs.real[:, None, :] - q_odd * freqs.imag[:, None, :]
+    q_ref[..., 1::2] = q_odd * freqs.real[:, None, :] + q_even * freqs.imag[:, None, :]
+
+    torch.testing.assert_close(q, q_ref)
+    torch.testing.assert_close(v.reshape(5, -1), values.qkv[:, 32:])
+
+
+def test_packed_qkv_complex_rotary_inputs_support_copy_v() -> None:
+    values = PackedQKVComplexRotaryInputs(
+        PackedQKVComplexRotaryInputConfig(
+            num_tokens=3,
+            num_heads=2,
+            head_dim=6,
+            dtype=torch.float32,
+            copy_v=True,
+        )
+    ).generate(seed=112, device="cpu")
+
+    _, _, v = packed_qkv_complex_rotary_reference(values)
+
+    assert v.is_contiguous()
+    torch.testing.assert_close(v.reshape(3, -1), values.qkv[:, 24:])
+
+
+def test_packed_qkv_complex_rotary_inputs_reject_invalid_configs_and_values() -> None:
+    with pytest.raises(ValueError, match="head_dim"):
+        PackedQKVComplexRotaryInputs(
+            PackedQKVComplexRotaryInputConfig(
+                num_tokens=5,
+                num_heads=2,
+                head_dim=7,
+                dtype=torch.float32,
+            )
+        )
+
+    values = PackedQKVComplexRotaryInputs(
+        PackedQKVComplexRotaryInputConfig(
+            num_tokens=5,
+            num_heads=2,
+            head_dim=8,
+            dtype=torch.float32,
+        )
+    ).generate(seed=113, device="cpu")
+    values.freqs_cis = values.freqs_cis[:-1]
+    with pytest.raises(ValueError, match="freqs_cis"):
+        packed_qkv_complex_rotary_reference(values)
+
+    values = PackedQKVComplexRotaryInputs(
+        PackedQKVComplexRotaryInputConfig(
+            num_tokens=5,
+            num_heads=2,
+            head_dim=8,
+            dtype=torch.float32,
+        )
+    ).generate(seed=114, device="cpu")
+    values.freqs_cis = values.freqs_cis.real
+    with pytest.raises(TypeError, match="complex"):
+        packed_qkv_complex_rotary_reference(values)
 
 
 def test_deepseek_v4_paged_index_inputs_generate_values_and_refs() -> None:
