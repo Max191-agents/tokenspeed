@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Generic, Protocol, TypeVar
+from typing import Generic, Literal, Protocol, TypeVar
 
 import torch
 from tokenspeed_numerics_input_generators.attention_cache import (
@@ -129,6 +129,7 @@ __all__ = [
     "MLAKVPackQuantizeFP8InputConfig",
     "MLAKVPackQuantizeFP8Inputs",
     "MLAKVPackQuantizeFP8InputValues",
+    "MLAKVPackKVLayout",
     "mla_kv_pack_quantize_fp8_reference",
     "MLAPrefillFP8InputConfig",
     "MLAPrefillFP8Inputs",
@@ -150,6 +151,7 @@ __all__ = [
 ]
 
 _AttentionCacheT = TypeVar("_AttentionCacheT")
+MLAKVPackKVLayout = Literal["separate", "packed_slices"]
 _DSA_SPARSE_DECODE_FP8_QUANT_BLOCK = 128
 _DSA_SPARSE_DECODE_FP8_SCALE_BYTES = 4
 _DSA_SPARSE_DECODE_BF16_BYTES = 2
@@ -594,6 +596,7 @@ class MLAKVPackQuantizeFP8InputValues:
     k_scale_inv: float
     v_scale_inv: float
     fp8_dtype: torch.dtype
+    kv_storage: torch.Tensor | None = None
 
 
 @dataclass
@@ -636,6 +639,12 @@ class MLAKVPackQuantizeFP8InputConfig:
     # rank 2 generates [tokens, rope_dim].
     k_pe_rank: int = 3
 
+    # Optional: "separate" generates contiguous k_nope/v tensors;
+    # "packed_slices" generates one packed KV tensor and returns k_nope/v as
+    # non-contiguous views into it. The latter models post-projection MLA call
+    # sites where NoPE K and V are adjacent slices of the same tensor.
+    kv_layout: MLAKVPackKVLayout = "separate"
+
     # Optional: inverse scale applied before casting packed K to FP8.
     k_scale_inv: float = 1.0
 
@@ -657,12 +666,14 @@ class MLAKVPackQuantizeFP8Inputs(NumericsInputGenerator):
     k_nope_input: TensorInput | None
     k_pe_input: TensorInput | None
     v_input: TensorInput | None
+    kv_storage_input: TensorInput | None
 
     def __init__(self, config: MLAKVPackQuantizeFP8InputConfig) -> None:
         self.config = config
         self.k_nope_input = None
         self.k_pe_input = None
         self.v_input = None
+        self.kv_storage_input = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -685,6 +696,11 @@ class MLAKVPackQuantizeFP8Inputs(NumericsInputGenerator):
         self.config.k_pe_rank = int(self.config.k_pe_rank)
         if self.config.k_pe_rank not in (2, 3):
             raise ValueError(f"k_pe_rank must be 2 or 3, got {self.config.k_pe_rank}")
+        if self.config.kv_layout not in ("separate", "packed_slices"):
+            raise ValueError(
+                "kv_layout must be 'separate' or 'packed_slices'; "
+                f"got {self.config.kv_layout!r}"
+            )
         self.config.k_scale_inv = float(self.config.k_scale_inv)
         self.config.v_scale_inv = float(self.config.v_scale_inv)
         if self.config.k_scale_inv <= 0.0:
@@ -724,6 +740,15 @@ class MLAKVPackQuantizeFP8Inputs(NumericsInputGenerator):
             self.config.input_dtype,
             device=self.config.device,
         )
+        self.kv_storage_input = self.kv_storage_input or TensorInput(
+            (
+                self.config.num_tokens,
+                self.config.num_kv_heads,
+                self.config.qk_nope_head_dim + self.config.v_head_dim,
+            ),
+            self.config.input_dtype,
+            device=self.config.device,
+        )
 
     def generate(
         self,
@@ -734,7 +759,12 @@ class MLAKVPackQuantizeFP8Inputs(NumericsInputGenerator):
     ) -> MLAKVPackQuantizeFP8InputValues:
         del metadata_seed
         self.__post_init__()
-        if self.k_nope_input is None or self.k_pe_input is None or self.v_input is None:
+        if (
+            self.k_nope_input is None
+            or self.k_pe_input is None
+            or self.v_input is None
+            or self.kv_storage_input is None
+        ):
             raise ValueError(
                 "MLAKVPackQuantizeFP8Inputs child generators must be initialized"
             )
@@ -757,28 +787,49 @@ class MLAKVPackQuantizeFP8Inputs(NumericsInputGenerator):
             self.config.v_head_dim,
         )
         self.v_input.dtype = self.config.input_dtype
-        return MLAKVPackQuantizeFP8InputValues(
-            k_nope=_require_tensor(
+        self.kv_storage_input.shape = (
+            self.config.num_tokens,
+            self.config.num_kv_heads,
+            self.config.qk_nope_head_dim + self.config.v_head_dim,
+        )
+        self.kv_storage_input.dtype = self.config.input_dtype
+        k_pe = _require_tensor(
+            self.k_pe_input.generate(
+                seed=_child_seed(seed, 2), device=target_device
+            ).values,
+            "k_pe",
+        ).contiguous()
+        kv_storage = None
+        if self.config.kv_layout == "packed_slices":
+            kv_storage = _require_tensor(
+                self.kv_storage_input.generate(
+                    seed=_child_seed(seed, 4), device=target_device
+                ).values,
+                "kv_storage",
+            ).contiguous()
+            k_nope = kv_storage[..., : self.config.qk_nope_head_dim]
+            v = kv_storage[..., self.config.qk_nope_head_dim :]
+        else:
+            k_nope = _require_tensor(
                 self.k_nope_input.generate(
                     seed=_child_seed(seed, 1), device=target_device
                 ).values,
                 "k_nope",
-            ).contiguous(),
-            k_pe=_require_tensor(
-                self.k_pe_input.generate(
-                    seed=_child_seed(seed, 2), device=target_device
-                ).values,
-                "k_pe",
-            ).contiguous(),
-            v=_require_tensor(
+            ).contiguous()
+            v = _require_tensor(
                 self.v_input.generate(
                     seed=_child_seed(seed, 3), device=target_device
                 ).values,
                 "v",
-            ).contiguous(),
+            ).contiguous()
+        return MLAKVPackQuantizeFP8InputValues(
+            k_nope=k_nope,
+            k_pe=k_pe,
+            v=v,
             k_scale_inv=self.config.k_scale_inv,
             v_scale_inv=self.config.v_scale_inv,
             fp8_dtype=self.config.fp8_dtype,
+            kv_storage=kv_storage,
         )
 
 

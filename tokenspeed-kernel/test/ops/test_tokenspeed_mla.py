@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
+    MLAKVPackKVLayout,
     MLAKVPackQuantizeFP8InputConfig,
     MLAKVPackQuantizeFP8Inputs,
     MLAKVPackQuantizeFP8InputValues,
@@ -78,6 +79,7 @@ def _make_mla_kv_pack_values(
     v_scale_inv: float = 1.0,
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
     k_pe_rank: int = 3,
+    kv_layout: MLAKVPackKVLayout = "separate",
     seed: int = 0,
 ) -> MLAKVPackQuantizeFP8InputValues:
     return MLAKVPackQuantizeFP8Inputs(
@@ -92,6 +94,7 @@ def _make_mla_kv_pack_values(
             v_scale_inv=v_scale_inv,
             fp8_dtype=fp8_dtype,
             k_pe_rank=k_pe_rank,
+            kv_layout=kv_layout,
         )
     ).generate(seed=seed, device=device)
 
@@ -102,14 +105,11 @@ def _make_kv_slice_inputs(
 ) -> MLAKVPackQuantizeFP8InputValues:
     """Mirror the deepseek_v3.py call site: k_nope and v are slice views of
     a packed kv tensor produced by kv_b_proj."""
-    values = _make_mla_kv_pack_values(device, dtype=dtype, seed=0)
-    kv = torch.empty(S, H, QK_NOPE + V_HEAD, device=device, dtype=dtype)
-    kv[..., :QK_NOPE].copy_(values.k_nope)
-    kv[..., QK_NOPE:].copy_(values.v)
-    return replace(
-        values,
-        k_nope=kv[..., :QK_NOPE],
-        v=kv[..., QK_NOPE:],
+    return _make_mla_kv_pack_values(
+        device,
+        dtype=dtype,
+        kv_layout="packed_slices",
+        seed=0,
     )
 
 

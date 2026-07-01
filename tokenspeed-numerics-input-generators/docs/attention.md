@@ -47,6 +47,11 @@ v_fp8 = cast_fp8(v * v_scale_inv)
 `k_nope` and `v` have shape `[num_tokens, num_kv_heads, dim]`. `k_pe` may be
 `[num_tokens, qk_rope_head_dim]` or `[num_tokens, 1, qk_rope_head_dim]`; both
 forms represent the same per-token RoPE key component shared by all KV heads.
+`k_nope` and `v` can be generated as separate contiguous tensors or as
+non-contiguous views into one packed `[tokens, kv_heads, qk_nope + v_dim]`
+projection tensor. Both layouts represent the same logical inputs; the packed
+layout exists so consumers can exercise production-style slice views while the
+reference continues to operate on the logical tensors.
 
 ### MLA FP8 Prefill
 

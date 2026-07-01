@@ -308,6 +308,35 @@ def test_mla_kv_pack_quantize_fp8_inputs_generate_values_and_reference() -> None
     )
 
 
+def test_mla_kv_pack_quantize_fp8_inputs_generate_packed_kv_slices() -> None:
+    values = MLAKVPackQuantizeFP8Inputs(
+        MLAKVPackQuantizeFP8InputConfig(
+            num_tokens=5,
+            num_kv_heads=3,
+            qk_nope_head_dim=7,
+            qk_rope_head_dim=4,
+            v_head_dim=6,
+            input_dtype=torch.bfloat16,
+            kv_layout="packed_slices",
+        )
+    ).generate(seed=17, device="cpu")
+
+    assert values.kv_storage is not None
+    assert values.kv_storage.shape == (5, 3, 13)
+    assert values.k_nope.shape == (5, 3, 7)
+    assert values.v.shape == (5, 3, 6)
+    assert not values.k_nope.is_contiguous()
+    assert not values.v.is_contiguous()
+    assert values.k_nope.data_ptr() == values.kv_storage.data_ptr()
+    assert values.v.data_ptr() > values.kv_storage.data_ptr()
+    torch.testing.assert_close(values.k_nope, values.kv_storage[..., :7])
+    torch.testing.assert_close(values.v, values.kv_storage[..., 7:])
+
+    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
+    assert k_ref.shape == (5, 3, 11)
+    assert v_ref.shape == (5, 3, 6)
+
+
 def test_mla_kv_pack_quantize_fp8_supports_2d_k_pe_and_e5m2() -> None:
     values = MLAKVPackQuantizeFP8Inputs(
         MLAKVPackQuantizeFP8InputConfig(
@@ -344,6 +373,19 @@ def test_mla_kv_pack_quantize_fp8_rejects_invalid_config() -> None:
                 v_head_dim=7,
                 input_dtype=torch.float16,
                 k_pe_rank=4,
+            )
+        )
+
+    with pytest.raises(ValueError, match="kv_layout"):
+        MLAKVPackQuantizeFP8Inputs(
+            MLAKVPackQuantizeFP8InputConfig(
+                num_tokens=4,
+                num_kv_heads=2,
+                qk_nope_head_dim=8,
+                qk_rope_head_dim=5,
+                v_head_dim=7,
+                input_dtype=torch.float16,
+                kv_layout="interleaved",  # type: ignore[arg-type]
             )
         )
 
