@@ -74,6 +74,13 @@ from tokenspeed_numerics_input_generators.core import (
     TensorInput,
     TensorValues,
 )
+from tokenspeed_numerics_input_generators.embedding import (
+    RopeFusedKVInputValues,
+    RopeInputConfig,
+    RopeInputValues,
+    RopeInputs,
+    rope_reference,
+)
 from tokenspeed_numerics_input_generators.gemm import (
     GemmInputConfig,
     GemmInputValues,
@@ -94,7 +101,6 @@ from tokenspeed_numerics_input_generators.layernorm import (
     RMSNormInputConfig,
     RMSNormInputs,
     RMSNormInputValues,
-    build_rope_cos_sin_cache,
     fused_qk_rmsnorm_rope_gate_reference,
     qk_rmsnorm_reference,
     rmsnorm_reference,
@@ -111,6 +117,7 @@ from tokenspeed_numerics_input_generators.quantization import (
     fp8_quantization_reference,
     fp8_scale_shape,
 )
+from tokenspeed_numerics_input_generators.rotary import build_rope_cos_sin_cache
 
 __all__ = [
     "AttentionCacheInput",
@@ -167,6 +174,10 @@ __all__ = [
     "RMSNormInputConfig",
     "RMSNormInputValues",
     "RMSNormInputs",
+    "RopeFusedKVInputValues",
+    "RopeInputConfig",
+    "RopeInputValues",
+    "RopeInputs",
     "SigmoidMulInputConfig",
     "SigmoidMulInputValues",
     "SigmoidMulInputs",
@@ -179,5 +190,6 @@ __all__ = [
     "gemm_scale_shape",
     "mxfp4_gemm_input_config",
     "qk_rmsnorm_reference",
+    "rope_reference",
     "rmsnorm_reference",
 ]

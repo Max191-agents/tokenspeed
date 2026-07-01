@@ -34,6 +34,7 @@ from tokenspeed_numerics_input_generators.core import (
     _resolve_device,
     _rng_for_device,
 )
+from tokenspeed_numerics_input_generators.rotary import build_rope_cos_sin_cache
 
 __all__ = [
     "FusedQKRMSNormRopeGateInputConfig",
@@ -738,34 +739,6 @@ def qk_rmsnorm_reference(
         return out.to(x.dtype).view(x.shape)
 
     return _norm(q, q_weight), _norm(k, k_weight)
-
-
-def build_rope_cos_sin_cache(
-    *,
-    rotary_dim: int,
-    max_position: int,
-    base: float,
-    device: DeviceLike,
-) -> torch.Tensor:
-    """Build a RoPE cache with per-position ``[cos | sin]`` layout."""
-
-    rotary_dim = _check_positive("rotary_dim", rotary_dim)
-    max_position = _check_positive("max_position", max_position)
-    if rotary_dim % 2 != 0:
-        raise ValueError(f"rotary_dim must be even, got {rotary_dim}")
-    if base <= 0.0:
-        raise ValueError(f"base must be positive, got {base}")
-    target_device = _resolve_device(device, None)
-    inv_freq = 1.0 / (
-        base
-        ** (
-            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=target_device)
-            / rotary_dim
-        )
-    )
-    positions = torch.arange(max_position, dtype=torch.float32, device=target_device)
-    freqs = torch.einsum("i,j -> ij", positions, inv_freq)
-    return torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
 
 
 def fused_qk_rmsnorm_rope_gate_reference(
