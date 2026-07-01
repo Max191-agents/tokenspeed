@@ -42,6 +42,30 @@ generated `B` tensor for that call while still comparing against
 `gemm_reference(values)`. That layout translation belongs at the consumer
 boundary, not in the generator definition.
 
+`RouterProjectionInputs` represents the MoE routing projection:
+
+```text
+router_logits = hidden_states @ router_weights.T
+```
+
+`hidden_states` has shape `[num_tokens, hidden_dim]`, `router_weights` has
+shape `[num_experts, hidden_dim]`, and the reference returns fp32 logits with
+shape `[num_tokens, num_experts]`. The generator is still operation-level: it
+does not encode a particular router kernel launch shape or backend ABI. TokenSpeed
+adapters can pass the generated tensors to CUDA helpers such as fp32 router GEMM
+or DeepSeek-V3 router GEMM when their backend-specific dtype and shape
+requirements are satisfied.
+
+Router projection generation uses ordinary floating-point tensor generation for
+hidden states and weights, then scales weights by `1 / sqrt(hidden_dim)` by
+default. That keeps generated logits roughly O(1), which is more useful for
+downstream routing checks than arbitrary unscaled random weights whose logits
+grow with the reduction dimension. Callers may override the hidden or weight
+scale when intentionally testing a different distribution.
+
+`router_projection_reference` computes the fp32 projection reference directly
+from the generated values.
+
 ## Scale And Quantized Storage
 
 Dense floating-point tensors use the core tensor generator. Scaled tensors use
@@ -109,3 +133,8 @@ require `MK` layout and custom `B` operands require `NK` layout.
 The fused NVFP4 generator also verifies the fixed NVFP4 scale group width,
 source dtype, divisibility of K and intermediate dimensions by the scale group,
 and scalar global-scale relationships.
+
+Router projection verification checks positive token, hidden, and expert
+dimensions; supported floating-point dtypes for hidden states and weights;
+finite positive generation scales; rank-2 generated tensors; matching hidden
+dimensions; and finite generated values.

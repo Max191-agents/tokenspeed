@@ -47,6 +47,9 @@ from tokenspeed_numerics_input_generators import (
     MoESoftplusSqrtTopKRoutingInputValues,
     NVFP4GemmSwiGLUNVFP4QuantInputConfig,
     NVFP4GemmSwiGLUNVFP4QuantInputs,
+    RouterProjectionInputConfig,
+    RouterProjectionInputs,
+    RouterProjectionInputValues,
     TensorInput,
     canonicalize_moe_align_block_size,
     gemm_reference,
@@ -62,6 +65,7 @@ from tokenspeed_numerics_input_generators import (
     mxint4_gemm_input_config,
     nvfp4_dequantization_reference,
     nvfp4_gemm_swiglu_nvfp4_quant_reference,
+    router_projection_reference,
 )
 
 _fp8_dtype = torch.float8_e4m3fn
@@ -649,6 +653,87 @@ def test_gemm_reference_applies_2d_block_scales() -> None:
     )
 
     torch.testing.assert_close(gemm_reference(values), expected)
+
+
+def test_router_projection_inputs_generate_useful_logits() -> None:
+    values = RouterProjectionInputs(
+        RouterProjectionInputConfig(
+            num_tokens=5,
+            hidden_dim=64,
+            num_experts=7,
+            hidden_dtype=torch.bfloat16,
+            router_weight_dtype=torch.float32,
+        )
+    ).generate(seed=95, device="cpu")
+
+    assert values.hidden_states.shape == (5, 64)
+    assert values.router_weights.shape == (7, 64)
+    assert values.hidden_states.dtype == torch.bfloat16
+    assert values.router_weights.dtype == torch.float32
+
+    logits = router_projection_reference(values)
+
+    assert logits.shape == (5, 7)
+    assert logits.dtype == torch.float32
+    assert torch.isfinite(logits).all()
+    assert logits.float().std() > 0.0
+    assert logits.float().abs().max() < 10.0
+
+
+def test_router_projection_reference_matches_matmul() -> None:
+    values = RouterProjectionInputValues(
+        hidden_states=torch.tensor(
+            [[1.0, 2.0, -1.0], [0.5, -0.25, 2.0]],
+            dtype=torch.float32,
+        ),
+        router_weights=torch.tensor(
+            [[0.5, 1.0, 2.0], [1.5, -1.0, 0.25]],
+            dtype=torch.float32,
+        ),
+    )
+
+    logits = router_projection_reference(values)
+
+    torch.testing.assert_close(logits, values.hidden_states @ values.router_weights.T)
+
+
+def test_router_projection_inputs_reject_invalid_configs() -> None:
+    with pytest.raises(ValueError, match="num_tokens"):
+        RouterProjectionInputs(
+            RouterProjectionInputConfig(
+                num_tokens=0,
+                hidden_dim=64,
+                num_experts=7,
+            )
+        )
+    with pytest.raises(ValueError, match="hidden_dtype"):
+        RouterProjectionInputs(
+            RouterProjectionInputConfig(
+                num_tokens=5,
+                hidden_dim=64,
+                num_experts=7,
+                hidden_dtype=torch.int32,  # type: ignore[arg-type]
+            )
+        )
+    with pytest.raises(ValueError, match="router_weight_scale"):
+        RouterProjectionInputs(
+            RouterProjectionInputConfig(
+                num_tokens=5,
+                hidden_dim=64,
+                num_experts=7,
+                router_weight_scale=0.0,
+            )
+        )
+
+
+def test_router_projection_reference_rejects_invalid_values() -> None:
+    values = RouterProjectionInputValues(
+        hidden_states=torch.randn(2, 4),
+        router_weights=torch.randn(3, 5),
+    )
+
+    with pytest.raises(ValueError, match="hidden dimensions"):
+        router_projection_reference(values)
 
 
 def test_nvfp4_gemm_swiglu_inputs_generate_values_and_reference() -> None:

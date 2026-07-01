@@ -27,15 +27,31 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
     GemmInputConfig,
     GemmInputs,
+    RouterProjectionInputConfig,
+    RouterProjectionInputs,
     gemm_reference,
     gemm_scale_shape,
     mxfp4_gemm_input_config,
+    router_projection_reference,
 )
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="GEMM generator kernel compatibility tests require a CUDA/ROCm GPU.",
 )
+
+
+def _skip_if_router_gemm_unavailable(exc: BaseException) -> None:
+    message = str(exc)
+    skip_fragments = (
+        "library not found",
+        "No module named 'tvm_ffi'",
+        "requires SM90",
+        "required CUDA ARCH",
+    )
+    if any(fragment in message for fragment in skip_fragments):
+        pytest.skip(message)
+    raise exc
 
 
 def test_dense_gemm_generator_runs_reference_kernel(device: str, require) -> None:
@@ -145,6 +161,70 @@ def test_fp8_scaled_gemm_generator_runs_triton_kernel(
     assert actual.shape == values.C.shape
     assert actual.dtype == values.C.dtype
     torch.testing.assert_close(actual.float(), expected.float(), atol=0.25, rtol=0.25)
+
+
+def test_router_projection_generator_runs_fp32_router_gemm(device: str) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or not platform.is_hopper_plus:
+        pytest.skip("fp32_router_gemm requires NVIDIA SM90+")
+
+    from tokenspeed_kernel.thirdparty.cuda import fp32_router_gemm
+
+    values = RouterProjectionInputs(
+        RouterProjectionInputConfig(
+            num_tokens=8,
+            hidden_dim=3072,
+            num_experts=256,
+            hidden_dtype=torch.bfloat16,
+            router_weight_dtype=torch.float32,
+        )
+    ).generate(seed=43, device=device)
+
+    try:
+        actual = fp32_router_gemm(values.hidden_states, values.router_weights)
+    except (RuntimeError, ModuleNotFoundError) as exc:
+        _skip_if_router_gemm_unavailable(exc)
+
+    expected = router_projection_reference(values).to(device=device)
+    torch.cuda.synchronize()
+
+    assert actual.shape == expected.shape
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, atol=1e-1, rtol=1e-2)
+
+
+def test_router_projection_generator_runs_dsv3_router_gemm(device: str) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or not platform.is_hopper_plus:
+        pytest.skip("dsv3_router_gemm requires NVIDIA SM90+")
+
+    from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm
+
+    values = RouterProjectionInputs(
+        RouterProjectionInputConfig(
+            num_tokens=8,
+            hidden_dim=7168,
+            num_experts=256,
+            hidden_dtype=torch.bfloat16,
+            router_weight_dtype=torch.bfloat16,
+        )
+    ).generate(seed=47, device=device)
+
+    try:
+        actual = dsv3_router_gemm(
+            values.hidden_states,
+            values.router_weights,
+            out_dtype=torch.float32,
+        )
+    except (RuntimeError, ModuleNotFoundError) as exc:
+        _skip_if_router_gemm_unavailable(exc)
+
+    expected = router_projection_reference(values).to(device=device)
+    torch.cuda.synchronize()
+
+    assert actual.shape == expected.shape
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, atol=1e-1, rtol=1e-2)
 
 
 def test_mxfp8_blockscale_gemm_generator_runs_triton_kernel(

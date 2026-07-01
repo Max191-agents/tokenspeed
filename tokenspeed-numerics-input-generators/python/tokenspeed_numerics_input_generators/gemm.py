@@ -51,11 +51,15 @@ __all__ = [
     "NVFP4GemmSwiGLUNVFP4QuantInputConfig",
     "NVFP4GemmSwiGLUNVFP4QuantInputs",
     "NVFP4GemmSwiGLUNVFP4QuantInputValues",
+    "RouterProjectionInputConfig",
+    "RouterProjectionInputs",
+    "RouterProjectionInputValues",
     "gemm_reference",
     "gemm_scale_shape",
     "mxfp4_gemm_input_config",
     "mxint4_gemm_input_config",
     "nvfp4_gemm_swiglu_nvfp4_quant_reference",
+    "router_projection_reference",
 ]
 
 GemmLayout = Literal["MK", "KM", "NK", "KN"]
@@ -65,6 +69,9 @@ _DEFAULT_MXFP4_BLOCK_SIZE = 32
 _DEFAULT_MXINT4_BLOCK_SIZE = 32
 _DEFAULT_NVFP4_BLOCK_SIZE = 16
 _GEMM_LAYOUTS = frozenset({"MK", "KM", "NK", "KN"})
+_ROUTER_PROJECTION_DTYPES = frozenset(
+    {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+)
 
 
 def _gemm_value_shape(
@@ -306,6 +313,24 @@ def _check_nvfp4_source_dtype(dtype: torch.dtype) -> torch.dtype:
             f"NVFP4 fused GEMM input dtype must be bf16 or fp16, got {dtype}"
         )
     return dtype
+
+
+def _check_router_projection_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"{name} must be a torch.dtype")
+    if dtype not in _ROUTER_PROJECTION_DTYPES:
+        raise ValueError(
+            f"{name} must be one of {sorted(str(d) for d in _ROUTER_PROJECTION_DTYPES)}, "
+            f"got {dtype}"
+        )
+    return dtype
+
+
+def _check_positive_float(name: str, value: float) -> float:
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be finite and positive")
+    return value
 
 
 def _nvfp4_global_scale_for(tensor: torch.Tensor) -> torch.Tensor:
@@ -654,6 +679,223 @@ def gemm_reference(
             )
         output = output + bias.to(device=output.device, dtype=output.dtype)
     return output.to(out_dtype)
+
+
+@dataclass
+class RouterProjectionInputValues:
+    """Generated values for router projection.
+
+    ``hidden_states`` contains per-token hidden activations. ``router_weights``
+    contains one projection row per expert. The represented operation computes
+    fp32 router logits as ``hidden_states @ router_weights.T``.
+    """
+
+    hidden_states: torch.Tensor
+    router_weights: torch.Tensor
+
+
+@dataclass
+class RouterProjectionInputConfig:
+    """Initialization parameters for ``RouterProjectionInputs``.
+
+    The generator models the unquantized router projection used before MoE
+    routing. Generated weights are scaled by ``1 / sqrt(hidden_dim)`` by default
+    so generated logits have roughly unit variance instead of growing with the
+    reduction dimension.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of token rows to route.
+    num_tokens: int
+
+    # Required: hidden-state width and router projection reduction dimension.
+    hidden_dim: int
+
+    # Required: number of expert logits produced for each token.
+    num_experts: int
+
+    # ------------------------------------------------------------------
+    # Optional dtype and value-distribution configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: dtype for generated hidden-state activations.
+    hidden_dtype: torch.dtype = torch.bfloat16
+
+    # Optional: dtype for generated router projection weights.
+    router_weight_dtype: torch.dtype = torch.float32
+
+    # Optional: multiplicative scale applied to generated hidden states.
+    hidden_scale: float = 1.0
+
+    # Optional: multiplicative scale applied to generated router weights. When
+    # omitted, generation uses 1 / sqrt(hidden_dim).
+    router_weight_scale: float | None = None
+
+    # ------------------------------------------------------------------
+    # Optional device configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class RouterProjectionInputs(NumericsInputGenerator):
+    """Generator for MoE router projection inputs.
+
+    The represented operation is:
+
+    ``router_logits = hidden_states @ router_weights.T``
+
+    This is a GEMM-family operation, but the named generator captures the
+    layer-level meaning of each operand and chooses a default value range that
+    keeps downstream routing tests numerically useful.
+    """
+
+    config: RouterProjectionInputConfig
+    hidden_states_input: TensorInput | None
+    router_weights_input: TensorInput | None
+
+    def __init__(self, config: RouterProjectionInputConfig) -> None:
+        self.config = config
+        self.hidden_states_input = None
+        self.router_weights_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = int(self.config.num_tokens)
+        self.config.hidden_dim = int(self.config.hidden_dim)
+        self.config.num_experts = int(self.config.num_experts)
+        if self.config.num_tokens <= 0:
+            raise ValueError("num_tokens must be positive")
+        if self.config.hidden_dim <= 0:
+            raise ValueError("hidden_dim must be positive")
+        if self.config.num_experts <= 0:
+            raise ValueError("num_experts must be positive")
+        self.config.hidden_dtype = _check_router_projection_dtype(
+            "hidden_dtype",
+            self.config.hidden_dtype,
+        )
+        self.config.router_weight_dtype = _check_router_projection_dtype(
+            "router_weight_dtype",
+            self.config.router_weight_dtype,
+        )
+        self.config.hidden_scale = _check_positive_float(
+            "hidden_scale",
+            self.config.hidden_scale,
+        )
+        if self.config.router_weight_scale is not None:
+            self.config.router_weight_scale = _check_positive_float(
+                "router_weight_scale",
+                self.config.router_weight_scale,
+            )
+        self.hidden_states_input = self.hidden_states_input or TensorInput(
+            (self.config.num_tokens, self.config.hidden_dim),
+            self.config.hidden_dtype,
+            device=self.config.device,
+        )
+        self.router_weights_input = self.router_weights_input or TensorInput(
+            (self.config.num_experts, self.config.hidden_dim),
+            self.config.router_weight_dtype,
+            device=self.config.device,
+        )
+        self.hidden_states_input.shape = (
+            self.config.num_tokens,
+            self.config.hidden_dim,
+        )
+        self.hidden_states_input.dtype = self.config.hidden_dtype
+        self.hidden_states_input.device = self.config.device
+        self.router_weights_input.shape = (
+            self.config.num_experts,
+            self.config.hidden_dim,
+        )
+        self.router_weights_input.dtype = self.config.router_weight_dtype
+        self.router_weights_input.device = self.config.device
+
+    def _router_weight_scale(self) -> float:
+        if self.config.router_weight_scale is not None:
+            return self.config.router_weight_scale
+        return 1.0 / math.sqrt(self.config.hidden_dim)
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> RouterProjectionInputValues:
+        self.__post_init__()
+        if self.hidden_states_input is None or self.router_weights_input is None:
+            raise ValueError("router projection child generators must be initialized")
+
+        hidden_states = self.hidden_states_input.generate(
+            seed=_child_seed(seed, 1),
+            device=device,
+        ).values
+        router_weights = self.router_weights_input.generate(
+            seed=_child_seed(seed, 2),
+            device=device,
+        ).values
+        if hidden_states is None or router_weights is None:
+            raise ValueError("router projection tensors must not be skipped")
+
+        hidden_states = (
+            hidden_states.float()
+            .mul(self.config.hidden_scale)
+            .to(self.config.hidden_dtype)
+            .contiguous()
+        )
+        router_weights = (
+            router_weights.float()
+            .mul(self._router_weight_scale())
+            .to(self.config.router_weight_dtype)
+            .contiguous()
+        )
+        values = RouterProjectionInputValues(
+            hidden_states=hidden_states,
+            router_weights=router_weights,
+        )
+        _check_router_projection_values(values)
+        return values
+
+
+def _check_router_projection_values(values: RouterProjectionInputValues) -> None:
+    if values.hidden_states.ndim != 2:
+        raise ValueError("hidden_states must be rank-2 [num_tokens, hidden_dim]")
+    if values.router_weights.ndim != 2:
+        raise ValueError("router_weights must be rank-2 [num_experts, hidden_dim]")
+    if values.hidden_states.shape[0] <= 0:
+        raise ValueError("hidden_states must contain at least one token row")
+    if values.hidden_states.shape[1] <= 0:
+        raise ValueError("hidden_dim must be positive")
+    if values.router_weights.shape[0] <= 0:
+        raise ValueError("router_weights must contain at least one expert row")
+    if values.router_weights.shape[1] != values.hidden_states.shape[1]:
+        raise ValueError(
+            "router projection hidden dimensions must match; "
+            f"hidden_states={tuple(values.hidden_states.shape)}, "
+            f"router_weights={tuple(values.router_weights.shape)}"
+        )
+    _check_router_projection_dtype("hidden_states dtype", values.hidden_states.dtype)
+    _check_router_projection_dtype(
+        "router_weights dtype",
+        values.router_weights.dtype,
+    )
+    if not torch.isfinite(values.hidden_states.float()).all():
+        raise ValueError("hidden_states must be finite")
+    if not torch.isfinite(values.router_weights.float()).all():
+        raise ValueError("router_weights must be finite")
+
+
+def router_projection_reference(
+    values: RouterProjectionInputValues,
+) -> torch.Tensor:
+    """Return fp32 router logits for ``hidden_states @ router_weights.T``."""
+
+    _check_router_projection_values(values)
+    return (values.hidden_states.float() @ values.router_weights.float().T).float()
 
 
 def mxfp4_gemm_input_config(
