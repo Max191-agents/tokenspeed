@@ -48,6 +48,7 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_compressed_slot_mapping,
     deepseek_v4_compute_global_topk_indices_and_lens,
     deepseek_v4_decode_swa_indices_and_lens,
+    deepseek_v4_gather_indexer_mxfp4_cache,
     deepseek_v4_indexer_decode_metadata_compute,
     deepseek_v4_save_compressor_state,
     write_deepseek_v4_indexer_mxfp4_cache_cuda,
@@ -67,6 +68,8 @@ from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputs,
     DeepSeekV4CompressorStateInputConfig,
     DeepSeekV4CompressorStateInputs,
+    DeepSeekV4IndexerMXFP4CacheGatherInputConfig,
+    DeepSeekV4IndexerMXFP4CacheGatherInputs,
     DeepSeekV4IndexerMXFP4CacheWriteInputConfig,
     DeepSeekV4IndexerMXFP4CacheWriteInputs,
     DeepSeekV4PagedIndexInputConfig,
@@ -98,6 +101,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
     deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_indexer_decode_metadata_reference,
+    deepseek_v4_indexer_mxfp4_cache_gather_reference,
     deepseek_v4_indexer_mxfp4_cache_write_reference,
     deepseek_v4_save_compressor_state_reference,
     dsa_full_context_topk_to_global_slots_reference,
@@ -728,6 +732,39 @@ def test_deepseek_v4_indexer_mxfp4_cache_write_generator_runs_tokenspeed_triton(
     torch.cuda.synchronize()
 
     torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+def test_deepseek_v4_indexer_mxfp4_cache_gather_generator_runs_tokenspeed_triton(
+    device: str,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm GPU is required for Triton MXFP4 cache-gather test")
+
+    values = DeepSeekV4IndexerMXFP4CacheGatherInputs(
+        DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
+            num_rows=6,
+            num_cache_blocks=2,
+            block_size=4,
+            negative_slot_count=2,
+        )
+    ).generate(seed=2093, device=device)
+    expected_values, expected_scales = deepseek_v4_indexer_mxfp4_cache_gather_reference(
+        values
+    )
+    actual_values = values.values_out.clone()
+    actual_scales = values.scales_out.clone()
+
+    deepseek_v4_gather_indexer_mxfp4_cache(
+        cache_2d=values.cache_2d,
+        slot_mapping=values.slot_mapping,
+        values_out=actual_values,
+        scales_out=actual_scales,
+        block_size=values.block_size,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual_values, expected_values, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(actual_scales, expected_scales, rtol=0.0, atol=0.0)
 
 
 def test_deepseek_v4_paged_index_generator_runs_tokenspeed_triton(

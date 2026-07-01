@@ -198,6 +198,23 @@ contents for that row remain unchanged. The generator gives writable rows
 unique in-range slots so generated inputs cannot describe write races or
 out-of-bounds cache accesses.
 
+### DeepSeek V4 Indexer MXFP4 Cache Gather
+
+`DeepSeekV4IndexerMXFP4CacheGatherInputs` represents reading 128-channel indexer
+K rows from the same paged MXFP4 byte-cache layout used by the write generator.
+For each requested row, `slot_mapping` selects the physical page and row within
+that page. The operation copies 64 packed value bytes and 4 scale bytes into
+dense output workspaces:
+
+```text
+value_base = page * page_stride + row * 64
+scale_base = page * page_stride + block_size * 64 + row * 4
+```
+
+Rows with `slot_mapping < 0` gather zeros. Non-negative slots are generated
+within the physical cache range, and generated cache/output byte workspaces use
+layouts compatible with this packed cache representation.
+
 ### DeepSeek V4 Sparse-Prefill Indices
 
 `DeepSeekV4SparsePrefillIndexInputs` represents the metadata/index construction

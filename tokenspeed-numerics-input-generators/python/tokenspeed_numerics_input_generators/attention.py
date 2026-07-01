@@ -87,6 +87,10 @@ __all__ = [
     "DeepSeekV4IndexerMXFP4CacheWriteInputs",
     "DeepSeekV4IndexerMXFP4CacheWriteInputValues",
     "deepseek_v4_indexer_mxfp4_cache_write_reference",
+    "DeepSeekV4IndexerMXFP4CacheGatherInputConfig",
+    "DeepSeekV4IndexerMXFP4CacheGatherInputs",
+    "DeepSeekV4IndexerMXFP4CacheGatherInputValues",
+    "deepseek_v4_indexer_mxfp4_cache_gather_reference",
     "DeepSeekV4PagedIndexInputConfig",
     "DeepSeekV4PagedIndexInputs",
     "DeepSeekV4PagedIndexValues",
@@ -3185,6 +3189,274 @@ def deepseek_v4_indexer_mxfp4_cache_write_reference(
         flat[value_base : value_base + _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES] = packed
         flat[scale_base : scale_base + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES] = scales
     return out.contiguous()
+
+
+@dataclass
+class DeepSeekV4IndexerMXFP4CacheGatherInputValues:
+    """Generated values for gathering DeepSeek V4 indexer MXFP4 cache rows."""
+
+    cache_2d: torch.Tensor
+    slot_mapping: torch.Tensor
+    values_out: torch.Tensor
+    scales_out: torch.Tensor
+    block_size: int
+
+
+@dataclass
+class DeepSeekV4IndexerMXFP4CacheGatherInputConfig:
+    """Initialization parameters for DeepSeek V4 indexer MXFP4 cache gathers.
+
+    The represented operation reads packed MXFP4 value bytes and UE8M0 scale
+    bytes from a paged cache into dense workspaces. Negative slot ids produce
+    zero-filled output rows.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of rows to gather.
+    num_rows: int
+
+    # Required: number of physical MXFP4 cache pages.
+    num_cache_blocks: int
+
+    # Required: number of indexer rows in each physical cache page.
+    block_size: int
+
+    # ------------------------------------------------------------------
+    # Optional metadata/value generation configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: rows with slot_mapping == -1. These rows gather zeros.
+    negative_slot_count: int = 0
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DeepSeekV4IndexerMXFP4CacheGatherInputs(NumericsInputGenerator):
+    """Generator for DeepSeek V4 indexer MXFP4 cache-gather inputs."""
+
+    config: DeepSeekV4IndexerMXFP4CacheGatherInputConfig
+
+    def __init__(self, config: DeepSeekV4IndexerMXFP4CacheGatherInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+
+    def generate(
+        self,
+        *,
+        seed: int | None = None,
+        metadata_seed: int | None = None,
+        value_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> DeepSeekV4IndexerMXFP4CacheGatherInputValues:
+        self.__post_init__()
+        metadata_seed, value_seed = _resolve_attention_seeds(
+            seed=seed,
+            metadata_seed=metadata_seed,
+            value_seed=value_seed,
+        )
+        target_device = _resolve_device(self.config.device, device)
+        values = DeepSeekV4IndexerMXFP4CacheGatherInputValues(
+            cache_2d=self._generate_cache(
+                seed=_child_seed(value_seed, 1),
+                device=target_device,
+            ),
+            slot_mapping=self._generate_slot_mapping(
+                seed=_child_seed(metadata_seed, 1),
+                device=target_device,
+            ),
+            values_out=self._generate_output(
+                seed=_child_seed(value_seed, 2),
+                shape=(self.config.num_rows, _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES),
+                device=target_device,
+            ),
+            scales_out=self._generate_output(
+                seed=_child_seed(value_seed, 3),
+                shape=(self.config.num_rows, _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES),
+                device=target_device,
+            ),
+            block_size=self.config.block_size,
+        )
+        _validate_deepseek_v4_indexer_mxfp4_cache_gather_values(values)
+        return values
+
+    def _normalize_config(self) -> None:
+        self.config.num_rows = _check_nonnegative("num_rows", self.config.num_rows)
+        self.config.num_cache_blocks = _check_positive(
+            "num_cache_blocks",
+            self.config.num_cache_blocks,
+        )
+        self.config.block_size = _check_positive("block_size", self.config.block_size)
+        self.config.negative_slot_count = _check_nonnegative(
+            "negative_slot_count",
+            self.config.negative_slot_count,
+        )
+        if self.config.negative_slot_count > self.config.num_rows:
+            raise ValueError("negative_slot_count must be <= num_rows")
+        total_slots = self.config.num_cache_blocks * self.config.block_size
+        if self.config.num_rows > 0 and total_slots <= 0:
+            raise ValueError("gather cache must contain at least one slot")
+
+    def _cache_row_bytes(self) -> int:
+        return self.config.block_size * (
+            _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
+            + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+        )
+
+    def _generate_cache(self, *, seed: int, device: torch.device) -> torch.Tensor:
+        rng_device = "cuda" if device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=rng_device).manual_seed(seed)
+        return torch.randint(
+            0,
+            256,
+            (self.config.num_cache_blocks, self._cache_row_bytes()),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+
+    def _generate_output(
+        self,
+        *,
+        seed: int,
+        shape: tuple[int, int],
+        device: torch.device,
+    ) -> torch.Tensor:
+        rng_device = "cuda" if device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=rng_device).manual_seed(seed)
+        return torch.randint(
+            0,
+            256,
+            shape,
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
+
+    def _generate_slot_mapping(
+        self, *, seed: int, device: torch.device
+    ) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        slots = torch.full((self.config.num_rows,), -1, dtype=torch.int64)
+        non_negative_count = self.config.num_rows - self.config.negative_slot_count
+        if non_negative_count:
+            total_slots = self.config.num_cache_blocks * self.config.block_size
+            slots[:non_negative_count] = torch.randint(
+                0,
+                total_slots,
+                (non_negative_count,),
+                dtype=torch.int64,
+                generator=rng,
+            )
+            order = torch.randperm(self.config.num_rows, generator=rng)
+            slots = slots[order]
+        return slots.to(device)
+
+
+def _validate_deepseek_v4_indexer_mxfp4_cache_gather_values(
+    values: DeepSeekV4IndexerMXFP4CacheGatherInputValues,
+) -> None:
+    if values.cache_2d.dtype != torch.uint8:
+        raise TypeError(f"cache_2d must be uint8, got {values.cache_2d.dtype}")
+    if values.values_out.dtype != torch.uint8:
+        raise TypeError(f"values_out must be uint8, got {values.values_out.dtype}")
+    if values.scales_out.dtype != torch.uint8:
+        raise TypeError(f"scales_out must be uint8, got {values.scales_out.dtype}")
+    if values.cache_2d.ndim != 2:
+        raise ValueError(f"cache_2d must be rank-2, got {values.cache_2d.ndim}")
+    if values.slot_mapping.ndim != 1:
+        raise ValueError("slot_mapping must be rank-1")
+    if values.values_out.ndim != 2 or values.scales_out.ndim != 2:
+        raise ValueError("values_out and scales_out must be rank-2")
+    block_size = _check_positive("block_size", values.block_size)
+    min_row_bytes = block_size * (
+        _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+    )
+    if values.cache_2d.shape[1] < min_row_bytes:
+        raise ValueError(
+            f"cache_2d row width must be at least {min_row_bytes}, "
+            f"got {values.cache_2d.shape[1]}"
+        )
+    if values.cache_2d.stride(1) != 1:
+        raise ValueError("cache_2d must be contiguous in the byte dimension")
+    rows = values.slot_mapping.numel()
+    if values.values_out.shape[0] < rows or values.scales_out.shape[0] < rows:
+        raise ValueError(
+            "gather output workspaces must have at least slot_mapping rows"
+        )
+    if values.values_out.shape[1] < _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES:
+        raise ValueError("values_out has insufficient value bytes")
+    if values.scales_out.shape[1] < _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES:
+        raise ValueError("scales_out has insufficient scale bytes")
+    if values.values_out.stride(1) != 1 or values.scales_out.stride(1) != 1:
+        raise ValueError(
+            "gather output workspaces must be contiguous in the byte dimension"
+        )
+    if values.slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            f"slot_mapping must be integer, got {values.slot_mapping.dtype}"
+        )
+    if (
+        values.slot_mapping.device != values.cache_2d.device
+        or values.values_out.device != values.cache_2d.device
+        or values.scales_out.device != values.cache_2d.device
+    ):
+        raise ValueError(
+            "cache_2d, slot_mapping, values_out, and scales_out must share device"
+        )
+    slots = values.slot_mapping.to(torch.int64)
+    valid = slots >= 0
+    if not bool(valid.any().item()):
+        return
+    total_slots = values.cache_2d.shape[0] * block_size
+    valid_slots = slots[valid]
+    if int(valid_slots.max().item()) >= total_slots:
+        raise ValueError(
+            f"slot_mapping entries must be < {total_slots}, "
+            f"got {int(valid_slots.max().item())}"
+        )
+
+
+def deepseek_v4_indexer_mxfp4_cache_gather_reference(
+    values: DeepSeekV4IndexerMXFP4CacheGatherInputValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return dense value and scale byte workspaces gathered from MXFP4 cache."""
+
+    _validate_deepseek_v4_indexer_mxfp4_cache_gather_values(values)
+    values_out = values.values_out.clone()
+    scales_out = values.scales_out.clone()
+    flat_cache = values.cache_2d.reshape(-1)
+    slots = values.slot_mapping.to(torch.int64)
+    for row_idx, slot_value in enumerate(slots.tolist()):
+        if slot_value < 0:
+            values_out[row_idx, :_DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES].zero_()
+            scales_out[row_idx, :_DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES].zero_()
+            continue
+        page = slot_value // values.block_size
+        pos = slot_value % values.block_size
+        page_base = page * values.cache_2d.stride(0)
+        value_base = page_base + pos * _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
+        scale_base = (
+            page_base
+            + values.block_size * _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
+            + pos * _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+        )
+        values_out[
+            row_idx,
+            :_DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES,
+        ] = flat_cache[value_base : value_base + _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES]
+        scales_out[
+            row_idx,
+            :_DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES,
+        ] = flat_cache[scale_base : scale_base + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES]
+    return values_out.contiguous(), scales_out.contiguous()
 
 
 @dataclass

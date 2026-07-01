@@ -27,6 +27,8 @@ from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputs,
     DeepSeekV4CompressorStateInputConfig,
     DeepSeekV4CompressorStateInputs,
+    DeepSeekV4IndexerMXFP4CacheGatherInputConfig,
+    DeepSeekV4IndexerMXFP4CacheGatherInputs,
     DeepSeekV4IndexerMXFP4CacheWriteInputConfig,
     DeepSeekV4IndexerMXFP4CacheWriteInputs,
     DeepSeekV4PagedIndexInputConfig,
@@ -65,6 +67,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
     deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_indexer_decode_metadata_reference,
+    deepseek_v4_indexer_mxfp4_cache_gather_reference,
     deepseek_v4_indexer_mxfp4_cache_write_reference,
     deepseek_v4_save_compressor_state_reference,
     dsa_full_context_topk_to_global_slots_reference,
@@ -1213,6 +1216,111 @@ def test_deepseek_v4_indexer_mxfp4_cache_write_rejects_invalid_configs_and_value
     values.valid = torch.tensor([True, True], dtype=torch.bool)
     with pytest.raises(ValueError, match="unique"):
         deepseek_v4_indexer_mxfp4_cache_write_reference(values)
+
+
+def test_deepseek_v4_indexer_mxfp4_cache_gather_inputs_generate_reference() -> None:
+    values = DeepSeekV4IndexerMXFP4CacheGatherInputs(
+        DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
+            num_rows=6,
+            num_cache_blocks=2,
+            block_size=4,
+            negative_slot_count=2,
+        )
+    ).generate(metadata_seed=141, value_seed=151, device="cpu")
+
+    expected_values, expected_scales = deepseek_v4_indexer_mxfp4_cache_gather_reference(
+        values
+    )
+
+    assert values.cache_2d.shape == (2, 4 * 68)
+    assert values.slot_mapping.shape == (6,)
+    assert values.values_out.shape == (6, 64)
+    assert values.scales_out.shape == (6, 4)
+    assert int((values.slot_mapping < 0).sum().item()) == 2
+    assert expected_values.shape == values.values_out.shape
+    assert expected_scales.shape == values.scales_out.shape
+
+    for row_idx, slot in enumerate(values.slot_mapping.to(torch.int64).tolist()):
+        if slot < 0:
+            torch.testing.assert_close(
+                expected_values[row_idx, :64],
+                torch.zeros((64,), dtype=torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                expected_scales[row_idx, :4],
+                torch.zeros((4,), dtype=torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+            continue
+
+        page = slot // values.block_size
+        pos = slot % values.block_size
+        value_base = pos * 64
+        scale_base = values.block_size * 64 + pos * 4
+        torch.testing.assert_close(
+            expected_values[row_idx, :64],
+            values.cache_2d[page, value_base : value_base + 64],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            expected_scales[row_idx, :4],
+            values.cache_2d[page, scale_base : scale_base + 4],
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_deepseek_v4_indexer_mxfp4_cache_gather_keeps_metadata_seed_independent() -> (
+    None
+):
+    generator = DeepSeekV4IndexerMXFP4CacheGatherInputs(
+        DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
+            num_rows=4,
+            num_cache_blocks=2,
+            block_size=2,
+            negative_slot_count=1,
+        )
+    )
+
+    first = generator.generate(metadata_seed=161, value_seed=171, device="cpu")
+    same_metadata = generator.generate(metadata_seed=161, value_seed=172, device="cpu")
+    same_values = generator.generate(metadata_seed=162, value_seed=171, device="cpu")
+
+    torch.testing.assert_close(first.slot_mapping, same_metadata.slot_mapping)
+    assert not torch.equal(first.cache_2d, same_metadata.cache_2d)
+    assert not torch.equal(first.values_out, same_metadata.values_out)
+    torch.testing.assert_close(first.cache_2d, same_values.cache_2d)
+    torch.testing.assert_close(first.values_out, same_values.values_out)
+    torch.testing.assert_close(first.scales_out, same_values.scales_out)
+
+
+def test_deepseek_v4_indexer_mxfp4_cache_gather_rejects_invalid_configs_and_values() -> (
+    None
+):
+    with pytest.raises(ValueError, match="negative_slot_count"):
+        DeepSeekV4IndexerMXFP4CacheGatherInputs(
+            DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
+                num_rows=1,
+                num_cache_blocks=1,
+                block_size=2,
+                negative_slot_count=2,
+            )
+        )
+
+    values = DeepSeekV4IndexerMXFP4CacheGatherInputs(
+        DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
+            num_rows=1,
+            num_cache_blocks=1,
+            block_size=2,
+        )
+    ).generate(seed=181, device="cpu")
+    values.slot_mapping = torch.tensor([2], dtype=torch.int64)
+    with pytest.raises(ValueError, match="slot_mapping entries"):
+        deepseek_v4_indexer_mxfp4_cache_gather_reference(values)
 
 
 def test_deepseek_v4_paged_index_inputs_generate_values_and_refs() -> None:
