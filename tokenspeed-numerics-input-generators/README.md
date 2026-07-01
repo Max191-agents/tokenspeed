@@ -91,6 +91,13 @@ operation inputs with no valid mathematical interpretation. That confidence is
 one of the reasons to use the generator library instead of ad hoc tensor setup
 inside each test.
 
+Verification should make the supported path trustworthy. If a caller stays
+inside the public generator API, the generated tensors and metadata should be
+valid for the documented operation family without every consumer adding its own
+generic well-formedness checks. Tests that intentionally need invalid inputs
+should construct those cases outside the normal generator path so the generator
+contract stays clear.
+
 Verification belongs at the same semantic level as generation. It should check
 shape relationships, datatype compatibility, required metadata, cache/page
 constraints, scale requirements, and other invariants that define whether the
