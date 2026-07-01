@@ -85,10 +85,13 @@ words, correctness tests should get well-formed inputs by construction as long
 as they use the generator API.
 
 The generator library should be the place where common input validity is
-centralized. Consumers may still check kernel-specific ABI details, but they
-should not need to rediscover whether an operation-family config is coherent or
-whether generated metadata can describe a valid computation. That confidence is
-part of the library contract.
+centralized. It is not enough for a generator to produce plausible tensors most
+of the time; the public generator path should make invalid or broken operation
+inputs unrepresentable, or reject them before generation completes. Consumers
+may still check kernel-specific ABI details, but they should not need to
+rediscover whether an operation-family config is coherent or whether generated
+metadata can describe a valid computation. That confidence is part of the
+library contract.
 
 The verification standard is misuse resistance, not exhaustive defensive
 programming. It should be difficult to call a generator in a way that produces
