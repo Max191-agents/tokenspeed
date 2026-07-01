@@ -77,89 +77,34 @@ objects.
 
 ## Verification
 
-Input generators should perform just enough verification that the library cannot
-be misused to silently produce invalid operation inputs. If a generator accepts
-a config and returns values, those values should satisfy the operation-level
+Input generators should perform just enough verification that they cannot be
+misused to silently produce invalid operation inputs. If a generator accepts a
+config and returns values, those values should satisfy the operation-level
 constraints documented for that generator. Correctness tests should get
 well-formed inputs by construction as long as they stay inside the public
 generator API.
 
-In other words, the generator should be the trust boundary for input validity.
-Consumers should be able to use generated values with confidence that the
-operation's generic invariants have already been checked, including the
-relationships between nested generators, generated metadata, tensor dtypes,
-scale tensors, and cache/index structures.
+That makes the generator library the trust boundary for input validity.
+Consumers may still check implementation-specific ABI details, but they should
+not need to rediscover whether an operation-family config is coherent, whether
+metadata can describe a valid computation, or whether generated tensors satisfy
+generic shape and dtype relationships.
 
-The verification standard is misuse resistance, not exhaustive defensive
-programming. The public generator path should make invalid or broken operation
-inputs unrepresentable, or reject them before generation completes. Consumers
-may still check kernel-specific ABI details, but they should not need to
-rediscover whether an operation-family config is coherent, whether metadata can
-describe a valid computation, or whether generated tensors satisfy the generic
-shape and dtype relationships for that operation.
+Verification is therefore part of the public contract, not an optional debug
+aid. Configs should reject impossible or contradictory operation descriptions
+before generation starts. `generate(...)` should validate relationships that
+depend on inferred defaults, nested generators, devices, dtypes, random
+metadata, scale tensors, or cache/page structures. Returned values should be
+ready for reference implementations or kernel adapters without each consumer
+repeating generic validity checks.
 
-This confidence is part of the library contract. It should be difficult to call
-a generator in a way that produces broken tensors, inconsistent metadata,
-unsupported dtype combinations, or operation inputs with no valid mathematical
-interpretation. Tests that intentionally need invalid inputs should construct
-those cases outside the normal generator path so the generator contract stays
-clear.
-
-Concretely, each generator should guarantee that:
-
-- Required operation-defining fields are present before generation starts.
-- Shape relationships are internally consistent, including relationships
-  between parent configs and nested child generators.
-- Dtype and custom-format requirements are enforced where the corresponding
-  tensor is generated.
-- Randomly generated metadata cannot describe impossible layouts, out-of-range
-  indices, invalid request lengths, or cache/page state that does not match the
-  generated tensors.
-- Returned values are ready for reference implementations or kernel adapters
-  without requiring each consumer to repeat generic validity checks.
-
-Verification belongs at the same semantic level as generation. It should check
-shape relationships, datatype compatibility, required metadata, cache/page
-constraints, scale requirements, and other invariants that define whether the
-generated inputs are meaningful. Examples include rejecting an MXFP4 tensor
-without scales, rejecting incompatible scale shapes, ensuring page-table
-metadata is consistent with cache layout, and requiring attention head counts or
-request-length metadata to satisfy the operation contract.
-
-The practical rule is that misuse should fail inside the generator library
-rather than later inside a reference implementation, kernel adapter, or backend
-kernel. If a public config can produce inputs that do not satisfy the documented
-operation semantics, the generator contract is incomplete and should be fixed at
-the source.
-
-Verification is part of the public API for each generator, not an optional
-debug aid. A generator should reject unsupported or contradictory configurations
-instead of guessing what the caller intended. It should also validate generated
-relationships that depend on inferred defaults, child generators, random
-metadata, or target-device choices. This makes the generator the trusted place
-where operation-specific constraints are encoded.
-
-The useful verification boundary is the point where misuse would create broken
-or meaningless inputs:
-
-- Config objects should reject impossible or contradictory operation
-  descriptions.
-- `generate(...)` should verify relationships that are only known after child
-  configs, inferred defaults, devices, dtypes, or generated metadata are
-  resolved.
-- Values returned by a generator should not need additional generic validity
-  checks before being passed to a reference implementation or kernel adapter.
-
-The goal is not to duplicate every assertion a kernel might make about its
-private ABI. Kernel-specific requirements still belong in adapters or tests.
-The generator should instead prevent misuse of the operation-family API itself:
-bad configs should fail early, and generated values should not require every
-consumer to rediscover the same validity checks.
-
-This keeps numerical tests focused on implementation correctness. If a test uses
-the generator library, failures should not be caused by malformed inputs unless
-the test deliberately mutates the generated values outside the generator
-contract.
+The standard is misuse resistance, not duplicating every kernel assertion.
+Kernel-specific requirements still belong in adapters or tests. The generator
+should instead prevent misuse of the operation-family API itself: missing
+required fields, incompatible shapes, unsupported dtype combinations, invalid
+quantized scale requirements, impossible request lengths, out-of-range metadata,
+and cache or page state that does not match the generated tensors should fail in
+the generator library.
 
 Tests for generators should cover that contract directly. Each family should
 include focused tests for invalid configurations that must be rejected and for
