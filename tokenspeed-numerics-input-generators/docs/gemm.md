@@ -27,6 +27,12 @@ for `A`, `B`, and `C`. `A` or `B` may use dtype `None` when a parent operation,
 such as a layer-level MoE generator, only needs one side of the GEMM. `C` is
 required and is always generated.
 
+`gemm_reference` computes the operation-level `A @ B.T` result from generated
+values. It normalizes dense operand layouts, applies scale sidecars for scaled
+tensors, and dequantizes MXFP4 storage with UE8M0 scales before multiplying.
+Kernel tests can use it as the semantic target while keeping backend-specific
+argument mapping in the adapter or test.
+
 ## Scale And Quantized Storage
 
 Dense floating-point tensors use the core tensor generator. Scaled tensors use
@@ -43,4 +49,7 @@ for MXFP4 operands with block scales.
 The generator verifies logical dimensions, required output dtype, layout-derived
 physical shapes, and scale requirements. It rejects configurations that would
 produce meaningless inputs, such as scales for skipped operands or MXFP4 storage
-without compatible scales.
+without compatible scales. Layout names are validated explicitly. The current
+MXFP4 GEMM definition is the row-major form consumed by the TokenSpeed Triton
+MXFP4 GEMM path, so MXFP4 `A` operands require `MK` layout and MXFP4 `B`
+operands require `NK` layout.

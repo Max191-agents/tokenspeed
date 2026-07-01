@@ -43,6 +43,7 @@ __all__ = [
     "GemmInputs",
     "GemmInputConfig",
     "GemmInputValues",
+    "gemm_reference",
     "gemm_scale_shape",
     "mxfp4_gemm_input_config",
 ]
@@ -51,6 +52,7 @@ GemmLayout = Literal["MK", "KM", "NK", "KN"]
 ScaleGranularity = Literal["tensor", "channel", "block"]
 
 _DEFAULT_MXFP4_BLOCK_SIZE = 32
+_GEMM_LAYOUTS = frozenset({"MK", "KM", "NK", "KN"})
 
 
 def _gemm_value_shape(
@@ -152,6 +154,103 @@ def _generate_tensor(
             .values
         )
     raise TypeError(f"unsupported GEMM dtype={dtype!r}")
+
+
+def _check_gemm_layout(name: str, layout: GemmLayout) -> GemmLayout:
+    if layout not in _GEMM_LAYOUTS:
+        raise ValueError(f"{name} must be one of {sorted(_GEMM_LAYOUTS)}, got {layout!r}")
+    return layout
+
+
+def _mxfp4_e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
+    magnitude_bits = nibbles & 0x7
+    exponent = (magnitude_bits >> 1).to(torch.float32)
+    mantissa = (magnitude_bits & 0x1).to(torch.float32)
+    normal = (1.0 + 0.5 * mantissa) * torch.exp2(exponent - 1.0)
+    subnormal = 0.5 * mantissa
+    magnitude = torch.where(exponent == 0, subnormal, normal)
+    sign = 1.0 - 2.0 * ((nibbles >> 3) & 0x1).to(torch.float32)
+    return magnitude * sign
+
+
+def _dequantize_mxfp4_linear(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+) -> torch.Tensor:
+    if packed.dtype != torch.uint8 or scales.dtype != torch.uint8:
+        raise ValueError("MXFP4 values and UE8M0 scales must use torch.uint8 storage")
+    if packed.ndim < 2:
+        raise ValueError("MXFP4 GEMM operands must be at least 2D")
+    if scales.shape[:-1] != packed.shape[:-1]:
+        raise ValueError(
+            "MXFP4 scale rows must match packed value rows; "
+            f"packed={tuple(packed.shape)}, scales={tuple(scales.shape)}"
+        )
+
+    out = packed.new_empty(
+        (*packed.shape[:-1], packed.shape[-1] * 2),
+        dtype=torch.float32,
+    )
+    out[..., 0::2] = _mxfp4_e2m1_values(packed & 0xF)
+    out[..., 1::2] = _mxfp4_e2m1_values(packed >> 4)
+
+    expected_groups = math.ceil(out.shape[-1] / _DEFAULT_MXFP4_BLOCK_SIZE)
+    if scales.shape[-1] != expected_groups:
+        raise ValueError(
+            "MXFP4 scale group count must match K dimension; "
+            f"got scales={tuple(scales.shape)}, values={tuple(out.shape)}"
+        )
+    scale_values = torch.pow(2.0, scales.to(torch.int32) - 127).to(torch.float32)
+    return out * scale_values.repeat_interleave(
+        _DEFAULT_MXFP4_BLOCK_SIZE,
+        dim=-1,
+    )[..., : out.shape[-1]]
+
+
+def _apply_regular_scales(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    scale_values = scales.float()
+    if scale_values.numel() == 1:
+        return values * scale_values.reshape((1,) * values.ndim)
+    if scale_values.ndim == 1 and scale_values.shape[0] == values.shape[-2]:
+        return values * scale_values.reshape(*values.shape[:-2], values.shape[-2], 1)
+    if scale_values.ndim >= 2 and scale_values.shape[-2] == values.shape[-2]:
+        groups = scale_values.shape[-1]
+        if groups <= 0:
+            raise ValueError("scale group count must be positive")
+        repeat = math.ceil(values.shape[-1] / groups)
+        expanded = scale_values.repeat_interleave(repeat, dim=-1)[
+            ..., : values.shape[-1]
+        ]
+        return values * expanded
+    raise ValueError(
+        "unsupported GEMM scale shape for reference; "
+        f"values={tuple(values.shape)}, scales={tuple(scales.shape)}"
+    )
+
+
+def _logical_operand(
+    values: torch.Tensor,
+    scales: torch.Tensor | None,
+    *,
+    layout: GemmLayout,
+    is_mxfp4: bool,
+) -> torch.Tensor:
+    if is_mxfp4:
+        if layout not in ("MK", "NK"):
+            raise ValueError(
+                "MXFP4 GEMM reference currently supports row-major MK/NK operands"
+            )
+        if scales is None:
+            raise ValueError("MXFP4 GEMM reference requires scales")
+        logical = _dequantize_mxfp4_linear(values, scales)
+    else:
+        logical = values.float()
+        if scales is not None:
+            logical = _apply_regular_scales(logical, scales)
+
+    if layout in ("KM", "KN"):
+        logical = logical.transpose(-1, -2)
+    return logical.contiguous()
 
 
 @dataclass
@@ -271,6 +370,12 @@ class GemmInputs(NumericsInputGenerator):
         self.config.K = int(self.config.K)
         if min(self.config.M, self.config.N, self.config.K) < 0:
             raise ValueError("M, N, and K must be non-negative")
+        self.config.a_layout = _check_gemm_layout("a_layout", self.config.a_layout)
+        self.config.b_layout = _check_gemm_layout("b_layout", self.config.b_layout)
+        if self.config.a_dtype == CustomDType.MXFP4 and self.config.a_layout != "MK":
+            raise ValueError("MXFP4 A operands currently require a_layout='MK'")
+        if self.config.b_dtype == CustomDType.MXFP4 and self.config.b_layout != "NK":
+            raise ValueError("MXFP4 B operands currently require b_layout='NK'")
         if self.config.c_dtype is None:
             raise ValueError("c_dtype is required")
         if not isinstance(self.config.c_dtype, torch.dtype):
@@ -363,6 +468,69 @@ class GemmInputs(NumericsInputGenerator):
             A_scales=a_values.scales,
             B_scales=b_values.scales,
         )
+
+
+def gemm_reference(
+    values: GemmInputValues,
+    *,
+    a_layout: GemmLayout = "MK",
+    b_layout: GemmLayout = "NK",
+    out_dtype: torch.dtype | None = None,
+    alpha: torch.Tensor | float | None = None,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return the semantic ``A @ B.T`` GEMM result for generated values.
+
+    Dense and scaled torch tensors are converted to fp32 and multiplied by
+    their scale sidecars before the matmul. MXFP4 operands are unpacked from
+    E2M1x2 bytes and dequantized with UE8M0 scales. The returned dtype defaults
+    to the generated ``C`` dtype, matching TokenSpeed's ``out_dtype`` role.
+    """
+
+    a_layout = _check_gemm_layout("a_layout", a_layout)
+    b_layout = _check_gemm_layout("b_layout", b_layout)
+    if values.A is None or values.B is None:
+        raise ValueError("gemm_reference requires generated A and B operands")
+    out_dtype = values.C.dtype if out_dtype is None else out_dtype
+    if not isinstance(out_dtype, torch.dtype):
+        raise TypeError("out_dtype must be a torch.dtype")
+
+    a_is_mxfp4 = values.A.dtype == torch.uint8 and values.A_scales is not None
+    b_is_mxfp4 = values.B.dtype == torch.uint8 and values.B_scales is not None
+    A = _logical_operand(
+        values.A,
+        values.A_scales,
+        layout=a_layout,
+        is_mxfp4=a_is_mxfp4,
+    )
+    B = _logical_operand(
+        values.B,
+        values.B_scales,
+        layout=b_layout,
+        is_mxfp4=b_is_mxfp4,
+    )
+    if A.shape[-1] != B.shape[-1]:
+        raise ValueError(
+            "GEMM K dimensions must match after layout normalization; "
+            f"A={tuple(A.shape)}, B={tuple(B.shape)}"
+        )
+
+    output = A.float() @ B.float().transpose(-1, -2)
+    if alpha is not None:
+        alpha_tensor = (
+            alpha
+            if isinstance(alpha, torch.Tensor)
+            else torch.tensor(alpha, dtype=torch.float32, device=output.device)
+        )
+        output = output * alpha_tensor.to(device=output.device, dtype=output.dtype)
+    if bias is not None:
+        if bias.shape[-1] != output.shape[-1]:
+            raise ValueError(
+                "bias last dimension must match GEMM N dimension; "
+                f"bias={tuple(bias.shape)}, output={tuple(output.shape)}"
+            )
+        output = output + bias.to(device=output.device, dtype=output.dtype)
+    return output.to(out_dtype)
 
 
 def mxfp4_gemm_input_config(

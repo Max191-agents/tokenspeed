@@ -35,6 +35,7 @@ from tokenspeed_numerics_input_generators import (
     MoeInputs,
     TensorInput,
     canonicalize_moe_align_block_size,
+    gemm_reference,
     gemm_scale_shape,
     moe_align_block_size_buffer_dims,
     moe_align_block_size_reference,
@@ -242,6 +243,29 @@ def test_gemm_inputs_accept_config_objects() -> None:
     assert values.C.shape == (2, 3)
 
 
+def test_gemm_reference_handles_dense_layouts() -> None:
+    values = GemmInputs(
+        GemmInputConfig(
+            M=2,
+            N=3,
+            K=4,
+            a_dtype=torch.float32,
+            b_dtype=torch.float32,
+            c_dtype=torch.float32,
+            a_layout="KM",
+            b_layout="KN",
+        )
+    ).generate(seed=10, device="cpu")
+    assert values.A is not None
+    assert values.B is not None
+
+    ref = gemm_reference(values, a_layout="KM", b_layout="KN")
+    manual = values.A.T.float() @ values.B.float()
+
+    assert ref.shape == (2, 3)
+    torch.testing.assert_close(ref, manual)
+
+
 def test_gemm_inputs_require_c_dtype() -> None:
     with pytest.raises(TypeError, match="c_dtype"):
         GemmInputConfig(
@@ -268,6 +292,21 @@ def test_gemm_inputs_require_c_dtype() -> None:
         inputs.generate(seed=8, device="cpu")
 
 
+def test_gemm_inputs_reject_invalid_layout() -> None:
+    with pytest.raises(ValueError, match="a_layout"):
+        GemmInputs(
+            GemmInputConfig(
+                M=2,
+                N=3,
+                K=4,
+                a_dtype=torch.float16,
+                b_dtype=torch.float16,
+                c_dtype=torch.float32,
+                a_layout="bad",  # type: ignore[arg-type]
+            )
+        )
+
+
 def test_gemm_inputs_reject_custom_mxfp4_without_scales() -> None:
     inputs = GemmInputs(
         GemmInputConfig(
@@ -282,6 +321,19 @@ def test_gemm_inputs_reject_custom_mxfp4_without_scales() -> None:
 
     with pytest.raises(ValueError, match="mxfp4 tensors require scale_shape"):
         inputs.generate(seed=9, device="cpu")
+
+
+def test_gemm_inputs_reject_mxfp4_non_kernel_layouts() -> None:
+    with pytest.raises(ValueError, match="a_layout='MK'"):
+        GemmInputs(
+            mxfp4_gemm_input_config(
+                M=4,
+                N=8,
+                K=64,
+                c_dtype=torch.float32,
+                a_layout="KM",
+            )
+        )
 
 
 def test_gemm_inputs_generate_scaled_operands() -> None:
@@ -390,6 +442,54 @@ def test_gemm_inputs_support_mxfp4_ue8m0_scales() -> None:
     assert inputs.B_scales.dtype == torch.uint8
     assert inputs.C is not None
     assert inputs.C.shape == (4, 8)
+
+
+def test_gemm_reference_dequantizes_mxfp4_inputs() -> None:
+    values = GemmInputs(
+        mxfp4_gemm_input_config(
+            M=4,
+            N=8,
+            K=64,
+            c_dtype=torch.float32,
+        )
+    ).generate(seed=21, device="cpu")
+
+    ref = gemm_reference(values)
+
+    assert ref.shape == (4, 8)
+    assert ref.dtype == torch.float32
+    assert torch.isfinite(ref).all()
+
+
+def test_gemm_reference_applies_scaled_operands() -> None:
+    values = GemmInputs(
+        GemmInputConfig(
+            M=3,
+            N=5,
+            K=7,
+            a_dtype=torch.float32,
+            b_dtype=torch.float32,
+            c_dtype=torch.float32,
+            a_scale_shape=(3,),
+            b_scale_shape=(5,),
+            a_scale_dtype=torch.float32,
+            b_scale_dtype=torch.float32,
+        )
+    ).generate(seed=22, device="cpu")
+    assert values.A is not None
+    assert values.B is not None
+    assert values.A_scales is not None
+    assert values.B_scales is not None
+
+    ref = gemm_reference(values)
+    manual = (
+        values.A.float()
+        * values.A_scales.float().view(3, 1)
+    ) @ (
+        values.B.float() * values.B_scales.float().view(5, 1)
+    ).T
+
+    torch.testing.assert_close(ref, manual)
 
 
 def test_moe_inputs_compose_dense_weight_gemms() -> None:

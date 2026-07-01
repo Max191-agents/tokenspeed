@@ -150,6 +150,7 @@ from tokenspeed_numerics_input_generators.gemm import (
     GemmInputConfig,
     GemmInputValues,
     GemmInputs,
+    gemm_reference,
     gemm_scale_shape,
     mxfp4_gemm_input_config,
 )
@@ -314,6 +315,7 @@ __all__ = [
     "GemmInputConfig",
     "GemmInputValues",
     "GemmInputs",
+    "gemm_reference",
     "GatedActivationInputConfig",
     "GatedActivationInputValues",
     "GatedActivationInputs",
