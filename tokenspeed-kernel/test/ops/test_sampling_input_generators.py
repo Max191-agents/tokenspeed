@@ -25,6 +25,12 @@ import torch
 from tokenspeed_kernel.ops.sampling import argmax
 from tokenspeed_kernel.ops.sampling.cuda import fused_topk_topp_renorm
 from tokenspeed_kernel.ops.sampling.cute_dsl import argmax_pair
+from tokenspeed_kernel.ops.sampling.flashinfer import (
+    top_k_renorm_prob as flashinfer_top_k_renorm_prob,
+)
+from tokenspeed_kernel.ops.sampling.flashinfer import (
+    top_p_renorm_prob as flashinfer_top_p_renorm_prob,
+)
 from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,
     min_p_renorm_prob,
@@ -172,4 +178,30 @@ def test_top_k_top_p_generator_runs_fused_cuda_kernel(device: str) -> None:
     ref = top_k_top_p_renorm_reference(values.probs, values.top_k, values.top_p)
     torch.cuda.synchronize()
 
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
+
+
+@requires_nvidia
+def test_top_k_top_p_generator_runs_flashinfer_renorm_sequence(device: str) -> None:
+    values = TopKTopPRenormInputs(
+        TopKTopPRenormInputConfig(
+            num_rows=4,
+            vocab_size=4096,
+            max_top_k=128,
+            include_disabled_top_k=True,
+        )
+    ).generate(seed=99, metadata_seed=100, device=device)
+
+    try:
+        top_k_out = flashinfer_top_k_renorm_prob(values.probs, values.top_k)
+        out = flashinfer_top_p_renorm_prob(
+            top_k_out,
+            values.top_p,
+            is_deterministic=True,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"FlashInfer top-k/top-p renormalization unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    ref = top_k_top_p_renorm_reference(values.probs, values.top_k, values.top_p)
     torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)

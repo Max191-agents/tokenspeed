@@ -85,6 +85,9 @@ TokenSpeed exposes sampling kernels through several modules:
 - `sampling.triton.gather_and_expand_scalars`
 - `sampling.triton.min_p_renorm_prob`
 - NVIDIA-only fused top-k/top-p renormalization helpers
+- FlashInfer `top_k_renorm_prob` followed by deterministic
+  `top_p_renorm_prob` consumes `TopKTopPRenormInputValues.probs`, `.top_k`,
+  and `.top_p`
 
 The standalone generators return operation-level values and references. Tests
 or adapters are responsible for selecting TokenSpeed solutions, passing `out=`
