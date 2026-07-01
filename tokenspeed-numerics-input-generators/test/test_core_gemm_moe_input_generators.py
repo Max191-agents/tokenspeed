@@ -30,12 +30,9 @@ from tokenspeed_numerics_input_generators import (
     MoeInputConfig,
     MoeInputValues,
     MoeInputs,
-    ScaledGemmInputConfig,
-    ScaledGemmInputValues,
-    ScaledGemmInputs,
     TensorInput,
     gemm_scale_shape,
-    mxfp4_scaled_gemm_input_config,
+    mxfp4_gemm_input_config,
 )
 
 _fp8_dtype = torch.float8_e4m3fn
@@ -281,9 +278,9 @@ def test_gemm_inputs_reject_custom_mxfp4_without_scales() -> None:
         inputs.generate(seed=9, device="cpu")
 
 
-def test_scaled_gemm_inputs_generate_scaled_operands() -> None:
-    inputs = ScaledGemmInputs(
-        ScaledGemmInputConfig(
+def test_gemm_inputs_generate_scaled_operands() -> None:
+    inputs = GemmInputs(
+        GemmInputConfig(
             M=4,
             N=6,
             K=8,
@@ -299,23 +296,21 @@ def test_scaled_gemm_inputs_generate_scaled_operands() -> None:
 
     assert inputs.A is not None
     assert inputs.B is not None
-    assert inputs.A.values is not None
-    assert inputs.B.values is not None
-    assert inputs.A.scales is not None
-    assert inputs.B.scales is not None
+    assert inputs.A_scales is not None
+    assert inputs.B_scales is not None
     assert inputs.C is not None
-    assert inputs.A.values.shape == (4, 8)
-    assert inputs.B.values.shape == (6, 8)
-    assert inputs.A.scales.shape == (4,)
-    assert inputs.B.scales.shape == (6,)
-    assert inputs.A.values.dtype == _fp8_dtype
-    assert inputs.B.values.dtype == _fp8_dtype
+    assert inputs.A.shape == (4, 8)
+    assert inputs.B.shape == (6, 8)
+    assert inputs.A_scales.shape == (4,)
+    assert inputs.B_scales.shape == (6,)
+    assert inputs.A.dtype == _fp8_dtype
+    assert inputs.B.dtype == _fp8_dtype
     assert inputs.C.shape == (4, 6)
 
 
-def test_scaled_gemm_inputs_use_mutable_config_fields() -> None:
-    inputs = ScaledGemmInputs(
-        ScaledGemmInputConfig(
+def test_gemm_inputs_use_mutable_scale_config_fields() -> None:
+    inputs = GemmInputs(
+        GemmInputConfig(
             M=4,
             N=6,
             K=8,
@@ -333,14 +328,14 @@ def test_scaled_gemm_inputs_use_mutable_config_fields() -> None:
     inputs.config.c_dtype = torch.float64
     values = inputs.generate(seed=18, device="cpu")
 
-    assert values.A.scales is not None
+    assert values.A_scales is not None
     assert values.C is not None
-    assert values.A.scales.dtype == torch.float64
+    assert values.A_scales.dtype == torch.float64
     assert values.C.dtype == torch.float64
 
 
-def test_scaled_gemm_inputs_accept_config_objects() -> None:
-    config = ScaledGemmInputConfig(
+def test_gemm_inputs_accept_scaled_config_objects() -> None:
+    config = GemmInputConfig(
         M=2,
         N=3,
         K=4,
@@ -349,24 +344,25 @@ def test_scaled_gemm_inputs_accept_config_objects() -> None:
         a_scale_dtype=torch.float32,
         b_scale_dtype=torch.float64,
         c_dtype=torch.float32,
+        a_scale_shape=(1,),
         b_scale_shape=(3,),
     )
-    inputs = ScaledGemmInputs(config)
+    inputs = GemmInputs(config)
 
     values = inputs.generate(seed=20, device="cpu")
 
     assert inputs.config is config
-    assert values.B.values is not None
-    assert values.B.scales is not None
-    assert values.B.values.dtype == torch.float64
-    assert values.B.scales.dtype == torch.float64
+    assert values.B is not None
+    assert values.B_scales is not None
+    assert values.B.dtype == torch.float64
+    assert values.B_scales.dtype == torch.float64
     assert values.C.shape == (2, 3)
     assert values.C.dtype == torch.float32
 
 
-def test_scaled_gemm_inputs_support_mxfp4_ue8m0_scales() -> None:
-    inputs = ScaledGemmInputs(
-        mxfp4_scaled_gemm_input_config(
+def test_gemm_inputs_support_mxfp4_ue8m0_scales() -> None:
+    inputs = GemmInputs(
+        mxfp4_gemm_input_config(
             M=4,
             N=8,
             K=64,
@@ -376,18 +372,16 @@ def test_scaled_gemm_inputs_support_mxfp4_ue8m0_scales() -> None:
 
     assert inputs.A is not None
     assert inputs.B is not None
-    assert inputs.A.values is not None
-    assert inputs.B.values is not None
-    assert inputs.A.scales is not None
-    assert inputs.B.scales is not None
-    assert inputs.A.values.shape == (4, 32)
-    assert inputs.B.values.shape == (8, 32)
-    assert inputs.A.values.dtype == torch.uint8
-    assert inputs.B.values.dtype == torch.uint8
-    assert inputs.A.scales.shape == (4, 2)
-    assert inputs.B.scales.shape == (8, 2)
-    assert inputs.A.scales.dtype == torch.uint8
-    assert inputs.B.scales.dtype == torch.uint8
+    assert inputs.A_scales is not None
+    assert inputs.B_scales is not None
+    assert inputs.A.shape == (4, 32)
+    assert inputs.B.shape == (8, 32)
+    assert inputs.A.dtype == torch.uint8
+    assert inputs.B.dtype == torch.uint8
+    assert inputs.A_scales.shape == (4, 2)
+    assert inputs.B_scales.shape == (8, 2)
+    assert inputs.A_scales.dtype == torch.uint8
+    assert inputs.B_scales.dtype == torch.uint8
     assert inputs.C is not None
     assert inputs.C.shape == (4, 8)
 
@@ -491,7 +485,7 @@ def test_moe_inputs_accept_config_objects() -> None:
     assert values.w13.C.dtype == torch.float32
 
 
-def test_moe_inputs_compose_mxfp4_scaled_weight_gemms() -> None:
+def test_moe_inputs_compose_mxfp4_weight_gemms() -> None:
     inputs = MoeInputs(
         MoeInputConfig(
             num_tokens=5,
@@ -504,23 +498,19 @@ def test_moe_inputs_compose_mxfp4_scaled_weight_gemms() -> None:
         )
     ).generate(seed=29, device="cpu")
 
-    assert isinstance(inputs.w13, ScaledGemmInputValues)
-    assert isinstance(inputs.w2, ScaledGemmInputValues)
-    assert inputs.w13.A is not None
+    assert isinstance(inputs.w13, GemmInputValues)
+    assert isinstance(inputs.w2, GemmInputValues)
+    assert inputs.w13.A is None
     assert inputs.w13.B is not None
-    assert inputs.w2.A is not None
+    assert inputs.w2.A is None
     assert inputs.w2.B is not None
-    assert inputs.w13.A.values is None
-    assert inputs.w13.A.scales is None
-    assert inputs.w2.A.values is None
-    assert inputs.w2.A.scales is None
-    assert inputs.w13.B.values is not None
-    assert inputs.w13.B.scales is not None
-    assert inputs.w2.B.values is not None
-    assert inputs.w2.B.scales is not None
-    assert inputs.w13.B.values.shape == (4, 64, 32)
-    assert inputs.w13.B.scales.shape == (4, 64, 2)
-    assert inputs.w2.B.values.shape == (4, 64, 16)
-    assert inputs.w2.B.scales.shape == (4, 64, 1)
-    assert inputs.w13.B.values.dtype == torch.uint8
-    assert inputs.w13.B.scales.dtype == torch.uint8
+    assert inputs.w13.A_scales is None
+    assert inputs.w2.A_scales is None
+    assert inputs.w13.B_scales is not None
+    assert inputs.w2.B_scales is not None
+    assert inputs.w13.B.shape == (4, 64, 32)
+    assert inputs.w13.B_scales.shape == (4, 64, 2)
+    assert inputs.w2.B.shape == (4, 64, 16)
+    assert inputs.w2.B_scales.shape == (4, 64, 1)
+    assert inputs.w13.B.dtype == torch.uint8
+    assert inputs.w13.B_scales.dtype == torch.uint8

@@ -43,11 +43,8 @@ __all__ = [
     "GemmInputs",
     "GemmInputConfig",
     "GemmInputValues",
-    "ScaledGemmInputs",
-    "ScaledGemmInputConfig",
-    "ScaledGemmInputValues",
     "gemm_scale_shape",
-    "mxfp4_scaled_gemm_input_config",
+    "mxfp4_gemm_input_config",
 ]
 
 GemmLayout = Literal["MK", "KM", "NK", "KN"]
@@ -164,15 +161,8 @@ class GemmInputValues:
     A: torch.Tensor | None
     B: torch.Tensor | None
     C: torch.Tensor
-
-
-@dataclass
-class ScaledGemmInputValues:
-    """Generated values for ``ScaledGemmInputs``."""
-
-    A: TensorValues
-    B: TensorValues
-    C: torch.Tensor
+    A_scales: torch.Tensor | None = None
+    B_scales: torch.Tensor | None = None
 
 
 @dataclass
@@ -216,6 +206,22 @@ class GemmInputConfig:
     # Optional: batch prefix for generated operands, e.g. expert dimension.
     batch_shape: tuple[int, ...] = ()
 
+    # Optional: physical A scale shape. ``None`` skips A scale generation unless
+    # A uses a custom dtype that requires scales.
+    a_scale_shape: tuple[int, ...] | None = None
+
+    # Optional: physical B scale shape. ``None`` skips B scale generation unless
+    # B uses a custom dtype that requires scales.
+    b_scale_shape: tuple[int, ...] | None = None
+
+    # Optional: A scale dtype. ``None`` skips A scales unless A uses a custom
+    # dtype with an inferred scale dtype, such as MXFP4.
+    a_scale_dtype: InputDType = None
+
+    # Optional: B scale dtype. ``None`` skips B scales unless B uses a custom
+    # dtype with an inferred scale dtype, such as MXFP4.
+    b_scale_dtype: InputDType = None
+
     # ------------------------------------------------------------------
     # Optional device configuration.
     # ------------------------------------------------------------------
@@ -225,6 +231,12 @@ class GemmInputConfig:
 
     # Optional: generated B device override.
     b_device: DeviceLike = None
+
+    # Optional: generated A scale device override.
+    a_scale_device: DeviceLike = None
+
+    # Optional: generated B scale device override.
+    b_scale_device: DeviceLike = None
 
     # Optional: generated C device override.
     c_device: DeviceLike = None
@@ -236,12 +248,12 @@ class GemmInputs(NumericsInputGenerator):
 
     ``M``, ``N``, and ``K`` are the logical matrix dimensions for ``A @ B.T``
     style kernels used by TokenSpeed. ``generate`` returns generated ``A``,
-    ``B``, and ``C`` tensors. ``A`` and ``B`` may use dtype ``None`` to skip
-    generation when a layer generator only needs one side of the GEMM, but
-    ``C`` is always generated.
+    ``B``, ``C``, and optional scale tensors. ``A`` and ``B`` may use dtype
+    ``None`` to skip generation when a layer generator only needs one side of
+    the GEMM, but ``C`` is always generated.
 
-    Mutate ``generator.config`` to adjust dtype, layout, batch shape, or device
-    before calling ``generate``.
+    Mutate ``generator.config`` to adjust dtype, scale dtype, shape, layout, or
+    device before calling ``generate``.
     """
 
     config: GemmInputConfig
@@ -264,6 +276,20 @@ class GemmInputs(NumericsInputGenerator):
         if not isinstance(self.config.c_dtype, torch.dtype):
             raise TypeError("c_dtype must be a torch.dtype")
         self.config.batch_shape = _normalize_shape(self.config.batch_shape)
+        if self.config.a_scale_shape is not None:
+            self.config.a_scale_shape = _normalize_shape(self.config.a_scale_shape)
+        if self.config.b_scale_shape is not None:
+            self.config.b_scale_shape = _normalize_shape(self.config.b_scale_shape)
+        if self.config.a_dtype is None and (
+            self.config.a_scale_shape is not None
+            or self.config.a_scale_dtype is not None
+        ):
+            raise ValueError("a_dtype=None skips A values and A scales")
+        if self.config.b_dtype is None and (
+            self.config.b_scale_shape is not None
+            or self.config.b_scale_dtype is not None
+        ):
+            raise ValueError("b_dtype=None skips B values and B scales")
 
     def _value_shape(self, role: Literal["a", "b", "c"]) -> tuple[int, ...]:
         if role == "a":
@@ -295,21 +321,32 @@ class GemmInputs(NumericsInputGenerator):
             layout="MK",
         )
 
+    def _generate_operand(
+        self,
+        role: Literal["a", "b"],
+        *,
+        seed: int,
+        device: DeviceLike,
+    ) -> TensorValues:
+        is_a = role == "a"
+        return TensorInput(
+            self._value_shape(role),
+            self.config.a_dtype if is_a else self.config.b_dtype,
+            scale_shape=self.config.a_scale_shape
+            if is_a
+            else self.config.b_scale_shape,
+            scale_dtype=self.config.a_scale_dtype
+            if is_a
+            else self.config.b_scale_dtype,
+            device=self.config.a_device if is_a else self.config.b_device,
+            scale_device=self.config.a_scale_device
+            if is_a
+            else self.config.b_scale_device,
+        ).generate(seed=seed, device=device)
+
     def generate(self, *, seed: int, device: DeviceLike = None) -> GemmInputValues:
-        A = _generate_tensor(
-            shape=self._value_shape("a"),
-            dtype=self.config.a_dtype,
-            seed=_child_seed(seed, 1),
-            configured_device=self.config.a_device,
-            device=device,
-        )
-        B = _generate_tensor(
-            shape=self._value_shape("b"),
-            dtype=self.config.b_dtype,
-            seed=_child_seed(seed, 2),
-            configured_device=self.config.b_device,
-            device=device,
-        )
+        a_values = self._generate_operand("a", seed=_child_seed(seed, 1), device=device)
+        b_values = self._generate_operand("b", seed=_child_seed(seed, 2), device=device)
         C = _generate_tensor(
             shape=self._value_shape("c"),
             dtype=self.config.c_dtype,
@@ -320,86 +357,15 @@ class GemmInputs(NumericsInputGenerator):
         if C is None:
             raise ValueError("c_dtype is required")
         return GemmInputValues(
-            A=A,
-            B=B,
+            A=a_values.values,
+            B=b_values.values,
             C=C,
+            A_scales=a_values.scales,
+            B_scales=b_values.scales,
         )
 
 
-@dataclass
-class ScaledGemmInputConfig:
-    """Initialization parameters for ``ScaledGemmInputs``."""
-
-    # ------------------------------------------------------------------
-    # Required configuration fields.
-    # ------------------------------------------------------------------
-
-    # Required: logical M dimension for A @ B.T style GEMM generation.
-    M: int
-
-    # Required: logical N dimension for A @ B.T style GEMM generation.
-    N: int
-
-    # Required: logical K reduction dimension.
-    K: int
-
-    # Required: generated A value dtype. ``None`` skips A values/scales.
-    a_dtype: InputDType
-
-    # Required: generated B value dtype. ``None`` skips B values/scales.
-    b_dtype: InputDType
-
-    # Required: generated A scale dtype. ``None`` skips A scales unless A uses
-    # a custom dtype with an inferred scale dtype, such as MXFP4.
-    a_scale_dtype: InputDType
-
-    # Required: generated B scale dtype. ``None`` skips B scales unless B uses
-    # a custom dtype with an inferred scale dtype, such as MXFP4.
-    b_scale_dtype: InputDType
-
-    # Required: dtype for generated C/output accumulator.
-    c_dtype: torch.dtype
-
-    # ------------------------------------------------------------------
-    # Optional operand and layout configuration.
-    # ------------------------------------------------------------------
-
-    # Optional: physical A layout.
-    a_layout: GemmLayout = "MK"
-
-    # Optional: physical B layout.
-    b_layout: GemmLayout = "NK"
-
-    # Optional: batch prefix for generated operands, e.g. expert dimension.
-    batch_shape: tuple[int, ...] = ()
-
-    # Optional: physical A scale shape.
-    a_scale_shape: tuple[int, ...] | None = (1,)
-
-    # Optional: physical B scale shape.
-    b_scale_shape: tuple[int, ...] | None = (1,)
-
-    # ------------------------------------------------------------------
-    # Optional device configuration.
-    # ------------------------------------------------------------------
-
-    # Optional: generated A value device override.
-    a_device: DeviceLike = None
-
-    # Optional: generated B value device override.
-    b_device: DeviceLike = None
-
-    # Optional: generated A scale device override.
-    a_scale_device: DeviceLike = None
-
-    # Optional: generated B scale device override.
-    b_scale_device: DeviceLike = None
-
-    # Optional: generated C device override.
-    c_device: DeviceLike = None
-
-
-def mxfp4_scaled_gemm_input_config(
+def mxfp4_gemm_input_config(
     *,
     M: int,
     N: int,
@@ -412,10 +378,10 @@ def mxfp4_scaled_gemm_input_config(
     b_layout: GemmLayout = "NK",
     batch_shape: tuple[int, ...] = (),
     block_size: int = _DEFAULT_MXFP4_BLOCK_SIZE,
-) -> ScaledGemmInputConfig:
-    """Build a scaled GEMM config for mxfp4 values with UE8M0 scales."""
+) -> GemmInputConfig:
+    """Build a GEMM config for MXFP4 values with UE8M0 scales."""
 
-    return ScaledGemmInputConfig(
+    return GemmInputConfig(
         M=M,
         N=N,
         K=K,
@@ -454,113 +420,3 @@ def mxfp4_scaled_gemm_input_config(
             )
         ),
     )
-
-
-@dataclass(init=False)
-class ScaledGemmInputs(NumericsInputGenerator):
-    """Typed input generator for GEMM with scaled ``A`` and ``B`` operands.
-
-    ``generate`` returns nested values where tensors are available as
-    ``A.values``, ``A.scales``, ``B.values``, and ``B.scales``. ``A`` and
-    ``B`` may skip their values/scales when their dtype or scale dtype is
-    ``None``. ``C`` is always generated.
-
-    Mutate ``generator.config`` to adjust dtype, scale dtype, shape, layout, or
-    device before calling ``generate``.
-    """
-
-    config: ScaledGemmInputConfig
-
-    def __init__(
-        self,
-        config: ScaledGemmInputConfig,
-    ) -> None:
-        self.config = config
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        self.config.M = int(self.config.M)
-        self.config.N = int(self.config.N)
-        self.config.K = int(self.config.K)
-        if min(self.config.M, self.config.N, self.config.K) < 0:
-            raise ValueError("M, N, and K must be non-negative")
-        if self.config.c_dtype is None:
-            raise ValueError("c_dtype is required")
-        if not isinstance(self.config.c_dtype, torch.dtype):
-            raise TypeError("c_dtype must be a torch.dtype")
-        self.config.batch_shape = _normalize_shape(self.config.batch_shape)
-        if self.config.a_scale_shape is not None:
-            self.config.a_scale_shape = _normalize_shape(self.config.a_scale_shape)
-        if self.config.b_scale_shape is not None:
-            self.config.b_scale_shape = _normalize_shape(self.config.b_scale_shape)
-
-    def _scaled_value_shape(
-        self,
-        role: Literal["a", "b"],
-    ) -> tuple[int, ...]:
-        is_a = role == "a"
-        return _gemm_value_shape(
-            role=role,
-            M=self.config.M,
-            N=self.config.N,
-            K=self.config.K,
-            batch_shape=self.config.batch_shape,
-            layout=self.config.a_layout if is_a else self.config.b_layout,
-            dtype=self.config.a_dtype if is_a else self.config.b_dtype,
-        )
-
-    def _c_shape(self) -> tuple[int, ...]:
-        return _gemm_value_shape(
-            role="c",
-            M=self.config.M,
-            N=self.config.N,
-            K=self.config.K,
-            batch_shape=self.config.batch_shape,
-            layout="MK",
-        )
-
-    def _generate_scaled(
-        self,
-        role: Literal["a", "b"],
-        *,
-        seed: int,
-        device: DeviceLike,
-    ) -> TensorValues:
-        is_a = role == "a"
-        return TensorInput(
-            self._scaled_value_shape(role),
-            self.config.a_dtype if is_a else self.config.b_dtype,
-            scale_shape=self.config.a_scale_shape
-            if is_a
-            else self.config.b_scale_shape,
-            scale_dtype=self.config.a_scale_dtype
-            if is_a
-            else self.config.b_scale_dtype,
-            device=self.config.a_device if is_a else self.config.b_device,
-            scale_device=self.config.a_scale_device
-            if is_a
-            else self.config.b_scale_device,
-        ).generate(seed=seed, device=device)
-
-    def generate(
-        self,
-        *,
-        seed: int,
-        device: DeviceLike = None,
-    ) -> ScaledGemmInputValues:
-        a_values = self._generate_scaled("a", seed=_child_seed(seed, 1), device=device)
-        b_values = self._generate_scaled("b", seed=_child_seed(seed, 2), device=device)
-        C = _generate_tensor(
-            shape=self._c_shape(),
-            dtype=self.config.c_dtype,
-            seed=_child_seed(seed, 3),
-            configured_device=self.config.c_device,
-            device=device,
-        )
-        if C is None:
-            raise ValueError("c_dtype is required")
-        return ScaledGemmInputValues(
-            A=a_values,
-            B=b_values,
-            C=C,
-        )

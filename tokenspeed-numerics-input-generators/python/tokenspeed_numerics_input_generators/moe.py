@@ -37,10 +37,7 @@ from tokenspeed_numerics_input_generators.gemm import (
     GemmInputConfig,
     GemmInputValues,
     GemmInputs,
-    ScaledGemmInputConfig,
-    ScaledGemmInputValues,
-    ScaledGemmInputs,
-    mxfp4_scaled_gemm_input_config,
+    mxfp4_gemm_input_config,
 )
 
 __all__ = ["MoeInputConfig", "MoeInputValues", "MoeInputs"]
@@ -53,8 +50,8 @@ class MoeInputValues:
     hidden_states: torch.Tensor | None
     router_logits: torch.Tensor | None
     topk_ids: torch.Tensor
-    w13: GemmInputValues | ScaledGemmInputValues
-    w2: GemmInputValues | ScaledGemmInputValues
+    w13: GemmInputValues
+    w2: GemmInputValues
     w13_bias: torch.Tensor | None
     w2_bias: torch.Tensor | None
 
@@ -123,10 +120,10 @@ class MoeInputConfig:
     # ------------------------------------------------------------------
 
     # Optional: nested config for gate/up projection expert weights.
-    w13: GemmInputConfig | ScaledGemmInputConfig | None = None
+    w13: GemmInputConfig | None = None
 
     # Optional: nested config for down projection expert weights.
-    w2: GemmInputConfig | ScaledGemmInputConfig | None = None
+    w2: GemmInputConfig | None = None
 
 
 @dataclass(init=False)
@@ -135,9 +132,9 @@ class MoeInputs(NumericsInputGenerator):
 
     Defaults model a SwiGLU MoE layer with generated hidden states, router
     logits, random top-k expert ids, and expert weight inputs for the gate/up
-    and down projections. Dense weights use ``GemmInputs``. Quantized/scaled
-    weights use ``ScaledGemmInputs`` and skip activation operands by default,
-    because activations normally come from the layer execution itself.
+    and down projections. Dense and quantized/scaled weights use ``GemmInputs``
+    and skip activation operands by default, because activations normally come
+    from the layer execution itself.
 
     Leaf tensor generators and child GEMM generators are initialized at
     construction time and reused by ``generate`` so callers can mutate child
@@ -147,8 +144,8 @@ class MoeInputs(NumericsInputGenerator):
     config: MoeInputConfig
     hidden_states_input: TensorInput | None
     router_logits_input: TensorInput | None
-    w13: GemmInputs | ScaledGemmInputs | None
-    w2: GemmInputs | ScaledGemmInputs | None
+    w13: GemmInputs | None
+    w2: GemmInputs | None
     w13_bias_input: TensorInput | None
     w2_bias_input: TensorInput | None
 
@@ -239,18 +236,16 @@ class MoeInputs(NumericsInputGenerator):
 
     def _make_weight_gemm(
         self,
-        config: GemmInputConfig | ScaledGemmInputConfig,
-    ) -> GemmInputs | ScaledGemmInputs:
-        if isinstance(config, GemmInputConfig):
-            return GemmInputs(config)
-        return ScaledGemmInputs(config)
+        config: GemmInputConfig,
+    ) -> GemmInputs:
+        return GemmInputs(config)
 
     def _make_weight_gemm_config(
         self,
         *,
         N: int,
         K: int,
-    ) -> GemmInputConfig | ScaledGemmInputConfig:
+    ) -> GemmInputConfig:
         c_dtype = self.config.output_dtype or self.config.hidden_dtype
         if self.config.weight_format == "dense":
             if not isinstance(self.config.weight_dtype, torch.dtype):
@@ -266,7 +261,7 @@ class MoeInputs(NumericsInputGenerator):
             )
 
         if self.config.weight_format == "mxfp4":
-            return mxfp4_scaled_gemm_input_config(
+            return mxfp4_gemm_input_config(
                 M=self.config.num_tokens,
                 N=N,
                 K=K,
@@ -277,18 +272,16 @@ class MoeInputs(NumericsInputGenerator):
                 batch_shape=(self.config.num_experts,),
             )
 
-        return ScaledGemmInputConfig(
+        return GemmInputConfig(
             M=self.config.num_tokens,
             N=N,
             K=K,
             a_dtype=None,
             b_dtype=self.config.weight_dtype,
-            a_scale_dtype=None,
-            b_scale_dtype=self.config.weight_scale_dtype or torch.float32,
             c_dtype=c_dtype,
-            a_scale_shape=None,
-            b_scale_shape=(1,),
             batch_shape=(self.config.num_experts,),
+            b_scale_shape=(1,),
+            b_scale_dtype=self.config.weight_scale_dtype or torch.float32,
         )
 
     def generate(self, *, seed: int, device: DeviceLike = None) -> MoeInputValues:

@@ -30,13 +30,13 @@ that input generation has a clear meaning:
 
 For example, a GEMM generator is meaningful because the operation is clearly
 defined by operands such as `A`, `B`, and `C` and shape parameters such as
-`M`, `N`, and `K`. A scaled GEMM extends that with scaled tensor operands whose
-values and scales together define the represented numerical values. Attention
-generators are meaningful only if they define the request metadata, query
-tokens, optional new key/value tokens, and optional cache contents. MoE
-generators should describe hidden states, routing metadata, expert weights, and
-intermediate activation relationships rather than only matching a particular
-fused kernel signature.
+`M`, `N`, and `K`. The same GEMM generator can optionally attach scale tensors
+to operands when values and scales together define the represented numerical
+values. Attention generators are meaningful only if they define the request
+metadata, query tokens, optional new key/value tokens, and optional cache
+contents. MoE generators should describe hidden states, routing metadata,
+expert weights, and intermediate activation relationships rather than only
+matching a particular fused kernel signature.
 
 If the operation cannot be described independently of an implementation API, the
 generator is probably too implementation-specific and should live in an adapter

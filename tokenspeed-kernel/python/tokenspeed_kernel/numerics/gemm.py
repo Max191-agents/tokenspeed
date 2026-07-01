@@ -29,8 +29,6 @@ from tokenspeed_numerics_input_generators import (
     GemmInputConfig,
     GemmInputs,
     InputDType,
-    ScaledGemmInputConfig,
-    ScaledGemmInputs,
     gemm_scale_shape,
 )
 from tokenspeed_kernel.numerics.inputs import (
@@ -186,52 +184,27 @@ class GemmInputGenerator(InputGenerator):
         b_layout = self._layout("b")
         out_dtype = torch.bfloat16
 
-        if (a_tensor_format is not None and a_tensor_format.scale is not None) or (
-            b_tensor_format is not None and b_tensor_format.scale is not None
-        ):
-            scaled_inputs = ScaledGemmInputs(
-                ScaledGemmInputConfig(
-                    M=M,
-                    N=N,
-                    K=K,
-                    a_dtype=a_dtype,
-                    b_dtype=b_dtype,
-                    a_scale_dtype=self._scale_dtype(a_tensor_format),
-                    b_scale_dtype=self._scale_dtype(b_tensor_format),
-                    c_dtype=out_dtype,
-                    a_layout=a_layout,
-                    b_layout=b_layout,
-                    a_scale_shape=self._scale_shape(
-                        a_tensor_format, "a", M=M, N=N, K=K
-                    ),
-                    b_scale_shape=self._scale_shape(
-                        b_tensor_format, "b", M=M, N=N, K=K
-                    ),
-                )
-            ).generate(seed=self.seed, device=self.device)
-            A = scaled_inputs.A.values if scaled_inputs.A is not None else None
-            B = scaled_inputs.B.values if scaled_inputs.B is not None else None
-            A_scales = scaled_inputs.A.scales if scaled_inputs.A is not None else None
-            B_scales = scaled_inputs.B.scales if scaled_inputs.B is not None else None
-            C = scaled_inputs.C
-        else:
-            gemm_inputs = GemmInputs(
-                GemmInputConfig(
-                    M=M,
-                    N=N,
-                    K=K,
-                    a_dtype=a_dtype,
-                    b_dtype=b_dtype,
-                    c_dtype=out_dtype,
-                    a_layout=a_layout,
-                    b_layout=b_layout,
-                )
-            ).generate(seed=self.seed, device=self.device)
-            A = gemm_inputs.A
-            B = gemm_inputs.B
-            A_scales = None
-            B_scales = None
-            C = gemm_inputs.C
+        gemm_inputs = GemmInputs(
+            GemmInputConfig(
+                M=M,
+                N=N,
+                K=K,
+                a_dtype=a_dtype,
+                b_dtype=b_dtype,
+                c_dtype=out_dtype,
+                a_layout=a_layout,
+                b_layout=b_layout,
+                a_scale_dtype=self._scale_dtype(a_tensor_format),
+                b_scale_dtype=self._scale_dtype(b_tensor_format),
+                a_scale_shape=self._scale_shape(a_tensor_format, "a", M=M, N=N, K=K),
+                b_scale_shape=self._scale_shape(b_tensor_format, "b", M=M, N=N, K=K),
+            )
+        ).generate(seed=self.seed, device=self.device)
+        A = gemm_inputs.A
+        B = gemm_inputs.B
+        A_scales = gemm_inputs.A_scales
+        B_scales = gemm_inputs.B_scales
+        C = gemm_inputs.C
 
         alpha = None
 

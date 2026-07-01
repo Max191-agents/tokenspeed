@@ -64,11 +64,8 @@ from tokenspeed_numerics_input_generators.gemm import (
     GemmInputConfig,
     GemmInputValues,
     GemmInputs,
-    ScaledGemmInputConfig,
-    ScaledGemmInputValues,
-    ScaledGemmInputs,
     gemm_scale_shape,
-    mxfp4_scaled_gemm_input_config,
+    mxfp4_gemm_input_config,
 )
 from tokenspeed_numerics_input_generators.moe import (
     MoeInputConfig,
@@ -107,11 +104,8 @@ __all__ = [
     "PageTableInput",
     "PageTableInputConfig",
     "PageTableValues",
-    "ScaledGemmInputConfig",
-    "ScaledGemmInputValues",
-    "ScaledGemmInputs",
     "TensorInput",
     "TensorValues",
     "gemm_scale_shape",
-    "mxfp4_scaled_gemm_input_config",
+    "mxfp4_gemm_input_config",
 ]
