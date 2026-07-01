@@ -22,16 +22,23 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import quantize_fp8
+from tokenspeed_kernel import quantize_fp8, quantize_mxfp4
 from tokenspeed_numerics_input_generators import (
     FP8QuantizationInputConfig,
     FP8QuantizationInputs,
+    MXFP4QuantizationInputConfig,
+    MXFP4QuantizationInputs,
     fp8_quantization_reference,
+    mxfp4_quantization_reference,
 )
 
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+def _uint8_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return torch.equal(a.to(torch.uint8), b.to(torch.uint8))
 
 
 @pytest.mark.parametrize("solution", ["triton"])
@@ -56,6 +63,36 @@ def test_fp8_quantization_generator_runs_pure_cast_kernel(
 
     assert out.shape == values.x.shape
     assert _bitwise_equal(out, ref)
+
+
+@pytest.mark.parametrize("solution", ["triton"])
+def test_mxfp4_quantization_generator_runs_kernel(
+    device: str,
+    solution: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    require("quantization", "mxfp4", solution, dtype, "x")
+    values = MXFP4QuantizationInputs(
+        MXFP4QuantizationInputConfig(
+            shape=(5, 64),
+            dtype=dtype,
+        )
+    ).generate(seed=53, device=device)
+    expected_out, expected_scales = mxfp4_quantization_reference(values.x)
+
+    out, scales = quantize_mxfp4(
+        values.x,
+        scale_size=values.scale_size,
+        scale_layout=values.scale_layout,
+        solution=solution,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == expected_out.shape
+    assert scales.shape == expected_scales.shape
+    assert _uint8_equal(out, expected_out)
+    assert _uint8_equal(scales, expected_scales)
 
 
 @pytest.mark.parametrize("solution", ["triton"])

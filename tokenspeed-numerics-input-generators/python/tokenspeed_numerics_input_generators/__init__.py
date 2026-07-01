@@ -154,8 +154,13 @@ from tokenspeed_numerics_input_generators.quantization import (
     FP8QuantizationInputConfig,
     FP8QuantizationInputs,
     FP8QuantizationInputValues,
+    MXFP4QuantizationInputConfig,
+    MXFP4QuantizationInputs,
+    MXFP4QuantizationInputValues,
     fp8_quantization_reference,
     fp8_scale_shape,
+    mxfp4_quantization_reference,
+    mxfp4_scale_shape,
 )
 from tokenspeed_numerics_input_generators.rotary import build_rope_cos_sin_cache
 from tokenspeed_numerics_input_generators.sampling import (
@@ -249,6 +254,9 @@ __all__ = [
     "MoeInputConfig",
     "MoeInputValues",
     "MoeInputs",
+    "MXFP4QuantizationInputConfig",
+    "MXFP4QuantizationInputValues",
+    "MXFP4QuantizationInputs",
     "NumericsInputGenerator",
     "PageTableInput",
     "PageTableGatherInputConfig",
@@ -296,6 +304,8 @@ __all__ = [
     "min_p_renorm_reference",
     "mla_kv_cache_transfer_reference",
     "mxfp4_gemm_input_config",
+    "mxfp4_quantization_reference",
+    "mxfp4_scale_shape",
     "qk_rmsnorm_reference",
     "page_table_gather_reference",
     "reduce_scatter_sum_reference",
