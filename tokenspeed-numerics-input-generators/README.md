@@ -290,6 +290,11 @@ The exact names and module boundaries can evolve, but the conceptual split
 should remain: core primitives, optional shared utilities, and documented
 operation-family generators.
 
+The current family documentation lives under
+[`docs/families`](docs/families/README.md). The implementation modules still use
+a flat Python import surface for compatibility, while the docs provide the
+family navigation structure expected by this design.
+
 ## Growth Model
 
 The library will grow alongside numerical testing needs in TokenSpeed. That is a
