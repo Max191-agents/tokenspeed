@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import math
 import platform
 from dataclasses import replace
 
@@ -172,41 +171,6 @@ def _run_mla_kv_pack_quantize_fp8(
     )
 
 
-def _prefill_reference(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    seq_lens_q: tuple[int, ...],
-    seq_lens_k: tuple[int, ...],
-    softmax_scale: float,
-    *,
-    is_causal: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    outputs = []
-    lses = []
-    q_offset = 0
-    k_offset = 0
-    for cur_s_q, cur_s_k in zip(seq_lens_q, seq_lens_k):
-        cur_q = query[q_offset : q_offset + cur_s_q]
-        cur_k = key[k_offset : k_offset + cur_s_k]
-        cur_v = value[k_offset : k_offset + cur_s_k]
-        scores = (
-            torch.einsum("qhd,khd->qkh", cur_q.float(), cur_k.float()) * softmax_scale
-        )
-        if is_causal:
-            q_idx = torch.arange(cur_s_q, device=query.device).view(-1, 1)
-            k_idx = torch.arange(cur_s_k, device=key.device).view(1, -1)
-            offset = cur_s_k - cur_s_q
-            mask = k_idx > q_idx + offset
-            scores = scores.masked_fill(mask.unsqueeze(-1), float("-inf"))
-        probs = torch.softmax(scores, dim=1)
-        outputs.append(torch.einsum("qkh,khd->qhd", probs, cur_v.float()))
-        lses.append(torch.logsumexp(scores, dim=1) * math.log2(math.e))
-        q_offset += cur_s_q
-        k_offset += cur_s_k
-    return torch.cat(outputs, dim=0).to(torch.bfloat16), torch.cat(lses, dim=0)
-
-
 def test_binary_prefill_so_loads() -> None:
     fmha_binary, so_path = _require_mla_binary_prefill()
 
@@ -239,83 +203,54 @@ def test_kernel_tokenspeed_mla_prefill_binary_e2e(
     mla_prefill._resolve_backend.cache_clear()
 
     seq_lens_q, seq_lens_k, h_q, h_k = shape_case
-    total_q = sum(seq_lens_q)
-    total_k = sum(seq_lens_k)
-    cum_seq_lens_q = torch.tensor(
-        [0, *torch.tensor(seq_lens_q, dtype=torch.int32).cumsum(0).tolist()],
-        device=device,
-        dtype=torch.int32,
-    )
-    cum_seq_lens_k = torch.tensor(
-        [0, *torch.tensor(seq_lens_k, dtype=torch.int32).cumsum(0).tolist()],
-        device=device,
-        dtype=torch.int32,
-    )
-    torch.manual_seed(3)
-    query = torch.randn(
-        total_q,
-        h_q,
-        QK_NOPE + QK_ROPE,
-        device=device,
-        dtype=torch.bfloat16,
-    ).to(torch.float8_e4m3fn)
-    key = torch.randn(
-        total_k,
-        h_k,
-        QK_NOPE + QK_ROPE,
-        device=device,
-        dtype=torch.bfloat16,
-    ).to(torch.float8_e4m3fn)
-    value = torch.randn(
-        total_k,
-        h_k,
-        V_HEAD,
-        device=device,
-        dtype=torch.bfloat16,
-    ).to(torch.float8_e4m3fn)
-    softmax_scale = 1.0 / math.sqrt(QK_NOPE + QK_ROPE)
+    assert seq_lens_q == seq_lens_k
+    assert h_q == h_k
+    values = MLAPrefillFP8Inputs(
+        MLAPrefillFP8InputConfig(
+            batch_size=len(seq_lens_q),
+            total_tokens=sum(seq_lens_q),
+            num_heads=h_q,
+            qk_head_dim=QK_NOPE + QK_ROPE,
+            v_head_dim=V_HEAD,
+            source_dtype=torch.bfloat16,
+            length_mode="ragged",
+            max_tokens_per_request=max(seq_lens_q),
+        )
+    ).generate(seed=3 + sum(seq_lens_q) + h_q, metadata_seed=4 + h_q, device=device)
+    expected = mla_prefill_fp8_reference(values, is_causal=is_causal)
 
     try:
         actual = kernel_mla.tokenspeed_mla_prefill(
-            query,
-            key,
-            value,
-            torch.tensor(seq_lens_k, device=device, dtype=torch.int32),
-            cum_seq_lens_k,
-            max(seq_lens_k),
-            batch_size=len(seq_lens_k),
-            softmax_scale=softmax_scale,
+            values.query,
+            values.key,
+            values.value,
+            values.metadata.cache_seqlens,
+            values.metadata.cu_seqlens_kv,
+            values.metadata.resolved_max_seqlen_k,
+            batch_size=len(values.metadata.visible_kv_lens_cpu),
+            softmax_scale=values.softmax_scale,
             is_causal=is_causal,
             return_lse=return_lse,
-            cum_seq_lens_q=cum_seq_lens_q,
-            max_seq_len_q=max(seq_lens_q),
+            cum_seq_lens_q=values.metadata.cu_seqlens_q,
+            max_seq_len_q=values.metadata.max_seqlen_q,
         )
     finally:
         mla_prefill._resolve_backend.cache_clear()
     torch.cuda.synchronize()
 
-    expected, expected_lse = _prefill_reference(
-        query,
-        key,
-        value,
-        seq_lens_q,
-        seq_lens_k,
-        softmax_scale,
-        is_causal=is_causal,
-    )
     if return_lse:
         actual, actual_lse = actual
-        assert actual_lse.shape == (total_q, h_q)
+        assert actual_lse.shape == expected.lse.shape
         assert actual_lse.dtype == torch.float32
     tolerance = 0.25 if is_causal else 0.1
-    assert actual.shape == (total_q, h_q, V_HEAD)
-    assert actual.dtype == torch.bfloat16
+    assert actual.shape == expected.out.shape
+    assert actual.dtype == expected.out.dtype
     torch.testing.assert_close(
-        actual.float(), expected.float(), atol=tolerance, rtol=1e-5
+        actual.float(), expected.out.float(), atol=tolerance, rtol=1e-5
     )
     if return_lse:
         torch.testing.assert_close(
-            actual_lse.float(), expected_lse.float(), atol=tolerance, rtol=1e-5
+            actual_lse.float(), expected.lse.float(), atol=tolerance, rtol=1e-5
         )
 
 
