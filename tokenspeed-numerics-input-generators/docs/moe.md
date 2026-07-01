@@ -79,6 +79,13 @@ directly to `moe_apply`. The generator does not own Triton-specific weight
 swizzling, precision-config objects, or module attributes such as `top_k` and
 `num_experts`; those remain in the TokenSpeed adapter/test layer.
 
+Dense TokenSpeed MoE adapters follow the same pattern with ordinary torch
+weight tensors. `MoeInputs` provides the semantic expert weights in
+`w13.B` and `w2.B`; the adapter attaches them to a small module, calls
+`moe_process_weights` for the selected backend, and then compares `moe_apply`
+against `moe_reference(values)`. Backend-specific gate/up reordering is owned
+by `moe_process_weights`, not by the generator.
+
 ## Verification
 
 MoE configs verify token counts, hidden/intermediate widths, expert counts,

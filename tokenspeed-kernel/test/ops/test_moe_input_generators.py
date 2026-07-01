@@ -70,6 +70,28 @@ def _make_mxfp4_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
     return layer
 
 
+def _make_dense_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
+    if values.hidden_states is None or values.router_logits is None:
+        raise ValueError("MoE values must include hidden states and router logits")
+    if values.w13.B is None or values.w2.B is None:
+        raise ValueError("MoE values must include dense W13 and W2 weights")
+
+    num_experts = values.w13.B.shape[0]
+    layer = torch.nn.Module()
+    layer.num_experts = num_experts
+    layer.num_local_experts = num_experts
+    layer.ep_size = 1
+    layer.ep_rank = 0
+    layer.tp_size = 1
+    layer.tp_rank = 0
+    layer.top_k = values.topk_ids.shape[1]
+    layer.activation = "silu"
+    layer.swiglu_arg = None
+    layer.w13_weight = torch.nn.Parameter(values.w13.B.clone(), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(values.w2.B.clone(), requires_grad=False)
+    return layer
+
+
 def test_moe_align_block_size_numerics_adapter_uses_generator() -> None:
     generated = get_input_generator(
         "moe",
@@ -137,6 +159,54 @@ def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None
     )
     assert plan["solution"] == "triton"
     assert plan["process_weights_kernel_name"] == "triton_mxfp4_moe_process_weights"
+
+    moe_process_weights(plan, layer)
+    actual = moe_apply(
+        plan,
+        values.hidden_states,
+        layer,
+        values.router_logits,
+        topk_weights=values.topk_weights,
+        topk_ids=values.topk_ids,
+    )
+    torch.cuda.synchronize()
+
+    expected = moe_reference(values, output_dtype=torch.bfloat16).to(device=device)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=5.0e-2, atol=0.1)
+
+
+def test_dense_moe_generator_runs_flashinfer_cutlass_kernel(device: str) -> None:
+    platform = current_platform()
+    if not torch.cuda.is_available() or not platform.is_hopper_plus:
+        pytest.skip("dense FlashInfer MoE compatibility test requires NVIDIA Hopper+")
+
+    load_builtin_kernels()
+    config = MoeInputConfig(
+        num_tokens=4,
+        hidden_size=64,
+        intermediate_size=64,
+        num_experts=4,
+        top_k=2,
+        hidden_dtype=torch.bfloat16,
+        router_dtype=torch.bfloat16,
+        weight_format="dense",
+        weight_dtype=torch.bfloat16,
+        bias_dtype=None,
+    )
+    values = MoeInputs(config).generate(seed=43, device=device)
+    layer = _make_dense_moe_weight_module(values)
+    plan = moe_plan(
+        "unquant",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        internal_activation_dtype="input",
+        with_bias=False,
+        solution="flashinfer_cutlass",
+    )
+    assert plan["solution"] == "flashinfer_cutlass"
+    assert plan["process_weights_kernel_name"] == (
+        "flashinfer_cutlass_unquant_moe_process_weights"
+    )
 
     moe_process_weights(plan, layer)
     actual = moe_apply(
