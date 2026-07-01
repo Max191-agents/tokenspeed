@@ -23,6 +23,43 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
+from tokenspeed_numerics_input_generators import (
+    RopeInputConfig,
+    RopeInputValues,
+    RopeInputs,
+    rope_reference,
+)
+
+
+def _apply_rope_values(
+    values: RopeInputValues,
+    config: RopeInputConfig,
+    *,
+    solution: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    fused_arg = None
+    if values.fused_kv is not None:
+        fused_arg = FusedSetKVBufferArg(
+            value=values.fused_kv.value,
+            k_buffer=values.fused_kv.k_buffer,
+            v_buffer=values.fused_kv.v_buffer,
+            k_scale=values.fused_kv.k_scale,
+            v_scale=values.fused_kv.v_scale,
+            cache_loc=values.fused_kv.cache_loc,
+        )
+    return apply_rope(
+        positions=values.positions,
+        query=values.query,
+        key=values.key,
+        head_size=config.head_size,
+        cos_sin_cache=values.cos_sin_cache,
+        is_neox=config.is_neox,
+        rotary_dim=config.rotary_dim,
+        fused_set_kv_buffer_arg=fused_arg,
+        output_q_rope=values.output_q_rope,
+        output_k_rope=values.output_k_rope,
+        solution=solution,
+    )
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
@@ -31,65 +68,34 @@ def test_rope_neox_full_bf16(
     solution: str,
     require,
 ) -> None:
-    torch.manual_seed(0)
-    num_tokens = 17
-    num_q_heads = 8
-    num_k_heads = 2
-    head_size = 128
-    rotary_dim = 128
-    max_position = 1024
     dtype = torch.bfloat16
     require("embedding", "rope", solution, dtype, "query")
-
-    inv_freq = 1.0 / (
-        10000.0
-        ** (
-            torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32)
-            / rotary_dim
-        )
-    )
-    t = torch.arange(max_position, device=device, dtype=torch.float32)
-    freqs = torch.einsum("i,j -> ij", t, inv_freq)
-    cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
-
-    positions = torch.randint(
-        0, max_position, (num_tokens,), device=device, dtype=torch.int64
-    )
-    query = torch.randn(num_tokens, num_q_heads * head_size, device=device, dtype=dtype)
-    key = torch.randn(num_tokens, num_k_heads * head_size, device=device, dtype=dtype)
-
-    # Reference (PyTorch).
-    cos_sin_ref = cos_sin_cache.index_select(0, positions)
-    cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
-    cos_ref = cos_ref.unsqueeze(-2).to(dtype)
-    sin_ref = sin_ref.unsqueeze(-2).to(dtype)
-
-    q_ref = query.clone().view(num_tokens, num_q_heads, head_size)
-    q1, q2 = torch.chunk(q_ref, 2, dim=-1)
-    q_out = torch.cat(
-        (q1 * cos_ref - q2 * sin_ref, q2 * cos_ref + q1 * sin_ref), dim=-1
-    )
-    q_ref = q_out.reshape(num_tokens, num_q_heads * head_size)
-
-    k_ref = key.clone().view(num_tokens, num_k_heads, head_size)
-    k1, k2 = torch.chunk(k_ref, 2, dim=-1)
-    k_out = torch.cat(
-        (k1 * cos_ref - k2 * sin_ref, k2 * cos_ref + k1 * sin_ref), dim=-1
-    )
-    k_ref = k_out.reshape(num_tokens, num_k_heads * head_size)
-
-    apply_rope(
-        positions=positions,
-        query=query,
-        key=key,
-        head_size=head_size,
-        cos_sin_cache=cos_sin_cache,
+    config = RopeInputConfig(
+        num_tokens=17,
+        num_q_heads=8,
+        num_kv_heads=2,
+        head_size=128,
+        rotary_dim=128,
+        max_position=1024,
+        dtype=dtype,
         is_neox=True,
-        solution=solution,
     )
+    values = RopeInputs(config).generate(seed=1, metadata_seed=2, device=device)
+    q_ref, k_ref = rope_reference(
+        values.query,
+        values.key,
+        values.positions,
+        head_size=config.head_size,
+        cos_sin_cache=values.cos_sin_cache,
+        is_neox=config.is_neox,
+        rotary_dim=config.rotary_dim,
+    )
+    q_out, k_out = _apply_rope_values(values, config, solution=solution)
 
-    torch.testing.assert_close(query, q_ref, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(key, k_ref, rtol=2e-2, atol=2e-2)
+    assert q_out.data_ptr() == values.query.data_ptr()
+    assert k_out.data_ptr() == values.key.data_ptr()
+    torch.testing.assert_close(values.query, q_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(values.key, k_ref, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
@@ -98,65 +104,32 @@ def test_rope_gptj_full_bf16(
     solution: str,
     require,
 ) -> None:
-    torch.manual_seed(1)
-    num_tokens = 9
-    num_q_heads = 4
-    num_k_heads = 2
-    head_size = 64
-    rotary_dim = 64
-    max_position = 512
     dtype = torch.bfloat16
     require("embedding", "rope", solution, dtype, "query")
-
-    inv_freq = 1.0 / (
-        10000.0
-        ** (
-            torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32)
-            / rotary_dim
-        )
-    )
-    t = torch.arange(max_position, device=device, dtype=torch.float32)
-    freqs = torch.einsum("i,j -> ij", t, inv_freq)
-    cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
-
-    positions = torch.randint(
-        0, max_position, (num_tokens,), device=device, dtype=torch.int64
-    )
-    query = torch.randn(num_tokens, num_q_heads * head_size, device=device, dtype=dtype)
-    key = torch.randn(num_tokens, num_k_heads * head_size, device=device, dtype=dtype)
-
-    cos_sin_ref = cos_sin_cache.index_select(0, positions)
-    cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
-    cos_ref = cos_ref.unsqueeze(-2).to(dtype)
-    sin_ref = sin_ref.unsqueeze(-2).to(dtype)
-
-    def _gptj_ref(x, num_heads):
-        x = x.view(num_tokens, num_heads, head_size)
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        o1 = x1 * cos_ref - x2 * sin_ref
-        o2 = x2 * cos_ref + x1 * sin_ref
-        return (
-            torch.stack((o1, o2), dim=-1)
-            .flatten(-2)
-            .reshape(num_tokens, num_heads * head_size)
-        )
-
-    q_ref = _gptj_ref(query.clone(), num_q_heads)
-    k_ref = _gptj_ref(key.clone(), num_k_heads)
-
-    apply_rope(
-        positions=positions,
-        query=query,
-        key=key,
-        head_size=head_size,
-        cos_sin_cache=cos_sin_cache,
+    config = RopeInputConfig(
+        num_tokens=9,
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_size=64,
+        rotary_dim=64,
+        max_position=512,
+        dtype=dtype,
         is_neox=False,
-        solution=solution,
     )
+    values = RopeInputs(config).generate(seed=3, metadata_seed=4, device=device)
+    q_ref, k_ref = rope_reference(
+        values.query,
+        values.key,
+        values.positions,
+        head_size=config.head_size,
+        cos_sin_cache=values.cos_sin_cache,
+        is_neox=config.is_neox,
+        rotary_dim=config.rotary_dim,
+    )
+    _apply_rope_values(values, config, solution=solution)
 
-    torch.testing.assert_close(query, q_ref, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(key, k_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(values.query, q_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(values.key, k_ref, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
@@ -165,75 +138,49 @@ def test_rope_neox_partial_bf16(
     solution: str,
     require,
 ) -> None:
-    torch.manual_seed(2)
-    num_tokens = 5
-    num_q_heads = 4
-    num_k_heads = 1
-    head_size = 128
-    rotary_dim = 64
-    max_position = 256
     dtype = torch.bfloat16
     require("embedding", "rope", solution, dtype, "query")
-
-    inv_freq = 1.0 / (
-        10000.0
-        ** (
-            torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32)
-            / rotary_dim
-        )
-    )
-    t = torch.arange(max_position, device=device, dtype=torch.float32)
-    freqs = torch.einsum("i,j -> ij", t, inv_freq)
-    cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
-
-    positions = torch.randint(
-        0, max_position, (num_tokens,), device=device, dtype=torch.int64
-    )
-    query = torch.randn(num_tokens, num_q_heads * head_size, device=device, dtype=dtype)
-    key = torch.randn(num_tokens, num_k_heads * head_size, device=device, dtype=dtype)
-    query_orig = query.clone()
-    key_orig = key.clone()
-
-    cos_sin_ref = cos_sin_cache.index_select(0, positions)
-    cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
-    cos_ref = cos_ref.unsqueeze(-2).to(dtype)
-    sin_ref = sin_ref.unsqueeze(-2).to(dtype)
-
-    def _ref(x, num_heads):
-        x = x.view(num_tokens, num_heads, head_size)
-        rot = x[..., :rotary_dim]
-        rest = x[..., rotary_dim:]
-        r1, r2 = torch.chunk(rot, 2, dim=-1)
-        rot_out = torch.cat(
-            (r1 * cos_ref - r2 * sin_ref, r2 * cos_ref + r1 * sin_ref), dim=-1
-        )
-        return torch.cat((rot_out, rest), dim=-1).reshape(
-            num_tokens, num_heads * head_size
-        )
-
-    q_ref = _ref(query.clone(), num_q_heads)
-    k_ref = _ref(key.clone(), num_k_heads)
-
-    apply_rope(
-        positions=positions,
-        query=query,
-        key=key,
-        head_size=head_size,
-        cos_sin_cache=cos_sin_cache,
+    config = RopeInputConfig(
+        num_tokens=5,
+        num_q_heads=4,
+        num_kv_heads=1,
+        head_size=128,
+        rotary_dim=64,
+        max_position=256,
+        dtype=dtype,
         is_neox=True,
-        rotary_dim=rotary_dim,
-        solution=solution,
     )
+    values = RopeInputs(config).generate(seed=5, metadata_seed=6, device=device)
+    query_orig = values.query.clone()
+    key_orig = values.key.clone()
+    q_ref, k_ref = rope_reference(
+        values.query,
+        values.key,
+        values.positions,
+        head_size=config.head_size,
+        cos_sin_cache=values.cos_sin_cache,
+        is_neox=config.is_neox,
+        rotary_dim=config.rotary_dim,
+    )
+    _apply_rope_values(values, config, solution=solution)
 
-    torch.testing.assert_close(query, q_ref, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(key, k_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(values.query, q_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(values.key, k_ref, rtol=2e-2, atol=2e-2)
 
-    q_view = query.view(num_tokens, num_q_heads, head_size)
-    q_orig_view = query_orig.view(num_tokens, num_q_heads, head_size)
-    assert torch.equal(q_view[..., rotary_dim:], q_orig_view[..., rotary_dim:])
-    k_view = key.view(num_tokens, num_k_heads, head_size)
-    k_orig_view = key_orig.view(num_tokens, num_k_heads, head_size)
-    assert torch.equal(k_view[..., rotary_dim:], k_orig_view[..., rotary_dim:])
+    q_view = values.query.view(config.num_tokens, config.num_q_heads, config.head_size)
+    q_orig_view = query_orig.view(
+        config.num_tokens,
+        config.num_q_heads,
+        config.head_size,
+    )
+    assert torch.equal(q_view[..., config.rotary_dim :], q_orig_view[..., config.rotary_dim :])
+    k_view = values.key.view(config.num_tokens, config.num_kv_heads, config.head_size)
+    k_orig_view = key_orig.view(
+        config.num_tokens,
+        config.num_kv_heads,
+        config.head_size,
+    )
+    assert torch.equal(k_view[..., config.rotary_dim :], k_orig_view[..., config.rotary_dim :])
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
@@ -243,58 +190,32 @@ def test_rope_single_token(
     require,
 ) -> None:
     """Edge case: num_tokens == 1 (decode step)."""
-    torch.manual_seed(4)
-    num_tokens = 1
-    num_q_heads = 8
-    num_k_heads = 1
-    head_size = 128
-    rotary_dim = 128
-    max_position = 64
     dtype = torch.bfloat16
     require("embedding", "rope", solution, dtype, "query")
-
-    inv_freq = 1.0 / (
-        10000.0
-        ** (
-            torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32)
-            / rotary_dim
-        )
-    )
-    t = torch.arange(max_position, device=device, dtype=torch.float32)
-    freqs = torch.einsum("i,j -> ij", t, inv_freq)
-    cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
-
-    positions = torch.tensor([5], device=device, dtype=torch.int64)
-    query = torch.randn(num_tokens, num_q_heads * head_size, device=device, dtype=dtype)
-    key = torch.randn(num_tokens, num_k_heads * head_size, device=device, dtype=dtype)
-
-    cos_sin_ref = cos_sin_cache.index_select(0, positions)
-    cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
-    cos_ref = cos_ref.unsqueeze(-2).to(dtype)
-    sin_ref = sin_ref.unsqueeze(-2).to(dtype)
-
-    def _ref(x, num_heads):
-        x = x.view(num_tokens, num_heads, head_size)
-        x1, x2 = torch.chunk(x, 2, dim=-1)
-        return torch.cat(
-            (x1 * cos_ref - x2 * sin_ref, x2 * cos_ref + x1 * sin_ref), dim=-1
-        ).reshape(num_tokens, num_heads * head_size)
-
-    q_ref = _ref(query.clone(), num_q_heads)
-    k_ref = _ref(key.clone(), num_k_heads)
-
-    apply_rope(
-        positions=positions,
-        query=query,
-        key=key,
-        head_size=head_size,
-        cos_sin_cache=cos_sin_cache,
+    config = RopeInputConfig(
+        num_tokens=1,
+        num_q_heads=8,
+        num_kv_heads=1,
+        head_size=128,
+        rotary_dim=128,
+        max_position=64,
+        dtype=dtype,
         is_neox=True,
-        solution=solution,
     )
+    values = RopeInputs(config).generate(seed=7, metadata_seed=8, device=device)
+    q_ref, k_ref = rope_reference(
+        values.query,
+        values.key,
+        values.positions,
+        head_size=config.head_size,
+        cos_sin_cache=values.cos_sin_cache,
+        is_neox=config.is_neox,
+        rotary_dim=config.rotary_dim,
+    )
+    _apply_rope_values(values, config, solution=solution)
 
-    torch.testing.assert_close(query, q_ref, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(key, k_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(values.query, q_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(values.key, k_ref, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
@@ -303,88 +224,50 @@ def test_rope_fused_set_kv_buffer(
     solution: str,
     require,
 ) -> None:
-    torch.manual_seed(5)
-    num_tokens = 13
-    num_q_heads = 4
-    num_k_heads = 2
-    head_size = 128
-    rotary_dim = 128
-    max_position = 512
-    cache_size = 32
     dtype = torch.bfloat16
     require("embedding", "rope", solution, dtype, "query")
-
-    inv_freq = 1.0 / (
-        10000.0
-        ** (
-            torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32)
-            / rotary_dim
-        )
-    )
-    t = torch.arange(max_position, device=device, dtype=torch.float32)
-    freqs = torch.einsum("i,j -> ij", t, inv_freq)
-    cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
-
-    positions = torch.randint(
-        0, max_position, (num_tokens,), device=device, dtype=torch.int64
-    )
-    query = torch.randn(num_tokens, num_q_heads * head_size, device=device, dtype=dtype)
-    key = torch.randn(num_tokens, num_k_heads * head_size, device=device, dtype=dtype)
-    value = torch.randn(num_tokens, num_k_heads, head_size, device=device, dtype=dtype)
-    query_orig = query.clone()
-    key_orig = key.clone()
-    cache_loc = torch.arange(num_tokens, device=device, dtype=torch.int32) + 3
-    k_buffer = torch.zeros(
-        cache_size, num_k_heads * head_size, device=device, dtype=dtype
-    )
-    v_buffer = torch.zeros_like(k_buffer)
-    output_q_rope = torch.empty_like(query)
-
-    cos_sin_ref = cos_sin_cache.index_select(0, positions)
-    cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
-    cos_ref = cos_ref.unsqueeze(-2).to(dtype)
-    sin_ref = sin_ref.unsqueeze(-2).to(dtype)
-
-    q_ref_view = query_orig.view(num_tokens, num_q_heads, head_size)
-    q1, q2 = torch.chunk(q_ref_view, 2, dim=-1)
-    q_ref = torch.cat(
-        (q1 * cos_ref - q2 * sin_ref, q2 * cos_ref + q1 * sin_ref), dim=-1
-    ).reshape(num_tokens, num_q_heads * head_size)
-
-    k_ref_view = key_orig.view(num_tokens, num_k_heads, head_size)
-    k1, k2 = torch.chunk(k_ref_view, 2, dim=-1)
-    k_ref = torch.cat(
-        (k1 * cos_ref - k2 * sin_ref, k2 * cos_ref + k1 * sin_ref), dim=-1
-    ).reshape(num_tokens, num_k_heads * head_size)
-
-    apply_rope(
-        positions=positions,
-        query=query,
-        key=key,
-        head_size=head_size,
-        cos_sin_cache=cos_sin_cache,
+    config = RopeInputConfig(
+        num_tokens=13,
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_size=128,
+        rotary_dim=128,
+        max_position=512,
+        cache_size=32,
+        dtype=dtype,
         is_neox=True,
-        fused_set_kv_buffer_arg=FusedSetKVBufferArg(
-            value=value,
-            k_buffer=k_buffer,
-            v_buffer=v_buffer,
-            k_scale=None,
-            v_scale=None,
-            cache_loc=cache_loc,
-        ),
-        output_q_rope=output_q_rope,
-        solution=solution,
+        with_fused_kv=True,
+        with_q_output=True,
     )
+    values = RopeInputs(config).generate(seed=9, metadata_seed=10, device=device)
+    assert values.fused_kv is not None
+    assert values.output_q_rope is not None
+    query_orig = values.query.clone()
+    q_ref, k_ref = rope_reference(
+        values.query,
+        values.key,
+        values.positions,
+        head_size=config.head_size,
+        cos_sin_cache=values.cos_sin_cache,
+        is_neox=config.is_neox,
+        rotary_dim=config.rotary_dim,
+    )
+    q_out, k_out = _apply_rope_values(values, config, solution=solution)
 
-    torch.testing.assert_close(query, query_orig, rtol=0, atol=0)
-    torch.testing.assert_close(output_q_rope, q_ref, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(key, k_ref, rtol=2e-2, atol=2e-2)
+    assert q_out.data_ptr() == values.output_q_rope.data_ptr()
+    assert k_out.data_ptr() == values.key.data_ptr()
+    torch.testing.assert_close(values.query, query_orig, rtol=0, atol=0)
+    torch.testing.assert_close(values.output_q_rope, q_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(values.key, k_ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(
-        k_buffer.index_select(0, cache_loc), k_ref, rtol=2e-2, atol=2e-2
+        values.fused_kv.k_buffer.index_select(0, values.fused_kv.cache_loc),
+        k_ref,
+        rtol=2e-2,
+        atol=2e-2,
     )
     torch.testing.assert_close(
-        v_buffer.index_select(0, cache_loc),
-        value.reshape(num_tokens, num_k_heads * head_size),
+        values.fused_kv.v_buffer.index_select(0, values.fused_kv.cache_loc),
+        values.fused_kv.value.reshape(config.num_tokens, -1),
         rtol=0,
         atol=0,
     )
