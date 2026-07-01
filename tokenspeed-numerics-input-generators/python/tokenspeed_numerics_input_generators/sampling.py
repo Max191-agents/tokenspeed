@@ -48,6 +48,10 @@ __all__ = [
     "MinPRenormInputConfig",
     "MinPRenormInputs",
     "MinPRenormInputValues",
+    "MinPSamplingInputConfig",
+    "MinPSamplingInputs",
+    "MinPSamplingInputValues",
+    "MinPSamplingReferenceValues",
     "TopPRenormInputConfig",
     "TopPRenormInputs",
     "TopPRenormInputValues",
@@ -68,6 +72,7 @@ __all__ = [
     "argmax_pair_reference",
     "argmax_reference",
     "gather_expand_scalars_reference",
+    "min_p_sampling_reference",
     "min_p_renorm_reference",
     "softmax_reference",
     "speculative_chain_sampling_reference",
@@ -1064,6 +1069,22 @@ class MinPRenormInputValues:
 
 
 @dataclass
+class MinPSamplingInputValues:
+    """Generated values for ``MinPSamplingInputs``."""
+
+    probs: torch.Tensor
+    min_p: torch.Tensor
+
+
+@dataclass
+class MinPSamplingReferenceValues:
+    """Exact reference outputs for deterministic-support min-p sampling."""
+
+    samples: torch.Tensor
+    valid: torch.Tensor
+
+
+@dataclass
 class MinPRenormInputConfig:
     """Initialization parameters for min-p probability renormalization."""
 
@@ -1144,6 +1165,117 @@ class MinPRenormInputs(NumericsInputGenerator):
         return MinPRenormInputValues(
             probs=probs.to(self.config.dtype).contiguous(),
             min_p=min_p.contiguous(),
+        )
+
+
+@dataclass
+class MinPSamplingInputConfig:
+    """Initialization parameters for exact-checkable min-p sampling inputs.
+
+    Min-p sampling first filters a probability row with
+    ``probs >= min_p * max(probs)`` and then samples categorically from the
+    renormalized row. General categorical sampling needs statistical
+    validation. This generator creates rows where exactly one token survives
+    min-p filtering, making the sampled token deterministic and suitable for
+    exact kernel smoke tests.
+    """
+
+    # Required: number of sample rows. Zero is valid.
+    num_rows: int
+
+    # Required: vocabulary width.
+    vocab_size: int
+
+    # Optional: dtype for probabilities. FlashInfer sampling expects float32.
+    dtype: torch.dtype = torch.float32
+
+    # Optional: dtype for generated min-p values.
+    min_p_dtype: torch.dtype = torch.float32
+
+    # Optional: lower bound for generated min-p threshold ratios.
+    min_min_p: float = 0.05
+
+    # Optional: upper bound for generated min-p threshold ratios.
+    max_min_p: float = 0.5
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class MinPSamplingInputs(NumericsInputGenerator):
+    """Generator for min-p sampling rows with deterministic filtered support."""
+
+    config: MinPSamplingInputConfig
+
+    def __init__(self, config: MinPSamplingInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_rows = _check_nonnegative("num_rows", self.config.num_rows)
+        self.config.vocab_size = _check_positive("vocab_size", self.config.vocab_size)
+        self.config.dtype = _check_float_dtype(
+            "dtype", self.config.dtype, allowed=_PROB_DTYPES
+        )
+        self.config.min_p_dtype = _check_float_dtype(
+            "min_p_dtype",
+            self.config.min_p_dtype,
+            allowed={torch.float32, torch.bfloat16},
+        )
+        self.config.min_min_p = float(self.config.min_min_p)
+        self.config.max_min_p = float(self.config.max_min_p)
+        if not 0.0 < self.config.min_min_p <= self.config.max_min_p <= 1.0:
+            raise ValueError(
+                "min-p bounds must satisfy 0 < min_min_p <= max_min_p <= 1; "
+                f"got min_min_p={self.config.min_min_p}, "
+                f"max_min_p={self.config.max_min_p}"
+            )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> MinPSamplingInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        selected = _randint(
+            low=0,
+            high=self.config.vocab_size,
+            shape=(self.config.num_rows,),
+            dtype=torch.int64,
+            seed=_child_seed(metadata_base_seed, 1),
+            device=device,
+            configured_device=self.config.device,
+        )
+        probs = torch.zeros(
+            self.config.num_rows,
+            self.config.vocab_size,
+            dtype=torch.float32,
+            device=target_device,
+        )
+        if self.config.num_rows > 0:
+            probs.scatter_(1, selected.view(-1, 1), 1.0)
+
+        min_p_generator = _rng_for_device(
+            target_device, _child_seed(metadata_base_seed, 2)
+        )
+        min_p = torch.rand(
+            self.config.num_rows,
+            dtype=torch.float32,
+            device=target_device,
+            generator=min_p_generator,
+        )
+        min_p = (
+            min_p * (self.config.max_min_p - self.config.min_min_p)
+            + self.config.min_min_p
+        )
+        return MinPSamplingInputValues(
+            probs=probs.to(self.config.dtype).contiguous(),
+            min_p=min_p.to(self.config.min_p_dtype).contiguous(),
         )
 
 
@@ -1690,6 +1822,43 @@ def min_p_renorm_reference(probs: torch.Tensor, min_p: torch.Tensor) -> torch.Te
     keep = probs >= min_p.to(probs.dtype).view(-1, 1) * max_probs
     out = torch.where(keep, probs, torch.zeros_like(probs))
     return out / out.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+
+
+def min_p_sampling_reference(
+    probs: torch.Tensor,
+    min_p: torch.Tensor,
+) -> MinPSamplingReferenceValues:
+    """Exact reference for min-p sampling rows with single-token support.
+
+    General min-p sampling is categorical and should be validated
+    statistically. This helper is intentionally exact only for rows where
+    min-p filtering leaves exactly one valid token.
+    """
+
+    if probs.dim() != 2:
+        raise ValueError(f"probs must be 2D, got {probs.dim()}D")
+    if min_p.dim() != 1:
+        raise ValueError(f"min_p must be 1D, got {min_p.dim()}D")
+    if min_p.numel() != probs.shape[0]:
+        raise ValueError(
+            "min_p must have one threshold per probability row; got "
+            f"{min_p.numel()} for {probs.shape[0]} rows"
+        )
+    if torch.any(min_p <= 0.0) or torch.any(min_p > 1.0):
+        raise ValueError("min_p thresholds must be in (0, 1]")
+
+    max_probs = probs.max(dim=-1, keepdim=True).values
+    keep = probs >= min_p.to(probs.dtype).view(-1, 1) * max_probs
+    support_size = keep.sum(dim=-1)
+    if torch.any(support_size != 1):
+        raise ValueError(
+            "exact min-p sampling reference requires one surviving token per row"
+        )
+    samples = torch.argmax(keep.to(torch.int32), dim=-1).to(torch.int32)
+    return MinPSamplingReferenceValues(
+        samples=samples,
+        valid=torch.ones(probs.shape[0], dtype=torch.bool, device=probs.device),
+    )
 
 
 def top_p_renorm_reference(probs: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:

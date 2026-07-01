@@ -29,6 +29,9 @@ from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy,
 )
 from tokenspeed_kernel.ops.sampling.cute_dsl import argmax_pair
+from tokenspeed_kernel.ops.sampling.flashinfer import (
+    min_p_sampling_from_probs as flashinfer_min_p_sampling_from_probs,
+)
 from tokenspeed_kernel.ops.sampling.flashinfer import softmax as flashinfer_softmax
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_k_renorm_prob as flashinfer_top_k_renorm_prob,
@@ -53,6 +56,8 @@ from tokenspeed_numerics_input_generators import (
     GatherExpandScalarsInputs,
     MinPRenormInputConfig,
     MinPRenormInputs,
+    MinPSamplingInputConfig,
+    MinPSamplingInputs,
     SoftmaxInputConfig,
     SoftmaxInputs,
     SpeculativeChainSamplingInputConfig,
@@ -67,6 +72,7 @@ from tokenspeed_numerics_input_generators import (
     argmax_reference,
     gather_expand_scalars_reference,
     min_p_renorm_reference,
+    min_p_sampling_reference,
     softmax_reference,
     speculative_chain_sampling_reference,
     speculative_greedy_verify_reference,
@@ -181,6 +187,35 @@ def test_min_p_renorm_generator_runs_triton_kernel(device: str) -> None:
         atol=1e-6,
         rtol=1e-6,
     )
+
+
+@requires_nvidia
+def test_min_p_sampling_generator_runs_flashinfer_kernel(device: str) -> None:
+    values = MinPSamplingInputs(
+        MinPSamplingInputConfig(
+            num_rows=5,
+            vocab_size=257,
+            min_min_p=0.05,
+            max_min_p=0.5,
+        )
+    ).generate(seed=96, metadata_seed=97, device=device)
+    expected = min_p_sampling_reference(values.probs, values.min_p)
+
+    try:
+        samples, valid = flashinfer_min_p_sampling_from_probs(
+            values.probs,
+            values.min_p,
+            deterministic=True,
+            seed=123,
+            offset=0,
+            return_valid=True,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"FlashInfer min-p sampling unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(samples, expected.samples, atol=0, rtol=0)
+    torch.testing.assert_close(valid, expected.valid, atol=0, rtol=0)
 
 
 @requires_nvidia

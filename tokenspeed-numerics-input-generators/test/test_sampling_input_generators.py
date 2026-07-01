@@ -31,6 +31,8 @@ from tokenspeed_numerics_input_generators import (
     GatherExpandScalarsInputs,
     MinPRenormInputConfig,
     MinPRenormInputs,
+    MinPSamplingInputConfig,
+    MinPSamplingInputs,
     SoftmaxInputConfig,
     SoftmaxInputs,
     SpeculativeChainSamplingInputConfig,
@@ -47,6 +49,7 @@ from tokenspeed_numerics_input_generators import (
     argmax_reference,
     gather_expand_scalars_reference,
     min_p_renorm_reference,
+    min_p_sampling_reference,
     softmax_reference,
     speculative_chain_sampling_reference,
     speculative_greedy_verify_reference,
@@ -440,6 +443,68 @@ def test_min_p_renorm_inputs_generate_probabilities_and_reference() -> None:
     ref = min_p_renorm_reference(values.probs, values.min_p)
     torch.testing.assert_close(ref.sum(dim=-1), torch.ones(4))
     assert torch.count_nonzero(ref == 0) > 0
+
+
+def test_min_p_sampling_inputs_generate_deterministic_reference() -> None:
+    values = MinPSamplingInputs(
+        MinPSamplingInputConfig(
+            num_rows=5,
+            vocab_size=17,
+            min_min_p=0.1,
+            max_min_p=0.7,
+        )
+    ).generate(seed=52, metadata_seed=53, device="cpu")
+
+    assert values.probs.shape == (5, 17)
+    assert values.probs.dtype == torch.float32
+    torch.testing.assert_close(values.probs.sum(dim=-1), torch.ones(5))
+    assert torch.all(torch.count_nonzero(values.probs, dim=-1) == 1)
+    assert values.min_p.shape == (5,)
+    assert values.min_p.min() >= 0.1
+    assert values.min_p.max() <= 0.7
+
+    ref = min_p_sampling_reference(values.probs, values.min_p)
+    torch.testing.assert_close(
+        ref.samples,
+        torch.argmax(values.probs, dim=-1).to(torch.int32),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(ref.valid, torch.ones(5, dtype=torch.bool))
+
+
+def test_min_p_sampling_metadata_seed_controls_selected_tokens() -> None:
+    generator = MinPSamplingInputs(
+        MinPSamplingInputConfig(
+            num_rows=4,
+            vocab_size=11,
+        )
+    )
+
+    values1 = generator.generate(seed=1, metadata_seed=99, device="cpu")
+    values2 = generator.generate(seed=2, metadata_seed=99, device="cpu")
+
+    torch.testing.assert_close(values1.probs, values2.probs)
+    torch.testing.assert_close(values1.min_p, values2.min_p)
+
+
+def test_min_p_sampling_reference_rejects_multi_token_support() -> None:
+    probs = torch.tensor([[0.6, 0.4, 0.0]], dtype=torch.float32)
+    min_p = torch.tensor([0.5], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="one surviving token"):
+        min_p_sampling_reference(probs, min_p)
+
+
+def test_min_p_sampling_rejects_invalid_threshold_bounds() -> None:
+    with pytest.raises(ValueError, match="min-p bounds"):
+        MinPSamplingInputs(
+            MinPSamplingInputConfig(
+                num_rows=1,
+                vocab_size=8,
+                min_min_p=0.0,
+            )
+        )
 
 
 def test_top_p_renorm_inputs_generate_values_and_reference() -> None:

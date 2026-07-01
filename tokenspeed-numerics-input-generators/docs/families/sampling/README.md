@@ -4,7 +4,8 @@ Sampling generators cover row-wise selection and probability filtering used in
 token sampling. The operation semantics include deterministic argmax behavior,
 metadata gather/broadcast, softmax, deterministic speculative greedy
 verification, target-only chain speculative sampling, min-p filtering, and
-top-p or top-k followed by top-p renormalization.
+exact-checkable min-p sampling, top-p or top-k followed by top-p
+renormalization.
 
 ## Generators
 
@@ -22,6 +23,8 @@ top-p or top-k followed by top-p renormalization.
   and verifier output buffers.
 - `MinPRenormInputs`: generates normalized probability rows and min-p
   thresholds.
+- `MinPSamplingInputs`: generates probability rows whose min-p filtered
+  support has one deterministic sampled token.
 - `TopPRenormInputs`: generates normalized probability rows and top-p
   thresholds for standalone nucleus filtering.
 - `TopKTopPRenormInputs`: generates normalized probability rows, top-k values,

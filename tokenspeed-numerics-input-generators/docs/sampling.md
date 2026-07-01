@@ -5,8 +5,8 @@ selection. They do not generate stochastic draws from a distribution. Instead,
 they model the tensor transforms that TokenSpeed kernels currently implement:
 row-wise argmax, packed max/index argmax pairs, scalar metadata
 gather/broadcast, softmax, speculative greedy verification, target-only chain
-speculative sampling, min-p renormalization, top-p renormalization, and
-top-k/top-p renormalization.
+speculative sampling, min-p renormalization, exact-checkable min-p sampling,
+top-p renormalization, and top-k/top-p renormalization.
 
 ## Operation Semantics
 
@@ -104,6 +104,23 @@ out = out / sum(out)
 
 Generated probability rows are positive and normalized before filtering.
 
+### Min-P Sampling
+
+`MinPSamplingInputs` represents categorical sampling after the same min-p
+filtering rule:
+
+```text
+threshold = min_p[row] * max(probs[row])
+filtered = where(probs >= threshold, probs, 0)
+sample ~ categorical(filtered / sum(filtered))
+```
+
+General categorical sampling requires statistical validation, so this generator
+currently produces exact-checkable rows where exactly one token survives the
+min-p filter. The reference returns that deterministic token and a valid mask.
+This lets kernel smoke tests verify API wiring and filtering semantics without
+claiming to validate the full random-sampling distribution.
+
 ### Top-P Renormalization
 
 `TopPRenormInputs` represents nucleus filtering and renormalization:
@@ -146,6 +163,8 @@ The generators reject invalid sampling inputs before values are returned:
 - chain speculative sampling output buffers use int32 storage and invalid slots
   are initialized to a sentinel so consumers can mask with `accept_index`
 - min-p and top-p values are generated in valid probability ranges
+- min-p sampling rows have exactly one survivor after filtering for exact
+  reference comparison
 - standalone top-p thresholds have one value per probability row and are in
   `(0, 1]`
 - planted argmax rows have a unique known maximum
@@ -165,6 +184,7 @@ TokenSpeed exposes sampling kernels through several modules:
   optional `.temperature`
 - `sampling.triton.gather_and_expand_scalars`
 - `sampling.triton.min_p_renorm_prob`
+- FlashInfer `min_p_sampling_from_probs` consumes `MinPSamplingInputValues`
 - NVIDIA-only CUDA `verify_chain_greedy` consumes
   `SpeculativeGreedyVerifyInputValues`
 - NVIDIA-only CUDA `chain_speculative_sampling_target_only` consumes
