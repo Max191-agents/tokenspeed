@@ -59,6 +59,10 @@ __all__ = [
     "AttentionMergeStateInputValues",
     "attention_generate",
     "attention_merge_state_reference",
+    "GDNQKVSplitInputConfig",
+    "GDNQKVSplitInputs",
+    "GDNQKVSplitInputValues",
+    "gdn_qkv_split_reference",
     "DeepSeekV4PagedIndexInputConfig",
     "DeepSeekV4PagedIndexInputs",
     "DeepSeekV4PagedIndexValues",
@@ -741,6 +745,210 @@ def mla_kv_pack_quantize_fp8_reference(
     k_fp8 = (k.float() * values.k_scale_inv).to(fp8_dtype)
     v_fp8 = (values.v.float() * values.v_scale_inv).to(fp8_dtype)
     return k_fp8.contiguous(), v_fp8.contiguous()
+
+
+@dataclass
+class GDNQKVSplitInputValues:
+    """Generated values for packed GDN QKV splitting."""
+
+    mixed_qkv: torch.Tensor
+    num_q_heads: int
+    num_k_heads: int
+    num_v_heads: int
+    head_q: int
+    head_k: int
+    head_v: int
+    fuse_l2norm: bool
+    l2norm_eps: float
+
+
+@dataclass
+class GDNQKVSplitInputConfig:
+    """Initialization parameters for packed GDN QKV splitting.
+
+    The represented operation splits a packed post-projection QKV row into
+    contiguous query, key, and value tensors. When ``fuse_l2norm`` is true, Q
+    and K are independently normalized over each head dimension before they are
+    returned; V is always copied as-is.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of packed token rows.
+    num_tokens: int
+
+    # Required: number of Q heads in the packed Q segment.
+    num_q_heads: int
+
+    # Required: number of K heads in the packed K segment.
+    num_k_heads: int
+
+    # Required: number of V heads in the packed V segment.
+    num_v_heads: int
+
+    # Required: per-head Q dimension.
+    head_q: int
+
+    # Required: per-head K dimension.
+    head_k: int
+
+    # Required: per-head V dimension.
+    head_v: int
+
+    # Required: dtype for generated packed QKV values.
+    dtype: torch.dtype
+
+    # ------------------------------------------------------------------
+    # Optional configuration fields.
+    # ------------------------------------------------------------------
+
+    # Optional: normalize Q and K per head after splitting. This models the
+    # fused fast path used by some GDN prefill implementations.
+    fuse_l2norm: bool = False
+
+    # Optional: epsilon used by the per-head L2 normalization.
+    l2norm_eps: float = 1.0e-6
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class GDNQKVSplitInputs(NumericsInputGenerator):
+    """Generator for packed GDN QKV split inputs."""
+
+    config: GDNQKVSplitInputConfig
+    mixed_qkv_input: TensorInput | None
+
+    def __init__(self, config: GDNQKVSplitInputConfig) -> None:
+        self.config = config
+        self.mixed_qkv_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.mixed_qkv_input = self.mixed_qkv_input or TensorInput(
+            (self.config.num_tokens, self._qkv_dim()),
+            self.config.dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> GDNQKVSplitInputValues:
+        self.__post_init__()
+        if self.mixed_qkv_input is None:
+            raise ValueError("mixed_qkv_input must be initialized")
+        target_device = _resolve_device(self.config.device, device)
+        self.mixed_qkv_input.shape = (self.config.num_tokens, self._qkv_dim())
+        self.mixed_qkv_input.dtype = self.config.dtype
+        mixed_qkv = _require_tensor(
+            self.mixed_qkv_input.generate(seed=seed, device=target_device).values,
+            "mixed_qkv",
+        )
+        return GDNQKVSplitInputValues(
+            mixed_qkv=mixed_qkv.contiguous(),
+            num_q_heads=self.config.num_q_heads,
+            num_k_heads=self.config.num_k_heads,
+            num_v_heads=self.config.num_v_heads,
+            head_q=self.config.head_q,
+            head_k=self.config.head_k,
+            head_v=self.config.head_v,
+            fuse_l2norm=bool(self.config.fuse_l2norm),
+            l2norm_eps=float(self.config.l2norm_eps),
+        )
+
+    def _normalize_config(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.num_q_heads = _check_positive(
+            "num_q_heads", self.config.num_q_heads
+        )
+        self.config.num_k_heads = _check_positive(
+            "num_k_heads", self.config.num_k_heads
+        )
+        self.config.num_v_heads = _check_positive(
+            "num_v_heads", self.config.num_v_heads
+        )
+        self.config.head_q = _check_positive("head_q", self.config.head_q)
+        self.config.head_k = _check_positive("head_k", self.config.head_k)
+        self.config.head_v = _check_positive("head_v", self.config.head_v)
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        self.config.l2norm_eps = float(self.config.l2norm_eps)
+        if self.config.l2norm_eps <= 0.0:
+            raise ValueError(
+                f"l2norm_eps must be positive, got {self.config.l2norm_eps}"
+            )
+
+    def _qkv_dim(self) -> int:
+        return (
+            self.config.num_q_heads * self.config.head_q
+            + self.config.num_k_heads * self.config.head_k
+            + self.config.num_v_heads * self.config.head_v
+        )
+
+
+def gdn_qkv_split_reference(
+    values: GDNQKVSplitInputValues,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return split Q/K/V tensors, optionally with per-head Q/K L2 norm."""
+
+    if values.mixed_qkv.ndim != 2:
+        raise ValueError(f"mixed_qkv must be rank-2, got {values.mixed_qkv.ndim}")
+    for name, value in (
+        ("num_q_heads", values.num_q_heads),
+        ("num_k_heads", values.num_k_heads),
+        ("num_v_heads", values.num_v_heads),
+        ("head_q", values.head_q),
+        ("head_k", values.head_k),
+        ("head_v", values.head_v),
+    ):
+        _check_positive(name, value)
+    if values.l2norm_eps <= 0.0:
+        raise ValueError(f"l2norm_eps must be positive, got {values.l2norm_eps}")
+
+    q_dim = values.num_q_heads * values.head_q
+    k_dim = values.num_k_heads * values.head_k
+    v_dim = values.num_v_heads * values.head_v
+    qkv_dim = q_dim + k_dim + v_dim
+    if values.mixed_qkv.shape[1] != qkv_dim:
+        raise ValueError(
+            f"mixed_qkv last dimension must be {qkv_dim}, "
+            f"got {values.mixed_qkv.shape[1]}"
+        )
+
+    tokens = values.mixed_qkv.shape[0]
+    q = values.mixed_qkv[:, :q_dim].reshape(tokens, values.num_q_heads, values.head_q)
+    k = values.mixed_qkv[:, q_dim : q_dim + k_dim].reshape(
+        tokens,
+        values.num_k_heads,
+        values.head_k,
+    )
+    v = values.mixed_qkv[:, q_dim + k_dim :].reshape(
+        tokens,
+        values.num_v_heads,
+        values.head_v,
+    )
+    if values.fuse_l2norm:
+        q_norm = torch.sqrt(
+            (q.float() * q.float()).sum(dim=-1, keepdim=True) + values.l2norm_eps
+        )
+        k_norm = torch.sqrt(
+            (k.float() * k.float()).sum(dim=-1, keepdim=True) + values.l2norm_eps
+        )
+        q = (q.float() / q_norm).to(values.mixed_qkv.dtype)
+        k = (k.float() / k_norm).to(values.mixed_qkv.dtype)
+    return (
+        q.unsqueeze(0).contiguous(),
+        k.unsqueeze(0).contiguous(),
+        v.unsqueeze(0).contiguous(),
+    )
 
 
 @dataclass

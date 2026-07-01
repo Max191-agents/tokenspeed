@@ -31,6 +31,9 @@ from tokenspeed_kernel import (
     mla_prefill,
 )
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
+    fused_qkv_split_gdn_prefill,
+)
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_compressed_slot_mapping,
@@ -51,6 +54,8 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    GDNQKVSplitInputConfig,
+    GDNQKVSplitInputs,
     DeepSeekV4PagedIndexInputConfig,
     DeepSeekV4PagedIndexInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
@@ -70,6 +75,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_combine_dense_swa_indices_reference,
     deepseek_v4_combine_topk_swa_indices_reference,
     deepseek_v4_indexer_decode_metadata_reference,
+    gdn_qkv_split_reference,
     mla_kv_pack_quantize_fp8_reference,
 )
 
@@ -366,6 +372,50 @@ def test_mla_kv_pack_quantize_fp8_generator_runs_tokenspeed_mla_kernel(
 
     assert torch.equal(actual_k.view(torch.uint8), expected_k.view(torch.uint8))
     assert torch.equal(actual_v.view(torch.uint8), expected_v.view(torch.uint8))
+
+
+@pytest.mark.parametrize("fuse_l2norm", [False, True], ids=["split", "split-l2"])
+def test_gdn_qkv_split_generator_runs_tokenspeed_triton(
+    device: str,
+    fuse_l2norm: bool,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm GPU is required for GDN QKV split Triton test")
+
+    values = GDNQKVSplitInputs(
+        GDNQKVSplitInputConfig(
+            num_tokens=13,
+            num_q_heads=4,
+            num_k_heads=2,
+            num_v_heads=2,
+            head_q=16,
+            head_k=16,
+            head_v=16,
+            dtype=torch.bfloat16,
+            fuse_l2norm=fuse_l2norm,
+        )
+    ).generate(seed=208, device=device)
+    expected_q, expected_k, expected_v = gdn_qkv_split_reference(values)
+
+    actual_q, actual_k, actual_v = fused_qkv_split_gdn_prefill(
+        values.mixed_qkv,
+        values.num_q_heads,
+        values.num_k_heads,
+        values.num_v_heads,
+        values.head_q,
+        values.head_k,
+        values.head_v,
+        fuse_l2norm=values.fuse_l2norm,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        actual_q.float(), expected_q.float(), rtol=1e-2, atol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_k.float(), expected_k.float(), rtol=1e-2, atol=1e-2
+    )
+    torch.testing.assert_close(actual_v.float(), expected_v.float(), rtol=0.0, atol=0.0)
 
 
 def test_deepseek_v4_global_topk_generator_runs_tokenspeed_cpu() -> None:

@@ -25,6 +25,8 @@ import torch
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    GDNQKVSplitInputConfig,
+    GDNQKVSplitInputs,
     DeepSeekV4PagedIndexInputConfig,
     DeepSeekV4PagedIndexInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
@@ -51,6 +53,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_combine_dense_swa_indices_reference,
     deepseek_v4_combine_topk_swa_indices_reference,
     deepseek_v4_indexer_decode_metadata_reference,
+    gdn_qkv_split_reference,
     mla_kv_pack_quantize_fp8_reference,
 )
 
@@ -348,6 +351,110 @@ def test_mla_kv_pack_quantize_fp8_reference_rejects_mixed_input_dtypes() -> None
 
     with pytest.raises(ValueError, match="same dtype"):
         mla_kv_pack_quantize_fp8_reference(values)
+
+
+def test_gdn_qkv_split_inputs_generate_plain_split_reference() -> None:
+    values = GDNQKVSplitInputs(
+        GDNQKVSplitInputConfig(
+            num_tokens=5,
+            num_q_heads=4,
+            num_k_heads=2,
+            num_v_heads=2,
+            head_q=8,
+            head_k=8,
+            head_v=6,
+            dtype=torch.float32,
+        )
+    ).generate(seed=101, device="cpu")
+
+    q, k, v = gdn_qkv_split_reference(values)
+
+    assert values.mixed_qkv.shape == (5, 60)
+    assert q.shape == (1, 5, 4, 8)
+    assert k.shape == (1, 5, 2, 8)
+    assert v.shape == (1, 5, 2, 6)
+    torch.testing.assert_close(q.reshape(5, -1), values.mixed_qkv[:, :32])
+    torch.testing.assert_close(k.reshape(5, -1), values.mixed_qkv[:, 32:48])
+    torch.testing.assert_close(v.reshape(5, -1), values.mixed_qkv[:, 48:])
+
+
+def test_gdn_qkv_split_inputs_generate_l2norm_reference() -> None:
+    values = GDNQKVSplitInputs(
+        GDNQKVSplitInputConfig(
+            num_tokens=7,
+            num_q_heads=3,
+            num_k_heads=2,
+            num_v_heads=2,
+            head_q=8,
+            head_k=8,
+            head_v=8,
+            dtype=torch.float32,
+            fuse_l2norm=True,
+        )
+    ).generate(seed=102, device="cpu")
+
+    q, k, v = gdn_qkv_split_reference(values)
+
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(q, dim=-1),
+        torch.ones((1, 7, 3)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(k, dim=-1),
+        torch.ones((1, 7, 2)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(v.reshape(7, -1), values.mixed_qkv[:, -16:])
+
+
+def test_gdn_qkv_split_inputs_reject_invalid_configs_and_values() -> None:
+    with pytest.raises(ValueError, match="head_q"):
+        GDNQKVSplitInputs(
+            GDNQKVSplitInputConfig(
+                num_tokens=5,
+                num_q_heads=4,
+                num_k_heads=2,
+                num_v_heads=2,
+                head_q=0,
+                head_k=8,
+                head_v=8,
+                dtype=torch.float32,
+            )
+        )
+
+    with pytest.raises(ValueError, match="l2norm_eps"):
+        GDNQKVSplitInputs(
+            GDNQKVSplitInputConfig(
+                num_tokens=5,
+                num_q_heads=4,
+                num_k_heads=2,
+                num_v_heads=2,
+                head_q=8,
+                head_k=8,
+                head_v=8,
+                dtype=torch.float32,
+                l2norm_eps=0.0,
+            )
+        )
+
+    values = GDNQKVSplitInputs(
+        GDNQKVSplitInputConfig(
+            num_tokens=5,
+            num_q_heads=4,
+            num_k_heads=2,
+            num_v_heads=2,
+            head_q=8,
+            head_k=8,
+            head_v=8,
+            dtype=torch.float32,
+        )
+    ).generate(seed=103, device="cpu")
+    values.mixed_qkv = values.mixed_qkv[:, :-1]
+    with pytest.raises(ValueError, match="last dimension"):
+        gdn_qkv_split_reference(values)
 
 
 def test_deepseek_v4_paged_index_inputs_generate_values_and_refs() -> None:
