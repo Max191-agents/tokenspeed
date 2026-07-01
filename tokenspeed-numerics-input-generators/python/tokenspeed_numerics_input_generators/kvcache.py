@@ -35,14 +35,22 @@ from tokenspeed_numerics_input_generators.core import (
 )
 
 __all__ = [
+    "KVCacheStoreInputConfig",
+    "KVCacheStoreInputs",
+    "KVCacheStoreInputValues",
     "KVCacheTransferInputConfig",
     "KVCacheTransferInputs",
     "KVCacheTransferInputValues",
     "MLAKVCacheTransferInputConfig",
     "MLAKVCacheTransferInputs",
     "MLAKVCacheTransferInputValues",
+    "PageTableGatherInputConfig",
+    "PageTableGatherInputs",
+    "PageTableGatherInputValues",
+    "kv_cache_store_reference",
     "kv_cache_transfer_reference",
     "mla_kv_cache_transfer_reference",
+    "page_table_gather_reference",
 ]
 
 _REGULAR_FLOAT_DTYPES = {
@@ -104,6 +112,51 @@ def _generate_unique_indices(
     return indices[:num_transfers].to(dtype)
 
 
+def _generate_index_matrix(
+    *,
+    rows: int,
+    cols: int,
+    high: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: DeviceLike,
+    configured_device: DeviceLike,
+) -> torch.Tensor:
+    target_device = _resolve_device(configured_device, device)
+    generator = _rng_for_device(target_device, seed)
+    return torch.randint(
+        0,
+        high,
+        (rows, cols),
+        dtype=dtype,
+        device=target_device,
+        generator=generator,
+    )
+
+
+def _randint_seq_lens(
+    *,
+    batch_size: int,
+    max_seq_len: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: DeviceLike,
+    configured_device: DeviceLike,
+) -> torch.Tensor:
+    target_device = _resolve_device(configured_device, device)
+    if batch_size == 0:
+        return torch.empty(0, dtype=dtype, device=target_device)
+    generator = _rng_for_device(target_device, seed)
+    return torch.randint(
+        0,
+        max_seq_len + 1,
+        (batch_size,),
+        dtype=dtype,
+        device=target_device,
+        generator=generator,
+    )
+
+
 def _generate_tensor_layers(
     inputs: list[TensorInput],
     *,
@@ -123,6 +176,296 @@ def _generate_tensor_layers(
             ).contiguous()
         )
     return layers
+
+
+@dataclass
+class KVCacheStoreInputValues:
+    """Generated values for K/V cache store/scatter operations."""
+
+    k_src: torch.Tensor
+    v_src: torch.Tensor
+    k_dst: torch.Tensor
+    v_dst: torch.Tensor
+    loc: torch.Tensor
+
+
+@dataclass
+class KVCacheStoreInputConfig:
+    """Initialization parameters for per-token K/V cache store inputs.
+
+    The represented operation scatters generated token K/V rows into cache
+    slots: ``k_dst[loc[i]] = k_src[i]`` and ``v_dst[loc[i]] = v_src[i]``.
+    Destination locations are generated without duplicates so the result is
+    independent of write order.
+    """
+
+    # Required: number of token rows to store.
+    num_tokens: int
+
+    # Required: number of destination cache slots.
+    num_slots: int
+
+    # Required: number of KV heads in each token/cache slot.
+    num_kv_heads: int
+
+    # Required: per-head dimension.
+    head_dim: int
+
+    # Required: generated dtype for source and destination caches.
+    dtype: torch.dtype
+
+    # Optional: dtype for generated destination locations.
+    index_dtype: torch.dtype = torch.int32
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class KVCacheStoreInputs(NumericsInputGenerator):
+    """Generator for per-token K/V cache store/scatter inputs."""
+
+    config: KVCacheStoreInputConfig
+    k_src_input: TensorInput | None
+    v_src_input: TensorInput | None
+    k_dst_input: TensorInput | None
+    v_dst_input: TensorInput | None
+
+    def __init__(self, config: KVCacheStoreInputConfig) -> None:
+        self.config = config
+        self.k_src_input = None
+        self.v_src_input = None
+        self.k_dst_input = None
+        self.v_dst_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.num_slots = _check_positive("num_slots", self.config.num_slots)
+        if self.config.num_tokens > self.config.num_slots:
+            raise ValueError(
+                "num_tokens must be <= num_slots for unique cache locations; "
+                f"got num_tokens={self.config.num_tokens}, "
+                f"num_slots={self.config.num_slots}"
+            )
+        self.config.num_kv_heads = _check_positive(
+            "num_kv_heads", self.config.num_kv_heads
+        )
+        self.config.head_dim = _check_positive("head_dim", self.config.head_dim)
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        self.config.index_dtype = _check_index_dtype(
+            "index_dtype", self.config.index_dtype
+        )
+        src_shape = (
+            self.config.num_tokens,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+        )
+        dst_shape = (
+            self.config.num_slots,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+        )
+        self.k_src_input = self.k_src_input or TensorInput(
+            src_shape,
+            self.config.dtype,
+            device=self.config.device,
+        )
+        self.v_src_input = self.v_src_input or TensorInput(
+            src_shape,
+            self.config.dtype,
+            device=self.config.device,
+        )
+        self.k_dst_input = self.k_dst_input or TensorInput(
+            dst_shape,
+            self.config.dtype,
+            device=self.config.device,
+        )
+        self.v_dst_input = self.v_dst_input or TensorInput(
+            dst_shape,
+            self.config.dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> KVCacheStoreInputValues:
+        self.__post_init__()
+        if (
+            self.k_src_input is None
+            or self.v_src_input is None
+            or self.k_dst_input is None
+            or self.v_dst_input is None
+        ):
+            raise ValueError("KVCacheStoreInputs child generators must be initialized")
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        loc = _generate_unique_indices(
+            num_slots=self.config.num_slots,
+            num_transfers=self.config.num_tokens,
+            dtype=self.config.index_dtype,
+            seed=_child_seed(metadata_base_seed, 1),
+            device=device,
+            configured_device=self.config.device,
+        )
+        return KVCacheStoreInputValues(
+            k_src=_require_tensor(
+                self.k_src_input.generate(
+                    seed=_child_seed(seed, 1), device=device
+                ).values,
+                "k_src",
+            ).contiguous(),
+            v_src=_require_tensor(
+                self.v_src_input.generate(
+                    seed=_child_seed(seed, 2), device=device
+                ).values,
+                "v_src",
+            ).contiguous(),
+            k_dst=_require_tensor(
+                self.k_dst_input.generate(
+                    seed=_child_seed(seed, 3), device=device
+                ).values,
+                "k_dst",
+            ).contiguous(),
+            v_dst=_require_tensor(
+                self.v_dst_input.generate(
+                    seed=_child_seed(seed, 4), device=device
+                ).values,
+                "v_dst",
+            ).contiguous(),
+            loc=loc.contiguous(),
+        )
+
+
+@dataclass
+class PageTableGatherInputValues:
+    """Generated values for page-table gather-with-padding operations."""
+
+    req_to_page: torch.Tensor
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    out: torch.Tensor
+
+
+@dataclass
+class PageTableGatherInputConfig:
+    """Initialization parameters for active page-table gather inputs.
+
+    The represented operation gathers selected request rows from a source page
+    table and writes dummy slots after the number of valid pages implied by
+    each request length.
+    """
+
+    # Required: number of rows in the source request-to-page table.
+    source_rows: int
+
+    # Required: number of active request rows to gather.
+    batch_size: int
+
+    # Required: number of page-table columns in source and destination.
+    max_num_pages: int
+
+    # Required: number of cache tokens represented by one page.
+    page_size: int
+
+    # Optional: dummy page id written into padding columns.
+    dummy_slot: int = 0
+
+    # Optional: dtype for request/page metadata tensors.
+    index_dtype: torch.dtype = torch.int32
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class PageTableGatherInputs(NumericsInputGenerator):
+    """Generator for page-table gather-with-padding inputs."""
+
+    config: PageTableGatherInputConfig
+
+    def __init__(self, config: PageTableGatherInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.source_rows = _check_positive(
+            "source_rows", self.config.source_rows
+        )
+        self.config.batch_size = _check_nonnegative(
+            "batch_size", self.config.batch_size
+        )
+        if self.config.batch_size > self.config.source_rows:
+            raise ValueError(
+                "batch_size must be <= source_rows for unique request rows; "
+                f"got batch_size={self.config.batch_size}, "
+                f"source_rows={self.config.source_rows}"
+            )
+        self.config.max_num_pages = _check_positive(
+            "max_num_pages", self.config.max_num_pages
+        )
+        self.config.page_size = _check_positive("page_size", self.config.page_size)
+        self.config.index_dtype = _check_index_dtype(
+            "index_dtype", self.config.index_dtype
+        )
+        if self.config.dummy_slot < 0:
+            raise ValueError(
+                f"dummy_slot must be non-negative, got {self.config.dummy_slot}"
+            )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> PageTableGatherInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        req_to_page = _generate_index_matrix(
+            rows=self.config.source_rows,
+            cols=self.config.max_num_pages,
+            high=max(self.config.source_rows * self.config.max_num_pages, 1),
+            dtype=self.config.index_dtype,
+            seed=_child_seed(seed, 1),
+            device=device,
+            configured_device=self.config.device,
+        )
+        req_pool_indices = _generate_unique_indices(
+            num_slots=self.config.source_rows,
+            num_transfers=self.config.batch_size,
+            dtype=self.config.index_dtype,
+            seed=_child_seed(metadata_base_seed, 1),
+            device=device,
+            configured_device=self.config.device,
+        )
+        max_seq_len = self.config.max_num_pages * self.config.page_size
+        seq_lens = _randint_seq_lens(
+            batch_size=self.config.batch_size,
+            max_seq_len=max_seq_len,
+            dtype=self.config.index_dtype,
+            seed=_child_seed(metadata_base_seed, 2),
+            device=device,
+            configured_device=self.config.device,
+        )
+        out = torch.full(
+            (self.config.batch_size, self.config.max_num_pages),
+            self.config.dummy_slot,
+            dtype=self.config.index_dtype,
+            device=target_device,
+        )
+        return PageTableGatherInputValues(
+            req_to_page=req_to_page.contiguous(),
+            req_pool_indices=req_pool_indices.contiguous(),
+            seq_lens=seq_lens.contiguous(),
+            out=out,
+        )
 
 
 @dataclass
@@ -419,6 +762,46 @@ class MLAKVCacheTransferInputs(NumericsInputGenerator):
             src_indices=src_indices.contiguous(),
             dst_indices=dst_indices.contiguous(),
         )
+
+
+def kv_cache_store_reference(
+    values: KVCacheStoreInputValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return expected destination K/V caches after per-token store."""
+
+    expected_k = values.k_dst.clone()
+    expected_v = values.v_dst.clone()
+    loc = values.loc.to(torch.int64)
+    expected_k[loc] = values.k_src
+    expected_v[loc] = values.v_src
+    return expected_k, expected_v
+
+
+def page_table_gather_reference(
+    values: PageTableGatherInputValues,
+    *,
+    page_size: int,
+    dummy_slot: int = 0,
+) -> torch.Tensor:
+    """Return expected gathered page table with padding columns cleared."""
+
+    page_size = _check_positive("page_size", page_size)
+    if dummy_slot < 0:
+        raise ValueError(f"dummy_slot must be non-negative, got {dummy_slot}")
+    expected = torch.full_like(values.out, dummy_slot)
+    max_num_pages = values.out.shape[1]
+    for row_idx in range(values.req_pool_indices.numel()):
+        seq_len = int(values.seq_lens[row_idx].item())
+        n_pages = (seq_len + page_size - 1) // page_size
+        if n_pages > max_num_pages:
+            raise ValueError(
+                "seq_lens imply more pages than out can hold; "
+                f"row={row_idx}, seq_len={seq_len}, page_size={page_size}, "
+                f"out_columns={max_num_pages}"
+            )
+        req_idx = int(values.req_pool_indices[row_idx].item())
+        expected[row_idx, :n_pages] = values.req_to_page[req_idx, :n_pages]
+    return expected
 
 
 def kv_cache_transfer_reference(

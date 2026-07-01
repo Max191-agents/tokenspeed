@@ -22,18 +22,26 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
+    gather_page_table_with_padding,
+    store_kv_cache,
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )
 from tokenspeed_numerics_input_generators import (
+    KVCacheStoreInputConfig,
+    KVCacheStoreInputs,
     KVCacheTransferInputConfig,
     KVCacheTransferInputs,
     MLAKVCacheTransferInputConfig,
     MLAKVCacheTransferInputs,
+    PageTableGatherInputConfig,
+    PageTableGatherInputs,
+    kv_cache_store_reference,
     kv_cache_transfer_reference,
     mla_kv_cache_transfer_reference,
+    page_table_gather_reference,
 )
 
 
@@ -43,6 +51,65 @@ def _ptr_tensor(layers: list[torch.Tensor]) -> torch.Tensor:
         device=layers[0].device,
         dtype=torch.uint64,
     )
+
+
+def test_kv_cache_store_generator_runs_kernel(device: str) -> None:
+    values = KVCacheStoreInputs(
+        KVCacheStoreInputConfig(
+            num_tokens=4,
+            num_slots=8,
+            num_kv_heads=2,
+            head_dim=32,
+            dtype=torch.float16,
+        )
+    ).generate(seed=77, metadata_seed=78, device=device)
+    expected_k, expected_v = kv_cache_store_reference(values)
+
+    store_kv_cache(
+        values.k_src,
+        values.v_src,
+        values.k_dst,
+        values.v_dst,
+        values.loc,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(values.k_dst, expected_k, atol=0, rtol=0)
+    torch.testing.assert_close(values.v_dst, expected_v, atol=0, rtol=0)
+
+
+def test_page_table_gather_generator_runs_kernel(device: str) -> None:
+    config = PageTableGatherInputConfig(
+        source_rows=8,
+        batch_size=4,
+        max_num_pages=5,
+        page_size=16,
+        dummy_slot=999,
+    )
+    values = PageTableGatherInputs(config).generate(
+        seed=79,
+        metadata_seed=80,
+        device=device,
+    )
+    expected = page_table_gather_reference(
+        values,
+        page_size=config.page_size,
+        dummy_slot=config.dummy_slot,
+    )
+
+    gather_page_table_with_padding(
+        values.req_to_page,
+        values.req_pool_indices,
+        values.seq_lens,
+        values.out,
+        bs=config.batch_size,
+        max_num_pages=config.max_num_pages,
+        page_size=config.page_size,
+        dummy_slot=config.dummy_slot,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(values.out, expected, atol=0, rtol=0)
 
 
 def test_kv_cache_transfer_generator_runs_per_layer_kernel(device: str) -> None:
