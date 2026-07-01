@@ -36,6 +36,8 @@ from tokenspeed_kernel.ops.communication.triton import (
     reduce_scatter,
 )
 from tokenspeed_numerics_input_generators import (
+    AllGatherDualRMSNormInputConfig,
+    AllGatherDualRMSNormInputs,
     AllGatherInputConfig,
     AllGatherInputs,
     AllReduceInputConfig,
@@ -48,11 +50,15 @@ from tokenspeed_numerics_input_generators import (
     ExpertParallelRoutingInputs,
     ReduceScatterInputConfig,
     ReduceScatterInputs,
+    ReduceScatterResidualRMSNormInputConfig,
+    ReduceScatterResidualRMSNormInputs,
+    all_gather_dual_rmsnorm_reference,
     all_gather_reference,
     all_reduce_residual_rmsnorm_reference,
     all_reduce_sum_reference,
     dp_sampling_reference,
     expert_parallel_routing_reference,
+    reduce_scatter_residual_rmsnorm_reference,
     reduce_scatter_sum_reference,
 )
 
@@ -352,6 +358,67 @@ def test_dp_sampling_generator_matches_triton_kernel_contract() -> None:
     )
     assert refs.accept_index.shape == refs.predict.shape
     assert refs.accept_length.shape == (config.pad_batch_size,)
+
+
+def test_reduce_scatter_residual_rmsnorm_generator_matches_trtllm_contract() -> None:
+    config = ReduceScatterResidualRMSNormInputConfig(
+        world_size=2,
+        total_tokens=5,
+        hidden_size=16,
+        dtype=torch.bfloat16,
+        residual_dtype=torch.bfloat16,
+        include_add_in=True,
+        weight_dtype=torch.float32,
+    )
+    values = ReduceScatterResidualRMSNormInputs(config).generate(
+        seed=102,
+        device="cpu",
+    )
+    refs = reduce_scatter_residual_rmsnorm_reference(values)
+
+    rank = 0
+    assert values.rank_inputs[rank].shape == (config.total_tokens, config.hidden_size)
+    assert values.residuals[rank].shape == (
+        values.tokens_per_rank[rank],
+        config.hidden_size,
+    )
+    assert values.add_ins is not None
+    assert values.add_ins[rank].shape == values.residuals[rank].shape
+    assert values.weight.shape == (config.hidden_size,)
+    assert refs.norm_outputs[rank].shape == values.residuals[rank].shape
+    assert refs.residual_outputs[rank].shape == values.residuals[rank].shape
+
+
+def test_all_gather_dual_rmsnorm_generator_matches_trtllm_contract() -> None:
+    config = AllGatherDualRMSNormInputConfig(
+        world_size=2,
+        total_tokens=7,
+        q_lora_rank=8,
+        kv_lora_rank=4,
+        qk_rope_head_dim=2,
+        max_tokens_per_rank=4,
+        dtype=torch.bfloat16,
+        q_weight_dtype=torch.float32,
+        kv_weight_dtype=torch.float32,
+    )
+    values = AllGatherDualRMSNormInputs(config).generate(
+        seed=103,
+        metadata_seed=104,
+        device="cpu",
+    )
+    refs = all_gather_dual_rmsnorm_reference(values)
+
+    hidden_size = config.q_lora_rank + config.kv_lora_rank + config.qk_rope_head_dim
+    rank = 0
+    assert values.rank_inputs[rank].shape == (
+        values.tokens_per_rank[rank],
+        hidden_size,
+    )
+    assert values.q_weight.shape == (config.q_lora_rank,)
+    assert values.kv_weight.shape == (config.kv_lora_rank,)
+    assert refs.gathered_output.shape == (config.total_tokens, hidden_size)
+    assert refs.q_norm_output.shape == (config.total_tokens, config.q_lora_rank)
+    assert refs.kv_norm_output.shape == (config.total_tokens, config.kv_lora_rank)
 
 
 def test_communication_generators_run_triton_collectives_world2() -> None:

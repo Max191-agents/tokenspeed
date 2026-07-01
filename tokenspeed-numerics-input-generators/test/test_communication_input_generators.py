@@ -23,6 +23,8 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_numerics_input_generators import (
+    AllGatherDualRMSNormInputConfig,
+    AllGatherDualRMSNormInputs,
     AllGatherInputConfig,
     AllGatherInputs,
     AllReduceInputConfig,
@@ -37,6 +39,9 @@ from tokenspeed_numerics_input_generators import (
     ExpertParallelRoutingInputValues,
     ReduceScatterInputConfig,
     ReduceScatterInputs,
+    ReduceScatterResidualRMSNormInputConfig,
+    ReduceScatterResidualRMSNormInputs,
+    all_gather_dual_rmsnorm_reference,
     all_gather_reference,
     all_reduce_residual_rmsnorm_reference,
     all_reduce_sum_reference,
@@ -44,6 +49,7 @@ from tokenspeed_numerics_input_generators import (
     dp_sampling_reference,
     dp_sampling_swap_reference,
     expert_parallel_routing_reference,
+    reduce_scatter_residual_rmsnorm_reference,
     reduce_scatter_sum_reference,
 )
 
@@ -431,6 +437,140 @@ def test_reduce_scatter_inputs_generate_values_and_reference() -> None:
         offset += num_tokens
 
 
+def test_reduce_scatter_residual_rmsnorm_inputs_generate_values_and_reference() -> None:
+    values = ReduceScatterResidualRMSNormInputs(
+        ReduceScatterResidualRMSNormInputConfig(
+            world_size=3,
+            total_tokens=8,
+            hidden_size=6,
+            dtype=torch.float32,
+            residual_dtype=torch.float32,
+            include_add_in=True,
+            add_in_dtype=torch.float32,
+            weight_dtype=torch.float32,
+            eps=1e-5,
+        )
+    ).generate(seed=151, device="cpu")
+
+    assert len(values.rank_inputs) == 3
+    assert values.tokens_per_rank == [3, 3, 2]
+    assert all(rank_input.shape == (8, 6) for rank_input in values.rank_inputs)
+    assert [residual.shape for residual in values.residuals] == [
+        (3, 6),
+        (3, 6),
+        (2, 6),
+    ]
+    assert values.add_ins is not None
+    assert [add_in.shape for add_in in values.add_ins] == [(3, 6), (3, 6), (2, 6)]
+
+    refs = reduce_scatter_residual_rmsnorm_reference(values)
+    reduced = sum(values.rank_inputs)
+    rank = 1
+    offset = sum(values.tokens_per_rank[:rank])
+    shard = reduced[offset : offset + values.tokens_per_rank[rank]]
+    manual_residual = shard + values.residuals[rank] + values.add_ins[rank]
+    manual_norm = manual_residual * torch.rsqrt(
+        manual_residual.pow(2).mean(dim=-1, keepdim=True) + values.eps
+    )
+    manual_norm = manual_norm * values.weight
+
+    torch.testing.assert_close(refs.residual_outputs[rank], manual_residual)
+    torch.testing.assert_close(refs.norm_outputs[rank], manual_norm)
+
+
+def test_reduce_scatter_residual_rmsnorm_outputs_match_wrapper_dtypes() -> None:
+    values = ReduceScatterResidualRMSNormInputs(
+        ReduceScatterResidualRMSNormInputConfig(
+            world_size=2,
+            total_tokens=5,
+            hidden_size=8,
+            dtype=torch.bfloat16,
+            residual_dtype=torch.float32,
+            weight_dtype=torch.float32,
+        )
+    ).generate(seed=152, device="cpu")
+
+    refs = reduce_scatter_residual_rmsnorm_reference(values)
+
+    assert [output.shape for output in refs.norm_outputs] == [(3, 8), (2, 8)]
+    assert [output.dtype for output in refs.norm_outputs] == [
+        torch.bfloat16,
+        torch.bfloat16,
+    ]
+    assert [output.dtype for output in refs.residual_outputs] == [
+        torch.float32,
+        torch.float32,
+    ]
+
+
+def test_all_gather_dual_rmsnorm_inputs_generate_values_and_reference() -> None:
+    values = AllGatherDualRMSNormInputs(
+        AllGatherDualRMSNormInputConfig(
+            world_size=3,
+            total_tokens=10,
+            q_lora_rank=4,
+            kv_lora_rank=3,
+            qk_rope_head_dim=2,
+            max_tokens_per_rank=5,
+            dtype=torch.float32,
+            q_weight_dtype=torch.float32,
+            kv_weight_dtype=torch.float32,
+            eps_q=1e-5,
+            eps_kv=2e-5,
+        )
+    ).generate(seed=161, metadata_seed=162, device="cpu")
+
+    assert len(values.rank_inputs) == 3
+    assert sum(values.tokens_per_rank) == 10
+    assert max(values.tokens_per_rank) <= 5
+    assert all(
+        rank_input.shape == (values.tokens_per_rank[rank], 9)
+        for rank, rank_input in enumerate(values.rank_inputs)
+    )
+    assert values.q_weight.shape == (4,)
+    assert values.kv_weight.shape == (3,)
+
+    refs = all_gather_dual_rmsnorm_reference(values)
+    gathered = torch.cat(values.rank_inputs, dim=0)
+    q_slice = gathered[:, :4]
+    kv_slice = gathered[:, 4:7]
+    manual_q = q_slice * torch.rsqrt(
+        q_slice.pow(2).mean(dim=-1, keepdim=True) + values.eps_q
+    )
+    manual_q = manual_q * values.q_weight
+    manual_kv = kv_slice * torch.rsqrt(
+        kv_slice.pow(2).mean(dim=-1, keepdim=True) + values.eps_kv
+    )
+    manual_kv = manual_kv * values.kv_weight
+    manual_gathered = gathered.clone()
+    manual_gathered[:, 4:7] = manual_kv
+
+    torch.testing.assert_close(refs.q_norm_output, manual_q)
+    torch.testing.assert_close(refs.kv_norm_output, manual_kv)
+    torch.testing.assert_close(refs.gathered_output, manual_gathered)
+
+
+def test_all_gather_dual_rmsnorm_metadata_seed_controls_token_distribution() -> None:
+    generator = AllGatherDualRMSNormInputs(
+        AllGatherDualRMSNormInputConfig(
+            world_size=4,
+            total_tokens=13,
+            q_lora_rank=8,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            max_tokens_per_rank=5,
+            dtype=torch.float32,
+        )
+    )
+
+    values1 = generator.generate(seed=163, metadata_seed=164, device="cpu")
+    values2 = generator.generate(seed=165, metadata_seed=164, device="cpu")
+
+    assert values1.tokens_per_rank == values2.tokens_per_rank
+    assert not torch.equal(values1.rank_inputs[0], values2.rank_inputs[0])
+    assert not torch.equal(values1.q_weight, values2.q_weight)
+
+
 def test_collective_metadata_seed_controls_token_distribution_only() -> None:
     generator = AllGatherInputs(
         AllGatherInputConfig(
@@ -646,3 +786,62 @@ def test_all_reduce_residual_rmsnorm_reference_rejects_bad_residual_shape() -> N
 
     with pytest.raises(ValueError, match="residual shape"):
         all_reduce_residual_rmsnorm_reference(values)
+
+
+def test_reduce_scatter_residual_rmsnorm_rejects_invalid_config() -> None:
+    with pytest.raises(ValueError, match="eps"):
+        ReduceScatterResidualRMSNormInputs(
+            ReduceScatterResidualRMSNormInputConfig(
+                world_size=2,
+                total_tokens=4,
+                hidden_size=8,
+                eps=-1e-6,
+            )
+        )
+
+
+def test_reduce_scatter_residual_rmsnorm_reference_rejects_bad_add_shape() -> None:
+    values = ReduceScatterResidualRMSNormInputs(
+        ReduceScatterResidualRMSNormInputConfig(
+            world_size=2,
+            total_tokens=4,
+            hidden_size=8,
+            include_add_in=True,
+            dtype=torch.float32,
+        )
+    ).generate(seed=153, device="cpu")
+    assert values.add_ins is not None
+    values.add_ins[0] = values.add_ins[0][:, :-1]
+
+    with pytest.raises(ValueError, match="add_ins"):
+        reduce_scatter_residual_rmsnorm_reference(values)
+
+
+def test_all_gather_dual_rmsnorm_rejects_invalid_config() -> None:
+    with pytest.raises(ValueError, match="q_lora_rank"):
+        AllGatherDualRMSNormInputs(
+            AllGatherDualRMSNormInputConfig(
+                world_size=2,
+                total_tokens=4,
+                q_lora_rank=0,
+                kv_lora_rank=4,
+                qk_rope_head_dim=2,
+            )
+        )
+
+
+def test_all_gather_dual_rmsnorm_reference_rejects_bad_weight_shape() -> None:
+    values = AllGatherDualRMSNormInputs(
+        AllGatherDualRMSNormInputConfig(
+            world_size=2,
+            total_tokens=4,
+            q_lora_rank=4,
+            kv_lora_rank=3,
+            qk_rope_head_dim=2,
+            dtype=torch.float32,
+        )
+    ).generate(seed=166, metadata_seed=167, device="cpu")
+    values.kv_weight = values.kv_weight[:-1]
+
+    with pytest.raises(ValueError, match="kv_weight"):
+        all_gather_dual_rmsnorm_reference(values)

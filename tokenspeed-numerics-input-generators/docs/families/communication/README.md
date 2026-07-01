@@ -12,8 +12,13 @@ rather than any specific communication library API.
   all-reduce style sum.
 - `AllGatherInputs`: generates rank-local shards for concatenating along a
   configured dimension.
+- `AllGatherDualRMSNormInputs`: generates Q/KV/RoPE shards, Q/KV RMSNorm
+  weights, and references for all-gather plus dual RMSNorm.
 - `ReduceScatterInputs`: generates full tensors and expected shard metadata for
   reduce-scatter sum.
+- `ReduceScatterResidualRMSNormInputs`: generates full rank contributions,
+  near-even scatter shard metadata, residuals, optional add inputs, and
+  references for reduce-scatter plus residual RMSNorm.
 - `ExpertParallelRoutingInputs`: generates routing assignments and token tensors
   for expert-parallel dispatch/combination tests.
 - `DPSamplingInputs`: generates the batch-DP sampling communication layout used
@@ -61,4 +66,5 @@ without duplicating generic collective validity checks.
 
 The generator verifies shapes, divisibility, rank bounds, and routing metadata
 so generated communication inputs are meaningful before a backend adapter sees
-them.
+them. Fused normalization generators additionally verify local shard shapes,
+rank-1 RMSNorm weights, and the slice widths used by dual-RMSNorm layouts.

@@ -6,8 +6,9 @@ or backend: each rank contributes rank-local tensors or metadata, and the
 communication operation defines how those inputs are combined and redistributed.
 
 This slice covers sum all-reduce, all-gather, sum reduce-scatter, fused sum
-all-reduce plus residual RMSNorm, and expert-parallel MoE dispatch/combine
-routing.
+all-reduce plus residual RMSNorm, fused reduce-scatter plus residual RMSNorm,
+fused all-gather plus dual RMSNorm, expert-parallel MoE dispatch/combine
+routing, and batch-DP sampling communication.
 
 ## Operation Semantics
 
@@ -54,6 +55,28 @@ Each rank's local shard has shape `[tokens_per_rank[rank], hidden_size]`.
 `tokens_per_rank` is generated from `total_tokens`, `world_size`, and optional
 `max_tokens_per_rank` using `metadata_seed`.
 
+### Fused All-Gather + Dual RMSNorm
+
+`AllGatherDualRMSNormInputs` represents the MLA-style pattern where every rank
+contributes Q/KV/RoPE token shards, all shards are gathered, and two low-rank
+slices are normalized independently:
+
+```text
+gathered = concat(qkv[0], qkv[1], ..., qkv[world_size - 1], dim=0)
+q_norm = rmsnorm(gathered[:, :q_lora_rank], q_weight, eps_q)
+kv_norm = rmsnorm(
+  gathered[:, q_lora_rank : q_lora_rank + kv_lora_rank],
+  kv_weight,
+  eps_kv,
+)
+```
+
+The generated row layout is
+`[q_lora_rank, kv_lora_rank, qk_rope_head_dim]`. The reference returns the
+gathered tensor with the normalized KV slice written back into place, plus the
+separate normalized Q and KV outputs. Backend-specific workspace setup and
+optional FP8 quantization epilogues are adapter concerns.
+
 ### Sum Reduce-Scatter
 
 `ReduceScatterInputs` represents a collective where every rank contributes a
@@ -68,6 +91,24 @@ out[rank] = reduced[offset[rank] : offset[rank] + tokens_per_rank[rank]]
 `tokens_per_rank` is generated using the same metadata policy as all-gather, so
 tests can exercise uneven token distributions while preserving a fixed total
 amount of work.
+
+### Fused Sum Reduce-Scatter + Residual RMSNorm
+
+`ReduceScatterResidualRMSNormInputs` represents a fused reduce-scatter epilogue
+where the summed token tensor is scattered using the standard near-even rank
+partition, then each rank adds local residual state and applies RMSNorm:
+
+```text
+reduced = sum(input[peer] for peer in ranks)
+shard[rank] = reduced[offset[rank] : offset[rank] + tokens_per_rank[rank]]
+residual_out[rank] = shard[rank] + residual[rank] + optional_add_in[rank]
+norm_out[rank] = rmsnorm(residual_out[rank], weight, eps)
+```
+
+The deterministic near-even partition matches common reduce-scatter wrapper
+contracts where `total_tokens` alone determines each rank's output row count.
+The optional `add_in` tensor models fused add+residual modes without changing
+the core operation definition.
 
 ### Expert-Parallel MoE Dispatch/Combine
 
@@ -108,6 +149,12 @@ The generators reject invalid collective descriptions before returning values:
 - all rank-local tensors for a collective have compatible shapes and dtypes
 - fused residual RMSNorm requires matching input and residual shapes, a
   rank-1 weight with length `hidden_size`, and non-negative `eps`
+- fused reduce-scatter residual RMSNorm requires the summed input row count to
+  match `sum(tokens_per_rank)` and each rank's residual/add tensors to match
+  that rank's scattered shard shape
+- fused all-gather dual RMSNorm requires Q/KV/RoPE widths to match every
+  gathered row, rank-local shard sizes to match `tokens_per_rank`, and separate
+  rank-1 Q/KV RMSNorm weights with matching lengths
 - expert-parallel routing requires an even expert partition across ranks,
   unique in-range top-k ids per token, normalized top-k weights, and compatible
   hidden/expert-output shapes
@@ -121,7 +168,8 @@ top-k weights, and synthetic expert outputs come from `seed`.
 ## TokenSpeed API Mapping
 
 TokenSpeed provides backend-specific communication implementations for
-all-reduce, all-gather, reduce-scatter, fused all-reduce residual RMSNorm, and
+all-reduce, all-gather, reduce-scatter, fused all-reduce residual RMSNorm,
+fused reduce-scatter residual RMSNorm, fused all-gather dual RMSNorm, and
 DeepEP-based expert-parallel dispatch/combine. The generated values map to
 those APIs through a small rank-local adapter: each distributed worker
 generates the same operation-level values, selects `rank_inputs[rank]` and any
@@ -133,6 +181,16 @@ For fused all-reduce residual RMSNorm, the adapter passes
 backend. The semantic comparison checks both returned tensors:
 `residual_out[rank]` after the reduced input is added to the local residual,
 and `norm_out[rank]` after RMSNorm is applied.
+
+For fused reduce-scatter residual RMSNorm, the adapter passes each rank's full
+contribution tensor plus the local residual and optional add tensor. The
+reference performs the sum, slices the near-even rank shard, and compares that
+rank's residual and normalized outputs.
+
+For fused all-gather dual RMSNorm, the adapter passes each rank's local QKV
+shard and the shared Q/KV RMSNorm weights. The reference compares the gathered
+output with normalized KV slice, the normalized Q output, and the normalized KV
+view.
 
 For DeepEP-style consumers, `rank_hidden_states[rank]`, `topk_ids[rank]`, and
 `topk_weights[rank]` are the rank-local dispatch inputs. The reference

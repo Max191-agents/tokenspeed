@@ -34,6 +34,10 @@ from tokenspeed_numerics_input_generators.core import (
 )
 
 __all__ = [
+    "AllGatherDualRMSNormInputConfig",
+    "AllGatherDualRMSNormInputs",
+    "AllGatherDualRMSNormInputValues",
+    "AllGatherDualRMSNormReferenceValues",
     "AllGatherInputConfig",
     "AllGatherInputs",
     "AllGatherInputValues",
@@ -56,6 +60,11 @@ __all__ = [
     "ReduceScatterInputConfig",
     "ReduceScatterInputs",
     "ReduceScatterInputValues",
+    "ReduceScatterResidualRMSNormInputConfig",
+    "ReduceScatterResidualRMSNormInputs",
+    "ReduceScatterResidualRMSNormInputValues",
+    "ReduceScatterResidualRMSNormReferenceValues",
+    "all_gather_dual_rmsnorm_reference",
     "all_gather_reference",
     "all_reduce_residual_rmsnorm_reference",
     "all_reduce_sum_reference",
@@ -63,6 +72,7 @@ __all__ = [
     "dp_sampling_reference",
     "dp_sampling_swap_reference",
     "expert_parallel_routing_reference",
+    "reduce_scatter_residual_rmsnorm_reference",
     "reduce_scatter_sum_reference",
 ]
 
@@ -171,6 +181,15 @@ def _generate_tokens_per_rank(
         )
         counts[candidates[candidate_idx]] += 1
     return counts
+
+
+def _even_tokens_per_rank(*, world_size: int, total_tokens: int) -> list[int]:
+    tokens_per_rank = []
+    base = total_tokens // world_size
+    remainder = total_tokens % world_size
+    for rank in range(world_size):
+        tokens_per_rank.append(base + (1 if rank < remainder else 0))
+    return tokens_per_rank
 
 
 def _generate_unique_topk_ids(
@@ -422,6 +441,56 @@ class DPSamplingReferenceValues:
 
 
 @dataclass
+class ReduceScatterResidualRMSNormInputValues:
+    """Generated values for fused reduce-scatter, residual add, and RMSNorm."""
+
+    rank_inputs: list[torch.Tensor]
+    residuals: list[torch.Tensor]
+    weight: torch.Tensor
+    eps: float
+    tokens_per_rank: list[int]
+    add_ins: list[torch.Tensor] | None = None
+
+
+@dataclass
+class ReduceScatterResidualRMSNormReferenceValues:
+    """Reference outputs for ``ReduceScatterResidualRMSNormInputs``."""
+
+    norm_outputs: list[torch.Tensor]
+    residual_outputs: list[torch.Tensor]
+
+
+@dataclass
+class AllGatherDualRMSNormInputValues:
+    """Generated values for fused all-gather and dual RMSNorm.
+
+    ``rank_inputs`` contain Q/KV/RoPE rows in the layout
+    ``[q_lora_rank, kv_lora_rank, qk_rope_head_dim]``. The reference gathers
+    all rank rows, computes RMSNorm over the Q and KV slices separately, and
+    writes the normalized KV slice back into the gathered output.
+    """
+
+    rank_inputs: list[torch.Tensor]
+    tokens_per_rank: list[int]
+    q_weight: torch.Tensor
+    kv_weight: torch.Tensor
+    eps_q: float
+    eps_kv: float
+    q_lora_rank: int
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+
+
+@dataclass
+class AllGatherDualRMSNormReferenceValues:
+    """Reference outputs for ``AllGatherDualRMSNormInputs``."""
+
+    gathered_output: torch.Tensor
+    q_norm_output: torch.Tensor
+    kv_norm_output: torch.Tensor
+
+
+@dataclass
 class AllReduceInputConfig:
     """Initialization parameters for sum all-reduce inputs.
 
@@ -544,6 +613,96 @@ class DPSamplingInputConfig:
     # Optional: generated logits dtype. Matches the TokenSpeed one-sided kernel
     # support surface.
     logits_dtype: torch.dtype = torch.bfloat16
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class ReduceScatterResidualRMSNormInputConfig:
+    """Initialization parameters for fused reduce-scatter + residual RMSNorm.
+
+    Every rank contributes a full ``[total_tokens, hidden_size]`` tensor. The
+    operation first performs a sum reduce-scatter over token rows using the
+    standard near-even rank partition. Each rank then adds its local residual
+    tensor, optionally adds a second local ``add_in`` tensor, and applies
+    RMSNorm with a shared weight vector.
+    """
+
+    # Required: number of ranks participating in reduce-scatter.
+    world_size: int
+
+    # Required: total token rows before scattering.
+    total_tokens: int
+
+    # Required: hidden dimension normalized independently for each output row.
+    hidden_size: int
+
+    # Optional: generated reduce-scatter input dtype.
+    dtype: torch.dtype = torch.bfloat16
+
+    # Optional: generated residual dtype. ``None`` uses ``dtype``.
+    residual_dtype: torch.dtype | None = None
+
+    # Optional: generate the fused extra add input used by add+residual modes.
+    include_add_in: bool = False
+
+    # Optional: generated add input dtype. ``None`` uses ``dtype``.
+    add_in_dtype: torch.dtype | None = None
+
+    # Optional: generated RMSNorm weight dtype.
+    weight_dtype: torch.dtype = torch.float32
+
+    # Optional: RMSNorm epsilon.
+    eps: float = 1e-6
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class AllGatherDualRMSNormInputConfig:
+    """Initialization parameters for fused all-gather + dual RMSNorm.
+
+    Each rank contributes a local shard with rows laid out as
+    ``[q_lora_rank, kv_lora_rank, qk_rope_head_dim]``. After all-gather, the Q
+    slice and KV slice are RMS-normalized independently with separate weights
+    and epsilons. The gathered output preserves the Q and RoPE slices and
+    contains the normalized KV slice in place of the raw KV slice.
+    """
+
+    # Required: number of ranks participating in all-gather.
+    world_size: int
+
+    # Required: total token rows after gathering all rank-local shards.
+    total_tokens: int
+
+    # Required: width of the Q LoRA slice normalized into q_norm_output.
+    q_lora_rank: int
+
+    # Required: width of the KV LoRA slice normalized in gathered_output.
+    kv_lora_rank: int
+
+    # Required: width of the RoPE slice carried through without normalization.
+    qk_rope_head_dim: int
+
+    # Optional: upper bound for generated token count on any one rank.
+    max_tokens_per_rank: int | None = None
+
+    # Optional: generated QKV shard dtype.
+    dtype: torch.dtype = torch.bfloat16
+
+    # Optional: generated Q RMSNorm weight dtype.
+    q_weight_dtype: torch.dtype = torch.float32
+
+    # Optional: generated KV RMSNorm weight dtype.
+    kv_weight_dtype: torch.dtype = torch.float32
+
+    # Optional: Q-slice RMSNorm epsilon.
+    eps_q: float = 1e-6
+
+    # Optional: KV-slice RMSNorm epsilon.
+    eps_kv: float = 1e-6
 
     # Optional: generated tensor device override.
     device: DeviceLike = None
@@ -850,6 +1009,215 @@ class DPSamplingInputs(NumericsInputGenerator):
         )
 
 
+@dataclass(init=False)
+class ReduceScatterResidualRMSNormInputs(NumericsInputGenerator):
+    """Generator for fused reduce-scatter, residual add, and RMSNorm inputs."""
+
+    config: ReduceScatterResidualRMSNormInputConfig
+
+    def __init__(self, config: ReduceScatterResidualRMSNormInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.world_size = _check_positive("world_size", self.config.world_size)
+        self.config.total_tokens = _check_nonnegative(
+            "total_tokens", self.config.total_tokens
+        )
+        self.config.hidden_size = _check_positive(
+            "hidden_size", self.config.hidden_size
+        )
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        if self.config.residual_dtype is None:
+            self.config.residual_dtype = self.config.dtype
+        self.config.residual_dtype = _check_float_dtype(
+            "residual_dtype", self.config.residual_dtype
+        )
+        if not isinstance(self.config.include_add_in, bool):
+            raise TypeError("include_add_in must be a bool")
+        if self.config.add_in_dtype is None:
+            self.config.add_in_dtype = self.config.dtype
+        self.config.add_in_dtype = _check_float_dtype(
+            "add_in_dtype", self.config.add_in_dtype
+        )
+        self.config.weight_dtype = _check_float_dtype(
+            "weight_dtype", self.config.weight_dtype
+        )
+        self.config.eps = float(self.config.eps)
+        if self.config.eps < 0.0:
+            raise ValueError(f"eps must be non-negative, got {self.config.eps}")
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> ReduceScatterResidualRMSNormInputValues:
+        del metadata_seed
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        tokens_per_rank = _even_tokens_per_rank(
+            world_size=self.config.world_size,
+            total_tokens=self.config.total_tokens,
+        )
+        tensor_shape = (self.config.total_tokens, self.config.hidden_size)
+        rank_inputs = [
+            _generate_tensor(
+                shape=tensor_shape,
+                dtype=self.config.dtype,
+                seed=_child_seed(seed, rank + 1),
+                device=target_device,
+                configured_device=self.config.device,
+            )
+            for rank in range(self.config.world_size)
+        ]
+        residuals = [
+            _generate_tensor(
+                shape=(num_tokens, self.config.hidden_size),
+                dtype=self.config.residual_dtype,
+                seed=_child_seed(seed, self.config.world_size + rank + 1),
+                device=target_device,
+                configured_device=self.config.device,
+            )
+            for rank, num_tokens in enumerate(tokens_per_rank)
+        ]
+        add_ins = (
+            [
+                _generate_tensor(
+                    shape=(num_tokens, self.config.hidden_size),
+                    dtype=self.config.add_in_dtype,
+                    seed=_child_seed(
+                        seed,
+                        2 * self.config.world_size + rank + 1,
+                    ),
+                    device=target_device,
+                    configured_device=self.config.device,
+                )
+                for rank, num_tokens in enumerate(tokens_per_rank)
+            ]
+            if self.config.include_add_in
+            else None
+        )
+        values = ReduceScatterResidualRMSNormInputValues(
+            rank_inputs=rank_inputs,
+            residuals=residuals,
+            weight=_generate_tensor(
+                shape=(self.config.hidden_size,),
+                dtype=self.config.weight_dtype,
+                seed=_child_seed(seed, 3 * self.config.world_size + 1),
+                device=target_device,
+                configured_device=self.config.device,
+            ),
+            eps=self.config.eps,
+            tokens_per_rank=tokens_per_rank,
+            add_ins=add_ins,
+        )
+        _validate_reduce_scatter_residual_rmsnorm_values(values)
+        return values
+
+
+@dataclass(init=False)
+class AllGatherDualRMSNormInputs(NumericsInputGenerator):
+    """Generator for fused all-gather and dual RMSNorm inputs."""
+
+    config: AllGatherDualRMSNormInputConfig
+
+    def __init__(self, config: AllGatherDualRMSNormInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.world_size = _check_positive("world_size", self.config.world_size)
+        self.config.total_tokens = _check_nonnegative(
+            "total_tokens", self.config.total_tokens
+        )
+        self.config.q_lora_rank = _check_positive(
+            "q_lora_rank", self.config.q_lora_rank
+        )
+        self.config.kv_lora_rank = _check_positive(
+            "kv_lora_rank", self.config.kv_lora_rank
+        )
+        self.config.qk_rope_head_dim = _check_nonnegative(
+            "qk_rope_head_dim", self.config.qk_rope_head_dim
+        )
+        self.config.max_tokens_per_rank = _check_max_tokens_per_rank(
+            world_size=self.config.world_size,
+            total_tokens=self.config.total_tokens,
+            max_tokens_per_rank=self.config.max_tokens_per_rank,
+        )
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        self.config.q_weight_dtype = _check_float_dtype(
+            "q_weight_dtype", self.config.q_weight_dtype
+        )
+        self.config.kv_weight_dtype = _check_float_dtype(
+            "kv_weight_dtype", self.config.kv_weight_dtype
+        )
+        self.config.eps_q = float(self.config.eps_q)
+        self.config.eps_kv = float(self.config.eps_kv)
+        if self.config.eps_q < 0.0:
+            raise ValueError(f"eps_q must be non-negative, got {self.config.eps_q}")
+        if self.config.eps_kv < 0.0:
+            raise ValueError(f"eps_kv must be non-negative, got {self.config.eps_kv}")
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> AllGatherDualRMSNormInputValues:
+        self.__post_init__()
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        target_device = _resolve_device(self.config.device, device)
+        assert self.config.max_tokens_per_rank is not None
+        tokens_per_rank = _generate_tokens_per_rank(
+            world_size=self.config.world_size,
+            total_tokens=self.config.total_tokens,
+            max_tokens_per_rank=self.config.max_tokens_per_rank,
+            seed=_child_seed(metadata_base_seed, 1),
+        )
+        hidden_size = (
+            self.config.q_lora_rank
+            + self.config.kv_lora_rank
+            + self.config.qk_rope_head_dim
+        )
+        values = AllGatherDualRMSNormInputValues(
+            rank_inputs=[
+                _generate_tensor(
+                    shape=(num_tokens, hidden_size),
+                    dtype=self.config.dtype,
+                    seed=_child_seed(seed, rank + 1),
+                    device=target_device,
+                    configured_device=self.config.device,
+                )
+                for rank, num_tokens in enumerate(tokens_per_rank)
+            ],
+            tokens_per_rank=tokens_per_rank,
+            q_weight=_generate_tensor(
+                shape=(self.config.q_lora_rank,),
+                dtype=self.config.q_weight_dtype,
+                seed=_child_seed(seed, self.config.world_size + 1),
+                device=target_device,
+                configured_device=self.config.device,
+            ),
+            kv_weight=_generate_tensor(
+                shape=(self.config.kv_lora_rank,),
+                dtype=self.config.kv_weight_dtype,
+                seed=_child_seed(seed, self.config.world_size + 2),
+                device=target_device,
+                configured_device=self.config.device,
+            ),
+            eps_q=self.config.eps_q,
+            eps_kv=self.config.eps_kv,
+            q_lora_rank=self.config.q_lora_rank,
+            kv_lora_rank=self.config.kv_lora_rank,
+            qk_rope_head_dim=self.config.qk_rope_head_dim,
+        )
+        _validate_all_gather_dual_rmsnorm_values(values)
+        return values
+
+
 @dataclass
 class AllGatherInputValues:
     """Generated per-rank inputs for an all-gather collective."""
@@ -1089,6 +1457,222 @@ def all_reduce_residual_rmsnorm_reference(
     return AllReduceResidualRMSNormReferenceValues(
         norm_outputs=norm_outputs,
         residual_outputs=residual_outputs,
+    )
+
+
+def _rmsnorm_rows(
+    rows: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    acc_dtype = torch.float64 if rows.dtype == torch.float64 else torch.float32
+    rows_acc = rows.to(acc_dtype)
+    variance = rows_acc.pow(2).mean(dim=-1, keepdim=True)
+    norm = rows_acc * torch.rsqrt(variance + eps)
+    norm = norm * weight.to(device=rows.device, dtype=acc_dtype)
+    return norm.to(output_dtype).contiguous()
+
+
+def _validate_reduce_scatter_residual_rmsnorm_values(
+    values: ReduceScatterResidualRMSNormInputValues,
+) -> tuple[int, int, torch.device]:
+    world_size = len(values.rank_inputs)
+    if world_size == 0:
+        raise ValueError("rank_inputs must be non-empty")
+    if len(values.tokens_per_rank) != world_size:
+        raise ValueError("tokens_per_rank must match rank_inputs")
+    if len(values.residuals) != world_size:
+        raise ValueError("residuals must match rank_inputs")
+    if values.add_ins is not None and len(values.add_ins) != world_size:
+        raise ValueError("add_ins must match rank_inputs when provided")
+    if values.eps < 0.0:
+        raise ValueError(f"eps must be non-negative, got {values.eps}")
+
+    first = values.rank_inputs[0]
+    if first.ndim != 2:
+        raise ValueError("rank_inputs must be rank-2")
+    _check_float_dtype("rank_inputs dtype", first.dtype)
+    total_tokens = sum(int(count) for count in values.tokens_per_rank)
+    if total_tokens < 0:
+        raise ValueError("tokens_per_rank entries must be non-negative")
+    if first.shape[0] != total_tokens:
+        raise ValueError(
+            "rank_inputs token dimension must equal sum(tokens_per_rank); "
+            f"shape={tuple(first.shape)}, total_tokens={total_tokens}"
+        )
+    hidden_size = int(first.shape[1])
+    if hidden_size <= 0:
+        raise ValueError("rank_inputs hidden dimension must be positive")
+    device = first.device
+    for rank, tensor in enumerate(values.rank_inputs):
+        if tensor.shape != first.shape:
+            raise ValueError(f"rank_inputs[{rank}] shape must match rank 0")
+        if tensor.dtype != first.dtype:
+            raise ValueError(f"rank_inputs[{rank}] dtype must match rank 0")
+        if tensor.device != device:
+            raise ValueError("rank_inputs must share a device")
+    if values.weight.shape != (hidden_size,):
+        raise ValueError(
+            f"weight must have shape {(hidden_size,)}, got {tuple(values.weight.shape)}"
+        )
+    _check_float_dtype("weight dtype", values.weight.dtype)
+    if values.weight.device != device:
+        raise ValueError("weight must share the rank input device")
+
+    for rank, num_tokens in enumerate(values.tokens_per_rank):
+        num_tokens = int(num_tokens)
+        if num_tokens < 0:
+            raise ValueError("tokens_per_rank entries must be non-negative")
+        expected_shape = (num_tokens, hidden_size)
+        residual = values.residuals[rank]
+        if residual.shape != expected_shape:
+            raise ValueError(
+                f"residuals[{rank}] must have shape {expected_shape}, "
+                f"got {tuple(residual.shape)}"
+            )
+        _check_float_dtype("residual dtype", residual.dtype)
+        if residual.device != device:
+            raise ValueError("residuals must share the rank input device")
+        if values.add_ins is not None:
+            add_in = values.add_ins[rank]
+            if add_in.shape != expected_shape:
+                raise ValueError(
+                    f"add_ins[{rank}] must have shape {expected_shape}, "
+                    f"got {tuple(add_in.shape)}"
+                )
+            _check_float_dtype("add_in dtype", add_in.dtype)
+            if add_in.device != device:
+                raise ValueError("add_ins must share the rank input device")
+    return total_tokens, hidden_size, device
+
+
+def reduce_scatter_residual_rmsnorm_reference(
+    values: ReduceScatterResidualRMSNormInputValues,
+) -> ReduceScatterResidualRMSNormReferenceValues:
+    """Return semantic fused reduce-scatter + residual RMSNorm outputs."""
+
+    _validate_reduce_scatter_residual_rmsnorm_values(values)
+    reduced = _sum_rank_inputs_for_rmsnorm(values.rank_inputs)
+    norm_outputs: list[torch.Tensor] = []
+    residual_outputs: list[torch.Tensor] = []
+    offset = 0
+    for rank, num_tokens in enumerate(values.tokens_per_rank):
+        shard = reduced[offset : offset + num_tokens]
+        offset += num_tokens
+        residual_out_acc = shard + values.residuals[rank].to(shard.dtype)
+        if values.add_ins is not None:
+            residual_out_acc = residual_out_acc + values.add_ins[rank].to(shard.dtype)
+        residual_out = residual_out_acc.to(values.residuals[rank].dtype).contiguous()
+        norm_outputs.append(
+            _rmsnorm_rows(
+                residual_out_acc,
+                values.weight,
+                values.eps,
+                output_dtype=values.rank_inputs[0].dtype,
+            )
+        )
+        residual_outputs.append(residual_out)
+    return ReduceScatterResidualRMSNormReferenceValues(
+        norm_outputs=norm_outputs,
+        residual_outputs=residual_outputs,
+    )
+
+
+def _validate_all_gather_dual_rmsnorm_values(
+    values: AllGatherDualRMSNormInputValues,
+) -> tuple[int, int, torch.device]:
+    world_size = len(values.rank_inputs)
+    if world_size == 0:
+        raise ValueError("rank_inputs must be non-empty")
+    if len(values.tokens_per_rank) != world_size:
+        raise ValueError("tokens_per_rank must match rank_inputs")
+    q_lora_rank = _check_positive("q_lora_rank", values.q_lora_rank)
+    kv_lora_rank = _check_positive("kv_lora_rank", values.kv_lora_rank)
+    qk_rope_head_dim = _check_nonnegative("qk_rope_head_dim", values.qk_rope_head_dim)
+    hidden_size = q_lora_rank + kv_lora_rank + qk_rope_head_dim
+    if values.eps_q < 0.0:
+        raise ValueError(f"eps_q must be non-negative, got {values.eps_q}")
+    if values.eps_kv < 0.0:
+        raise ValueError(f"eps_kv must be non-negative, got {values.eps_kv}")
+
+    first = values.rank_inputs[0]
+    if first.ndim != 2:
+        raise ValueError("rank_inputs must be rank-2")
+    _check_float_dtype("rank_inputs dtype", first.dtype)
+    if first.shape[1] != hidden_size:
+        raise ValueError(
+            f"rank_inputs hidden size must be {hidden_size}, got {first.shape[1]}"
+        )
+    device = first.device
+    for rank, (tensor, num_tokens) in enumerate(
+        zip(values.rank_inputs, values.tokens_per_rank, strict=True)
+    ):
+        num_tokens = int(num_tokens)
+        if num_tokens < 0:
+            raise ValueError("tokens_per_rank entries must be non-negative")
+        expected_shape = (num_tokens, hidden_size)
+        if tensor.shape != expected_shape:
+            raise ValueError(
+                f"rank_inputs[{rank}] must have shape {expected_shape}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if tensor.dtype != first.dtype:
+            raise ValueError("rank_inputs must share a dtype")
+        if tensor.device != device:
+            raise ValueError("rank_inputs must share a device")
+    if values.q_weight.shape != (q_lora_rank,):
+        raise ValueError(
+            f"q_weight must have shape {(q_lora_rank,)}, "
+            f"got {tuple(values.q_weight.shape)}"
+        )
+    if values.kv_weight.shape != (kv_lora_rank,):
+        raise ValueError(
+            f"kv_weight must have shape {(kv_lora_rank,)}, "
+            f"got {tuple(values.kv_weight.shape)}"
+        )
+    _check_float_dtype("q_weight dtype", values.q_weight.dtype)
+    _check_float_dtype("kv_weight dtype", values.kv_weight.dtype)
+    if values.q_weight.device != device or values.kv_weight.device != device:
+        raise ValueError("RMSNorm weights must share the rank input device")
+    return q_lora_rank, kv_lora_rank, device
+
+
+def all_gather_dual_rmsnorm_reference(
+    values: AllGatherDualRMSNormInputValues,
+) -> AllGatherDualRMSNormReferenceValues:
+    """Return semantic fused all-gather + dual RMSNorm outputs."""
+
+    q_lora_rank, kv_lora_rank, _ = _validate_all_gather_dual_rmsnorm_values(values)
+    gathered = all_gather_reference(
+        AllGatherInputValues(
+            rank_inputs=values.rank_inputs,
+            tokens_per_rank=values.tokens_per_rank,
+        )
+    ).contiguous()
+    q_slice = gathered[:, :q_lora_rank]
+    kv_start = q_lora_rank
+    kv_end = q_lora_rank + kv_lora_rank
+    kv_slice = gathered[:, kv_start:kv_end]
+    q_norm = _rmsnorm_rows(
+        q_slice,
+        values.q_weight,
+        values.eps_q,
+        output_dtype=gathered.dtype,
+    )
+    kv_norm = _rmsnorm_rows(
+        kv_slice,
+        values.kv_weight,
+        values.eps_kv,
+        output_dtype=gathered.dtype,
+    )
+    gathered_output = gathered.clone()
+    gathered_output[:, kv_start:kv_end] = kv_norm
+    return AllGatherDualRMSNormReferenceValues(
+        gathered_output=gathered_output.contiguous(),
+        q_norm_output=q_norm,
+        kv_norm_output=kv_norm,
     )
 
 
