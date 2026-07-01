@@ -70,7 +70,9 @@ concern.
 
 TokenSpeed currently exposes Triton layernorm functions for ordinary RMSNorm,
 residual RMSNorm, QK RMSNorm, fused QK RMSNorm + RoPE + gate, and fused-parallel
-RMSNorm. The generator values map directly to those APIs with small adapters:
+RMSNorm. It also exposes FlashInfer wrappers for ordinary RMSNorm and in-place
+fused add RMSNorm. The generator values map directly to those APIs with small
+adapters:
 
 - `RMSNormInputValues` provides `x`, `weight`, and optional `residual`
 - `QKRMSNormInputValues` provides `q`, `k`, `q_weight`, and `k_weight`
