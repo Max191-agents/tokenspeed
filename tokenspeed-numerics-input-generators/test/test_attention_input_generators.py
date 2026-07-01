@@ -33,6 +33,8 @@ from tokenspeed_numerics_input_generators import (
     DSASparseDecodeKVPackInputs,
     DSATopKSlotInputConfig,
     DSATopKSlotInputs,
+    GDNChunkPrefillInputConfig,
+    GDNChunkPrefillInputs,
     GDNQKVSplitInputConfig,
     GDNQKVSplitInputs,
     KVCacheInput,
@@ -63,6 +65,7 @@ from tokenspeed_numerics_input_generators import (
     dsa_local_topk_to_global_slots_reference,
     dsa_sparse_decode_kv_pack_reference,
     dsa_sparse_decode_row_bytes,
+    gdn_chunk_prefill_reference,
     gdn_qkv_split_reference,
     mla_kv_pack_quantize_fp8_reference,
     packed_qkv_complex_rotary_reference,
@@ -466,6 +469,166 @@ def test_gdn_qkv_split_inputs_reject_invalid_configs_and_values() -> None:
     values.mixed_qkv = values.mixed_qkv[:, :-1]
     with pytest.raises(ValueError, match="last dimension"):
         gdn_qkv_split_reference(values)
+
+
+def test_gdn_chunk_prefill_inputs_generate_values_and_reference() -> None:
+    values = GDNChunkPrefillInputs(
+        GDNChunkPrefillInputConfig(
+            batch_size=3,
+            total_tokens=18,
+            num_q_heads=2,
+            num_v_heads=4,
+            head_dim=8,
+            dtype=torch.float32,
+            max_tokens_per_sequence=8,
+        )
+    ).generate(metadata_seed=201, value_seed=301, device="cpu")
+
+    assert values.q.shape == (18, 2, 8)
+    assert values.k.shape == (18, 2, 8)
+    assert values.v.shape == (18, 4, 8)
+    assert values.g.shape == (18, 4)
+    assert values.beta.shape == (18, 4)
+    assert values.initial_state.shape == (3, 4, 8, 8)
+    assert values.cu_seqlens.tolist()[-1] == 18
+    assert sum(values.seq_lens_cpu) == 18
+    assert max(values.seq_lens_cpu) <= 8
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(values.q.float(), dim=-1),
+        torch.ones((18, 2)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(values.k.float(), dim=-1),
+        torch.ones((18, 2)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    assert torch.all(torch.exp(values.g) >= 0.75)
+    assert torch.all(torch.exp(values.g) <= 0.99)
+    assert torch.all(values.beta >= 0.05)
+    assert torch.all(values.beta <= 0.95)
+
+    reference = gdn_chunk_prefill_reference(values)
+
+    assert reference.out.shape == (18, 4, 8)
+    assert reference.out.dtype == torch.float32
+    assert reference.final_state.shape == (3, 4, 8, 8)
+    assert reference.final_state.dtype == torch.float32
+    assert reference.state_checkpoints is None
+    assert reference.checkpoint_cu_starts is None
+    assert torch.isfinite(reference.out).all()
+    assert torch.isfinite(reference.final_state).all()
+
+
+def test_gdn_chunk_prefill_inputs_support_batch_axis_and_checkpoints() -> None:
+    values = GDNChunkPrefillInputs(
+        GDNChunkPrefillInputConfig(
+            batch_size=2,
+            total_tokens=128,
+            num_q_heads=2,
+            num_v_heads=4,
+            head_dim=8,
+            dtype=torch.float32,
+            length_mode="fixed_per_request",
+            include_batch_dim=True,
+            output_h=True,
+        )
+    ).generate(seed=401, device="cpu")
+
+    reference = gdn_chunk_prefill_reference(values)
+
+    assert values.q.shape == (1, 128, 2, 8)
+    assert values.g.shape == (1, 128, 4)
+    assert values.seq_lens_cpu == [64, 64]
+    assert reference.out.shape == (1, 128, 4, 8)
+    assert reference.state_checkpoints is not None
+    assert reference.state_checkpoints.shape == (2, 4, 8, 8)
+    assert reference.checkpoint_cu_starts is not None
+    assert reference.checkpoint_cu_starts.tolist() == [0, 1, 2]
+
+
+def test_gdn_chunk_prefill_inputs_keep_metadata_seed_independent() -> None:
+    generator = GDNChunkPrefillInputs(
+        GDNChunkPrefillInputConfig(
+            batch_size=4,
+            total_tokens=23,
+            num_q_heads=1,
+            num_v_heads=2,
+            head_dim=8,
+            dtype=torch.float32,
+            max_tokens_per_sequence=9,
+        )
+    )
+
+    first = generator.generate(metadata_seed=501, value_seed=601, device="cpu")
+    same_metadata = generator.generate(
+        metadata_seed=501,
+        value_seed=602,
+        device="cpu",
+    )
+    same_values = generator.generate(
+        metadata_seed=502,
+        value_seed=601,
+        device="cpu",
+    )
+
+    torch.testing.assert_close(first.cu_seqlens, same_metadata.cu_seqlens)
+    assert not torch.equal(first.q, same_metadata.q)
+    torch.testing.assert_close(first.q, same_values.q)
+
+
+def test_gdn_chunk_prefill_inputs_reject_invalid_configs_and_values() -> None:
+    with pytest.raises(ValueError, match="num_v_heads must be >= num_q_heads"):
+        GDNChunkPrefillInputs(
+            GDNChunkPrefillInputConfig(
+                batch_size=2,
+                total_tokens=8,
+                num_q_heads=4,
+                num_v_heads=2,
+                head_dim=8,
+                dtype=torch.float32,
+            )
+        )
+
+    with pytest.raises(ValueError, match="integer multiple"):
+        GDNChunkPrefillInputs(
+            GDNChunkPrefillInputConfig(
+                batch_size=2,
+                total_tokens=8,
+                num_q_heads=2,
+                num_v_heads=3,
+                head_dim=8,
+                dtype=torch.float32,
+            )
+        )
+
+    with pytest.raises(ValueError, match="total_tokens must be >= batch_size"):
+        GDNChunkPrefillInputs(
+            GDNChunkPrefillInputConfig(
+                batch_size=4,
+                total_tokens=3,
+                num_q_heads=2,
+                num_v_heads=2,
+                head_dim=8,
+                dtype=torch.float32,
+            )
+        )
+
+    values = GDNChunkPrefillInputs(
+        GDNChunkPrefillInputConfig(
+            batch_size=2,
+            total_tokens=8,
+            num_q_heads=2,
+            num_v_heads=2,
+            head_dim=8,
+            dtype=torch.float32,
+        )
+    ).generate(seed=701, device="cpu")
+    values.beta = values.beta[:, :1]
+    with pytest.raises(ValueError, match="beta must have shape"):
+        gdn_chunk_prefill_reference(values)
 
 
 def test_packed_qkv_complex_rotary_inputs_generate_values_and_reference() -> None:

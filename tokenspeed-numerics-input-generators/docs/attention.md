@@ -66,6 +66,41 @@ V is always copied without normalization. The generator owns the packed-width
 relationships between head counts and per-head dimensions, and its reference
 implements both the plain split and fused-normalization variants.
 
+### GDN Chunked Prefill
+
+`GDNChunkPrefillInputs` represents the prompt-side recurrent scan for
+Gated DeltaNet-style linear attention. Unlike softmax attention, the operation
+does not materialize pairwise attention over all prior tokens. It maintains a
+per-sequence, per-value-head matrix state with shape `[head_dim, head_dim]`.
+Each token decays the previous state, applies a delta-rule correction, writes
+the corrected value back through the key vector, and reads the updated state
+with the query vector:
+
+```text
+state = exp(g_t) * state
+delta = beta_t * (v_t - k_t @ state)
+state = state + outer(k_t, delta)
+out_t = scale * (q_t @ state)
+```
+
+The generated Q and K rows are L2-normalized because the chunked prefill fast
+paths expect normalized Q/K inputs. `g` is generated in log space, so `exp(g)`
+is the multiplicative state decay. `beta` is generated as a bounded update gate
+in `[0.05, 0.95]`. Sequence metadata is represented by `cu_seqlens`, which
+partitions the flattened prompt stream into independent recurrent scans.
+
+The generator supports equal Q/V head counts and grouped-value attention where
+`num_v_heads` is an integer multiple of `num_q_heads`. In the grouped-value
+case, multiple value/state heads share one Q/K head. The optional
+`include_batch_dim` setting only controls whether tensors include the leading
+singleton batch axis accepted by TokenSpeed's wrapper; the operation is still
+defined by the flattened token stream and `cu_seqlens`.
+
+When `output_h` is requested, the reference returns recurrent-state
+checkpoints after each full 64-token chunk in every sequence, along with
+`checkpoint_cu_starts` metadata describing how many checkpoints belong to each
+sequence.
+
 ### Packed QKV Complex Rotary
 
 `PackedQKVComplexRotaryInputs` represents splitting equal-width packed Q/K/V

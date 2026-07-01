@@ -17,6 +17,8 @@ compressed/cache-specific representations with different per-token shapes.
 - `MLAKVPackQuantizeFP8Inputs`: generates MLA KV pack and FP8 quantization
   inputs.
 - `GDNQKVSplitInputs`: generates packed QKV inputs for split operations.
+- `GDNChunkPrefillInputs`: generates Gated DeltaNet chunked-prefill tensors,
+  log-space gates, recurrent state, and sequence metadata.
 - `PackedQKVComplexRotaryInputs`: generates packed QKV and rotary metadata for
   complex rotary transforms.
 - `DSASparseDecodeKVPackInputs`, `DSATopKSlotInputs`,

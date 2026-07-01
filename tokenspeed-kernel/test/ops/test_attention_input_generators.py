@@ -37,6 +37,9 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mla_decode_with_kvcache_kwargs,
     mla_prefill_kwargs,
 )
+from tokenspeed_kernel.ops.attention.flashinfer import (
+    gated_delta_rule as flashinfer_gdn,
+)
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
@@ -68,6 +71,8 @@ from tokenspeed_numerics_input_generators import (
     DSASparseDecodeKVPackInputs,
     DSATopKSlotInputConfig,
     DSATopKSlotInputs,
+    GDNChunkPrefillInputConfig,
+    GDNChunkPrefillInputs,
     GDNQKVSplitInputConfig,
     GDNQKVSplitInputs,
     MHAInputConfig,
@@ -90,6 +95,7 @@ from tokenspeed_numerics_input_generators import (
     dsa_full_context_topk_to_global_slots_reference,
     dsa_local_topk_to_global_slots_reference,
     dsa_sparse_decode_kv_pack_reference,
+    gdn_chunk_prefill_reference,
     gdn_qkv_split_reference,
     mla_kv_pack_quantize_fp8_reference,
     packed_qkv_complex_rotary_reference,
@@ -432,6 +438,51 @@ def test_gdn_qkv_split_generator_runs_tokenspeed_triton(
         actual_k.float(), expected_k.float(), rtol=1e-2, atol=1e-2
     )
     torch.testing.assert_close(actual_v.float(), expected_v.float(), rtol=0.0, atol=0.0)
+
+
+def test_gdn_chunk_prefill_generator_runs_tokenspeed_flashinfer(device: str) -> None:
+    if not flashinfer_gdn.is_available():
+        pytest.skip("FlashInfer GDN chunk-prefill fast path is unavailable")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU is required for FlashInfer GDN chunk-prefill test")
+
+    values = GDNChunkPrefillInputs(
+        GDNChunkPrefillInputConfig(
+            batch_size=2,
+            total_tokens=32,
+            num_q_heads=2,
+            num_v_heads=4,
+            head_dim=flashinfer_gdn.SUPPORTED_HEAD_DIM,
+            dtype=torch.bfloat16,
+            length_mode="regular",
+            include_batch_dim=True,
+            initial_state_dtype=torch.float32,
+        )
+    ).generate(seed=209, device=device)
+    expected = gdn_chunk_prefill_reference(values)
+
+    actual_out, actual_state = flashinfer_gdn.gdn_chunk_prefill(
+        values.q,
+        values.k,
+        values.v,
+        values.g,
+        values.beta,
+        scale=values.scale,
+        initial_state=values.initial_state,
+        cu_seqlens=values.cu_seqlens,
+    )
+    torch.cuda.synchronize()
+
+    assert actual_out.shape == expected.out.shape
+    assert actual_state.shape == expected.final_state.shape
+    assert actual_out.dtype == values.q.dtype
+    torch.testing.assert_close(
+        actual_out.float(),
+        expected.out.float(),
+        rtol=1e-2,
+        atol=1e-1,
+    )
+    assert (actual_state.float() - expected.final_state).abs().mean() < 1e-2
 
 
 @pytest.mark.parametrize("copy_v", [False, True], ids=["view-v", "copy-v"])
