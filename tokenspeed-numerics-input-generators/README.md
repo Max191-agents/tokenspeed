@@ -84,6 +84,12 @@ constraints documented for that generator. Correctness tests should get
 well-formed inputs by construction as long as they stay inside the public
 generator API.
 
+In other words, the generator should be the trust boundary for input validity.
+Consumers should be able to use generated values with confidence that the
+operation's generic invariants have already been checked, including the
+relationships between nested generators, generated metadata, tensor dtypes,
+scale tensors, and cache/index structures.
+
 The verification standard is misuse resistance, not exhaustive defensive
 programming. The public generator path should make invalid or broken operation
 inputs unrepresentable, or reject them before generation completes. Consumers
