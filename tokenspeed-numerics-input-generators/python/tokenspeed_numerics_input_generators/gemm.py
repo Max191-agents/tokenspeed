@@ -225,16 +225,30 @@ def _apply_regular_scales(values: torch.Tensor, scales: torch.Tensor) -> torch.T
     scale_values = scales.float()
     if scale_values.numel() == 1:
         return values * scale_values.reshape((1,) * values.ndim)
+    if scale_values.shape == values.shape[:-1]:
+        return values * scale_values.unsqueeze(-1)
     if scale_values.ndim == 1 and scale_values.shape[0] == values.shape[-2]:
         return values * scale_values.reshape(*values.shape[:-2], values.shape[-2], 1)
-    if scale_values.ndim >= 2 and scale_values.shape[-2] == values.shape[-2]:
-        groups = scale_values.shape[-1]
-        if groups <= 0:
-            raise ValueError("scale group count must be positive")
-        repeat = math.ceil(values.shape[-1] / groups)
-        expanded = scale_values.repeat_interleave(repeat, dim=-1)[
-            ..., : values.shape[-1]
-        ]
+    if scale_values.ndim == values.ndim:
+        row_groups, k_groups = scale_values.shape[-2:]
+        if row_groups <= 0 or k_groups <= 0:
+            raise ValueError("scale group counts must be positive")
+        if row_groups > values.shape[-2] or k_groups > values.shape[-1]:
+            raise ValueError(
+                "scale groups cannot exceed value shape; "
+                f"values={tuple(values.shape)}, scales={tuple(scales.shape)}"
+            )
+        if values.shape[-2] % row_groups != 0 or values.shape[-1] % k_groups != 0:
+            raise ValueError(
+                "regular GEMM scale grids must evenly partition value rows and K; "
+                f"values={tuple(values.shape)}, scales={tuple(scales.shape)}"
+            )
+        row_repeat = values.shape[-2] // row_groups
+        k_repeat = values.shape[-1] // k_groups
+        expanded = scale_values.repeat_interleave(
+            row_repeat,
+            dim=-2,
+        ).repeat_interleave(k_repeat, dim=-1)
         return values * expanded
     raise ValueError(
         "unsupported GEMM scale shape for reference; "

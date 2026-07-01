@@ -52,6 +52,13 @@ shared custom dtype enum so the format-specific constraints are centralized.
 channel, and block granularities. `mxfp4_gemm_input_config` builds a GEMM config
 for MXFP4 operands with block scales.
 
+For block-scaled FP8 GEMM, generated storage values are interpreted as FP8
+values multiplied by a scale grid. `A` commonly uses one scale row per logical
+`M` row and one scale group per `K` block, while `B` may use a 2D grid over
+logical `N` blocks and `K` blocks. The reference expands those grids over the
+logical operand before computing `A @ B.T`. The current generator path expects
+regular scale grids that evenly partition the generated physical operand shape.
+
 ## Fused NVFP4 GEMM And SwiGLU
 
 `NVFP4GemmSwiGLUNVFP4QuantInputs` represents the fused dense MLP primitive:

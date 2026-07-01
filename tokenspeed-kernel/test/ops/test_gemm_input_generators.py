@@ -28,6 +28,7 @@ from tokenspeed_numerics_input_generators import (
     GemmInputConfig,
     GemmInputs,
     gemm_reference,
+    gemm_scale_shape,
     mxfp4_gemm_input_config,
 )
 
@@ -105,6 +106,68 @@ def test_fp8_scaled_gemm_generator_runs_triton_kernel(
         out_dtype=values.C.dtype,
         quant="fp8",
         expected_kernel_name="triton_mm_fp8_scaled",
+    )
+    expected = gemm_reference(values).to(device=device)
+    torch.cuda.synchronize()
+
+    assert actual.shape == values.C.shape
+    assert actual.dtype == values.C.dtype
+    torch.testing.assert_close(actual.float(), expected.float(), atol=0.25, rtol=0.25)
+
+
+def test_mxfp8_blockscale_gemm_generator_runs_triton_kernel(
+    device: str,
+    require,
+) -> None:
+    if not current_platform().is_blackwell_plus:
+        pytest.skip("triton_mm_fp8_blockscale requires NVIDIA Blackwell or newer")
+    require("gemm", "mm", "triton", torch.float8_e4m3fn, "a")
+
+    block_size = [128, 128]
+    M, N, K = 8, 256, 256
+    values = GemmInputs(
+        GemmInputConfig(
+            M=M,
+            N=N,
+            K=K,
+            a_dtype=torch.float8_e4m3fn,
+            b_dtype=torch.float8_e4m3fn,
+            c_dtype=torch.float16,
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=M,
+                N=N,
+                K=K,
+                block_shape=tuple(block_size),
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=M,
+                N=N,
+                K=K,
+                block_shape=tuple(block_size),
+            ),
+            a_scale_dtype=torch.float32,
+            b_scale_dtype=torch.float32,
+        )
+    ).generate(seed=41, device=device)
+    assert values.A is not None
+    assert values.B is not None
+    assert values.A_scales is not None
+    assert values.B_scales is not None
+
+    actual = tokenspeed_kernel.mm(
+        values.A,
+        values.B,
+        A_scales=values.A_scales,
+        B_scales=values.B_scales,
+        C=values.C,
+        out_dtype=values.C.dtype,
+        block_size=block_size,
+        quant="mxfp8",
+        expected_kernel_name="triton_mm_fp8_blockscale",
     )
     expected = gemm_reference(values).to(device=device)
     torch.cuda.synchronize()

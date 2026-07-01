@@ -494,6 +494,55 @@ def test_gemm_reference_applies_scaled_operands() -> None:
     torch.testing.assert_close(ref, manual)
 
 
+def test_gemm_reference_applies_2d_block_scales() -> None:
+    block_shape = (128, 128)
+    values = GemmInputs(
+        GemmInputConfig(
+            M=4,
+            N=256,
+            K=256,
+            a_dtype=_fp8_dtype,
+            b_dtype=_fp8_dtype,
+            c_dtype=torch.float32,
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=4,
+                N=256,
+                K=256,
+                block_shape=block_shape,
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=4,
+                N=256,
+                K=256,
+                block_shape=block_shape,
+            ),
+            a_scale_dtype=torch.float32,
+            b_scale_dtype=torch.float32,
+        )
+    ).generate(seed=93, device="cpu")
+    assert values.A is not None
+    assert values.B is not None
+    assert values.A_scales is not None
+    assert values.B_scales is not None
+    assert values.A_scales.shape == (4, 2)
+    assert values.B_scales.shape == (2, 2)
+
+    a_scales = values.A_scales.repeat_interleave(block_shape[1], dim=-1)
+    b_scales = values.B_scales.repeat_interleave(
+        block_shape[0],
+        dim=-2,
+    ).repeat_interleave(block_shape[1], dim=-1)
+    expected = (values.A.float() * a_scales) @ (values.B.float() * b_scales).transpose(
+        -1, -2
+    )
+
+    torch.testing.assert_close(gemm_reference(values), expected)
+
+
 def test_nvfp4_gemm_swiglu_inputs_generate_values_and_reference() -> None:
     values = NVFP4GemmSwiGLUNVFP4QuantInputs(
         NVFP4GemmSwiGLUNVFP4QuantInputConfig(
