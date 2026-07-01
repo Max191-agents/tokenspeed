@@ -26,13 +26,19 @@ import torch.nn.functional as F
 from tokenspeed_numerics_input_generators import (
     FusedGateSigmoidMulAddInputConfig,
     FusedGateSigmoidMulAddInputs,
+    FusedSwiGLUFP8BlockQuantInputConfig,
+    FusedSwiGLUFP8BlockQuantInputs,
     FusedSwiGLUFP8UE8M0InputConfig,
     FusedSwiGLUFP8UE8M0Inputs,
+    FusedSwiGLUNVFP4QuantInputConfig,
+    FusedSwiGLUNVFP4QuantInputs,
     GatedActivationInputConfig,
     GatedActivationInputs,
     SigmoidMulInputConfig,
     SigmoidMulInputs,
+    fused_swiglu_fp8_block_quant_reference,
     fused_swiglu_fp8_ue8m0_reference,
+    fused_swiglu_nvfp4_quant_reference,
 )
 
 
@@ -208,6 +214,86 @@ def test_fused_swiglu_fp8_ue8m0_reference_packs_four_scale_groups() -> None:
     assert torch.equal(scales.view(torch.uint8).reshape(2, 4), expected_bytes)
 
 
+def test_fused_swiglu_fp8_block_quant_inputs_generate_dense_values() -> None:
+    values = FusedSwiGLUFP8BlockQuantInputs(
+        FusedSwiGLUFP8BlockQuantInputConfig(
+            num_tokens=5,
+            hidden_dim=256,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=17, device="cpu")
+
+    assert values.gate_up.shape == (5, 512)
+    assert values.gate_up.dtype == torch.bfloat16
+    assert values.scale_out.shape == (5, 2)
+    assert values.scale_out.dtype == torch.float32
+    assert values.num_tokens_per_expert is None
+
+    q, scales = fused_swiglu_fp8_block_quant_reference(values)
+    assert q.shape == (5, 256)
+    assert q.dtype == torch.float8_e4m3fn
+    assert scales.shape == (5, 2)
+    assert scales.dtype == torch.float32
+
+    gate, up = values.gate_up.float().chunk(2, dim=-1)
+    ref = F.silu(gate) * up
+    dequantized = (q.float().reshape(5, 2, 128) * scales.unsqueeze(-1)).reshape(5, 256)
+    cos_sim = F.cosine_similarity(
+        ref.flatten().unsqueeze(0), dequantized.flatten().unsqueeze(0)
+    )
+    assert cos_sim.item() > 0.99
+
+
+def test_fused_swiglu_fp8_block_quant_inputs_generate_ep_metadata() -> None:
+    values = FusedSwiGLUFP8BlockQuantInputs(
+        FusedSwiGLUFP8BlockQuantInputConfig(
+            num_tokens=4,
+            hidden_dim=256,
+            dtype=torch.float16,
+            num_experts=3,
+        )
+    ).generate(seed=18, device="cpu")
+
+    assert values.gate_up.shape == (3, 4, 512)
+    assert values.scale_out.shape == (3, 4, 2)
+    assert values.num_experts == 3
+    assert values.num_tokens_hint == 4
+    assert values.num_tokens_per_expert is not None
+    torch.testing.assert_close(
+        values.num_tokens_per_expert,
+        torch.full((3,), 4, dtype=torch.int32),
+        atol=0,
+        rtol=0,
+    )
+
+    q, scales = fused_swiglu_fp8_block_quant_reference(values)
+    assert q.shape == (3, 4, 256)
+    assert scales.shape == (3, 4, 2)
+
+
+def test_fused_swiglu_nvfp4_quant_inputs_generate_values() -> None:
+    values = FusedSwiGLUNVFP4QuantInputs(
+        FusedSwiGLUNVFP4QuantInputConfig(
+            num_tokens=6,
+            hidden_dim=64,
+            dtype=torch.bfloat16,
+            input_scale=0.125,
+        )
+    ).generate(seed=19, device="cpu")
+
+    assert values.gate_up.shape == (6, 128)
+    assert values.gate_up.dtype == torch.bfloat16
+    assert values.global_scale.shape == (1,)
+    assert values.global_scale.item() == pytest.approx(8.0)
+    assert values.scale_size == 16
+
+    packed, scales = fused_swiglu_nvfp4_quant_reference(values)
+    assert packed.shape == (6, 32)
+    assert packed.dtype == torch.uint8
+    assert scales.shape == (6, 4)
+    assert scales.dtype == torch.float8_e4m3fn
+
+
 def test_sigmoid_mul_inputs_reject_invalid_qkv_split_config() -> None:
     with pytest.raises(ValueError, match="num_heads \\* head_dim == hidden_dim"):
         SigmoidMulInputs(
@@ -242,5 +328,28 @@ def test_fused_swiglu_fp8_ue8m0_rejects_incompatible_group_size() -> None:
                 hidden_dim=192,
                 dtype=torch.bfloat16,
                 group_size=128,
+            )
+        )
+
+
+def test_fused_swiglu_fp8_block_quant_rejects_incompatible_group_size() -> None:
+    with pytest.raises(ValueError, match="hidden_dim must be divisible"):
+        FusedSwiGLUFP8BlockQuantInputs(
+            FusedSwiGLUFP8BlockQuantInputConfig(
+                num_tokens=3,
+                hidden_dim=192,
+                dtype=torch.bfloat16,
+            )
+        )
+
+
+def test_fused_swiglu_nvfp4_quant_rejects_invalid_scale() -> None:
+    with pytest.raises(ValueError, match="input_scale"):
+        FusedSwiGLUNVFP4QuantInputs(
+            FusedSwiGLUNVFP4QuantInputConfig(
+                num_tokens=3,
+                hidden_dim=64,
+                dtype=torch.float16,
+                input_scale=0.0,
             )
         )

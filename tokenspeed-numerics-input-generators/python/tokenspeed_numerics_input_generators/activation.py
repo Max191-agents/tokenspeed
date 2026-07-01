@@ -52,14 +52,25 @@ from tokenspeed_numerics_input_generators.core import (
     _is_floating_storage_dtype,
     _resolve_device,
 )
+from tokenspeed_numerics_input_generators.quantization import (
+    nvfp4_quantization_reference,
+)
 
 __all__ = [
+    "FusedSwiGLUFP8BlockQuantInputConfig",
+    "FusedSwiGLUFP8BlockQuantInputs",
+    "FusedSwiGLUFP8BlockQuantInputValues",
+    "FusedSwiGLUNVFP4QuantInputConfig",
+    "FusedSwiGLUNVFP4QuantInputs",
+    "FusedSwiGLUNVFP4QuantInputValues",
     "FusedGateSigmoidMulAddInputConfig",
     "FusedGateSigmoidMulAddInputs",
     "FusedGateSigmoidMulAddInputValues",
     "FusedSwiGLUFP8UE8M0InputConfig",
     "FusedSwiGLUFP8UE8M0Inputs",
     "FusedSwiGLUFP8UE8M0InputValues",
+    "fused_swiglu_fp8_block_quant_reference",
+    "fused_swiglu_nvfp4_quant_reference",
     "fused_swiglu_fp8_ue8m0_reference",
     "fused_gate_sigmoid_mul_add_reference",
     "GatedActivationInputConfig",
@@ -95,6 +106,12 @@ def _check_torch_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
         raise TypeError(f"{name} must be a torch.dtype")
     if not _is_floating_storage_dtype(dtype):
         raise ValueError(f"{name} must be a floating torch dtype, got {dtype}")
+    return dtype
+
+
+def _check_fused_quant_input_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"{name} must be torch.bfloat16 or torch.float16, got {dtype}")
     return dtype
 
 
@@ -553,6 +570,33 @@ class FusedSwiGLUFP8UE8M0InputValues:
 
 
 @dataclass
+class FusedSwiGLUFP8BlockQuantInputValues:
+    """Generated values for fused SiLU+Mul with FP8 block quantization.
+
+    ``gate_up`` stores split gate/up activations. ``scale_out`` is the
+    preallocated float32 per-token/per-block scale buffer consumed by kernels
+    that write scales as an output argument. In expert-parallel mode,
+    ``num_tokens_per_expert`` marks the valid token prefix for each expert.
+    """
+
+    gate_up: torch.Tensor
+    scale_out: torch.Tensor
+    group_size: int
+    num_tokens_per_expert: torch.Tensor | None = None
+    num_tokens_hint: int | None = None
+    num_experts: int | None = None
+
+
+@dataclass
+class FusedSwiGLUNVFP4QuantInputValues:
+    """Generated values for fused SiLU+Mul with dense NVFP4 quantization."""
+
+    gate_up: torch.Tensor
+    global_scale: torch.Tensor
+    scale_size: int
+
+
+@dataclass
 class FusedSwiGLUFP8UE8M0InputConfig:
     """Initialization parameters for fused SwiGLU + FP8/UE8M0 quant inputs.
 
@@ -578,6 +622,69 @@ class FusedSwiGLUFP8UE8M0InputConfig:
     swiglu_limit: float = 0.0
 
     # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class FusedSwiGLUFP8BlockQuantInputConfig:
+    """Initialization parameters for fused SiLU+Mul + FP8 block quant inputs.
+
+    The represented operation computes ``silu(gate) * up`` from a split
+    ``[..., 2 * hidden_dim]`` tensor and quantizes each contiguous
+    ``group_size`` block to FP8 E4M3 with a float32 block scale.
+    """
+
+    # Required: number of token rows. In expert-parallel mode this is the
+    # maximum token rows per expert.
+    num_tokens: int
+
+    # Required: output width after splitting gate/up. Must be divisible by
+    # group_size.
+    hidden_dim: int
+
+    # Required: dtype for generated gate/up values.
+    dtype: torch.dtype
+
+    # Optional: group width used for block quantization.
+    group_size: int = 128
+
+    # Optional: number of experts for the expert-parallel variant. ``None``
+    # generates the dense two-dimensional variant.
+    num_experts: int | None = None
+
+    # Optional: generated tensor and scale-buffer device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class FusedSwiGLUNVFP4QuantInputConfig:
+    """Initialization parameters for fused SiLU+Mul + NVFP4 quant inputs.
+
+    The represented operation computes ``silu(gate) * up`` from a
+    ``[num_tokens, 2 * hidden_dim]`` tensor, then quantizes the result into
+    packed E2M1 NVFP4 values with one FP8 E4M3 scale per 16 values and one
+    tensor-wide input scale.
+    """
+
+    # Required: number of token rows.
+    num_tokens: int
+
+    # Required: output width after splitting gate/up. Must be divisible by
+    # scale_size and even for packed NVFP4 output.
+    hidden_dim: int
+
+    # Required: dtype for generated gate/up values.
+    dtype: torch.dtype
+
+    # Optional: actual input scale represented by the kernel's global inverse
+    # scale tensor.
+    input_scale: float = 0.125
+
+    # Optional: number of values per FP8 NVFP4 group scale. Currently fixed to
+    # the NVFP4 group size used by TokenSpeed kernels.
+    scale_size: int = 16
+
+    # Optional: generated tensor and scale device override.
     device: DeviceLike = None
 
 
@@ -638,6 +745,155 @@ class FusedSwiGLUFP8UE8M0Inputs(NumericsInputGenerator):
         )
 
 
+@dataclass(init=False)
+class FusedSwiGLUFP8BlockQuantInputs(NumericsInputGenerator):
+    """Generator for fused SiLU+Mul plus FP8 float-scale block quantization."""
+
+    config: FusedSwiGLUFP8BlockQuantInputConfig
+    gate_up_input: TensorInput | None
+
+    def __init__(self, config: FusedSwiGLUFP8BlockQuantInputConfig) -> None:
+        self.config = config
+        self.gate_up_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.hidden_dim = _check_positive("hidden_dim", self.config.hidden_dim)
+        self.config.group_size = _check_positive("group_size", self.config.group_size)
+        self.config.dtype = _check_fused_quant_input_dtype("dtype", self.config.dtype)
+        if self.config.hidden_dim % self.config.group_size != 0:
+            raise ValueError(
+                "hidden_dim must be divisible by group_size for FP8 block "
+                f"quantization, got {self.config.hidden_dim} and "
+                f"{self.config.group_size}"
+            )
+        if self.config.num_experts is not None:
+            self.config.num_experts = _check_positive(
+                "num_experts", self.config.num_experts
+            )
+            shape = (
+                self.config.num_experts,
+                self.config.num_tokens,
+                2 * self.config.hidden_dim,
+            )
+        else:
+            shape = (self.config.num_tokens, 2 * self.config.hidden_dim)
+        self.gate_up_input = self.gate_up_input or TensorInput(
+            shape,
+            self.config.dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> FusedSwiGLUFP8BlockQuantInputValues:
+        if self.gate_up_input is None:
+            raise ValueError(
+                "FusedSwiGLUFP8BlockQuantInputs child generator must be initialized"
+            )
+        target_device = _resolve_device(self.config.device, device)
+        gate_up = _require_tensor(
+            self.gate_up_input.generate(
+                seed=_child_seed(seed, 1),
+                device=target_device,
+            ).values,
+            "gate_up",
+        )
+        groups_per_row = self.config.hidden_dim // self.config.group_size
+        scale_shape = (*gate_up.shape[:-1], groups_per_row)
+        scale_out = torch.zeros(scale_shape, dtype=torch.float32, device=target_device)
+        num_tokens_per_expert = None
+        num_tokens_hint = None
+        if self.config.num_experts is not None:
+            num_tokens_per_expert = torch.full(
+                (self.config.num_experts,),
+                self.config.num_tokens,
+                dtype=torch.int32,
+                device=target_device,
+            )
+            num_tokens_hint = self.config.num_tokens
+        return FusedSwiGLUFP8BlockQuantInputValues(
+            gate_up=gate_up.contiguous(),
+            scale_out=scale_out.contiguous(),
+            group_size=self.config.group_size,
+            num_tokens_per_expert=num_tokens_per_expert,
+            num_tokens_hint=num_tokens_hint,
+            num_experts=self.config.num_experts,
+        )
+
+
+@dataclass(init=False)
+class FusedSwiGLUNVFP4QuantInputs(NumericsInputGenerator):
+    """Generator for fused SiLU+Mul plus dense NVFP4 quantization."""
+
+    config: FusedSwiGLUNVFP4QuantInputConfig
+    gate_up_input: TensorInput | None
+
+    def __init__(self, config: FusedSwiGLUNVFP4QuantInputConfig) -> None:
+        self.config = config
+        self.gate_up_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.hidden_dim = _check_positive("hidden_dim", self.config.hidden_dim)
+        self.config.dtype = _check_fused_quant_input_dtype("dtype", self.config.dtype)
+        self.config.scale_size = _check_positive("scale_size", self.config.scale_size)
+        if self.config.hidden_dim % self.config.scale_size != 0:
+            raise ValueError(
+                "hidden_dim must be divisible by scale_size for NVFP4 "
+                f"quantization, got {self.config.hidden_dim} and "
+                f"{self.config.scale_size}"
+            )
+        if self.config.hidden_dim % 2 != 0:
+            raise ValueError("hidden_dim must be even for packed NVFP4 output")
+        self.config.input_scale = float(self.config.input_scale)
+        if self.config.input_scale <= 0.0:
+            raise ValueError("input_scale must be positive")
+        self.gate_up_input = self.gate_up_input or TensorInput(
+            (self.config.num_tokens, 2 * self.config.hidden_dim),
+            self.config.dtype,
+            device=self.config.device,
+        )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> FusedSwiGLUNVFP4QuantInputValues:
+        if self.gate_up_input is None:
+            raise ValueError(
+                "FusedSwiGLUNVFP4QuantInputs child generator must be initialized"
+            )
+        target_device = _resolve_device(self.config.device, device)
+        gate_up = _require_tensor(
+            self.gate_up_input.generate(
+                seed=_child_seed(seed, 1),
+                device=target_device,
+            ).values,
+            "gate_up",
+        )
+        global_scale = torch.tensor(
+            [1.0 / self.config.input_scale],
+            dtype=torch.float32,
+            device=target_device,
+        )
+        return FusedSwiGLUNVFP4QuantInputValues(
+            gate_up=gate_up.contiguous(),
+            global_scale=global_scale,
+            scale_size=self.config.scale_size,
+        )
+
+
 def fused_swiglu_fp8_ue8m0_reference(
     values: FusedSwiGLUFP8UE8M0InputValues,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -695,3 +951,105 @@ def fused_swiglu_fp8_ue8m0_reference(
         )
 
     return quantized.reshape(num_tokens, hidden_dim).contiguous(), packed_scales
+
+
+def fused_swiglu_fp8_block_quant_reference(
+    values: FusedSwiGLUFP8BlockQuantInputValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return FP8 SiLU+Mul values and float32 group scales."""
+
+    if values.gate_up.shape[-1] % 2 != 0:
+        raise ValueError(
+            f"gate_up last dimension must be even, got {values.gate_up.shape[-1]}"
+        )
+    group_size = _check_positive("group_size", values.group_size)
+    hidden_dim = values.gate_up.shape[-1] // 2
+    if hidden_dim % group_size != 0:
+        raise ValueError(
+            "hidden_dim must be divisible by group_size for FP8 block "
+            f"quantization, got {hidden_dim} and {group_size}"
+        )
+    expected_scale_shape = (*values.gate_up.shape[:-1], hidden_dim // group_size)
+    if tuple(values.scale_out.shape) != expected_scale_shape:
+        raise ValueError(
+            f"scale_out must have shape {expected_scale_shape}, "
+            f"got {tuple(values.scale_out.shape)}"
+        )
+    if values.scale_out.dtype != torch.float32:
+        raise ValueError(f"scale_out must be float32, got {values.scale_out.dtype}")
+
+    activated = gated_activation_reference(values.gate_up, activation="silu")
+    groups = activated.reshape(
+        *activated.shape[:-1], hidden_dim // group_size, group_size
+    )
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_info = torch.finfo(fp8_dtype)
+    scales = (groups.abs().amax(dim=-1) / fp8_info.max).clamp(min=1.0e-10)
+    quantized = torch.clamp(
+        groups / scales.unsqueeze(-1),
+        min=fp8_info.min,
+        max=fp8_info.max,
+    ).to(fp8_dtype)
+    quantized = quantized.reshape(*activated.shape).contiguous()
+    scales = scales.to(torch.float32).contiguous()
+
+    if values.num_tokens_per_expert is not None:
+        if values.num_experts is None:
+            raise ValueError("num_experts is required with num_tokens_per_expert")
+        if values.gate_up.ndim != 3:
+            raise ValueError(
+                "expert-parallel FP8 block quantization requires 3D gate_up"
+            )
+        if values.num_tokens_per_expert.shape != (values.num_experts,):
+            raise ValueError(
+                "num_tokens_per_expert must have shape "
+                f"{(values.num_experts,)}, got {tuple(values.num_tokens_per_expert.shape)}"
+            )
+        if values.num_tokens_hint is None or values.num_tokens_hint <= 0:
+            raise ValueError("num_tokens_hint must be positive in expert-parallel mode")
+        counts = values.num_tokens_per_expert.to(device=quantized.device)
+        if torch.any(counts < 0) or torch.any(counts > values.gate_up.shape[1]):
+            raise ValueError(
+                "num_tokens_per_expert entries must be within the expert token capacity"
+            )
+        token_positions = torch.arange(values.gate_up.shape[1], device=quantized.device)
+        invalid = token_positions.unsqueeze(0) >= counts.unsqueeze(1)
+        if torch.any(invalid):
+            quantized = quantized.clone()
+            scales = scales.clone()
+            quantized.view(torch.uint8)[invalid] = 0
+            scales[invalid] = 0.0
+    return quantized, scales
+
+
+def fused_swiglu_nvfp4_quant_reference(
+    values: FusedSwiGLUNVFP4QuantInputValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return packed NVFP4 SiLU+Mul values and linear FP8 group scales."""
+
+    if values.gate_up.ndim != 2:
+        raise ValueError(f"gate_up must be 2D, got {values.gate_up.ndim}D")
+    if values.gate_up.shape[-1] % 2 != 0:
+        raise ValueError(
+            f"gate_up last dimension must be even, got {values.gate_up.shape[-1]}"
+        )
+    scale_size = _check_positive("scale_size", values.scale_size)
+    hidden_dim = values.gate_up.shape[-1] // 2
+    if hidden_dim % scale_size != 0:
+        raise ValueError(
+            "hidden_dim must be divisible by scale_size for NVFP4 quantization, "
+            f"got {hidden_dim} and {scale_size}"
+        )
+    if values.global_scale.numel() != 1:
+        raise ValueError("global_scale must contain one element")
+    global_scale_value = values.global_scale.float().reshape(())
+    if global_scale_value.item() <= 0.0:
+        raise ValueError("global_scale must be positive")
+    input_scale = torch.reciprocal(global_scale_value).reshape(1)
+    activated = gated_activation_reference(values.gate_up, activation="silu")
+    return nvfp4_quantization_reference(
+        activated,
+        scale=input_scale,
+        scale_size=scale_size,
+        scale_layout="linear",
+    )

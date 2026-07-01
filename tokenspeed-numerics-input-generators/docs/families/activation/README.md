@@ -15,6 +15,31 @@ kernel signature.
   a fused gate/sigmoid/multiply/add expression.
 - `FusedSwiGLUFP8UE8M0Inputs`: generates SwiGLU inputs plus FP8 output scale
   metadata for fused activation and quantization paths.
+- `FusedSwiGLUFP8BlockQuantInputs`: generates SiLU+Mul inputs plus preallocated
+  float32 block-scale buffers for FP8 E4M3 block quantization, including the
+  expert-parallel tensor/metadata variant.
+- `FusedSwiGLUNVFP4QuantInputs`: generates dense SiLU+Mul inputs and the global
+  inverse input scale used by NVFP4 quantization paths.
+
+## Fused Quantized SiLU+Mul
+
+The fused quantized activation generators model a two-stage operation:
+
+```text
+activated = silu(gate) * up
+quantized = quantize(activated)
+```
+
+`FusedSwiGLUFP8BlockQuantInputs` uses one float32 scale for each contiguous
+`group_size` block of activated values. The expert-parallel variant uses
+`gate_up[num_experts, max_tokens_per_expert, 2 * hidden_dim]` plus
+`num_tokens_per_expert` metadata to describe the valid token prefix for each
+expert.
+
+`FusedSwiGLUNVFP4QuantInputs` uses packed E2M1 NVFP4 values with one FP8 E4M3
+scale for each group of 16 values and a tensor-wide inverse input scale. The
+reference returns linear group scales; backend-specific swizzled/padded scale
+layouts are adapter concerns.
 
 ## Generated Values
 
