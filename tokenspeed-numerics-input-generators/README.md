@@ -77,35 +77,27 @@ objects.
 
 ## Verification
 
-Input generators should perform just enough verification that using the library
-cannot silently produce invalid operation inputs. A caller should be able to
-trust that if a generator accepts a config and returns values, those values
-satisfy the operation-level constraints documented for that generator. In other
-words, correctness tests should get well-formed inputs by construction as long
-as they use the generator API.
-
-The generator library should be the place where common input validity is
-centralized. It is not enough for a generator to produce plausible tensors most
-of the time; the public generator path should make invalid or broken operation
-inputs unrepresentable, or reject them before generation completes. Consumers
-may still check kernel-specific ABI details, but they should not need to
-rediscover whether an operation-family config is coherent or whether generated
-metadata can describe a valid computation. That confidence is part of the
-library contract.
+Input generators should perform just enough verification that the library cannot
+be misused to silently produce invalid operation inputs. If a generator accepts
+a config and returns values, those values should satisfy the operation-level
+constraints documented for that generator. Correctness tests should get
+well-formed inputs by construction as long as they stay inside the public
+generator API.
 
 The verification standard is misuse resistance, not exhaustive defensive
-programming. It should be difficult to call a generator in a way that produces
-broken tensors, inconsistent metadata, unsupported dtype combinations, or
-operation inputs with no valid mathematical interpretation. That confidence is
-one of the reasons to use the generator library instead of ad hoc tensor setup
-inside each test.
+programming. The public generator path should make invalid or broken operation
+inputs unrepresentable, or reject them before generation completes. Consumers
+may still check kernel-specific ABI details, but they should not need to
+rediscover whether an operation-family config is coherent, whether metadata can
+describe a valid computation, or whether generated tensors satisfy the generic
+shape and dtype relationships for that operation.
 
-Verification should make the supported path trustworthy. If a caller stays
-inside the public generator API, the generated tensors and metadata should be
-valid for the documented operation family without every consumer adding its own
-generic well-formedness checks. Tests that intentionally need invalid inputs
-should construct those cases outside the normal generator path so the generator
-contract stays clear.
+This confidence is part of the library contract. It should be difficult to call
+a generator in a way that produces broken tensors, inconsistent metadata,
+unsupported dtype combinations, or operation inputs with no valid mathematical
+interpretation. Tests that intentionally need invalid inputs should construct
+those cases outside the normal generator path so the generator contract stays
+clear.
 
 Concretely, each generator should guarantee that:
 
