@@ -33,6 +33,14 @@ tensors, and dequantizes MXFP4 storage with UE8M0 scales before multiplying.
 Kernel tests can use it as the semantic target while keeping backend-specific
 argument mapping in the adapter or test.
 
+Some backend entry points consume a different physical layout than the
+operation-level default. For example, the TokenSpeed Triton scaled-FP8 GEMM path
+accepts `B` as `[K, N]`, while `GemmInputs` defaults to the semantic right-hand
+operand shape `[N, K]` used by `A @ B.T`. A kernel adapter can transpose the
+generated `B` tensor for that call while still comparing against
+`gemm_reference(values)`. That layout translation belongs at the consumer
+boundary, not in the generator definition.
+
 ## Scale And Quantized Storage
 
 Dense floating-point tensors use the core tensor generator. Scaled tensors use
