@@ -195,10 +195,15 @@ from tokenspeed_numerics_input_generators.core import (
     TensorValues,
 )
 from tokenspeed_numerics_input_generators.embedding import (
+    MLARopeQuantizeFP8InputConfig,
+    MLARopeQuantizeFP8Inputs,
+    MLARopeQuantizeFP8InputValues,
+    MLARopeQuantizeFP8ReferenceValues,
     RopeFusedKVInputValues,
     RopeInputConfig,
     RopeInputs,
     RopeInputValues,
+    mla_rope_quantize_fp8_reference,
     rope_reference,
 )
 from tokenspeed_numerics_input_generators.gemm import (
@@ -438,6 +443,10 @@ __all__ = [
     "MLAKVPackQuantizeFP8InputConfig",
     "MLAKVPackQuantizeFP8InputValues",
     "MLAKVPackQuantizeFP8Inputs",
+    "MLARopeQuantizeFP8InputConfig",
+    "MLARopeQuantizeFP8InputValues",
+    "MLARopeQuantizeFP8Inputs",
+    "MLARopeQuantizeFP8ReferenceValues",
     "MLAKVCacheInput",
     "MLAKVCacheInputConfig",
     "MLAKVCacheTransferInputConfig",
@@ -552,6 +561,7 @@ __all__ = [
     "min_p_renorm_reference",
     "mla_kv_cache_transfer_reference",
     "mla_kv_pack_quantize_fp8_reference",
+    "mla_rope_quantize_fp8_reference",
     "moe_align_block_size_buffer_dims",
     "moe_align_block_size_reference",
     "moe_reference",

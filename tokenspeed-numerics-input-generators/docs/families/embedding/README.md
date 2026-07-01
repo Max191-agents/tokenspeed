@@ -2,7 +2,8 @@
 
 Embedding generators currently focus on rotary positional embedding. Rotary
 embedding applies position-dependent 2D rotations to pairs of hidden dimensions,
-with optional fused handling for K/V tensors in attention frontends.
+with optional fused handling for K/V tensors and FP8 quantization paths in
+attention frontends.
 
 ## Generators
 
@@ -10,16 +11,22 @@ with optional fused handling for K/V tensors in attention frontends.
   caches for rotary embedding.
 - `RopeFusedKVInputValues`: represents generated values for fused K/V rotary
   scenarios.
+- `MLARopeQuantizeFP8Inputs`: generates decomposed MLA/GQA query-key slices,
+  position metadata, RoPE cache, and FP8 output buffers for fused RoPE plus
+  quantization.
 
 The shared `build_rope_cos_sin_cache` utility constructs deterministic rotary
 tables for a requested context length and rotary dimension.
 
 ## Generated Values
 
-Generated values include the input tensor, position metadata, and precomputed
-cosine/sine cache. The reference applies rotary math directly over the generated
-values, while backend adapters can translate those values into kernel-specific
-layouts.
+Generated values include input tensors, position metadata, precomputed
+cosine/sine caches, and optional output buffers. The references apply rotary
+math directly over the generated values, while backend adapters can translate
+those values into kernel-specific layouts.
 
 Verification keeps position ids within the generated cache range and enforces
-compatible rotary dimensions so consumers receive valid embedding inputs.
+compatible rotary dimensions. For fused RoPE quantization, verification also
+enforces the PE/NOPE shape relationships, FP8 output dtype, positive
+quantization scales, and the distinction between rank-2 shared-K MLA tensors
+and rank-3 explicit-KV-head tensors.

@@ -2,8 +2,8 @@
 
 The current TokenSpeed embedding family is rotary positional embedding (RoPE)
 over query and key heads. It is not a token-lookup embedding table generator.
-The generator therefore models the Q/K tensors, position metadata, and RoPE
-cache needed to apply position-dependent rotations.
+The generators therefore model Q/K tensors, position metadata, RoPE caches, and
+the MLA-style fused RoPE plus FP8 quantization path used before attention.
 
 ## Operation Semantics
 
@@ -23,6 +23,42 @@ Two rotation layouts are supported:
 The generator can also produce optional output buffers. When output buffers are
 present, the operation writes rotated values there instead of mutating the
 corresponding input.
+
+### MLA RoPE FP8 Quantization
+
+`MLARopeQuantizeFP8Inputs` represents a fused operation over decomposed query
+and key tensors:
+
+```text
+q_rope_rot = rope(q_rope, positions, cos_sin_cache)
+k_rope_rot = rope(k_rope, positions, cos_sin_cache)
+q_nope_fp8 = fp8(q_nope * quant_scale_q)
+q_rope_fp8 = fp8(q_rope_rot * quant_scale_q)
+k_nope_fp8 = fp8(k_nope * quant_scale_kv)
+k_rope_fp8 = fp8(k_rope_rot * quant_scale_kv)
+query = concat(q_nope_fp8, q_rope_fp8, dim=-1)
+key = concat(k_nope_fp8, k_rope_fp8, dim=-1)
+```
+
+The query inputs are rank-3 tensors:
+
+- `q_nope[num_tokens, num_q_heads, qk_nope_head_dim]`
+- `q_rope[num_tokens, num_q_heads, qk_rope_head_dim]`
+
+The key inputs support two operation shapes. Rank-2 key tensors model MLA's
+shared key head:
+
+- `k_nope[num_tokens, qk_nope_head_dim]`
+- `k_rope[num_tokens, qk_rope_head_dim]`
+
+Rank-3 key tensors model explicit GQA/MHA KV heads:
+
+- `k_nope[num_tokens, num_kv_heads, qk_nope_head_dim]`
+- `k_rope[num_tokens, num_kv_heads, qk_rope_head_dim]`
+
+The generated output buffers have the same shapes as their corresponding input
+slices and FP8 dtype. The reference returns both the slice outputs and the
+concatenated query/key tensors.
 
 ## Fused KV Writes
 
@@ -48,10 +84,16 @@ The generator rejects invalid RoPE inputs before values are returned:
 - input dtype must be a regular floating torch dtype
 - position and cache-location dtypes must be int32 or int64
 - fused KV cache size must be large enough for unique generated cache locations
+- MLA RoPE FP8 input dtype must be fp16 or bf16
+- MLA RoPE FP8 output dtype must be FP8 E4M3 or FP8 E5M2
+- MLA RoPE FP8 PE dimensions must be even and match between query and key
+- rank-2 MLA key tensors use an implicit shared KV head
+- RoPE FP8 quantization scales must be positive
 
 Positions and cache locations are generated from `metadata_seed`, while query,
-key, and value tensors are generated from `seed`. This lets callers keep the
-same positional/cache metadata across different random tensor draws.
+key, value, and MLA RoPE FP8 tensors are generated from `seed`. This lets
+callers keep the same positional/cache metadata across different random tensor
+draws.
 
 ## TokenSpeed API Mapping
 
@@ -66,3 +108,9 @@ the backend supports the requested traits, such as head size, partial-rotary
 mode, layout, fused KV writes, and output buffers. Backend selection is an
 adapter concern; the generator only defines the operation-level Q/K tensors,
 positions, RoPE cache, and optional cache-write values.
+
+TokenSpeed's FlashInfer `mla_rope_quantize_fp8(...)` wrapper consumes the MLA
+RoPE FP8 values directly: the generated input slices, `cos_sin_cache`,
+`positions`, FP8 output buffers, layout flag, and quantization scales. The
+generator does not depend on FlashInfer; tests can adapt the values into that
+wrapper when the backend is available.

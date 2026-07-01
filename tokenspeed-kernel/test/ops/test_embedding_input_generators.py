@@ -23,11 +23,18 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
+from tokenspeed_kernel.ops.embedding.flashinfer import mla_rope_quantize_fp8
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
+    MLARopeQuantizeFP8InputConfig,
+    MLARopeQuantizeFP8Inputs,
     RopeInputConfig,
     RopeInputs,
+    mla_rope_quantize_fp8_reference,
     rope_reference,
 )
+
+platform = current_platform()
 
 
 @pytest.mark.parametrize("is_neox", [True, False])
@@ -198,3 +205,70 @@ def test_rope_generator_runs_cuda_kernel_with_output_buffers(
     torch.testing.assert_close(values.key, key_orig, atol=0, rtol=0)
     torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not platform.is_nvidia,
+    reason="FlashInfer MLA RoPE FP8 quantization requires NVIDIA CUDA.",
+)
+def test_mla_rope_quantize_fp8_generator_runs_flashinfer_kernel(device: str) -> None:
+    values = MLARopeQuantizeFP8Inputs(
+        MLARopeQuantizeFP8InputConfig(
+            num_tokens=5,
+            num_q_heads=4,
+            qk_nope_head_dim=8,
+            qk_rope_head_dim=16,
+            input_dtype=torch.bfloat16,
+            quant_scale_q=1.0,
+            quant_scale_kv=0.75,
+            max_position=64,
+        )
+    ).generate(seed=77, metadata_seed=78, device=device)
+    expected = mla_rope_quantize_fp8_reference(values)
+
+    try:
+        mla_rope_quantize_fp8(
+            q_rope=values.q_rope,
+            k_rope=values.k_rope,
+            q_nope=values.q_nope,
+            k_nope=values.k_nope,
+            cos_sin_cache=values.cos_sin_cache,
+            pos_ids=values.positions,
+            is_neox=values.is_neox,
+            quantize_dtype=values.fp8_dtype,
+            q_rope_out=values.q_rope_out,
+            k_rope_out=values.k_rope_out,
+            q_nope_out=values.q_nope_out,
+            k_nope_out=values.k_nope_out,
+            quant_scale_q=values.quant_scale_q,
+            quant_scale_kv=values.quant_scale_kv,
+            enable_pdl=False,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"FlashInfer MLA RoPE FP8 quantization unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        values.q_nope_out.view(torch.uint8),
+        expected.q_nope.view(torch.uint8),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        values.q_rope_out.view(torch.uint8),
+        expected.q_rope.view(torch.uint8),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        values.k_nope_out.view(torch.uint8),
+        expected.k_nope.view(torch.uint8),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        values.k_rope_out.view(torch.uint8),
+        expected.k_rope.view(torch.uint8),
+        atol=0,
+        rtol=0,
+    )
