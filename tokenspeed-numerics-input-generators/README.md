@@ -75,6 +75,32 @@ stored directly. Composite generated values, such as scaled tensors with values
 and scales or attention caches with page tables, should use small typed value
 objects.
 
+## Verification
+
+Input generators should perform enough validation that using the library cannot
+silently produce invalid operation inputs. A caller should be able to trust that
+if a generator accepts a config and returns values, those values satisfy the
+operation-level constraints documented for that generator.
+
+Verification belongs at the same semantic level as generation. It should check
+shape relationships, datatype compatibility, required metadata, cache/page
+constraints, scale requirements, and other invariants that define whether the
+generated inputs are meaningful. Examples include rejecting an MXFP4 tensor
+without scales, rejecting incompatible scale shapes, ensuring page-table
+metadata is consistent with cache layout, and requiring attention head counts or
+request-length metadata to satisfy the operation contract.
+
+The goal is not to duplicate every assertion a kernel might make about its
+private ABI. Kernel-specific requirements still belong in adapters or tests.
+The generator should instead prevent misuse of the operation-family API itself:
+bad configs should fail early, and generated values should not require every
+consumer to rediscover the same validity checks.
+
+This keeps numerical tests focused on implementation correctness. If a test uses
+the generator library, failures should not be caused by malformed inputs unless
+the test deliberately mutates the generated values outside the generator
+contract.
+
 ## Configuration Ownership
 
 Configuration fields should have one clear owner. Parent generators may expose a
