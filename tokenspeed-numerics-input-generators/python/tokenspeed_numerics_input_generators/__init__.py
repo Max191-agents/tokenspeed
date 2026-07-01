@@ -39,6 +39,7 @@ from tokenspeed_numerics_input_generators.activation import (
     SigmoidMulInputConfig,
     SigmoidMulInputs,
     SigmoidMulInputValues,
+    fused_swiglu_fp8_ue8m0_reference,
 )
 from tokenspeed_numerics_input_generators.attention import (
     AttentionMergeStateInputConfig,
@@ -422,6 +423,7 @@ __all__ = [
     "fp8_kv_cache_write_reference",
     "fp8_scale_shape",
     "fused_qk_rmsnorm_rope_gate_reference",
+    "fused_swiglu_fp8_ue8m0_reference",
     "gather_expand_scalars_reference",
     "gdn_qkv_split_reference",
     "gemm_scale_shape",

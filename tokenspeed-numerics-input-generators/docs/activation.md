@@ -62,6 +62,11 @@ The generated `gate_up` tensor has shape `[num_tokens, 2 * hidden_dim]`.
 `hidden_dim` must be divisible by `group_size` because the quantized operation
 computes one scale per token group.
 
+The reference returns `(fp8_out, packed_scales)`. `fp8_out` has shape
+`[num_tokens, hidden_dim]` and dtype FP8 E4M3. `packed_scales` has shape
+`[num_tokens, ceil(num_groups / 4)]` with dtype int32, where each int32 packs up
+to four UE8M0 biased exponent bytes for consecutive groups.
+
 ## Validation Contract
 
 The activation generators reject invalid operation inputs before generation:
@@ -73,6 +78,8 @@ The activation generators reject invalid operation inputs before generation:
 - qkv-split sigmoid gates require enough KV-head metadata to construct the
   backing QKV row stride
 - fused SwiGLU FP8/UE8M0 requires `hidden_dim % group_size == 0`
+- fused SwiGLU FP8/UE8M0 references require a 2D `gate_up` tensor with an even
+  last dimension and a positive `group_size`
 - all generated tensor dtypes must be `torch.dtype` values accepted by the core
   tensor generator
 

@@ -43,6 +43,7 @@ __all__ = [
     "FusedSwiGLUFP8UE8M0InputConfig",
     "FusedSwiGLUFP8UE8M0Inputs",
     "FusedSwiGLUFP8UE8M0InputValues",
+    "fused_swiglu_fp8_ue8m0_reference",
     "GatedActivationInputConfig",
     "GatedActivationInputs",
     "GatedActivationInputValues",
@@ -446,6 +447,7 @@ class FusedSwiGLUFP8UE8M0InputValues:
 
     gate_up: torch.Tensor
     swiglu_limit: float
+    group_size: int
 
 
 @dataclass
@@ -530,4 +532,64 @@ class FusedSwiGLUFP8UE8M0Inputs(NumericsInputGenerator):
         return FusedSwiGLUFP8UE8M0InputValues(
             gate_up=gate_up,
             swiglu_limit=self.config.swiglu_limit,
+            group_size=self.config.group_size,
         )
+
+
+def fused_swiglu_fp8_ue8m0_reference(
+    values: FusedSwiGLUFP8UE8M0InputValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return FP8 SwiGLU values and packed UE8M0 group scales."""
+
+    if values.gate_up.ndim != 2:
+        raise ValueError(f"gate_up must be 2D, got {values.gate_up.ndim}D")
+    if values.gate_up.shape[-1] % 2 != 0:
+        raise ValueError(
+            f"gate_up last dimension must be even, got {values.gate_up.shape[-1]}"
+        )
+    group_size = _check_positive("group_size", values.group_size)
+    num_tokens, two_hidden_dim = values.gate_up.shape
+    hidden_dim = two_hidden_dim // 2
+    if hidden_dim % group_size != 0:
+        raise ValueError(
+            "hidden_dim must be divisible by group_size for FP8/UE8M0 "
+            f"quantization, got {hidden_dim} and {group_size}"
+        )
+
+    gate, up = values.gate_up.float().chunk(2, dim=-1)
+    if values.swiglu_limit > 0.0:
+        gate = gate.clamp(max=values.swiglu_limit)
+        up = up.clamp(min=-values.swiglu_limit, max=values.swiglu_limit)
+    activated = torch.nn.functional.silu(gate) * up
+
+    groups_per_row = hidden_dim // group_size
+    grouped = activated.reshape(num_tokens, groups_per_row, group_size)
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_info = torch.finfo(fp8_dtype)
+    scale_raw = grouped.abs().amax(dim=-1) / fp8_info.max
+    exponent = torch.ceil(torch.log2(scale_raw.clamp(min=1.0e-10)))
+    scale = torch.pow(
+        torch.tensor(2.0, dtype=torch.float32, device=values.gate_up.device),
+        exponent,
+    )
+    quantized = torch.clamp(
+        grouped / scale.unsqueeze(-1),
+        min=fp8_info.min,
+        max=fp8_info.max,
+    ).to(fp8_dtype)
+
+    packed_scale_cols = (groups_per_row + 3) // 4
+    packed_scales = torch.zeros(
+        (num_tokens, packed_scale_cols),
+        dtype=torch.int32,
+        device=values.gate_up.device,
+    )
+    biased_exponent = (exponent + 127.0).clamp(min=0.0, max=255.0).to(torch.int32)
+    for group_idx in range(groups_per_row):
+        packed_col = group_idx // 4
+        packed_pos = group_idx % 4
+        packed_scales[:, packed_col] |= biased_exponent[:, group_idx] << (
+            packed_pos * 8
+        )
+
+    return quantized.reshape(num_tokens, hidden_dim).contiguous(), packed_scales

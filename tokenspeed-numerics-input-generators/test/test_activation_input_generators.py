@@ -32,6 +32,7 @@ from tokenspeed_numerics_input_generators import (
     GatedActivationInputs,
     SigmoidMulInputConfig,
     SigmoidMulInputs,
+    fused_swiglu_fp8_ue8m0_reference,
 )
 
 
@@ -168,6 +169,43 @@ def test_fused_swiglu_fp8_ue8m0_inputs_generate_grouped_gate_up() -> None:
     y = F.silu(gate.clamp(max=7.0)) * up.clamp(min=-7.0, max=7.0)
     assert y.shape == (4, 256)
     assert torch.isfinite(y).all()
+
+    q, scales = fused_swiglu_fp8_ue8m0_reference(values)
+    assert q.shape == (4, 256)
+    assert q.dtype == torch.float8_e4m3fn
+    assert scales.shape == (4, 1)
+    assert scales.dtype == torch.int32
+    scale_bytes = scales.view(torch.uint8).reshape(4, 4)
+    assert torch.all(scale_bytes[:, :2] > 0)
+    assert torch.all(scale_bytes[:, 2:] == 0)
+
+
+def test_fused_swiglu_fp8_ue8m0_reference_packs_four_scale_groups() -> None:
+    values = FusedSwiGLUFP8UE8M0Inputs(
+        FusedSwiGLUFP8UE8M0InputConfig(
+            num_tokens=2,
+            hidden_dim=512,
+            dtype=torch.float32,
+            swiglu_limit=0.0,
+        )
+    ).generate(seed=16, device="cpu")
+
+    q, scales = fused_swiglu_fp8_ue8m0_reference(values)
+    gate, up = values.gate_up.float().chunk(2, dim=-1)
+    y = F.silu(gate) * up
+    grouped = y.reshape(2, 4, 128)
+    exponent = torch.ceil(
+        torch.log2(
+            (grouped.abs().amax(dim=-1) / torch.finfo(torch.float8_e4m3fn).max).clamp(
+                min=1.0e-10
+            )
+        )
+    )
+    expected_bytes = (exponent + 127).clamp(min=0, max=255).to(torch.uint8)
+
+    assert q.shape == (2, 512)
+    assert scales.shape == (2, 1)
+    assert torch.equal(scales.view(torch.uint8).reshape(2, 4), expected_bytes)
 
 
 def test_sigmoid_mul_inputs_reject_invalid_qkv_split_config() -> None:

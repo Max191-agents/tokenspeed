@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
+    fused_swiglu_fp8_ue8m0,
     sigmoid_mul,
     silu_and_mul,
 )
@@ -32,10 +33,13 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
     FusedGateSigmoidMulAddInputConfig,
     FusedGateSigmoidMulAddInputs,
+    FusedSwiGLUFP8UE8M0InputConfig,
+    FusedSwiGLUFP8UE8M0Inputs,
     GatedActivationInputConfig,
     GatedActivationInputs,
     SigmoidMulInputConfig,
     SigmoidMulInputs,
+    fused_swiglu_fp8_ue8m0_reference,
 )
 
 platform = current_platform()
@@ -141,3 +145,24 @@ def test_fused_gate_sigmoid_mul_add_generator_runs_kernel(device: str) -> None:
 
     assert out.data_ptr() == final.data_ptr()
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
+
+
+def test_fused_swiglu_fp8_ue8m0_generator_runs_kernel(device: str) -> None:
+    values = FusedSwiGLUFP8UE8M0Inputs(
+        FusedSwiGLUFP8UE8M0InputConfig(
+            num_tokens=5,
+            hidden_dim=256,
+            dtype=torch.bfloat16,
+            swiglu_limit=7.0,
+        )
+    ).generate(seed=105, device=device)
+    expected_q, expected_scales = fused_swiglu_fp8_ue8m0_reference(values)
+
+    actual_q, actual_scales = fused_swiglu_fp8_ue8m0(
+        values.gate_up,
+        values.swiglu_limit,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual_q.view(torch.uint8), expected_q.view(torch.uint8))
+    assert torch.equal(actual_scales, expected_scales)
