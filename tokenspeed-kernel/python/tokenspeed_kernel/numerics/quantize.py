@@ -23,6 +23,10 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from tokenspeed_numerics_input_generators import (
+    FP8QuantizationInputConfig,
+    FP8QuantizationInputs,
+)
 from tokenspeed_kernel.numerics.inputs import (
     InputGenerator,
     set_benchmark_shapes,
@@ -65,11 +69,34 @@ set_family_tolerance("quantize", tolerance)
 class QuantizeInputGenerator(InputGenerator):
     """Generates a 2D activation tensor [M, K] for fp8 quantize kernels."""
 
+    def _mode_config(self, *, M: int, K: int) -> FP8QuantizationInputConfig:
+        if self.op_mode == "fp8_token_group_128":
+            return FP8QuantizationInputConfig(
+                shape=(M, K),
+                dtype=self.dtype,
+                granularity="token_group",
+                group_size=128,
+            )
+        if self.op_mode == "fp8_token":
+            return FP8QuantizationInputConfig(
+                shape=(M, K),
+                dtype=self.dtype,
+                granularity="token",
+            )
+        if self.op_mode == "fp8_tensor":
+            return FP8QuantizationInputConfig(
+                shape=(M, K),
+                dtype=self.dtype,
+                granularity="tensor",
+            )
+        raise ValueError(f"unsupported quantize input mode={self.op_mode!r}")
+
     def generate(self, M: int, K: int) -> dict[str, Any]:
-        x = torch.randn(
-            M, K, dtype=torch.float32, device=self.device, generator=self.rng
-        ).to(self.dtype)
-        return {"x": x}
+        values = FP8QuantizationInputs(self._mode_config(M=M, K=K)).generate(
+            seed=self.seed,
+            device=self.device,
+        )
+        return {"x": values.x}
 
 
 set_input_generator("quantize", "fp8_token_group_128", QuantizeInputGenerator)

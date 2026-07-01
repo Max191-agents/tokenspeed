@@ -86,6 +86,13 @@ from tokenspeed_numerics_input_generators.moe import (
     MoeInputs,
     MoeInputValues,
 )
+from tokenspeed_numerics_input_generators.quantization import (
+    FP8QuantizationInputConfig,
+    FP8QuantizationInputs,
+    FP8QuantizationInputValues,
+    fp8_quantization_reference,
+    fp8_scale_shape,
+)
 
 __all__ = [
     "AttentionCacheInput",
@@ -97,6 +104,9 @@ __all__ = [
     "FusedSwiGLUFP8UE8M0InputConfig",
     "FusedSwiGLUFP8UE8M0InputValues",
     "FusedSwiGLUFP8UE8M0Inputs",
+    "FP8QuantizationInputConfig",
+    "FP8QuantizationInputValues",
+    "FP8QuantizationInputs",
     "GemmInputConfig",
     "GemmInputValues",
     "GemmInputs",
@@ -132,6 +142,8 @@ __all__ = [
     "SigmoidMulInputs",
     "TensorInput",
     "TensorValues",
+    "fp8_quantization_reference",
+    "fp8_scale_shape",
     "gemm_scale_shape",
     "mxfp4_gemm_input_config",
 ]
