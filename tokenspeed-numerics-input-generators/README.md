@@ -84,6 +84,15 @@ constraints documented for that generator. Correctness tests should get
 well-formed inputs by construction as long as they stay inside the public
 generator API.
 
+Verification in this layer is about input validity, not proving numerical
+agreement. It should establish that the generated inputs make sense for the
+operation being represented: shapes line up, dtypes are supported, quantized
+values have the scale tensors they require, ragged metadata is coherent,
+indices are in range, caches agree with their page tables, and optional inputs
+are present only in combinations that define a valid computation. Numerical
+validators and kernel tests can then focus on comparing reference and test
+outputs instead of defending against malformed generated inputs.
+
 That makes the generator library the trust boundary for input validity. The
 goal is confidence by construction: a consumer that uses the public input
 generator API should be able to assume that generated shapes, dtypes, metadata,
