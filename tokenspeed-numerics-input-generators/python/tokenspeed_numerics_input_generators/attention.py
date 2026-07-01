@@ -57,6 +57,12 @@ __all__ = [
     "AttentionMergeStateInputValues",
     "attention_generate",
     "attention_merge_state_reference",
+    "DeepSeekV4SparsePrefillIndexInputConfig",
+    "DeepSeekV4SparsePrefillIndexInputs",
+    "DeepSeekV4SparsePrefillIndexValues",
+    "deepseek_v4_build_dense_prefill_local_compressed_indices_reference",
+    "deepseek_v4_combine_dense_swa_indices_reference",
+    "deepseek_v4_combine_topk_swa_indices_reference",
     "MLAKVPackQuantizeFP8InputConfig",
     "MLAKVPackQuantizeFP8Inputs",
     "MLAKVPackQuantizeFP8InputValues",
@@ -70,6 +76,7 @@ __all__ = [
 ]
 
 _AttentionCacheT = TypeVar("_AttentionCacheT")
+_DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 
 
 def _check_positive(name: str, value: int) -> int:
@@ -84,6 +91,10 @@ def _check_nonnegative(name: str, value: int) -> int:
     if value < 0:
         raise ValueError(f"{name} must be non-negative, got {value}")
     return value
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (int(value) + alignment - 1) // alignment * alignment
 
 
 def _check_float_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
@@ -721,6 +732,499 @@ def mla_kv_pack_quantize_fp8_reference(
     k_fp8 = (k.float() * values.k_scale_inv).to(fp8_dtype)
     v_fp8 = (values.v.float() * values.v_scale_inv).to(fp8_dtype)
     return k_fp8.contiguous(), v_fp8.contiguous()
+
+
+@dataclass
+class DeepSeekV4SparsePrefillIndexValues:
+    """Generated values for DeepSeek V4 sparse-prefill index construction.
+
+    The tensors describe one packed batch of new query tokens. For each query
+    token, the operation can build candidate KV workspace indices from a
+    compressed prefix, a sparse top-k compressed-prefix selection, and a local
+    sliding-window attention span.
+    """
+
+    metadata: MHARequestMetadataValues
+    topk_indices: torch.Tensor
+    positions: torch.Tensor
+    token_to_req_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    compressed_lens: torch.Tensor
+    gather_lens: torch.Tensor
+    window_size: int
+    compress_ratio: int
+    topk: int
+    workspace_width: int
+    compressed_base: int
+
+
+@dataclass
+class DeepSeekV4SparsePrefillIndexInputConfig:
+    """Initialization parameters for DeepSeek V4 sparse-prefill indices.
+
+    The represented operation builds integer candidate lists for sparse
+    prefill attention. Each request has a per-request workspace. The compressed
+    prefix occupies local workspace slots ``[0, compressed_base)`` and the
+    gathered sliding-window span starts at ``compressed_base``.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of request sequences represented by generated metadata.
+    batch_size: int
+
+    # Required: total already-resident KV tokens across all requests.
+    total_cached_tokens: int
+
+    # Required: total new query/KV tokens across all requests.
+    total_new_q_tokens: int
+
+    # Required: maximum number of sparse compressed-prefix candidates per token.
+    topk: int
+
+    # Required: sliding-window token count included for each query position.
+    window_size: int
+
+    # Required: number of original sequence positions represented by one
+    # compressed prefix position. DeepSeek V4 sparse prefill uses a compressed
+    # prefix plus an uncompressed sliding-window span, so this must be > 1.
+    compress_ratio: int
+
+    # ------------------------------------------------------------------
+    # Optional workspace and metadata configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: number of per-request workspace slots reserved for compressed
+    # prefix entries. Defaults to the maximum generated compressed prefix length.
+    compressed_base: int | None = None
+
+    # Optional: total per-request workspace width. Defaults to
+    # compressed_base + max(gather_lens).
+    workspace_width: int | None = None
+
+    # Optional: ordering policy for generated top-k compressed-prefix indices.
+    # "identity" uses the first valid compressed positions; "random" samples a
+    # metadata-seeded permutation from the valid compressed-prefix range.
+    topk_indexing: PageTableIndexing = "random"
+
+    # Optional: nested request metadata config. If supplied, its batch size and
+    # token totals must match this parent config.
+    metadata_input: MHARequestMetadataInputConfig | None = None
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DeepSeekV4SparsePrefillIndexInputs(NumericsInputGenerator):
+    """Generator for DeepSeek V4 sparse-prefill index-construction inputs."""
+
+    config: DeepSeekV4SparsePrefillIndexInputConfig
+    metadata_input: MHARequestMetadataInput | None
+
+    def __init__(self, config: DeepSeekV4SparsePrefillIndexInputConfig) -> None:
+        self.config = config
+        self.metadata_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.metadata_input = self.metadata_input or MHARequestMetadataInput(
+            self.config.metadata_input or self._make_metadata_config()
+        )
+        self._verify_metadata_config_matches_parent()
+        self.config.metadata_input = self.metadata_input.config
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> DeepSeekV4SparsePrefillIndexValues:
+        self.__post_init__()
+        if self.metadata_input is None:
+            raise ValueError("metadata_input must be initialized")
+        target_device = _resolve_device(self.config.device, device)
+        metadata = self.metadata_input.generate(
+            seed=_child_seed(seed, 1),
+            device=target_device,
+        )
+        if metadata.new_q_lens_cpu != metadata.new_kv_lens_cpu:
+            raise ValueError("DeepSeek V4 sparse prefill requires tied Q/KV lengths")
+
+        positions_cpu: list[int] = []
+        token_to_req_cpu: list[int] = []
+        gather_lens_cpu: list[int] = []
+        compressed_lens_cpu: list[int] = []
+        max_compressed_len = 0
+        max_gather_len = 0
+        for req, (query_len, seq_len) in enumerate(
+            zip(metadata.new_q_lens_cpu, metadata.visible_kv_lens_cpu, strict=True)
+        ):
+            start_pos = seq_len - query_len
+            gather_len = min(seq_len, self.config.window_size + query_len - 1)
+            compressed_len = seq_len // self.config.compress_ratio
+            gather_lens_cpu.append(gather_len)
+            compressed_lens_cpu.append(compressed_len)
+            max_gather_len = max(max_gather_len, gather_len)
+            max_compressed_len = max(max_compressed_len, compressed_len)
+            for offset in range(query_len):
+                positions_cpu.append(start_pos + offset)
+                token_to_req_cpu.append(req)
+
+        compressed_base = (
+            max_compressed_len
+            if self.config.compressed_base is None
+            else self.config.compressed_base
+        )
+        required_topk_prefix = min(max_compressed_len, self.config.topk)
+        if compressed_base < required_topk_prefix:
+            raise ValueError(
+                "compressed_base is too small for generated top-k indices; "
+                f"need at least {required_topk_prefix}, got {compressed_base}"
+            )
+        compressed_lens_cpu = [
+            min(compressed_len, compressed_base)
+            for compressed_len in compressed_lens_cpu
+        ]
+        workspace_width = (
+            compressed_base + max_gather_len
+            if self.config.workspace_width is None
+            else self.config.workspace_width
+        )
+        if workspace_width < compressed_base + max_gather_len:
+            raise ValueError(
+                "workspace_width must cover compressed prefix slots plus gathered "
+                f"SWA slots; need at least {compressed_base + max_gather_len}, "
+                f"got {workspace_width}"
+            )
+
+        topk_indices_cpu = self._generate_topk_indices(
+            seed=_child_seed(seed, 2),
+            positions=positions_cpu,
+            compressed_base=compressed_base,
+        )
+
+        return DeepSeekV4SparsePrefillIndexValues(
+            metadata=metadata,
+            topk_indices=topk_indices_cpu.to(target_device),
+            positions=torch.tensor(
+                positions_cpu,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            token_to_req_indices=torch.tensor(
+                token_to_req_cpu,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            seq_lens=torch.tensor(
+                metadata.visible_kv_lens_cpu,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            compressed_lens=torch.tensor(
+                compressed_lens_cpu,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            gather_lens=torch.tensor(
+                gather_lens_cpu,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            window_size=self.config.window_size,
+            compress_ratio=self.config.compress_ratio,
+            topk=self.config.topk,
+            workspace_width=workspace_width,
+            compressed_base=compressed_base,
+        )
+
+    def _normalize_config(self) -> None:
+        self.config.batch_size = _check_positive("batch_size", self.config.batch_size)
+        self.config.total_cached_tokens = _check_nonnegative(
+            "total_cached_tokens",
+            self.config.total_cached_tokens,
+        )
+        self.config.total_new_q_tokens = _check_positive(
+            "total_new_q_tokens",
+            self.config.total_new_q_tokens,
+        )
+        self.config.topk = _check_positive("topk", self.config.topk)
+        self.config.window_size = _check_positive(
+            "window_size", self.config.window_size
+        )
+        self.config.compress_ratio = _check_positive(
+            "compress_ratio", self.config.compress_ratio
+        )
+        if self.config.compress_ratio <= 1:
+            raise ValueError(
+                "compress_ratio must be greater than 1 for compressed-prefix "
+                f"sparse prefill, got {self.config.compress_ratio}"
+            )
+        if self.config.compressed_base is not None:
+            self.config.compressed_base = _check_nonnegative(
+                "compressed_base",
+                self.config.compressed_base,
+            )
+        if self.config.workspace_width is not None:
+            self.config.workspace_width = _check_positive(
+                "workspace_width",
+                self.config.workspace_width,
+            )
+        self.config.topk_indexing = _check_page_table_indexing(
+            self.config.topk_indexing
+        )
+
+    def _make_metadata_config(self) -> MHARequestMetadataInputConfig:
+        return MHARequestMetadataInputConfig(
+            batch_size=self.config.batch_size,
+            total_cached_tokens=self.config.total_cached_tokens,
+            total_new_q_tokens=self.config.total_new_q_tokens,
+            cache_layout=("dense" if self.config.total_cached_tokens else "none"),
+            device=self.config.device,
+        )
+
+    def _verify_metadata_config_matches_parent(self) -> None:
+        if self.metadata_input is None:
+            raise ValueError("metadata_input must be initialized")
+        metadata_config = self.metadata_input.config
+        for name in ("batch_size", "total_cached_tokens", "total_new_q_tokens"):
+            _check_matches(
+                parent_name=f"DeepSeekV4SparsePrefillIndexInputConfig.{name}",
+                child_name=f"metadata_input.{name}",
+                parent_value=getattr(self.config, name),
+                child_value=getattr(metadata_config, name),
+            )
+        if metadata_config.total_new_kv_tokens is not None:
+            _check_matches(
+                parent_name=(
+                    "DeepSeekV4SparsePrefillIndexInputConfig.total_new_q_tokens"
+                ),
+                child_name="metadata_input.total_new_kv_tokens",
+                parent_value=self.config.total_new_q_tokens,
+                child_value=metadata_config.total_new_kv_tokens,
+            )
+        if not metadata_config.tie_new_kv_to_query:
+            raise ValueError(
+                "metadata_input.tie_new_kv_to_query must be true for sparse prefill"
+            )
+
+    def _generate_topk_indices(
+        self,
+        *,
+        seed: int,
+        positions: list[int],
+        compressed_base: int,
+    ) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        topk_indices = torch.full(
+            (len(positions), self.config.topk),
+            -1,
+            dtype=torch.int32,
+        )
+        for token_idx, pos in enumerate(positions):
+            available = min((pos + 1) // self.config.compress_ratio, compressed_base)
+            topk_len = min(available, self.config.topk)
+            if topk_len == 0:
+                continue
+            if self.config.topk_indexing == "identity":
+                selected = torch.arange(topk_len, dtype=torch.int32)
+            else:
+                selected = torch.randperm(available, generator=rng)[:topk_len].to(
+                    torch.int32
+                )
+            topk_indices[token_idx, :topk_len] = selected
+        return topk_indices
+
+
+def _validate_deepseek_v4_sparse_prefill_values(
+    values: DeepSeekV4SparsePrefillIndexValues,
+) -> None:
+    if values.topk_indices.dtype != torch.int32:
+        raise TypeError(f"topk_indices must be int32, got {values.topk_indices.dtype}")
+    if values.positions.dtype != torch.int32:
+        raise TypeError(f"positions must be int32, got {values.positions.dtype}")
+    if values.token_to_req_indices.dtype != torch.int32:
+        raise TypeError(
+            "token_to_req_indices must be int32, "
+            f"got {values.token_to_req_indices.dtype}"
+        )
+    for name, tensor in (
+        ("seq_lens", values.seq_lens),
+        ("compressed_lens", values.compressed_lens),
+        ("gather_lens", values.gather_lens),
+    ):
+        if tensor.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32, got {tensor.dtype}")
+    if values.topk_indices.ndim != 2:
+        raise ValueError("topk_indices must be rank-2")
+    num_tokens = values.topk_indices.shape[0]
+    if values.topk_indices.shape[1] != values.topk:
+        raise ValueError("topk scalar must match topk_indices width")
+    if values.positions.shape != (num_tokens,):
+        raise ValueError("positions must have shape [num_tokens]")
+    if values.token_to_req_indices.shape != (num_tokens,):
+        raise ValueError("token_to_req_indices must have shape [num_tokens]")
+    batch_size = len(values.metadata.new_q_lens_cpu)
+    if values.seq_lens.shape != (batch_size,):
+        raise ValueError("seq_lens must have one value per request")
+    if values.compressed_lens.shape != (batch_size,):
+        raise ValueError("compressed_lens must have one value per request")
+    if values.gather_lens.shape != (batch_size,):
+        raise ValueError("gather_lens must have one value per request")
+    if values.window_size <= 0:
+        raise ValueError("window_size must be positive")
+    if values.compress_ratio <= 1:
+        raise ValueError("compress_ratio must be greater than 1")
+    if values.topk <= 0:
+        raise ValueError("topk must be positive")
+    if values.compressed_base < 0:
+        raise ValueError("compressed_base must be non-negative")
+    if values.workspace_width <= 0:
+        raise ValueError("workspace_width must be positive")
+    max_gather_len = int(values.gather_lens.max().item()) if batch_size else 0
+    if values.workspace_width < values.compressed_base + max_gather_len:
+        raise ValueError("workspace_width does not cover generated workspace indices")
+
+
+def deepseek_v4_build_dense_prefill_local_compressed_indices_reference(
+    values: DeepSeekV4SparsePrefillIndexValues,
+    *,
+    width: int | None = None,
+) -> torch.Tensor:
+    """Return per-token local compressed-prefix indices for dense prefill."""
+
+    _validate_deepseek_v4_sparse_prefill_values(values)
+    width = (
+        values.compressed_base if width is None else _check_nonnegative("width", width)
+    )
+    positions = values.positions.to(torch.int64)
+    offsets = torch.arange(width, dtype=torch.int64, device=positions.device)
+    compressed_lens = torch.div(
+        positions + 1,
+        values.compress_ratio,
+        rounding_mode="floor",
+    ).clamp(0, width)
+    local = offsets[None, :].expand(positions.numel(), -1)
+    valid = offsets[None, :] < compressed_lens[:, None]
+    return torch.where(valid, local, torch.full_like(local, -1)).to(torch.int32)
+
+
+def deepseek_v4_combine_topk_swa_indices_reference(
+    values: DeepSeekV4SparsePrefillIndexValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return sparse-prefill candidate indices from top-k prefix plus SWA."""
+
+    _validate_deepseek_v4_sparse_prefill_values(values)
+    device = values.topk_indices.device
+    num_tokens = int(values.topk_indices.shape[0])
+    combined_topk = _align_up(
+        values.topk + values.window_size,
+        _DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
+    )
+    combined_indices = torch.full(
+        (num_tokens, combined_topk),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    combined_lens = torch.empty(num_tokens, dtype=torch.int32, device=device)
+
+    base = values.metadata.cu_seqlens_q_cpu[0]
+    topk_cpu = values.topk_indices.cpu()
+    for req, seq_len in enumerate(values.metadata.visible_kv_lens_cpu):
+        query_start = values.metadata.cu_seqlens_q_cpu[req] - base
+        query_end = values.metadata.cu_seqlens_q_cpu[req + 1] - base
+        query_len = query_end - query_start
+        start_pos = seq_len - query_len
+        gather_start = seq_len - int(values.gather_lens[req].item())
+        for token_idx in range(query_start, query_end):
+            token_offset = token_idx - query_start
+            pos = start_pos + token_offset
+            topk_len = min((pos + 1) // values.compress_ratio, values.topk)
+            swa_len = min(pos + 1, values.window_size)
+            if topk_len:
+                topk_values = topk_cpu[token_idx, :topk_len].to(device=device)
+                if (topk_values < 0).any() or (
+                    topk_values >= values.compressed_base
+                ).any():
+                    raise ValueError("topk_indices contain invalid compressed slots")
+                combined_indices[token_idx, :topk_len] = (
+                    topk_values + values.workspace_width * req
+                )
+            swa_values = (
+                values.workspace_width * req
+                + values.compressed_base
+                + torch.arange(swa_len, dtype=torch.int32, device=device)
+                + pos
+                - swa_len
+                + 1
+                - gather_start
+            )
+            combined_indices[token_idx, topk_len : topk_len + swa_len] = swa_values
+            combined_lens[token_idx] = topk_len + swa_len
+
+    return combined_indices, combined_lens
+
+
+def deepseek_v4_combine_dense_swa_indices_reference(
+    values: DeepSeekV4SparsePrefillIndexValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return sparse-prefill candidate indices from dense prefix plus SWA."""
+
+    _validate_deepseek_v4_sparse_prefill_values(values)
+    device = values.positions.device
+    num_tokens = int(values.positions.numel())
+    combined_topk = _align_up(
+        max(values.compressed_base + values.window_size, 1),
+        _DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
+    )
+    combined_indices = torch.full(
+        (num_tokens, combined_topk),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    combined_lens = torch.empty(num_tokens, dtype=torch.int32, device=device)
+
+    positions_cpu = values.positions.cpu().tolist()
+    reqs_cpu = values.token_to_req_indices.cpu().tolist()
+    seq_lens_cpu = values.seq_lens.cpu().tolist()
+    compressed_lens_cpu = values.compressed_lens.cpu().tolist()
+    gather_lens_cpu = values.gather_lens.cpu().tolist()
+    for token_idx, (pos, req) in enumerate(zip(positions_cpu, reqs_cpu, strict=True)):
+        if req < 0 or req >= len(seq_lens_cpu):
+            raise ValueError("token_to_req_indices contains an invalid request id")
+        seq_len = int(seq_lens_cpu[req])
+        gather_start = seq_len - int(gather_lens_cpu[req])
+        compressed_len = min(
+            (int(pos) + 1) // values.compress_ratio,
+            int(compressed_lens_cpu[req]),
+        )
+        swa_len = min(int(pos) + 1, values.window_size)
+        request_base = values.workspace_width * int(req)
+        if compressed_len:
+            combined_indices[token_idx, :compressed_len] = request_base + torch.arange(
+                compressed_len, dtype=torch.int32, device=device
+            )
+        swa_values = (
+            request_base
+            + values.compressed_base
+            + torch.arange(swa_len, dtype=torch.int32, device=device)
+            + int(pos)
+            - swa_len
+            + 1
+            - gather_start
+        )
+        combined_indices[token_idx, compressed_len : compressed_len + swa_len] = (
+            swa_values
+        )
+        combined_lens[token_idx] = compressed_len + swa_len
+
+    return combined_indices, combined_lens
 
 
 @dataclass

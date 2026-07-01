@@ -25,6 +25,8 @@ import torch
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    DeepSeekV4SparsePrefillIndexInputConfig,
+    DeepSeekV4SparsePrefillIndexInputs,
     KVCacheInput,
     KVCacheInputConfig,
     MHAInputConfig,
@@ -40,6 +42,9 @@ from tokenspeed_numerics_input_generators import (
     PageTableInput,
     PageTableInputConfig,
     attention_merge_state_reference,
+    deepseek_v4_build_dense_prefill_local_compressed_indices_reference,
+    deepseek_v4_combine_dense_swa_indices_reference,
+    deepseek_v4_combine_topk_swa_indices_reference,
     mla_kv_pack_quantize_fp8_reference,
 )
 
@@ -337,6 +342,174 @@ def test_mla_kv_pack_quantize_fp8_reference_rejects_mixed_input_dtypes() -> None
 
     with pytest.raises(ValueError, match="same dtype"):
         mla_kv_pack_quantize_fp8_reference(values)
+
+
+def test_deepseek_v4_sparse_prefill_indices_generate_values_and_refs() -> None:
+    values = DeepSeekV4SparsePrefillIndexInputs(
+        DeepSeekV4SparsePrefillIndexInputConfig(
+            batch_size=3,
+            total_cached_tokens=17,
+            total_new_q_tokens=9,
+            topk=4,
+            window_size=5,
+            compress_ratio=3,
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=3,
+                total_cached_tokens=17,
+                total_new_q_tokens=9,
+                cache_layout="dense",
+                cached_length_mode="regular",
+                new_q_length_mode="fixed_per_request",
+            ),
+        )
+    ).generate(seed=17, device="cpu")
+
+    assert values.topk_indices.shape == (9, 4)
+    assert values.positions.shape == (9,)
+    assert values.token_to_req_indices.shape == (9,)
+    assert values.seq_lens.shape == (3,)
+    assert values.gather_lens.shape == (3,)
+    assert values.compressed_lens.shape == (3,)
+    assert values.topk_indices.dtype == torch.int32
+    assert values.positions.dtype == torch.int32
+    assert values.workspace_width >= (
+        values.compressed_base + int(values.gather_lens.max().item())
+    )
+
+    local = deepseek_v4_build_dense_prefill_local_compressed_indices_reference(values)
+    topk_indices, topk_lens = deepseek_v4_combine_topk_swa_indices_reference(values)
+    dense_indices, dense_lens = deepseek_v4_combine_dense_swa_indices_reference(values)
+
+    assert local.shape == (9, values.compressed_base)
+    assert topk_indices.shape == (9, 128)
+    assert dense_indices.shape == (9, 128)
+    assert topk_lens.shape == (9,)
+    assert dense_lens.shape == (9,)
+    assert torch.all(topk_lens > 0)
+    assert torch.all(dense_lens > 0)
+    for token_idx, pos in enumerate(values.positions.tolist()):
+        req = int(values.token_to_req_indices[token_idx].item())
+        expected_topk_len = min((pos + 1) // values.compress_ratio, values.topk)
+        expected_swa_len = min(pos + 1, values.window_size)
+        expected_dense_len = min(
+            (pos + 1) // values.compress_ratio,
+            int(values.compressed_lens[req].item()),
+        )
+        assert int(topk_lens[token_idx].item()) == (
+            expected_topk_len + expected_swa_len
+        )
+        assert int(dense_lens[token_idx].item()) == (
+            expected_dense_len + expected_swa_len
+        )
+        topk_len = int(topk_lens[token_idx].item())
+        dense_len = int(dense_lens[token_idx].item())
+        assert torch.all(topk_indices[token_idx, topk_len:] == -1)
+        assert torch.all(dense_indices[token_idx, dense_len:] == -1)
+
+
+def test_deepseek_v4_sparse_prefill_index_inputs_keep_seeded_metadata_stable() -> None:
+    config = DeepSeekV4SparsePrefillIndexInputConfig(
+        batch_size=2,
+        total_cached_tokens=20,
+        total_new_q_tokens=8,
+        topk=3,
+        window_size=4,
+        compress_ratio=2,
+        topk_indexing="random",
+        metadata_input=MHARequestMetadataInputConfig(
+            batch_size=2,
+            total_cached_tokens=20,
+            total_new_q_tokens=8,
+            cache_layout="dense",
+            cached_length_mode="regular",
+            new_q_length_mode="fixed_per_request",
+        ),
+    )
+
+    first = DeepSeekV4SparsePrefillIndexInputs(config).generate(seed=23, device="cpu")
+    second = DeepSeekV4SparsePrefillIndexInputs(config).generate(seed=23, device="cpu")
+    third = DeepSeekV4SparsePrefillIndexInputs(config).generate(seed=24, device="cpu")
+
+    assert torch.equal(first.positions, second.positions)
+    assert torch.equal(first.token_to_req_indices, second.token_to_req_indices)
+    assert torch.equal(first.topk_indices, second.topk_indices)
+    assert not torch.equal(first.topk_indices, third.topk_indices)
+
+
+def test_deepseek_v4_sparse_prefill_index_inputs_support_identity_topk() -> None:
+    values = DeepSeekV4SparsePrefillIndexInputs(
+        DeepSeekV4SparsePrefillIndexInputConfig(
+            batch_size=1,
+            total_cached_tokens=12,
+            total_new_q_tokens=4,
+            topk=4,
+            window_size=3,
+            compress_ratio=2,
+            topk_indexing="identity",
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=1,
+                total_cached_tokens=12,
+                total_new_q_tokens=4,
+                cache_layout="dense",
+                new_q_length_mode="fixed_per_request",
+            ),
+        )
+    ).generate(seed=31, device="cpu")
+
+    for token_idx, pos in enumerate(values.positions.tolist()):
+        valid = min((pos + 1) // values.compress_ratio, values.topk)
+        assert torch.equal(
+            values.topk_indices[token_idx, :valid],
+            torch.arange(valid, dtype=torch.int32),
+        )
+
+
+def test_deepseek_v4_sparse_prefill_index_inputs_reject_invalid_configs() -> None:
+    with pytest.raises(ValueError, match="compress_ratio"):
+        DeepSeekV4SparsePrefillIndexInputs(
+            DeepSeekV4SparsePrefillIndexInputConfig(
+                batch_size=2,
+                total_cached_tokens=0,
+                total_new_q_tokens=4,
+                topk=2,
+                window_size=4,
+                compress_ratio=1,
+            )
+        )
+
+    with pytest.raises(ValueError, match="total_new_kv_tokens"):
+        DeepSeekV4SparsePrefillIndexInputs(
+            DeepSeekV4SparsePrefillIndexInputConfig(
+                batch_size=2,
+                total_cached_tokens=0,
+                total_new_q_tokens=4,
+                topk=2,
+                window_size=4,
+                compress_ratio=2,
+                metadata_input=MHARequestMetadataInputConfig(
+                    batch_size=2,
+                    total_cached_tokens=0,
+                    total_new_q_tokens=4,
+                    total_new_kv_tokens=3,
+                    tie_new_kv_to_query=False,
+                    allow_untied_non_cached_kv=True,
+                ),
+            )
+        )
+
+    with pytest.raises(ValueError, match="workspace_width"):
+        DeepSeekV4SparsePrefillIndexInputs(
+            DeepSeekV4SparsePrefillIndexInputConfig(
+                batch_size=1,
+                total_cached_tokens=8,
+                total_new_q_tokens=4,
+                topk=2,
+                window_size=4,
+                compress_ratio=2,
+                compressed_base=6,
+                workspace_width=7,
+            )
+        ).generate(seed=1, device="cpu")
 
 
 def test_page_table_input_generates_identity_and_random_indexing() -> None:

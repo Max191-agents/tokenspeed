@@ -31,6 +31,11 @@ from tokenspeed_kernel import (
     mla_prefill,
 )
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_build_dense_prefill_local_compressed_indices,
+    deepseek_v4_combine_dense_swa_indices,
+    deepseek_v4_combine_topk_swa_indices,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mla_decode_with_kvcache_kwargs,
@@ -42,6 +47,8 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    DeepSeekV4SparsePrefillIndexInputConfig,
+    DeepSeekV4SparsePrefillIndexInputs,
     MHAInputConfig,
     MHAInputs,
     MLAInputConfig,
@@ -50,6 +57,9 @@ from tokenspeed_numerics_input_generators import (
     MLAKVPackQuantizeFP8Inputs,
     MHARequestMetadataInputConfig,
     attention_merge_state_reference,
+    deepseek_v4_build_dense_prefill_local_compressed_indices_reference,
+    deepseek_v4_combine_dense_swa_indices_reference,
+    deepseek_v4_combine_topk_swa_indices_reference,
     mla_kv_pack_quantize_fp8_reference,
 )
 
@@ -346,6 +356,106 @@ def test_mla_kv_pack_quantize_fp8_generator_runs_tokenspeed_mla_kernel(
 
     assert torch.equal(actual_k.view(torch.uint8), expected_k.view(torch.uint8))
     assert torch.equal(actual_v.view(torch.uint8), expected_v.view(torch.uint8))
+
+
+def test_deepseek_v4_local_compressed_generator_runs_tokenspeed_cpu() -> None:
+    values = DeepSeekV4SparsePrefillIndexInputs(
+        DeepSeekV4SparsePrefillIndexInputConfig(
+            batch_size=3,
+            total_cached_tokens=18,
+            total_new_q_tokens=9,
+            topk=4,
+            window_size=8,
+            compress_ratio=3,
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=3,
+                total_cached_tokens=18,
+                total_new_q_tokens=9,
+                cache_layout="dense",
+                cached_length_mode="regular",
+                new_q_length_mode="fixed_per_request",
+            ),
+        )
+    ).generate(seed=207, device="cpu")
+    out = torch.empty(
+        values.positions.numel(),
+        values.compressed_base,
+        dtype=torch.int32,
+        device="cpu",
+    )
+
+    actual = deepseek_v4_build_dense_prefill_local_compressed_indices(
+        positions=values.positions,
+        compress_ratio=values.compress_ratio,
+        width=values.compressed_base,
+        out=out,
+    )
+    expected = deepseek_v4_build_dense_prefill_local_compressed_indices_reference(
+        values
+    )
+
+    assert torch.equal(actual, expected)
+
+
+def test_deepseek_v4_sparse_prefill_combine_generator_runs_tokenspeed_triton(
+    device: str,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/ROCm GPU is required for Triton sparse-prefill index tests")
+
+    values = DeepSeekV4SparsePrefillIndexInputs(
+        DeepSeekV4SparsePrefillIndexInputConfig(
+            batch_size=3,
+            total_cached_tokens=18,
+            total_new_q_tokens=9,
+            topk=4,
+            window_size=8,
+            compress_ratio=3,
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=3,
+                total_cached_tokens=18,
+                total_new_q_tokens=9,
+                cache_layout="dense",
+                cached_length_mode="regular",
+                new_q_length_mode="fixed_per_request",
+            ),
+        )
+    ).generate(seed=208, device=device)
+
+    expected_topk_indices, expected_topk_lens = (
+        deepseek_v4_combine_topk_swa_indices_reference(values)
+    )
+    actual_topk_indices, actual_topk_lens = deepseek_v4_combine_topk_swa_indices(
+        topk_indices=values.topk_indices,
+        query_start_loc=values.metadata.cu_seqlens_q,
+        seq_lens=values.seq_lens,
+        gather_lens=values.gather_lens,
+        window_size=values.window_size,
+        compress_ratio=values.compress_ratio,
+        topk=values.topk,
+        workspace_width=values.workspace_width,
+        compressed_base=values.compressed_base,
+    )
+    expected_dense_indices, expected_dense_lens = (
+        deepseek_v4_combine_dense_swa_indices_reference(values)
+    )
+    actual_dense_indices, actual_dense_lens = deepseek_v4_combine_dense_swa_indices(
+        positions=values.positions,
+        token_to_req_indices=values.token_to_req_indices,
+        seq_lens=values.seq_lens,
+        compressed_lens=values.compressed_lens,
+        gather_lens=values.gather_lens,
+        window_size=values.window_size,
+        compress_ratio=values.compress_ratio,
+        workspace_width=values.workspace_width,
+        compressed_base=values.compressed_base,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual_topk_indices, expected_topk_indices)
+    assert torch.equal(actual_topk_lens, expected_topk_lens)
+    assert torch.equal(actual_dense_indices, expected_dense_indices)
+    assert torch.equal(actual_dense_lens, expected_dense_lens)
 
 
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
