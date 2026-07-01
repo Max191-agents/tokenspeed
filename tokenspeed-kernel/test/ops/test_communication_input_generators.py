@@ -48,6 +48,8 @@ from tokenspeed_numerics_input_generators import (
     DPSamplingInputs,
     ExpertParallelRoutingInputConfig,
     ExpertParallelRoutingInputs,
+    MiniMaxAllReduceQKRMSNormInputConfig,
+    MiniMaxAllReduceQKRMSNormInputs,
     ReduceScatterInputConfig,
     ReduceScatterInputs,
     ReduceScatterResidualRMSNormInputConfig,
@@ -58,6 +60,7 @@ from tokenspeed_numerics_input_generators import (
     all_reduce_sum_reference,
     dp_sampling_reference,
     expert_parallel_routing_reference,
+    minimax_allreduce_qk_rmsnorm_reference,
     reduce_scatter_residual_rmsnorm_reference,
     reduce_scatter_sum_reference,
 )
@@ -419,6 +422,33 @@ def test_all_gather_dual_rmsnorm_generator_matches_trtllm_contract() -> None:
     assert refs.gathered_output.shape == (config.total_tokens, hidden_size)
     assert refs.q_norm_output.shape == (config.total_tokens, config.q_lora_rank)
     assert refs.kv_norm_output.shape == (config.total_tokens, config.kv_lora_rank)
+
+
+def test_minimax_allreduce_qk_rmsnorm_generator_matches_trtllm_contract() -> None:
+    config = MiniMaxAllReduceQKRMSNormInputConfig(
+        world_size=2,
+        num_tokens=4,
+        dtype=torch.bfloat16,
+        stride_padding=8,
+    )
+    values = MiniMaxAllReduceQKRMSNormInputs(config).generate(seed=105, device="cpu")
+    refs = minimax_allreduce_qk_rmsnorm_reference(values)
+
+    rank = 0
+    assert values.q_rank_inputs[rank].shape == (config.num_tokens, 3072)
+    assert values.k_rank_inputs[rank].shape == (config.num_tokens, 512)
+    assert values.q_rank_inputs[rank].dtype == config.dtype
+    assert values.k_rank_inputs[rank].dtype == config.dtype
+    assert values.q_weight.shape == (3072,)
+    assert values.k_weight.shape == (512,)
+    assert values.q_weight.dtype == torch.bfloat16
+    assert values.k_weight.dtype == torch.bfloat16
+    assert values.q_rank_inputs[rank].stride(1) == 1
+    assert values.k_rank_inputs[rank].stride(1) == 1
+    assert values.q_rank_inputs[rank].stride(0) % 8 == 0
+    assert values.k_rank_inputs[rank].stride(0) % 8 == 0
+    assert refs.q_norm_outputs[rank].shape == values.q_rank_inputs[rank].shape
+    assert refs.k_norm_outputs[rank].shape == values.k_rank_inputs[rank].shape
 
 
 def test_communication_generators_run_triton_collectives_world2() -> None:

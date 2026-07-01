@@ -7,8 +7,9 @@ communication operation defines how those inputs are combined and redistributed.
 
 This slice covers sum all-reduce, all-gather, sum reduce-scatter, fused sum
 all-reduce plus residual RMSNorm, fused reduce-scatter plus residual RMSNorm,
-fused all-gather plus dual RMSNorm, expert-parallel MoE dispatch/combine
-routing, and batch-DP sampling communication.
+fused all-gather plus dual RMSNorm, MiniMax Q/K all-reduce plus RMSNorm,
+expert-parallel MoE dispatch/combine routing, and batch-DP sampling
+communication.
 
 ## Operation Semantics
 
@@ -110,6 +111,27 @@ contracts where `total_tokens` alone determines each rank's output row count.
 The optional `add_in` tensor models fused add+residual modes without changing
 the core operation definition.
 
+### MiniMax Q/K All-Reduce + RMSNorm
+
+`MiniMaxAllReduceQKRMSNormInputs` represents the MiniMax M2 communication
+pattern where Q and K projection shards are all-reduced independently before
+RMSNorm:
+
+```text
+reduced_q = sum(q_input[peer] for peer in ranks)
+reduced_k = sum(k_input[peer] for peer in ranks)
+q_norm[rank] = rmsnorm(reduced_q, q_weight, eps)
+k_norm[rank] = rmsnorm(reduced_k, k_weight, eps)
+```
+
+The all-reduce result is shared by every rank, so the reference returns the
+same normalized Q/K tensors for each rank. TokenSpeed's MiniMax path is
+specialized for global Q width 6144 and global K width 1024, with those widths
+sharded evenly across `world_size` in `{2, 4, 8, 16}`. RMSNorm weights are bf16
+because that is the operation ABI for the fused path. The generator can also
+produce padded-row-stride Q/K views to exercise the API mode where Q and K are
+slices of larger projection storage.
+
 ### Expert-Parallel MoE Dispatch/Combine
 
 `ExpertParallelRoutingInputs` represents the routing semantics behind
@@ -155,6 +177,9 @@ The generators reject invalid collective descriptions before returning values:
 - fused all-gather dual RMSNorm requires Q/KV/RoPE widths to match every
   gathered row, rank-local shard sizes to match `tokens_per_rank`, and separate
   rank-1 Q/KV RMSNorm weights with matching lengths
+- MiniMax Q/K all-reduce RMSNorm requires supported world sizes, fixed global
+  Q/K widths, bf16 RMSNorm weights, and valid row strides for dense or padded
+  Q/K views
 - expert-parallel routing requires an even expert partition across ranks,
   unique in-range top-k ids per token, normalized top-k weights, and compatible
   hidden/expert-output shapes
@@ -169,9 +194,9 @@ top-k weights, and synthetic expert outputs come from `seed`.
 
 TokenSpeed provides backend-specific communication implementations for
 all-reduce, all-gather, reduce-scatter, fused all-reduce residual RMSNorm,
-fused reduce-scatter residual RMSNorm, fused all-gather dual RMSNorm, and
-DeepEP-based expert-parallel dispatch/combine. The generated values map to
-those APIs through a small rank-local adapter: each distributed worker
+fused reduce-scatter residual RMSNorm, fused all-gather dual RMSNorm, MiniMax
+Q/K all-reduce RMSNorm, and DeepEP-based expert-parallel dispatch/combine. The
+generated values map to those APIs through a small rank-local adapter: each distributed worker
 generates the same operation-level values, selects `rank_inputs[rank]` and any
 other rank-local tensors such as `residuals[rank]`, invokes the backend kernel,
 and compares against the reference result for that rank.
@@ -191,6 +216,11 @@ For fused all-gather dual RMSNorm, the adapter passes each rank's local QKV
 shard and the shared Q/KV RMSNorm weights. The reference compares the gathered
 output with normalized KV slice, the normalized Q output, and the normalized KV
 view.
+
+For MiniMax Q/K all-reduce RMSNorm, the adapter passes
+`q_rank_inputs[rank]`, `k_rank_inputs[rank]`, the shared Q/K RMSNorm weights,
+and `eps` to the fused MiniMax backend. The reference compares that rank's
+normalized Q and K outputs.
 
 For DeepEP-style consumers, `rank_hidden_states[rank]`, `topk_ids[rank]`, and
 `topk_weights[rank]` are the rank-local dispatch inputs. The reference

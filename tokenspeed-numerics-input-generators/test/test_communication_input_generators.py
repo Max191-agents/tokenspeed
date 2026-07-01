@@ -37,6 +37,8 @@ from tokenspeed_numerics_input_generators import (
     ExpertParallelRoutingInputConfig,
     ExpertParallelRoutingInputs,
     ExpertParallelRoutingInputValues,
+    MiniMaxAllReduceQKRMSNormInputConfig,
+    MiniMaxAllReduceQKRMSNormInputs,
     ReduceScatterInputConfig,
     ReduceScatterInputs,
     ReduceScatterResidualRMSNormInputConfig,
@@ -49,6 +51,7 @@ from tokenspeed_numerics_input_generators import (
     dp_sampling_reference,
     dp_sampling_swap_reference,
     expert_parallel_routing_reference,
+    minimax_allreduce_qk_rmsnorm_reference,
     reduce_scatter_residual_rmsnorm_reference,
     reduce_scatter_sum_reference,
 )
@@ -571,6 +574,72 @@ def test_all_gather_dual_rmsnorm_metadata_seed_controls_token_distribution() -> 
     assert not torch.equal(values1.q_weight, values2.q_weight)
 
 
+def test_minimax_allreduce_qk_rmsnorm_inputs_generate_values_and_reference() -> None:
+    values = MiniMaxAllReduceQKRMSNormInputs(
+        MiniMaxAllReduceQKRMSNormInputConfig(
+            world_size=2,
+            num_tokens=3,
+            dtype=torch.float32,
+            eps=1e-5,
+        )
+    ).generate(seed=171, device="cpu")
+
+    assert len(values.q_rank_inputs) == 2
+    assert len(values.k_rank_inputs) == 2
+    assert all(q.shape == (3, 3072) for q in values.q_rank_inputs)
+    assert all(k.shape == (3, 512) for k in values.k_rank_inputs)
+    assert values.q_weight.shape == (3072,)
+    assert values.k_weight.shape == (512,)
+    assert values.q_weight.dtype == torch.bfloat16
+    assert values.k_weight.dtype == torch.bfloat16
+
+    refs = minimax_allreduce_qk_rmsnorm_reference(values)
+    reduced_q = sum(values.q_rank_inputs)
+    reduced_k = sum(values.k_rank_inputs)
+    manual_q = reduced_q * torch.rsqrt(
+        reduced_q.pow(2).mean(dim=-1, keepdim=True) + values.eps
+    )
+    manual_q = manual_q * values.q_weight.float()
+    manual_k = reduced_k * torch.rsqrt(
+        reduced_k.pow(2).mean(dim=-1, keepdim=True) + values.eps
+    )
+    manual_k = manual_k * values.k_weight.float()
+
+    torch.testing.assert_close(refs.q_norm_outputs[0], manual_q)
+    torch.testing.assert_close(refs.q_norm_outputs[1], manual_q)
+    torch.testing.assert_close(refs.k_norm_outputs[0], manual_k)
+    torch.testing.assert_close(refs.k_norm_outputs[1], manual_k)
+
+
+def test_minimax_allreduce_qk_rmsnorm_generates_strided_views() -> None:
+    values = MiniMaxAllReduceQKRMSNormInputs(
+        MiniMaxAllReduceQKRMSNormInputConfig(
+            world_size=4,
+            num_tokens=2,
+            dtype=torch.bfloat16,
+            stride_padding=8,
+        )
+    ).generate(seed=172, device="cpu")
+
+    assert values.q_storage is not None
+    assert values.k_storage is not None
+    assert values.q_rank_inputs[0].shape == (2, 1536)
+    assert values.k_rank_inputs[0].shape == (2, 256)
+    assert values.q_storage[0].shape == (2, 1544)
+    assert values.k_storage[0].shape == (2, 264)
+    assert values.q_rank_inputs[0].stride() == (1544, 1)
+    assert values.k_rank_inputs[0].stride() == (264, 1)
+    assert not values.q_rank_inputs[0].is_contiguous()
+    assert not values.k_rank_inputs[0].is_contiguous()
+
+    refs = minimax_allreduce_qk_rmsnorm_reference(values)
+
+    assert refs.q_norm_outputs[0].shape == (2, 1536)
+    assert refs.k_norm_outputs[0].shape == (2, 256)
+    assert refs.q_norm_outputs[0].dtype == torch.bfloat16
+    assert refs.k_norm_outputs[0].dtype == torch.bfloat16
+
+
 def test_collective_metadata_seed_controls_token_distribution_only() -> None:
     generator = AllGatherInputs(
         AllGatherInputConfig(
@@ -845,3 +914,52 @@ def test_all_gather_dual_rmsnorm_reference_rejects_bad_weight_shape() -> None:
 
     with pytest.raises(ValueError, match="kv_weight"):
         all_gather_dual_rmsnorm_reference(values)
+
+
+def test_minimax_allreduce_qk_rmsnorm_rejects_invalid_config() -> None:
+    with pytest.raises(ValueError, match="world_size"):
+        MiniMaxAllReduceQKRMSNormInputs(
+            MiniMaxAllReduceQKRMSNormInputConfig(
+                world_size=3,
+                num_tokens=2,
+            )
+        )
+    with pytest.raises(ValueError, match="q_global_hidden_size"):
+        MiniMaxAllReduceQKRMSNormInputs(
+            MiniMaxAllReduceQKRMSNormInputConfig(
+                world_size=2,
+                num_tokens=2,
+                q_global_hidden_size=4096,
+            )
+        )
+    with pytest.raises(ValueError, match="weights"):
+        MiniMaxAllReduceQKRMSNormInputs(
+            MiniMaxAllReduceQKRMSNormInputConfig(
+                world_size=2,
+                num_tokens=2,
+                weight_dtype=torch.float32,
+            )
+        )
+    with pytest.raises(ValueError, match="row stride"):
+        MiniMaxAllReduceQKRMSNormInputs(
+            MiniMaxAllReduceQKRMSNormInputConfig(
+                world_size=2,
+                num_tokens=2,
+                dtype=torch.bfloat16,
+                stride_padding=1,
+            )
+        )
+
+
+def test_minimax_allreduce_qk_rmsnorm_reference_rejects_bad_weight_shape() -> None:
+    values = MiniMaxAllReduceQKRMSNormInputs(
+        MiniMaxAllReduceQKRMSNormInputConfig(
+            world_size=2,
+            num_tokens=2,
+            dtype=torch.float32,
+        )
+    ).generate(seed=173, device="cpu")
+    values.q_weight = values.q_weight[:-1]
+
+    with pytest.raises(ValueError, match="q_weight"):
+        minimax_allreduce_qk_rmsnorm_reference(values)

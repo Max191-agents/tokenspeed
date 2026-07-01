@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -57,6 +58,10 @@ __all__ = [
     "ExpertParallelRoutingInputs",
     "ExpertParallelRoutingInputValues",
     "ExpertParallelRoutingReferenceValues",
+    "MiniMaxAllReduceQKRMSNormInputConfig",
+    "MiniMaxAllReduceQKRMSNormInputs",
+    "MiniMaxAllReduceQKRMSNormInputValues",
+    "MiniMaxAllReduceQKRMSNormReferenceValues",
     "ReduceScatterInputConfig",
     "ReduceScatterInputs",
     "ReduceScatterInputValues",
@@ -72,6 +77,7 @@ __all__ = [
     "dp_sampling_reference",
     "dp_sampling_swap_reference",
     "expert_parallel_routing_reference",
+    "minimax_allreduce_qk_rmsnorm_reference",
     "reduce_scatter_residual_rmsnorm_reference",
     "reduce_scatter_sum_reference",
 ]
@@ -83,6 +89,10 @@ _REGULAR_FLOAT_DTYPES = {
     torch.float64,
 }
 _DP_SAMPLING_LOGITS_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
+_MINIMAX_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
+_MINIMAX_WORLD_SIZES = {2, 4, 8, 16}
+_MINIMAX_GLOBAL_Q_DIM = 6144
+_MINIMAX_GLOBAL_K_DIM = 1024
 _TOPK_ID_DTYPES = {torch.int32, torch.int64}
 
 
@@ -106,6 +116,22 @@ def _check_float_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
     if dtype not in _REGULAR_FLOAT_DTYPES:
         raise ValueError(f"{name} must be a regular floating torch dtype, got {dtype}")
     return dtype
+
+
+def _check_minimax_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+    if dtype not in _MINIMAX_DTYPES:
+        raise ValueError(
+            f"{name} must be one of {sorted(str(d) for d in _MINIMAX_DTYPES)}, "
+            f"got {dtype}"
+        )
+    return dtype
+
+
+def _check_nonnegative_finite_float(name: str, value: float) -> float:
+    value = float(value)
+    if value < 0.0 or not math.isfinite(value):
+        raise ValueError(f"{name} must be non-negative and finite, got {value}")
+    return value
 
 
 def _check_topk_id_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
@@ -190,6 +216,20 @@ def _even_tokens_per_rank(*, world_size: int, total_tokens: int) -> list[int]:
     for rank in range(world_size):
         tokens_per_rank.append(base + (1 if rank < remainder else 0))
     return tokens_per_rank
+
+
+def _check_minimax_world_size(world_size: int) -> int:
+    world_size = _check_positive("world_size", world_size)
+    if world_size not in _MINIMAX_WORLD_SIZES:
+        raise ValueError(
+            "MiniMax all-reduce QK RMSNorm supports world_size in "
+            f"{sorted(_MINIMAX_WORLD_SIZES)}, got {world_size}"
+        )
+    return world_size
+
+
+def _minimax_elems_per_access(dtype: torch.dtype) -> int:
+    return 4 if dtype == torch.float32 else 8
 
 
 def _generate_unique_topk_ids(
@@ -491,6 +531,33 @@ class AllGatherDualRMSNormReferenceValues:
 
 
 @dataclass
+class MiniMaxAllReduceQKRMSNormInputValues:
+    """Generated values for MiniMax fused Q/K all-reduce + RMSNorm.
+
+    ``q_rank_inputs`` and ``k_rank_inputs`` contain the rank-local Q and K
+    hidden shards. Every rank contributes tensors with the same token count and
+    local hidden width. The operation all-reduces Q and K independently, then
+    applies separate RMSNorm weights to the reduced Q and K rows.
+    """
+
+    q_rank_inputs: list[torch.Tensor]
+    k_rank_inputs: list[torch.Tensor]
+    q_weight: torch.Tensor
+    k_weight: torch.Tensor
+    eps: float
+    q_storage: list[torch.Tensor] | None = None
+    k_storage: list[torch.Tensor] | None = None
+
+
+@dataclass
+class MiniMaxAllReduceQKRMSNormReferenceValues:
+    """Reference outputs for ``MiniMaxAllReduceQKRMSNormInputs``."""
+
+    q_norm_outputs: list[torch.Tensor]
+    k_norm_outputs: list[torch.Tensor]
+
+
+@dataclass
 class AllReduceInputConfig:
     """Initialization parameters for sum all-reduce inputs.
 
@@ -703,6 +770,47 @@ class AllGatherDualRMSNormInputConfig:
 
     # Optional: KV-slice RMSNorm epsilon.
     eps_kv: float = 1e-6
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class MiniMaxAllReduceQKRMSNormInputConfig:
+    """Initialization parameters for MiniMax fused Q/K all-reduce + RMSNorm.
+
+    MiniMax M2 shards Q and K hidden dimensions across ranks. Each rank owns
+    local Q/K shards, the communication step all-reduces each shard across
+    ranks, and separate RMSNorms are applied to the reduced Q and K tensors.
+    TokenSpeed's MiniMax fused path supports global Q width 6144 and global K
+    width 1024, so this generator treats those as operation-family constraints.
+    """
+
+    # Required: number of ranks participating in the all-reduce.
+    world_size: int
+
+    # Required: number of token rows in each rank-local Q and K tensor.
+    num_tokens: int
+
+    # Optional: generated Q/K dtype. MiniMax supports fp16, bf16, and fp32.
+    dtype: torch.dtype = torch.bfloat16
+
+    # Optional: global Q hidden width. TokenSpeed's MiniMax path requires 6144.
+    q_global_hidden_size: int = _MINIMAX_GLOBAL_Q_DIM
+
+    # Optional: global K hidden width. TokenSpeed's MiniMax path requires 1024.
+    k_global_hidden_size: int = _MINIMAX_GLOBAL_K_DIM
+
+    # Optional: generated RMSNorm weight dtype. TokenSpeed requires bf16.
+    weight_dtype: torch.dtype = torch.bfloat16
+
+    # Optional: RMSNorm epsilon shared by Q and K.
+    eps: float = 1e-6
+
+    # Optional: extra columns in the backing storage for generated Q/K views.
+    # A non-zero value produces valid strided views that exercise the API mode
+    # where Q and K are slices of larger fused projection storage.
+    stride_padding: int = 0
 
     # Optional: generated tensor device override.
     device: DeviceLike = None
@@ -1218,6 +1326,136 @@ class AllGatherDualRMSNormInputs(NumericsInputGenerator):
         return values
 
 
+@dataclass(init=False)
+class MiniMaxAllReduceQKRMSNormInputs(NumericsInputGenerator):
+    """Generator for MiniMax fused Q/K all-reduce and RMSNorm inputs."""
+
+    config: MiniMaxAllReduceQKRMSNormInputConfig
+
+    def __init__(self, config: MiniMaxAllReduceQKRMSNormInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.world_size = _check_minimax_world_size(self.config.world_size)
+        self.config.num_tokens = _check_positive("num_tokens", self.config.num_tokens)
+        self.config.dtype = _check_minimax_dtype("dtype", self.config.dtype)
+        self.config.q_global_hidden_size = _check_positive(
+            "q_global_hidden_size", self.config.q_global_hidden_size
+        )
+        self.config.k_global_hidden_size = _check_positive(
+            "k_global_hidden_size", self.config.k_global_hidden_size
+        )
+        if self.config.q_global_hidden_size != _MINIMAX_GLOBAL_Q_DIM:
+            raise ValueError(
+                "MiniMax all-reduce QK RMSNorm requires "
+                f"q_global_hidden_size={_MINIMAX_GLOBAL_Q_DIM}, got "
+                f"{self.config.q_global_hidden_size}"
+            )
+        if self.config.k_global_hidden_size != _MINIMAX_GLOBAL_K_DIM:
+            raise ValueError(
+                "MiniMax all-reduce QK RMSNorm requires "
+                f"k_global_hidden_size={_MINIMAX_GLOBAL_K_DIM}, got "
+                f"{self.config.k_global_hidden_size}"
+            )
+        if self.config.q_global_hidden_size % self.config.world_size != 0:
+            raise ValueError("q_global_hidden_size must be divisible by world_size")
+        if self.config.k_global_hidden_size % self.config.world_size != 0:
+            raise ValueError("k_global_hidden_size must be divisible by world_size")
+        if self.config.weight_dtype != torch.bfloat16:
+            raise ValueError("MiniMax all-reduce QK RMSNorm weights must be bf16")
+        self.config.eps = _check_nonnegative_finite_float("eps", self.config.eps)
+        self.config.stride_padding = _check_nonnegative(
+            "stride_padding", self.config.stride_padding
+        )
+        elems_per_access = _minimax_elems_per_access(self.config.dtype)
+        for name, local_dim in (
+            ("q", self._q_local_hidden_size()),
+            ("k", self._k_local_hidden_size()),
+        ):
+            row_stride = local_dim + self.config.stride_padding
+            if row_stride % elems_per_access != 0:
+                raise ValueError(
+                    f"{name} row stride must be divisible by "
+                    f"elems_per_access={elems_per_access}; got {row_stride}"
+                )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> MiniMaxAllReduceQKRMSNormInputValues:
+        del metadata_seed
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        q_rank_inputs, q_storage = self._generate_rank_inputs(
+            local_hidden_size=self._q_local_hidden_size(),
+            seed_base=_child_seed(seed, 1),
+            device=target_device,
+        )
+        k_rank_inputs, k_storage = self._generate_rank_inputs(
+            local_hidden_size=self._k_local_hidden_size(),
+            seed_base=_child_seed(seed, 2),
+            device=target_device,
+        )
+        values = MiniMaxAllReduceQKRMSNormInputValues(
+            q_rank_inputs=q_rank_inputs,
+            k_rank_inputs=k_rank_inputs,
+            q_weight=_generate_tensor(
+                shape=(self._q_local_hidden_size(),),
+                dtype=self.config.weight_dtype,
+                seed=_child_seed(seed, 3),
+                device=target_device,
+                configured_device=self.config.device,
+            ),
+            k_weight=_generate_tensor(
+                shape=(self._k_local_hidden_size(),),
+                dtype=self.config.weight_dtype,
+                seed=_child_seed(seed, 4),
+                device=target_device,
+                configured_device=self.config.device,
+            ),
+            eps=self.config.eps,
+            q_storage=q_storage,
+            k_storage=k_storage,
+        )
+        _validate_minimax_allreduce_qk_rmsnorm_values(values)
+        return values
+
+    def _q_local_hidden_size(self) -> int:
+        return self.config.q_global_hidden_size // self.config.world_size
+
+    def _k_local_hidden_size(self) -> int:
+        return self.config.k_global_hidden_size // self.config.world_size
+
+    def _generate_rank_inputs(
+        self,
+        *,
+        local_hidden_size: int,
+        seed_base: int,
+        device: torch.device,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor] | None]:
+        qk_inputs: list[torch.Tensor] = []
+        storage_values: list[torch.Tensor] = []
+        storage_width = local_hidden_size + self.config.stride_padding
+        for rank in range(self.config.world_size):
+            storage = _generate_tensor(
+                shape=(self.config.num_tokens, storage_width),
+                dtype=self.config.dtype,
+                seed=_child_seed(seed_base, rank + 1),
+                device=device,
+                configured_device=self.config.device,
+            )
+            if self.config.stride_padding:
+                storage_values.append(storage)
+                qk_inputs.append(storage[:, :local_hidden_size])
+            else:
+                qk_inputs.append(storage)
+        return qk_inputs, storage_values or None
+
+
 @dataclass
 class AllGatherInputValues:
     """Generated per-rank inputs for an all-gather collective."""
@@ -1673,6 +1911,119 @@ def all_gather_dual_rmsnorm_reference(
         gathered_output=gathered_output.contiguous(),
         q_norm_output=q_norm,
         kv_norm_output=kv_norm,
+    )
+
+
+def _validate_minimax_allreduce_qk_rmsnorm_values(
+    values: MiniMaxAllReduceQKRMSNormInputValues,
+) -> tuple[int, int, int, torch.device]:
+    world_size = len(values.q_rank_inputs)
+    if world_size == 0:
+        raise ValueError("q_rank_inputs must be non-empty")
+    if world_size not in _MINIMAX_WORLD_SIZES:
+        raise ValueError(
+            "MiniMax all-reduce QK RMSNorm supports world sizes "
+            f"{sorted(_MINIMAX_WORLD_SIZES)}, got {world_size}"
+        )
+    if len(values.k_rank_inputs) != world_size:
+        raise ValueError("k_rank_inputs must match q_rank_inputs")
+    if values.q_storage is not None and len(values.q_storage) != world_size:
+        raise ValueError("q_storage must match q_rank_inputs when provided")
+    if values.k_storage is not None and len(values.k_storage) != world_size:
+        raise ValueError("k_storage must match k_rank_inputs when provided")
+    if values.eps < 0.0 or not math.isfinite(values.eps):
+        raise ValueError(f"eps must be non-negative and finite, got {values.eps}")
+
+    first_q = values.q_rank_inputs[0]
+    first_k = values.k_rank_inputs[0]
+    if first_q.ndim != 2:
+        raise ValueError("q_rank_inputs must be rank-2")
+    if first_k.ndim != 2:
+        raise ValueError("k_rank_inputs must be rank-2")
+    if first_q.shape[0] != first_k.shape[0]:
+        raise ValueError("Q and K inputs must have the same token count")
+    dtype = _check_minimax_dtype("q/k dtype", first_q.dtype)
+    if first_k.dtype != dtype:
+        raise ValueError("Q and K inputs must share dtype")
+    device = first_q.device
+    num_tokens = int(first_q.shape[0])
+    q_local = int(first_q.shape[1])
+    k_local = int(first_k.shape[1])
+    if num_tokens <= 0:
+        raise ValueError("MiniMax all-reduce QK RMSNorm requires positive tokens")
+    if q_local * world_size != _MINIMAX_GLOBAL_Q_DIM:
+        raise ValueError(
+            "MiniMax all-reduce QK RMSNorm requires global Q hidden size "
+            f"{_MINIMAX_GLOBAL_Q_DIM}, got local={q_local}, world_size={world_size}"
+        )
+    if k_local * world_size != _MINIMAX_GLOBAL_K_DIM:
+        raise ValueError(
+            "MiniMax all-reduce QK RMSNorm requires global K hidden size "
+            f"{_MINIMAX_GLOBAL_K_DIM}, got local={k_local}, world_size={world_size}"
+        )
+    if q_local < k_local:
+        raise ValueError("Q local hidden size must be >= K local hidden size")
+    elems_per_access = _minimax_elems_per_access(dtype)
+    for name, tensors, expected_shape in (
+        ("q_rank_inputs", values.q_rank_inputs, first_q.shape),
+        ("k_rank_inputs", values.k_rank_inputs, first_k.shape),
+    ):
+        for rank, tensor in enumerate(tensors):
+            if tensor.shape != expected_shape:
+                raise ValueError(f"{name}[{rank}] shape must match rank 0")
+            if tensor.dtype != dtype:
+                raise ValueError(f"{name}[{rank}] dtype must match rank 0")
+            if tensor.device != device:
+                raise ValueError(f"{name}[{rank}] must share device with rank 0")
+            if tensor.stride(1) != 1:
+                raise ValueError(f"{name}[{rank}] inner stride must be 1")
+            if tensor.stride(0) % elems_per_access != 0:
+                raise ValueError(
+                    f"{name}[{rank}] row stride must be divisible by "
+                    f"elems_per_access={elems_per_access}"
+                )
+    if values.q_weight.shape != (q_local,):
+        raise ValueError(
+            f"q_weight must have shape {(q_local,)}, got {tuple(values.q_weight.shape)}"
+        )
+    if values.k_weight.shape != (k_local,):
+        raise ValueError(
+            f"k_weight must have shape {(k_local,)}, got {tuple(values.k_weight.shape)}"
+        )
+    if values.q_weight.dtype != torch.bfloat16:
+        raise ValueError("q_weight must be bf16")
+    if values.k_weight.dtype != torch.bfloat16:
+        raise ValueError("k_weight must be bf16")
+    if values.q_weight.device != device or values.k_weight.device != device:
+        raise ValueError("MiniMax RMSNorm weights must share the input device")
+    return world_size, q_local, k_local, device
+
+
+def minimax_allreduce_qk_rmsnorm_reference(
+    values: MiniMaxAllReduceQKRMSNormInputValues,
+) -> MiniMaxAllReduceQKRMSNormReferenceValues:
+    """Return semantic MiniMax fused Q/K all-reduce + RMSNorm outputs."""
+
+    world_size, _q_local, _k_local, _device = (
+        _validate_minimax_allreduce_qk_rmsnorm_values(values)
+    )
+    reduced_q = _sum_rank_inputs_for_rmsnorm(values.q_rank_inputs)
+    reduced_k = _sum_rank_inputs_for_rmsnorm(values.k_rank_inputs)
+    q_norm = _rmsnorm_rows(
+        reduced_q,
+        values.q_weight,
+        values.eps,
+        output_dtype=values.q_rank_inputs[0].dtype,
+    )
+    k_norm = _rmsnorm_rows(
+        reduced_k,
+        values.k_weight,
+        values.eps,
+        output_dtype=values.k_rank_inputs[0].dtype,
+    )
+    return MiniMaxAllReduceQKRMSNormReferenceValues(
+        q_norm_outputs=[q_norm.clone() for _ in range(world_size)],
+        k_norm_outputs=[k_norm.clone() for _ in range(world_size)],
     )
 
 

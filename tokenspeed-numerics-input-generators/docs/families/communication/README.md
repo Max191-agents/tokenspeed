@@ -19,6 +19,9 @@ rather than any specific communication library API.
 - `ReduceScatterResidualRMSNormInputs`: generates full rank contributions,
   near-even scatter shard metadata, residuals, optional add inputs, and
   references for reduce-scatter plus residual RMSNorm.
+- `MiniMaxAllReduceQKRMSNormInputs`: generates rank-local MiniMax Q/K shards,
+  bf16 RMSNorm weights, optional padded-stride views, and references for fused
+  Q/K all-reduce plus RMSNorm.
 - `ExpertParallelRoutingInputs`: generates routing assignments and token tensors
   for expert-parallel dispatch/combination tests.
 - `DPSamplingInputs`: generates the batch-DP sampling communication layout used
@@ -67,4 +70,5 @@ without duplicating generic collective validity checks.
 The generator verifies shapes, divisibility, rank bounds, and routing metadata
 so generated communication inputs are meaningful before a backend adapter sees
 them. Fused normalization generators additionally verify local shard shapes,
-rank-1 RMSNorm weights, and the slice widths used by dual-RMSNorm layouts.
+rank-1 RMSNorm weights, MiniMax Q/K shard constraints, and the slice widths
+used by dual-RMSNorm layouts.
