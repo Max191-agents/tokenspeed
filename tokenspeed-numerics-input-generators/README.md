@@ -98,6 +98,14 @@ metadata, scale tensors, or cache/page structures. Returned values should be
 ready for reference implementations or kernel adapters without each consumer
 repeating generic validity checks.
 
+The practical bar is that a valid generator call should either fail before
+returning or return internally consistent, operation-valid inputs. It should not
+return partially valid values with hidden assumptions that a downstream test has
+to know how to repair. This lets tests, references, and kernel adapters treat
+the input generator library as the shared source of truth for input validity:
+when they use a public generator API, they can focus on numerical agreement and
+implementation adaptation instead of rechecking generic operation invariants.
+
 Checks should be placed where the invariant is owned:
 
 - A config should validate static operation constraints, such as required
