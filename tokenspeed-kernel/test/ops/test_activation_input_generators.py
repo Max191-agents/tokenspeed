@@ -26,6 +26,15 @@ from tokenspeed_kernel.ops.activation.cuda import (
     silu_and_mul_fuse_block_quant,
     silu_and_mul_fuse_nvfp4_quant,
 )
+from tokenspeed_kernel.ops.activation.flashinfer import (
+    gelu_and_mul as flashinfer_gelu_and_mul,
+)
+from tokenspeed_kernel.ops.activation.flashinfer import (
+    gelu_tanh_and_mul as flashinfer_gelu_tanh_and_mul,
+)
+from tokenspeed_kernel.ops.activation.flashinfer import (
+    silu_and_mul as flashinfer_silu_and_mul,
+)
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     fused_swiglu_fp8_ue8m0,
@@ -110,6 +119,42 @@ def test_silu_and_mul_generator_runs_kernel(device: str) -> None:
     out = silu_and_mul(values.x)
     ref = gated_activation_reference(values.x, activation="silu")
 
+    torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(
+    not platform.is_nvidia,
+    reason="FlashInfer gated activation kernels require NVIDIA CUDA.",
+)
+@pytest.mark.parametrize(
+    "activation,kernel",
+    [
+        ("silu", flashinfer_silu_and_mul),
+        ("gelu", flashinfer_gelu_and_mul),
+        ("gelu_tanh", flashinfer_gelu_tanh_and_mul),
+    ],
+)
+def test_gated_activation_generator_runs_flashinfer_kernel(
+    device: str,
+    activation: str,
+    kernel,
+) -> None:
+    values = GatedActivationInputs(
+        GatedActivationInputConfig(
+            num_tokens=11,
+            hidden_dim=1024,
+            dtype=torch.bfloat16,
+            activation=activation,  # type: ignore[arg-type]
+        )
+    ).generate(seed=111, device=device)
+
+    try:
+        out = kernel(values.x)
+    except RuntimeError as exc:
+        pytest.skip(f"FlashInfer gated activation kernel unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    ref = gated_activation_reference(values.x, activation=activation)
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
 
 

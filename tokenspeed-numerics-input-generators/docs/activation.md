@@ -140,6 +140,9 @@ the registry numerics harness:
 - `sigmoid_mul(x, gate)` consumes `SigmoidMulInputValues.x` and `.gate`
 - `silu_and_mul(x)` consumes `GatedActivationInputValues.x` with
   `activation="silu"`
+- FlashInfer `silu_and_mul(x)`, `gelu_and_mul(x)`, and
+  `gelu_tanh_and_mul(x)` consume `GatedActivationInputValues.x` with the
+  corresponding split-gated activation configuration
 - `fused_gate_sigmoid_mul_add(...)` consumes the four tensors from
   `FusedGateSigmoidMulAddInputValues`
 - `fused_swiglu_fp8_ue8m0(gate_up, swiglu_limit)` consumes
