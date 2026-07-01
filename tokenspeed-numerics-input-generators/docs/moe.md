@@ -66,6 +66,26 @@ selected top-k set. That gives consumers coverage for both ordinary expert
 selection and zero-expert masking without making the generator depend on any
 particular fused routing kernel.
 
+`MoEBiasedGroupedTopKInputs` generates inputs for sigmoid/correction-bias MoE
+routing with optional expert-group filtering. The operation is:
+
+1. `scores = sigmoid(gating_output)`.
+2. `selection_scores = scores + correction_bias`.
+3. Partition experts into `num_expert_groups` equal-size groups.
+4. Score each group by summing the top two `selection_scores` in that group.
+5. Select `top_k_groups` groups and mask experts outside those groups.
+6. Select `top_k` experts from the remaining `selection_scores`.
+7. Gather route weights from the original sigmoid `scores`.
+8. If `renormalize` is enabled, normalize selected weights by their selected
+   sum and multiply by `routed_scaling_factor`.
+9. Optionally map logical expert ids through a generated physical-id
+   permutation and optionally mark padded token rows with output ids `-1`.
+
+The generated `hidden_states` tensor represents the token rows associated with
+the router logits. Its values do not affect the grouped top-k computation, but
+it keeps the generated values aligned with implementation APIs that route a
+hidden-state batch.
+
 ## References
 
 `moe_reference` implements the routed layer computation for generated MoE
@@ -93,6 +113,10 @@ from parallel implementations.
 selection, optional selected-weight renormalization, scaling, and padded-expert
 masking semantics described above. Ties are resolved by selecting the smaller
 expert id first so reference output is deterministic.
+
+`moe_biased_grouped_topk_reference` implements sigmoid scoring, grouped
+candidate filtering, top-k expert selection, optional renormalization/scaling,
+logical-to-physical expert id mapping, and padded-token output id masking.
 
 ## TokenSpeed API Mapping
 
@@ -132,6 +156,15 @@ helper arguments. The generator keeps the routing operation independent of that
 helper's supported expert counts and extension-loading details; those remain
 adapter/test concerns.
 
+The Triton `minimax_biased_grouped_topk` helper maps directly to
+`MoEBiasedGroupedTopKInputs`: generated `hidden_states`, `gating_output`,
+`correction_bias`, `top_k`, `renormalize`, `num_expert_groups`,
+`top_k_groups`, `routed_scaling_factor`, optional
+`num_token_non_padded`, and optional `logical_to_physical_map` become the
+helper arguments. The generator describes the grouped routing operation; the
+wrapper's fast-path restrictions, such as specific `top_k` and group settings,
+remain implementation-specific details.
+
 ## Verification
 
 MoE configs verify token counts, hidden/intermediate widths, expert counts,
@@ -150,3 +183,9 @@ tensors with matching expert width, output buffers are rank-2 with matching
 token/top-k shape, output indices use `torch.int32` or `torch.int64`, output
 weights use FP32, `num_experts_real` identifies a proper prefix of real experts,
 and `scaling_factor` is positive and finite.
+
+Biased grouped top-k routing verifies finite floating hidden/router tensors,
+finite FP32 correction bias, matching token/expert dimensions, equal-size expert
+groups with at least two experts per group, selected-group capacity sufficient
+for `top_k`, positive finite routed scaling, permutation validity for optional
+logical-to-physical maps, and in-range scalar padding cutoffs.

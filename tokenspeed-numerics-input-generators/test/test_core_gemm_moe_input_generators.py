@@ -30,6 +30,9 @@ from tokenspeed_numerics_input_generators import (
     MoeAlignBlockSizeInputConfig,
     MoeAlignBlockSizeInputs,
     MoeAlignBlockSizeInputValues,
+    MoEBiasedGroupedTopKInputConfig,
+    MoEBiasedGroupedTopKInputs,
+    MoEBiasedGroupedTopKInputValues,
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
@@ -44,6 +47,7 @@ from tokenspeed_numerics_input_generators import (
     gemm_scale_shape,
     moe_align_block_size_buffer_dims,
     moe_align_block_size_reference,
+    moe_biased_grouped_topk_reference,
     moe_reference,
     moe_softmax_topk_routing_reference,
     mxfp4_gemm_input_config,
@@ -1218,6 +1222,128 @@ def test_moe_softmax_topk_routing_verifies_config_and_values() -> None:
     )
     with pytest.raises(ValueError, match="one value per expert"):
         moe_softmax_topk_routing_reference(values)
+
+
+def test_moe_biased_grouped_topk_inputs_generate_values_and_reference() -> None:
+    values = MoEBiasedGroupedTopKInputs(
+        MoEBiasedGroupedTopKInputConfig(
+            num_tokens=4,
+            hidden_size=6,
+            num_experts=8,
+            top_k=3,
+            num_expert_groups=2,
+            top_k_groups=1,
+            renormalize=True,
+            routed_scaling_factor=2.5,
+            use_logical_to_physical_map=True,
+            num_token_non_padded=3,
+        )
+    ).generate(seed=52, device="cpu")
+
+    ref = moe_biased_grouped_topk_reference(values)
+
+    assert values.hidden_states.shape == (4, 6)
+    assert values.gating_output.shape == (4, 8)
+    assert values.correction_bias.shape == (8,)
+    assert values.logical_to_physical_map is not None
+    torch.testing.assert_close(
+        values.logical_to_physical_map.sort().values,
+        torch.arange(8, dtype=torch.int32),
+    )
+    assert values.num_token_non_padded is not None
+    assert int(values.num_token_non_padded.item()) == 3
+    assert ref.topk_weights.shape == (4, 3)
+    assert ref.topk_ids.shape == (4, 3)
+    assert ref.topk_ids.dtype == torch.int32
+    assert torch.all(ref.topk_ids[:3] >= 0)
+    assert torch.all(ref.topk_ids[:3] < 8)
+    assert torch.all(ref.topk_ids[3] == -1)
+    torch.testing.assert_close(
+        ref.topk_weights[:3].sum(dim=-1),
+        torch.full((3,), 2.5),
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    )
+
+
+def test_moe_biased_grouped_topk_reference_matches_manual_group_filter() -> None:
+    values = MoEBiasedGroupedTopKInputValues(
+        hidden_states=torch.zeros((1, 4), dtype=torch.float32),
+        gating_output=torch.tensor(
+            [[0.0, 1.0, 3.0, -1.0, 2.0, -2.0]],
+            dtype=torch.float32,
+        ),
+        correction_bias=torch.tensor(
+            [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            dtype=torch.float32,
+        ),
+        top_k=3,
+        renormalize=False,
+        num_expert_groups=3,
+        top_k_groups=2,
+        routed_scaling_factor=1.0,
+        logical_to_physical_map=None,
+        num_token_non_padded=None,
+    )
+
+    ref = moe_biased_grouped_topk_reference(values)
+    scores = values.gating_output.sigmoid()
+    selection_scores = scores + values.correction_bias.reshape(1, -1)
+    group_scores = selection_scores.reshape(1, 3, 2).topk(2, dim=-1).values.sum(dim=-1)
+    selected_groups = torch.topk(group_scores, k=2, dim=-1, sorted=False).indices
+    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+    group_mask.scatter_(1, selected_groups, True)
+    expert_mask = group_mask.unsqueeze(-1).expand(1, 3, 2).reshape(1, 6)
+    expected_ids = torch.topk(
+        selection_scores.masked_fill(~expert_mask, float("-inf")),
+        k=3,
+        dim=-1,
+        sorted=False,
+    ).indices.to(torch.int32)
+    expected_weights = scores.gather(1, expected_ids.to(torch.long)).to(torch.float32)
+
+    torch.testing.assert_close(ref.topk_ids, expected_ids)
+    torch.testing.assert_close(ref.topk_weights, expected_weights)
+
+
+def test_moe_biased_grouped_topk_verifies_config_and_values() -> None:
+    with pytest.raises(ValueError, match="divisible by num_expert_groups"):
+        MoEBiasedGroupedTopKInputs(
+            MoEBiasedGroupedTopKInputConfig(
+                num_tokens=3,
+                hidden_size=4,
+                num_experts=7,
+                top_k=2,
+                num_expert_groups=2,
+            )
+        )
+
+    with pytest.raises(ValueError, match="selected groups"):
+        MoEBiasedGroupedTopKInputs(
+            MoEBiasedGroupedTopKInputConfig(
+                num_tokens=3,
+                hidden_size=4,
+                num_experts=8,
+                top_k=5,
+                num_expert_groups=2,
+                top_k_groups=1,
+            )
+        )
+
+    values = MoEBiasedGroupedTopKInputs(
+        MoEBiasedGroupedTopKInputConfig(
+            num_tokens=2,
+            hidden_size=4,
+            num_experts=4,
+            top_k=2,
+            use_logical_to_physical_map=True,
+        )
+    ).generate(seed=53, device="cpu")
+    assert values.logical_to_physical_map is not None
+    values.logical_to_physical_map[0] = values.logical_to_physical_map[1]
+
+    with pytest.raises(ValueError, match="must be a permutation"):
+        moe_biased_grouped_topk_reference(values)
 
 
 def test_moe_align_block_size_inputs_generate_topk_ids() -> None:

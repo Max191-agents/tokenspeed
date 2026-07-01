@@ -31,6 +31,8 @@ from tokenspeed_kernel.registry import load_builtin_kernels
 from tokenspeed_numerics_input_generators import (
     CustomDType,
     MoeAlignBlockSizeInputValues,
+    MoEBiasedGroupedTopKInputConfig,
+    MoEBiasedGroupedTopKInputs,
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
@@ -38,6 +40,7 @@ from tokenspeed_numerics_input_generators import (
     MoESoftmaxTopKRoutingInputs,
     canonicalize_moe_align_block_size,
     moe_align_block_size_reference,
+    moe_biased_grouped_topk_reference,
     moe_reference,
     moe_softmax_topk_routing_reference,
 )
@@ -186,6 +189,42 @@ def test_moe_softmax_topk_routing_generator_runs_cuda_helper() -> None:
         rtol=1.0e-3,
         atol=8.0e-2,
     )
+
+
+def test_moe_biased_grouped_topk_generator_matches_triton_fallback() -> None:
+    from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
+
+    values = MoEBiasedGroupedTopKInputs(
+        MoEBiasedGroupedTopKInputConfig(
+            num_tokens=5,
+            hidden_size=8,
+            num_experts=8,
+            top_k=3,
+            num_expert_groups=2,
+            top_k_groups=1,
+            renormalize=True,
+            routed_scaling_factor=2.0,
+            use_logical_to_physical_map=True,
+            num_token_non_padded=4,
+        )
+    ).generate(seed=46, device="cpu")
+    expected = moe_biased_grouped_topk_reference(values)
+
+    actual_weights, actual_ids = minimax_biased_grouped_topk(
+        values.hidden_states,
+        values.gating_output,
+        values.correction_bias,
+        topk=values.top_k,
+        renormalize=values.renormalize,
+        num_expert_group=values.num_expert_groups,
+        topk_group=values.top_k_groups,
+        routed_scaling_factor=values.routed_scaling_factor,
+        num_token_non_padded=values.num_token_non_padded,
+        logical_to_physical_map=values.logical_to_physical_map,
+    )
+
+    torch.testing.assert_close(actual_ids, expected.topk_ids)
+    torch.testing.assert_close(actual_weights, expected.topk_weights)
 
 
 def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None:

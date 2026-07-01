@@ -54,12 +54,17 @@ __all__ = [
     "MoESoftmaxTopKRoutingInputs",
     "MoESoftmaxTopKRoutingInputValues",
     "MoESoftmaxTopKRoutingReferenceValues",
+    "MoEBiasedGroupedTopKInputConfig",
+    "MoEBiasedGroupedTopKInputs",
+    "MoEBiasedGroupedTopKInputValues",
+    "MoEBiasedGroupedTopKReferenceValues",
     "MoeInputConfig",
     "MoeInputValues",
     "MoeInputs",
     "canonicalize_moe_align_block_size",
     "moe_align_block_size_buffer_dims",
     "moe_align_block_size_reference",
+    "moe_biased_grouped_topk_reference",
     "moe_reference",
     "moe_softmax_topk_routing_reference",
 ]
@@ -140,6 +145,30 @@ class MoESoftmaxTopKRoutingReferenceValues:
 
 
 @dataclass
+class MoEBiasedGroupedTopKInputValues:
+    """Generated values for sigmoid/bias grouped top-k MoE routing."""
+
+    hidden_states: torch.Tensor
+    gating_output: torch.Tensor
+    correction_bias: torch.Tensor
+    top_k: int
+    renormalize: bool
+    num_expert_groups: int
+    top_k_groups: int
+    routed_scaling_factor: float
+    logical_to_physical_map: torch.Tensor | None
+    num_token_non_padded: torch.Tensor | None
+
+
+@dataclass
+class MoEBiasedGroupedTopKReferenceValues:
+    """Reference outputs for sigmoid/bias grouped top-k MoE routing."""
+
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+
+
+@dataclass
 class MoeAlignBlockSizeInputConfig:
     """Initialization parameters for ``MoeAlignBlockSizeInputs``.
 
@@ -210,6 +239,56 @@ class MoESoftmaxTopKRoutingInputConfig:
 
     # Optional: bias at least one padded expert into the selected top-k set.
     include_zero_expert_selection: bool = True
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class MoEBiasedGroupedTopKInputConfig:
+    """Initialization parameters for sigmoid/bias grouped top-k MoE routing.
+
+    The represented operation computes sigmoid router scores, selects candidate
+    expert groups using correction-biased scores, then selects top-k experts
+    from those groups. Output weights come from the original sigmoid scores.
+    """
+
+    # Required: number of token rows to route.
+    num_tokens: int
+
+    # Required: hidden-state width associated with the routed token rows.
+    hidden_size: int
+
+    # Required: total number of routed experts.
+    num_experts: int
+
+    # Required: number of selected experts per token.
+    top_k: int
+
+    # Optional: number of equal-size expert groups used for candidate filtering.
+    num_expert_groups: int = 1
+
+    # Optional: number of expert groups selected before expert-level top-k.
+    top_k_groups: int = 1
+
+    # Optional: generated hidden-state dtype. Hidden values identify token rows
+    # for implementation APIs but do not affect the routing scores.
+    hidden_dtype: torch.dtype = torch.float32
+
+    # Optional: generated router-logit dtype.
+    router_dtype: torch.dtype = torch.float32
+
+    # Optional: renormalize selected sigmoid weights before applying the scale.
+    renormalize: bool = False
+
+    # Optional: positive scale applied only when ``renormalize`` is enabled.
+    routed_scaling_factor: float = 1.0
+
+    # Optional: generate a logical-to-physical expert id permutation.
+    use_logical_to_physical_map: bool = False
+
+    # Optional: if set, rows at or after this token count get output ids ``-1``.
+    num_token_non_padded: int | None = None
 
     # Optional: generated tensor device override.
     device: DeviceLike = None
@@ -361,6 +440,142 @@ class MoESoftmaxTopKRoutingInputs(NumericsInputGenerator):
         return candidates[: self.config.top_k]
 
 
+@dataclass(init=False)
+class MoEBiasedGroupedTopKInputs(NumericsInputGenerator):
+    """Input generator for sigmoid/bias grouped top-k MoE routing."""
+
+    config: MoEBiasedGroupedTopKInputConfig
+    hidden_states_input: TensorInput | None
+    gating_output_input: TensorInput | None
+
+    def __init__(self, config: MoEBiasedGroupedTopKInputConfig) -> None:
+        self.config = config
+        self.hidden_states_input = None
+        self.gating_output_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.hidden_size = int(self.config.hidden_size)
+        self.config.num_experts = int(self.config.num_experts)
+        self.config.top_k = int(self.config.top_k)
+        self.config.num_expert_groups = int(self.config.num_expert_groups)
+        self.config.top_k_groups = int(self.config.top_k_groups)
+        if self.config.hidden_size <= 0:
+            raise ValueError("hidden_size must be positive")
+        if self.config.num_experts <= 0:
+            raise ValueError("num_experts must be positive")
+        if self.config.top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if self.config.num_expert_groups <= 0:
+            raise ValueError("num_expert_groups must be positive")
+        if self.config.num_experts % self.config.num_expert_groups != 0:
+            raise ValueError("num_experts must be divisible by num_expert_groups")
+        experts_per_group = self.config.num_experts // self.config.num_expert_groups
+        if experts_per_group < 2:
+            raise ValueError("each expert group must contain at least two experts")
+        if self.config.top_k_groups <= 0:
+            raise ValueError("top_k_groups must be positive")
+        if self.config.top_k_groups > self.config.num_expert_groups:
+            raise ValueError("top_k_groups must be <= num_expert_groups")
+        if self.config.top_k > self.config.top_k_groups * experts_per_group:
+            raise ValueError("top_k must fit within the experts in the selected groups")
+        self.config.hidden_dtype = _check_moe_float_dtype(
+            "hidden_dtype", self.config.hidden_dtype
+        )
+        self.config.router_dtype = _check_moe_float_dtype(
+            "router_dtype", self.config.router_dtype
+        )
+        self.config.routed_scaling_factor = _check_positive_finite_float(
+            "routed_scaling_factor", self.config.routed_scaling_factor
+        )
+        if self.config.num_token_non_padded is not None:
+            self.config.num_token_non_padded = int(self.config.num_token_non_padded)
+            if not 0 <= self.config.num_token_non_padded <= self.config.num_tokens:
+                raise ValueError(
+                    "num_token_non_padded must be in [0, num_tokens] when set"
+                )
+        if self.hidden_states_input is None:
+            self.hidden_states_input = TensorInput(
+                (self.config.num_tokens, self.config.hidden_size),
+                self.config.hidden_dtype,
+                device=self.config.device,
+            )
+        if self.gating_output_input is None:
+            self.gating_output_input = TensorInput(
+                (self.config.num_tokens, self.config.num_experts),
+                self.config.router_dtype,
+                device=self.config.device,
+            )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> MoEBiasedGroupedTopKInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        if self.hidden_states_input is None or self.gating_output_input is None:
+            raise ValueError("MoEBiasedGroupedTopKInputs child generators are missing")
+
+        hidden_states = self.hidden_states_input.generate(
+            seed=_child_seed(seed, 1),
+            device=target_device,
+        ).values
+        gating_output = self.gating_output_input.generate(
+            seed=_child_seed(seed, 2),
+            device=target_device,
+        ).values
+        if hidden_states is None:
+            raise ValueError("hidden_states generation was skipped")
+        if gating_output is None:
+            raise ValueError("gating_output generation was skipped")
+
+        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=rng_device).manual_seed(_child_seed(seed, 3))
+        correction_bias = (
+            torch.randn(
+                (self.config.num_experts,),
+                dtype=torch.float32,
+                device=target_device,
+                generator=generator,
+            )
+            * 0.25
+        )
+        logical_to_physical_map = None
+        if self.config.use_logical_to_physical_map:
+            logical_to_physical_map = torch.randperm(
+                self.config.num_experts,
+                dtype=torch.int32,
+                device=target_device,
+                generator=generator,
+            )
+        num_token_non_padded = None
+        if self.config.num_token_non_padded is not None:
+            num_token_non_padded = torch.tensor(
+                self.config.num_token_non_padded,
+                dtype=torch.int32,
+                device=target_device,
+            )
+        values = MoEBiasedGroupedTopKInputValues(
+            hidden_states=hidden_states.contiguous(),
+            gating_output=gating_output.contiguous(),
+            correction_bias=correction_bias.contiguous(),
+            top_k=self.config.top_k,
+            renormalize=self.config.renormalize,
+            num_expert_groups=self.config.num_expert_groups,
+            top_k_groups=self.config.top_k_groups,
+            routed_scaling_factor=self.config.routed_scaling_factor,
+            logical_to_physical_map=logical_to_physical_map,
+            num_token_non_padded=num_token_non_padded,
+        )
+        _validate_moe_biased_grouped_topk_values(values)
+        return values
+
+
 def _validate_moe_align_block_size_values(
     values: MoeAlignBlockSizeInputValues,
 ) -> None:
@@ -424,6 +639,77 @@ def _validate_moe_softmax_topk_routing_values(
     _check_positive_finite_float("scaling_factor", values.scaling_factor)
     if not torch.isfinite(values.logits).all():
         raise ValueError("logits must be finite")
+    if not torch.isfinite(values.correction_bias).all():
+        raise ValueError("correction_bias must be finite")
+
+
+def _validate_moe_biased_grouped_topk_values(
+    values: MoEBiasedGroupedTopKInputValues,
+) -> None:
+    if values.hidden_states.ndim != 2:
+        raise ValueError("hidden_states must be rank-2")
+    if values.gating_output.ndim != 2:
+        raise ValueError("gating_output must be rank-2")
+    if values.correction_bias.ndim != 1:
+        raise ValueError("correction_bias must be rank-1")
+    if not torch.is_floating_point(values.hidden_states):
+        raise TypeError("hidden_states must use a floating dtype")
+    if not torch.is_floating_point(values.gating_output):
+        raise TypeError("gating_output must use a floating dtype")
+    if values.correction_bias.dtype != torch.float32:
+        raise TypeError("correction_bias must use torch.float32")
+    num_tokens, num_experts = values.gating_output.shape
+    if values.hidden_states.shape[0] != num_tokens:
+        raise ValueError("hidden_states rows must match gating_output rows")
+    if values.correction_bias.shape != (num_experts,):
+        raise ValueError("correction_bias must have one value per expert")
+    top_k = int(values.top_k)
+    num_expert_groups = int(values.num_expert_groups)
+    top_k_groups = int(values.top_k_groups)
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if num_expert_groups <= 0:
+        raise ValueError("num_expert_groups must be positive")
+    if num_experts % num_expert_groups != 0:
+        raise ValueError("num_experts must be divisible by num_expert_groups")
+    experts_per_group = num_experts // num_expert_groups
+    if experts_per_group < 2:
+        raise ValueError("each expert group must contain at least two experts")
+    if top_k_groups <= 0 or top_k_groups > num_expert_groups:
+        raise ValueError("top_k_groups must be in [1, num_expert_groups]")
+    if top_k > top_k_groups * experts_per_group:
+        raise ValueError("top_k must fit within the experts in the selected groups")
+    if values.hidden_states.device != values.gating_output.device:
+        raise ValueError("hidden_states and gating_output must share device")
+    if values.correction_bias.device != values.gating_output.device:
+        raise ValueError("correction_bias must share device with gating_output")
+    if values.logical_to_physical_map is not None:
+        mapping = values.logical_to_physical_map
+        if mapping.shape != (num_experts,):
+            raise ValueError("logical_to_physical_map must have one entry per expert")
+        if mapping.dtype != torch.int32:
+            raise TypeError("logical_to_physical_map must use torch.int32")
+        if mapping.device != values.gating_output.device:
+            raise ValueError("logical_to_physical_map must share device")
+        sorted_mapping = mapping.detach().cpu().to(torch.long).sort().values
+        expected = torch.arange(num_experts, dtype=torch.long)
+        if not torch.equal(sorted_mapping, expected):
+            raise ValueError("logical_to_physical_map must be a permutation")
+    if values.num_token_non_padded is not None:
+        if values.num_token_non_padded.shape != ():
+            raise ValueError("num_token_non_padded must be a scalar tensor")
+        if values.num_token_non_padded.dtype != torch.int32:
+            raise TypeError("num_token_non_padded must use torch.int32")
+        if values.num_token_non_padded.device != values.gating_output.device:
+            raise ValueError("num_token_non_padded must share device")
+        value = int(values.num_token_non_padded.detach().cpu().item())
+        if not 0 <= value <= num_tokens:
+            raise ValueError("num_token_non_padded must be in [0, num_tokens]")
+    _check_positive_finite_float("routed_scaling_factor", values.routed_scaling_factor)
+    if not torch.isfinite(values.hidden_states).all():
+        raise ValueError("hidden_states must be finite")
+    if not torch.isfinite(values.gating_output).all():
+        raise ValueError("gating_output must be finite")
     if not torch.isfinite(values.correction_bias).all():
         raise ValueError("correction_bias must be finite")
 
@@ -991,6 +1277,66 @@ def moe_softmax_topk_routing_reference(
     return MoESoftmaxTopKRoutingReferenceValues(
         topk_indices=out_indices,
         topk_weights=out_weights,
+    )
+
+
+def moe_biased_grouped_topk_reference(
+    values: MoEBiasedGroupedTopKInputValues,
+) -> MoEBiasedGroupedTopKReferenceValues:
+    """Reference implementation for sigmoid/bias grouped top-k MoE routing."""
+
+    _validate_moe_biased_grouped_topk_values(values)
+    scores = values.gating_output.float().sigmoid()
+    num_tokens, num_experts = scores.shape
+    experts_per_group = num_experts // values.num_expert_groups
+    selection_scores = scores + values.correction_bias.reshape(1, -1)
+    grouped_scores = selection_scores.reshape(
+        num_tokens,
+        values.num_expert_groups,
+        experts_per_group,
+    )
+    group_scores = grouped_scores.topk(2, dim=-1).values.sum(dim=-1)
+    selected_groups = torch.topk(
+        group_scores,
+        k=values.top_k_groups,
+        dim=-1,
+        sorted=False,
+    ).indices
+    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+    group_mask.scatter_(1, selected_groups, True)
+    expert_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, values.num_expert_groups, experts_per_group)
+        .reshape(num_tokens, num_experts)
+    )
+    candidate_scores = selection_scores.masked_fill(~expert_mask, float("-inf"))
+    topk_ids = torch.topk(
+        candidate_scores,
+        k=values.top_k,
+        dim=-1,
+        sorted=False,
+    ).indices.to(torch.int32)
+    topk_weights = scores.gather(1, topk_ids.to(torch.long)).to(torch.float32)
+
+    if values.renormalize:
+        weight_sum = topk_weights.sum(dim=-1, keepdim=True)
+        denom = torch.where(weight_sum != 0.0, weight_sum, torch.ones_like(weight_sum))
+        topk_weights = topk_weights / denom
+        topk_weights = topk_weights * float(values.routed_scaling_factor)
+
+    if values.logical_to_physical_map is not None:
+        topk_ids = values.logical_to_physical_map[topk_ids.to(torch.long)].to(
+            torch.int32
+        )
+    if values.num_token_non_padded is not None:
+        valid_tokens = int(values.num_token_non_padded.detach().cpu().item())
+        if valid_tokens < num_tokens:
+            topk_ids = topk_ids.clone()
+            topk_ids[valid_tokens:, :] = -1
+
+    return MoEBiasedGroupedTopKReferenceValues(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
     )
 
 
