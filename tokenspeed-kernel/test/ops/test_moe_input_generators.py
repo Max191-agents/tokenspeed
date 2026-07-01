@@ -20,15 +20,54 @@
 
 from __future__ import annotations
 
+import pytest
 import tokenspeed_kernel.numerics.moe  # noqa: F401
 import torch
+from tokenspeed_kernel import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.numerics.inputs import get_input_generator
 from tokenspeed_kernel.numerics.moe import canonicalize_align_block_size
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import load_builtin_kernels
 from tokenspeed_numerics_input_generators import (
+    CustomDType,
     MoeAlignBlockSizeInputValues,
+    MoeInputConfig,
+    MoeInputs,
+    MoeInputValues,
     canonicalize_moe_align_block_size,
     moe_align_block_size_reference,
+    moe_reference,
 )
+
+
+def _make_mxfp4_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
+    if values.hidden_states is None or values.router_logits is None:
+        raise ValueError("MoE values must include hidden states and router logits")
+    if values.w13.B is None or values.w13.B_scales is None:
+        raise ValueError("MoE values must include W13 MXFP4 weights and scales")
+    if values.w2.B is None or values.w2.B_scales is None:
+        raise ValueError("MoE values must include W2 MXFP4 weights and scales")
+
+    num_experts = values.w13.B.shape[0]
+    layer = torch.nn.Module()
+    layer.num_experts = num_experts
+    layer.num_local_experts = num_experts
+    layer.ep_size = 1
+    layer.ep_rank = 0
+    layer.top_k = values.topk_ids.shape[1]
+    layer.activation = "silu"
+    layer.swiglu_arg = None
+    layer.w13_weight = torch.nn.Parameter(values.w13.B.clone(), requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(
+        values.w13.B_scales.clone(),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(values.w2.B.clone(), requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(
+        values.w2.B_scales.clone(),
+        requires_grad=False,
+    )
+    return layer
 
 
 def test_moe_align_block_size_numerics_adapter_uses_generator() -> None:
@@ -65,3 +104,50 @@ def test_moe_align_block_size_numerics_adapter_uses_generator() -> None:
         atol=0,
         rtol=0,
     )
+
+
+def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None:
+    platform = current_platform()
+    if not torch.cuda.is_available() or not platform.is_amd:
+        pytest.skip("Triton MXFP4 MoE compatibility test requires an AMD GPU")
+
+    load_builtin_kernels()
+    config = MoeInputConfig(
+        num_tokens=4,
+        hidden_size=64,
+        intermediate_size=64,
+        num_experts=4,
+        top_k=2,
+        hidden_dtype=torch.bfloat16,
+        router_dtype=torch.bfloat16,
+        weight_format="mxfp4",
+        weight_dtype=CustomDType.MXFP4,
+        weight_scale_dtype=None,
+        bias_dtype=None,
+    )
+    values = MoeInputs(config).generate(seed=42, device=device)
+    layer = _make_mxfp4_moe_weight_module(values)
+    plan = moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        internal_activation_dtype="input",
+        with_bias=False,
+        solution="triton",
+    )
+    assert plan["solution"] == "triton"
+    assert plan["process_weights_kernel_name"] == "triton_mxfp4_moe_process_weights"
+
+    moe_process_weights(plan, layer)
+    actual = moe_apply(
+        plan,
+        values.hidden_states,
+        layer,
+        values.router_logits,
+        topk_weights=values.topk_weights,
+        topk_ids=values.topk_ids,
+    )
+    torch.cuda.synchronize()
+
+    expected = moe_reference(values, output_dtype=torch.bfloat16).to(device=device)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=5.0e-2, atol=0.1)

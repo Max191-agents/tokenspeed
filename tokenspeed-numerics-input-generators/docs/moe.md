@@ -63,6 +63,22 @@ semantics directly:
 comparison tensor while ignoring intra-block ordering differences that can arise
 from parallel implementations.
 
+## TokenSpeed API Mapping
+
+TokenSpeed fused MoE kernels consume a runtime weight module plus a plan created
+by `moe_plan`. That module is a backend adapter concern. `MoeInputs` produces
+the operation-level tensors: hidden states, router logits, explicit top-k
+routing results, and expert weights with optional scale sidecars. Tests that
+exercise TokenSpeed kernels should build a small adapter module from those
+values, call `moe_process_weights` for the selected backend, and then pass the
+generated hidden/routing tensors to `moe_apply`.
+
+For example, the MXFP4 Triton precomputed-routing path uses `MoeInputs` with
+MXFP4 expert weights and passes generated `topk_ids` and `topk_weights`
+directly to `moe_apply`. The generator does not own Triton-specific weight
+swizzling, precision-config objects, or module attributes such as `top_k` and
+`num_experts`; those remain in the TokenSpeed adapter/test layer.
+
 ## Verification
 
 MoE configs verify token counts, hidden/intermediate widths, expert counts,
