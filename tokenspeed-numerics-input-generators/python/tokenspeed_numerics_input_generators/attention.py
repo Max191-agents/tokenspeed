@@ -62,6 +62,10 @@ __all__ = [
     "AttentionMergeStateInputValues",
     "attention_generate",
     "attention_merge_state_reference",
+    "DSADecodeTopKInputConfig",
+    "DSADecodeTopKInputs",
+    "DSADecodeTopKInputValues",
+    "dsa_decode_topk_reference",
     "DSASparseDecodeKVPackInputConfig",
     "DSASparseDecodeKVPackInputs",
     "DSASparseDecodeKVPackInputValues",
@@ -2511,6 +2515,219 @@ def dsa_sparse_decode_kv_pack_reference(
     out[loc, scale_offset:rope_offset] = scale_bytes
     out[loc, rope_offset:] = rope_bytes
     return out
+
+
+@dataclass
+class DSADecodeTopKInputValues:
+    """Generated values for deterministic DSA decode top-k selection."""
+
+    logits: torch.Tensor
+    out: torch.Tensor
+    valid_lens: torch.Tensor
+    topk: int
+
+
+@dataclass
+class DSADecodeTopKInputConfig:
+    """Initialization parameters for deterministic DSA decode top-k inputs.
+
+    The represented operation selects the top-k local context offsets from each
+    row of pre-masked DSA decode indexer logits. Logits beyond each row's valid
+    context length are set to ``-inf``. Ties are resolved by choosing the
+    smaller local offset first.
+    """
+
+    # Required: number of independent decode rows.
+    num_rows: int
+
+    # Required: maximum number of local context offsets in each row.
+    vocab_size: int
+
+    # Required: number of selected offsets per row.
+    topk: int
+
+    # Required: generated logit dtype.
+    dtype: torch.dtype
+
+    # Optional: minimum generated valid context length. Defaults to topk so
+    # every row has enough finite logits to produce top-k valid offsets.
+    min_valid_len: int | None = None
+
+    # Optional: maximum generated valid context length. Defaults to vocab_size.
+    max_valid_len: int | None = None
+
+    # Optional: plant a deterministic equal-logit boundary case when the row
+    # has at least one spare valid offset beyond topk.
+    include_boundary_tie: bool = True
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DSADecodeTopKInputs(NumericsInputGenerator):
+    """Generator for deterministic DSA decode top-k logits and output buffers."""
+
+    config: DSADecodeTopKInputConfig
+
+    def __init__(self, config: DSADecodeTopKInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_rows = _check_nonnegative("num_rows", self.config.num_rows)
+        self.config.vocab_size = _check_positive("vocab_size", self.config.vocab_size)
+        self.config.topk = _check_positive("topk", self.config.topk)
+        if self.config.topk > self.config.vocab_size:
+            raise ValueError("topk must be <= vocab_size")
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        min_valid_len = (
+            self.config.topk
+            if self.config.min_valid_len is None
+            else _check_positive("min_valid_len", self.config.min_valid_len)
+        )
+        max_valid_len = (
+            self.config.vocab_size
+            if self.config.max_valid_len is None
+            else _check_positive("max_valid_len", self.config.max_valid_len)
+        )
+        if min_valid_len < self.config.topk:
+            raise ValueError("min_valid_len must be >= topk")
+        if max_valid_len > self.config.vocab_size:
+            raise ValueError("max_valid_len must be <= vocab_size")
+        if min_valid_len > max_valid_len:
+            raise ValueError("min_valid_len must be <= max_valid_len")
+        self.config.min_valid_len = min_valid_len
+        self.config.max_valid_len = max_valid_len
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> DSADecodeTopKInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        value_generator = _rng_for_device(target_device, _child_seed(seed, 1))
+        logits = -1.0 - 3.0 * torch.rand(
+            (self.config.num_rows, self.config.vocab_size),
+            dtype=torch.float32,
+            device=target_device,
+            generator=value_generator,
+        )
+        valid_lens = self._generate_valid_lens(seed=_child_seed(seed, 2)).to(
+            target_device
+        )
+        for row_idx, valid_len_tensor in enumerate(valid_lens.cpu()):
+            valid_len = int(valid_len_tensor.item())
+            if valid_len < self.config.vocab_size:
+                logits[row_idx, valid_len:] = -float("inf")
+            self._plant_topk_row(logits[row_idx], valid_len=valid_len)
+        logits = logits.to(self.config.dtype)
+        out = torch.full(
+            (self.config.num_rows, self.config.topk),
+            -1,
+            dtype=torch.int32,
+            device=target_device,
+        )
+        values = DSADecodeTopKInputValues(
+            logits=logits,
+            out=out,
+            valid_lens=valid_lens,
+            topk=self.config.topk,
+        )
+        _validate_dsa_decode_topk_values(values)
+        return values
+
+    def _generate_valid_lens(self, *, seed: int) -> torch.Tensor:
+        if self.config.num_rows == 0:
+            return torch.empty((0,), dtype=torch.int32)
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        return torch.randint(
+            int(self.config.min_valid_len),
+            int(self.config.max_valid_len) + 1,
+            (self.config.num_rows,),
+            dtype=torch.int32,
+            generator=rng,
+        )
+
+    def _plant_topk_row(self, row: torch.Tensor, *, valid_len: int) -> None:
+        if valid_len <= 0:
+            return
+        if self.config.include_boundary_tie and valid_len > self.config.topk:
+            for rank in range(self.config.topk - 1):
+                row[rank] = 32.0 - float(rank)
+            row[valid_len - 2] = 1.0
+            row[valid_len - 1] = 1.0
+            return
+        for rank in range(self.config.topk):
+            row[rank] = 32.0 - float(rank)
+
+
+def _validate_dsa_decode_topk_values(values: DSADecodeTopKInputValues) -> None:
+    if values.logits.ndim != 2:
+        raise ValueError("logits must be rank-2")
+    if values.out.ndim != 2:
+        raise ValueError("out must be rank-2")
+    if values.valid_lens.ndim != 1:
+        raise ValueError("valid_lens must be rank-1")
+    if not torch.is_floating_point(values.logits):
+        raise TypeError("logits must use a floating dtype")
+    if values.out.dtype != torch.int32:
+        raise TypeError(f"out must be int32, got {values.out.dtype}")
+    if values.valid_lens.dtype != torch.int32:
+        raise TypeError(f"valid_lens must be int32, got {values.valid_lens.dtype}")
+    if values.topk <= 0:
+        raise ValueError("topk must be positive")
+    num_rows, vocab_size = values.logits.shape
+    if values.out.shape != (num_rows, values.topk):
+        raise ValueError("out must have shape [num_rows, topk]")
+    if values.valid_lens.shape != (num_rows,):
+        raise ValueError("valid_lens must have one entry per logit row")
+    if values.topk > vocab_size:
+        raise ValueError("topk must be <= logits width")
+    if (
+        values.logits.device != values.out.device
+        or values.logits.device != values.valid_lens.device
+    ):
+        raise ValueError("logits, out, and valid_lens must share device")
+    valid_lens = values.valid_lens.cpu().tolist()
+    logits_cpu = values.logits.detach().cpu()
+    for row_idx, valid_len in enumerate(valid_lens):
+        valid_len = int(valid_len)
+        if valid_len < values.topk or valid_len > vocab_size:
+            raise ValueError("valid_lens entries must be in [topk, logits width]")
+        valid_logits = logits_cpu[row_idx, :valid_len]
+        if not torch.isfinite(valid_logits).all():
+            raise ValueError("valid logits must be finite")
+        if (
+            valid_len < vocab_size
+            and not torch.isneginf(logits_cpu[row_idx, valid_len:]).all()
+        ):
+            raise ValueError("logits after valid_lens must be masked with -inf")
+
+
+def dsa_decode_topk_reference(values: DSADecodeTopKInputValues) -> torch.Tensor:
+    """Return stable top-k local offsets for pre-masked DSA decode logits."""
+
+    _validate_dsa_decode_topk_values(values)
+    logits_cpu = values.logits.detach().cpu().float()
+    result = torch.empty(
+        values.out.shape,
+        dtype=torch.int32,
+        device=values.logits.device,
+    )
+    for row_idx in range(logits_cpu.shape[0]):
+        ordered = sorted(
+            range(logits_cpu.shape[1]),
+            key=lambda index: (-float(logits_cpu[row_idx, index]), index),
+        )
+        result[row_idx] = torch.tensor(
+            ordered[: values.topk],
+            dtype=torch.int32,
+            device=values.logits.device,
+        )
+    return result
 
 
 @dataclass

@@ -45,6 +45,8 @@ from tokenspeed_numerics_input_generators import (
     DeepSeekV4SparseCompressCacheInsertInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
     DeepSeekV4SparsePrefillIndexInputs,
+    DSADecodeTopKInputConfig,
+    DSADecodeTopKInputs,
     DSASparseDecodeKVPackInputConfig,
     DSASparseDecodeKVPackInputs,
     DSATopKSlotInputConfig,
@@ -87,6 +89,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_inv_rope_fp8_quant_reference,
     deepseek_v4_save_compressor_state_reference,
     deepseek_v4_sparse_compress_cache_insert_reference,
+    dsa_decode_topk_reference,
     dsa_full_context_topk_to_global_slots_reference,
     dsa_local_topk_to_global_slots_reference,
     dsa_sparse_decode_kv_pack_reference,
@@ -988,6 +991,96 @@ def test_dsa_sparse_decode_kv_pack_rejects_invalid_configs_and_values() -> None:
     values.loc = torch.tensor([0, 0, 1], dtype=torch.int64)
     with pytest.raises(ValueError, match="unique"):
         dsa_sparse_decode_kv_pack_reference(values)
+
+
+def test_dsa_decode_topk_inputs_generate_stable_tie_values() -> None:
+    values = DSADecodeTopKInputs(
+        DSADecodeTopKInputConfig(
+            num_rows=4,
+            vocab_size=12,
+            topk=3,
+            dtype=torch.float32,
+            min_valid_len=6,
+            max_valid_len=12,
+        )
+    ).generate(seed=188, device="cpu")
+
+    expected = dsa_decode_topk_reference(values)
+
+    assert values.logits.shape == (4, 12)
+    assert values.out.shape == (4, 3)
+    assert values.out.dtype == torch.int32
+    assert values.valid_lens.shape == (4,)
+    assert values.valid_lens.dtype == torch.int32
+    assert expected.shape == (4, 3)
+    assert expected.dtype == torch.int32
+    for row, valid_len_tensor in enumerate(values.valid_lens):
+        valid_len = int(valid_len_tensor.item())
+        assert torch.isneginf(values.logits[row, valid_len:]).all()
+        if valid_len > values.topk:
+            assert expected[row, -1].item() == valid_len - 2
+
+
+def test_dsa_decode_topk_reference_matches_manual_ordering() -> None:
+    values = DSADecodeTopKInputs(
+        DSADecodeTopKInputConfig(
+            num_rows=1,
+            vocab_size=5,
+            topk=3,
+            dtype=torch.float32,
+            min_valid_len=5,
+            max_valid_len=5,
+        )
+    ).generate(seed=189, device="cpu")
+    values.logits[0] = torch.tensor([1.0, 3.0, 3.0, 2.0, -float("inf")])
+    values.valid_lens[0] = 4
+
+    expected = dsa_decode_topk_reference(values)
+
+    torch.testing.assert_close(
+        expected,
+        torch.tensor([[1, 2, 3]], dtype=torch.int32),
+        atol=0,
+        rtol=0,
+    )
+
+
+def test_dsa_decode_topk_inputs_reject_invalid_configs_and_values() -> None:
+    with pytest.raises(ValueError, match="topk must be <= vocab_size"):
+        DSADecodeTopKInputs(
+            DSADecodeTopKInputConfig(
+                num_rows=1,
+                vocab_size=4,
+                topk=5,
+                dtype=torch.float32,
+            )
+        )
+
+    with pytest.raises(ValueError, match="min_valid_len must be >= topk"):
+        DSADecodeTopKInputs(
+            DSADecodeTopKInputConfig(
+                num_rows=1,
+                vocab_size=8,
+                topk=4,
+                dtype=torch.float32,
+                min_valid_len=3,
+            )
+        )
+
+    values = DSADecodeTopKInputs(
+        DSADecodeTopKInputConfig(
+            num_rows=1,
+            vocab_size=8,
+            topk=4,
+            dtype=torch.float32,
+            min_valid_len=6,
+            max_valid_len=6,
+        )
+    ).generate(seed=190, device="cpu")
+    values.logits[0, int(values.valid_lens[0].item()) :] = 0.0
+
+    with pytest.raises(ValueError, match="masked with -inf"):
+        dsa_decode_topk_reference(values)
 
 
 def test_dsa_topk_slot_inputs_generate_values_and_references() -> None:

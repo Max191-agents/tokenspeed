@@ -42,8 +42,9 @@ compressed/cache-specific representations with different per-token shapes.
 - `DeepSeekV4KCacheGatherInputs`: generates DeepSeek V4 sparse-window
   K-cache gather/dequantization inputs.
 - `DSASparseDecodeKVPackInputs`, `DSATopKSlotInputs`,
-  `DeepSeekV4PagedIndexInputs`, and `DeepSeekV4SparsePrefillIndexInputs`:
-  generate DeepSeek-style sparse decode/prefill indexing and cache metadata.
+  `DSADecodeTopKInputs`, `DeepSeekV4PagedIndexInputs`, and
+  `DeepSeekV4SparsePrefillIndexInputs`: generate DeepSeek-style sparse
+  decode/prefill indexing, deterministic top-k selection, and cache metadata.
 
 ## Generated Values
 

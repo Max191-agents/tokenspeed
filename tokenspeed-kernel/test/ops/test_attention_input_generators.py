@@ -40,6 +40,10 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
 from tokenspeed_kernel.ops.attention.flashinfer import (
     gated_delta_rule as flashinfer_gdn,
 )
+from tokenspeed_kernel.ops.attention.flashinfer.dsa_topk import (
+    deterministic_decode_topk,
+    has_deterministic_decode_topk,
+)
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
@@ -91,6 +95,8 @@ from tokenspeed_numerics_input_generators import (
     DeepSeekV4SparseCompressCacheInsertInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
     DeepSeekV4SparsePrefillIndexInputs,
+    DSADecodeTopKInputConfig,
+    DSADecodeTopKInputs,
     DSASparseDecodeKVPackInputConfig,
     DSASparseDecodeKVPackInputs,
     DSATopKSlotInputConfig,
@@ -124,6 +130,7 @@ from tokenspeed_numerics_input_generators import (
     deepseek_v4_inv_rope_fp8_quant_reference,
     deepseek_v4_save_compressor_state_reference,
     deepseek_v4_sparse_compress_cache_insert_reference,
+    dsa_decode_topk_reference,
     dsa_full_context_topk_to_global_slots_reference,
     dsa_local_topk_to_global_slots_reference,
     dsa_sparse_decode_kv_pack_reference,
@@ -648,6 +655,28 @@ def test_dsa_topk_slot_generator_runs_tokenspeed_triton(
     assert torch.equal(actual_local_lens, expected_local_lens)
     assert torch.equal(actual_full_slots, expected_full_slots)
     assert torch.equal(actual_full_lens, expected_full_lens)
+
+
+def test_dsa_decode_topk_generator_runs_flashinfer_kernel(device: str) -> None:
+    if not torch.cuda.is_available() or not has_deterministic_decode_topk():
+        pytest.skip("FlashInfer deterministic DSA top-k requires CUDA and flashinfer")
+
+    values = DSADecodeTopKInputs(
+        DSADecodeTopKInputConfig(
+            num_rows=5,
+            vocab_size=32,
+            topk=6,
+            dtype=torch.float32,
+            min_valid_len=8,
+            max_valid_len=32,
+        )
+    ).generate(seed=213, device=device)
+    expected = dsa_decode_topk_reference(values)
+
+    deterministic_decode_topk(values.logits, values.out, values.topk)
+    torch.cuda.synchronize()
+
+    assert torch.equal(values.out, expected)
 
 
 def test_deepseek_v4_global_topk_generator_runs_tokenspeed_cpu() -> None:
