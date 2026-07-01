@@ -8,14 +8,28 @@ from tokenspeed_kernel.ops.activation.triton import (
     silu_and_mul,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_numerics_input_generators import (
+    FusedGateSigmoidMulAddInputConfig,
+    FusedGateSigmoidMulAddInputs,
+    GatedActivationInputConfig,
+    GatedActivationInputs,
+    SigmoidMulInputConfig,
+    SigmoidMulInputs,
+    fused_gate_sigmoid_mul_add_reference,
+    gated_activation_reference,
+    sigmoid_mul_reference,
+)
 
 platform = current_platform()
-torch.manual_seed(42)
 
 pytestmark = pytest.mark.skipif(
     not (platform.is_nvidia or platform.is_amd),
     reason="Triton activation tests require an NVIDIA or AMD GPU.",
 )
+
+
+def _activation_tol(dtype: torch.dtype) -> float:
+    return 1e-2 if dtype == torch.bfloat16 else 5e-3
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -27,43 +41,69 @@ pytestmark = pytest.mark.skipif(
 def test_sigmoid_mul_matches_eager(
     dtype: torch.dtype, shape: tuple[int, int], device: str
 ) -> None:
-    x = torch.randn(shape, device=device, dtype=dtype)
-    gate = torch.randn(shape, device=device, dtype=dtype)
-    ref = x.to(torch.float32) * gate.to(torch.float32).sigmoid()
-    ref = ref.to(dtype)
+    values = SigmoidMulInputs(
+        SigmoidMulInputConfig(
+            num_tokens=shape[0],
+            hidden_dim=shape[1],
+            dtype=dtype,
+        )
+    ).generate(seed=shape[0] * 101 + shape[1], device=device)
+    ref = sigmoid_mul_reference(values.x, values.gate)
 
-    out = sigmoid_mul(x.clone(), gate)
+    out = sigmoid_mul(values.x.clone(), values.gate)
 
-    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
-    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+    tol = _activation_tol(dtype)
+    torch.testing.assert_close(out.float(), ref, atol=tol, rtol=tol)
 
 
 def test_sigmoid_mul_is_inplace(device: str) -> None:
-    x = torch.randn(8, 256, device=device, dtype=torch.bfloat16)
-    gate = torch.randn_like(x)
-    same = sigmoid_mul(x, gate)
-    assert same.data_ptr() == x.data_ptr()
+    values = SigmoidMulInputs(
+        SigmoidMulInputConfig(
+            num_tokens=8,
+            hidden_dim=256,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=11, device=device)
+    same = sigmoid_mul(values.x, values.gate)
+    assert same.data_ptr() == values.x.data_ptr()
 
 
 def test_sigmoid_mul_empty(device: str) -> None:
-    x = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
-    gate = torch.empty_like(x)
-    out = sigmoid_mul(x, gate)
-    assert out.shape == x.shape
+    values = SigmoidMulInputs(
+        SigmoidMulInputConfig(
+            num_tokens=0,
+            hidden_dim=256,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=12, device=device)
+    out = sigmoid_mul(values.x, values.gate)
+    assert out.shape == values.x.shape
 
 
 def test_sigmoid_mul_rejects_shape_mismatch(device: str) -> None:
-    x = torch.randn(4, 32, device=device, dtype=torch.bfloat16)
-    gate = torch.randn(4, 16, device=device, dtype=torch.bfloat16)
+    values = SigmoidMulInputs(
+        SigmoidMulInputConfig(
+            num_tokens=4,
+            hidden_dim=32,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=13, device=device)
+    gate = values.gate[:, :16].contiguous()
     with pytest.raises(ValueError, match="shape mismatch"):
-        sigmoid_mul(x, gate)
+        sigmoid_mul(values.x, gate)
 
 
 def test_sigmoid_mul_rejects_dtype_mismatch(device: str) -> None:
-    x = torch.randn(4, 32, device=device, dtype=torch.bfloat16)
-    gate = torch.randn(4, 32, device=device, dtype=torch.float16)
+    values = SigmoidMulInputs(
+        SigmoidMulInputConfig(
+            num_tokens=4,
+            hidden_dim=32,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=14, device=device)
+    gate = values.gate.to(torch.float16)
     with pytest.raises(ValueError, match="dtype mismatch"):
-        sigmoid_mul(x, gate)
+        sigmoid_mul(values.x, gate)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -87,31 +127,42 @@ def test_sigmoid_mul_strided_gate_from_qkv_split(
     a contiguous copy."""
     num_tokens = 19
     q_size = num_heads * head_dim
-    kv_size = num_kv_heads * head_dim
-    qkv = torch.randn(num_tokens, 2 * q_size + 2 * kv_size, device=device, dtype=dtype)
-    q_gate, _k, _v = qkv.split([2 * q_size, kv_size, kv_size], dim=-1)
-    q_gate = q_gate.view(num_tokens, num_heads, 2 * head_dim)
-    _q, gate = torch.chunk(q_gate, 2, dim=-1)
+    values = SigmoidMulInputs(
+        SigmoidMulInputConfig(
+            num_tokens=num_tokens,
+            hidden_dim=q_size,
+            dtype=dtype,
+            gate_layout="qkv_split",
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+        )
+    ).generate(seed=num_heads * 1000 + num_kv_heads * 100 + head_dim, device=device)
     # Lock in the production-shape stride: row stride is the full qkv width.
-    assert not gate.is_contiguous()
-    assert gate.stride(0) == 2 * q_size + 2 * kv_size
-    assert gate.stride(-1) == 1
+    assert values.gate_storage is not None
+    assert not values.gate.is_contiguous()
+    assert values.gate.stride(0) == values.gate_storage.stride(0)
+    assert values.gate.stride(-1) == 1
 
-    x = torch.randn(num_tokens, q_size, device=device, dtype=dtype)
-    ref = x.to(torch.float32) * gate.reshape(num_tokens, -1).to(torch.float32).sigmoid()
-    ref = ref.to(dtype)
+    ref = sigmoid_mul_reference(values.x, values.gate)
 
-    out = sigmoid_mul(x.clone(), gate)
+    out = sigmoid_mul(values.x.clone(), values.gate)
 
-    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
-    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+    tol = _activation_tol(dtype)
+    torch.testing.assert_close(out.float(), ref, atol=tol, rtol=tol)
 
 
 def test_sigmoid_mul_rejects_4d_gate(device: str) -> None:
-    x = torch.randn(4, 32, device=device, dtype=torch.bfloat16)
-    gate = torch.randn(4, 2, 4, 4, device=device, dtype=torch.bfloat16)
+    values = SigmoidMulInputs(
+        SigmoidMulInputConfig(
+            num_tokens=4,
+            hidden_dim=32,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=15, device=device)
+    gate = values.gate.reshape(4, 2, 4, 4)
     with pytest.raises(ValueError, match="gate must be 2D or 3D"):
-        sigmoid_mul(x, gate)
+        sigmoid_mul(values.x, gate)
 
 
 # --- silu_and_mul tests ---
@@ -122,35 +173,61 @@ def test_sigmoid_mul_rejects_4d_gate(device: str) -> None:
 def test_silu_and_mul_matches_eager(
     dtype: torch.dtype, shape: tuple[int, int], device: str
 ) -> None:
-    x = torch.randn(shape, device=device, dtype=dtype)
-    d = shape[-1] // 2
-    ref = torch.nn.functional.silu(x[..., :d].float()) * x[..., d:].float()
-    ref = ref.to(dtype)
+    values = GatedActivationInputs(
+        GatedActivationInputConfig(
+            num_tokens=shape[0],
+            hidden_dim=shape[1] // 2,
+            dtype=dtype,
+            activation="silu",
+        )
+    ).generate(seed=shape[0] * 103 + shape[1], device=device)
+    ref = gated_activation_reference(values.x, activation="silu")
 
-    out = silu_and_mul(x)
+    out = silu_and_mul(values.x)
 
-    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
-    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+    tol = _activation_tol(dtype)
+    torch.testing.assert_close(out.float(), ref, atol=tol, rtol=tol)
 
 
 def test_silu_and_mul_writes_provided_output(device: str) -> None:
-    x = torch.randn(8, 512, device=device, dtype=torch.bfloat16)
+    values = GatedActivationInputs(
+        GatedActivationInputConfig(
+            num_tokens=8,
+            hidden_dim=256,
+            dtype=torch.bfloat16,
+            activation="silu",
+        )
+    ).generate(seed=21, device=device)
     out = torch.empty(8, 256, device=device, dtype=torch.bfloat16)
-    same = silu_and_mul(x, out)
+    same = silu_and_mul(values.x, out)
     assert same.data_ptr() == out.data_ptr()
 
 
 def test_silu_and_mul_empty(device: str) -> None:
-    x = torch.empty(0, 512, device=device, dtype=torch.bfloat16)
-    out = silu_and_mul(x)
+    values = GatedActivationInputs(
+        GatedActivationInputConfig(
+            num_tokens=0,
+            hidden_dim=256,
+            dtype=torch.bfloat16,
+            activation="silu",
+        )
+    ).generate(seed=22, device=device)
+    out = silu_and_mul(values.x)
     assert out.shape == (0, 256)
 
 
 def test_silu_and_mul_rejects_bad_output_shape(device: str) -> None:
-    x = torch.randn(4, 512, device=device, dtype=torch.bfloat16)
+    values = GatedActivationInputs(
+        GatedActivationInputConfig(
+            num_tokens=4,
+            hidden_dim=256,
+            dtype=torch.bfloat16,
+            activation="silu",
+        )
+    ).generate(seed=23, device=device)
     out = torch.empty(4, 128, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="out shape"):
-        silu_and_mul(x, out)
+        silu_and_mul(values.x, out)
 
 
 # --- fused_gate_sigmoid_mul_add tests ---
@@ -164,41 +241,57 @@ def test_silu_and_mul_rejects_bad_output_shape(device: str) -> None:
 def test_fused_gate_sigmoid_mul_add_matches_eager(
     dtype: torch.dtype, num_tokens: int, hidden_dim: int, device: str
 ) -> None:
-    hidden_states = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
-    gate_weight = torch.randn(hidden_dim, device=device, dtype=dtype)
-    shared_output = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
-    final = torch.randn(num_tokens, hidden_dim, device=device, dtype=dtype)
-
-    # Eager reference
-    gate_val = (hidden_states.float() @ gate_weight.float().unsqueeze(1)).sigmoid()
-    ref = final.float() + gate_val * shared_output.float()
-    ref = ref.to(dtype)
+    values = FusedGateSigmoidMulAddInputs(
+        FusedGateSigmoidMulAddInputConfig(
+            num_tokens=num_tokens,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+        )
+    ).generate(seed=num_tokens * 107 + hidden_dim, device=device)
+    ref = fused_gate_sigmoid_mul_add_reference(values)
 
     out = fused_gate_sigmoid_mul_add(
-        hidden_states, gate_weight, shared_output.clone(), final.clone()
+        values.hidden_states,
+        values.gate_weight,
+        values.shared_output.clone(),
+        values.final_hidden_states.clone(),
     )
 
-    tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
-    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+    tol = _activation_tol(dtype)
+    torch.testing.assert_close(out.float(), ref, atol=tol, rtol=tol)
 
 
 def test_fused_gate_sigmoid_mul_add_is_inplace(device: str) -> None:
-    hidden_states = torch.randn(8, 256, device=device, dtype=torch.bfloat16)
-    gate_weight = torch.randn(256, device=device, dtype=torch.bfloat16)
-    shared_output = torch.randn(8, 256, device=device, dtype=torch.bfloat16)
-    final = torch.randn(8, 256, device=device, dtype=torch.bfloat16)
+    values = FusedGateSigmoidMulAddInputs(
+        FusedGateSigmoidMulAddInputConfig(
+            num_tokens=8,
+            hidden_dim=256,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=31, device=device)
 
     result = fused_gate_sigmoid_mul_add(
-        hidden_states, gate_weight, shared_output, final
+        values.hidden_states,
+        values.gate_weight,
+        values.shared_output,
+        values.final_hidden_states,
     )
-    assert result.data_ptr() == final.data_ptr()
+    assert result.data_ptr() == values.final_hidden_states.data_ptr()
 
 
 def test_fused_gate_sigmoid_mul_add_empty(device: str) -> None:
-    hidden_states = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
-    gate_weight = torch.randn(256, device=device, dtype=torch.bfloat16)
-    shared_output = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
-    final = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
+    values = FusedGateSigmoidMulAddInputs(
+        FusedGateSigmoidMulAddInputConfig(
+            num_tokens=0,
+            hidden_dim=256,
+            dtype=torch.bfloat16,
+        )
+    ).generate(seed=32, device=device)
 
-    out = fused_gate_sigmoid_mul_add(hidden_states, gate_weight, shared_output, final)
+    out = fused_gate_sigmoid_mul_add(
+        values.hidden_states,
+        values.gate_weight,
+        values.shared_output,
+        values.final_hidden_states,
+    )
     assert out.shape == (0, 256)

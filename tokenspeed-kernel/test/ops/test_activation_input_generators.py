@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     fused_swiglu_fp8_ue8m0,
@@ -39,7 +38,10 @@ from tokenspeed_numerics_input_generators import (
     GatedActivationInputs,
     SigmoidMulInputConfig,
     SigmoidMulInputs,
+    fused_gate_sigmoid_mul_add_reference,
     fused_swiglu_fp8_ue8m0_reference,
+    gated_activation_reference,
+    sigmoid_mul_reference,
 )
 
 platform = current_platform()
@@ -48,25 +50,6 @@ pytestmark = pytest.mark.skipif(
     not (platform.is_nvidia or platform.is_amd),
     reason="Triton activation generator smoke tests require an NVIDIA or AMD GPU.",
 )
-
-
-def _sigmoid_mul_reference(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    return x.float() * gate.reshape_as(x).float().sigmoid()
-
-
-def _silu_and_mul_reference(x: torch.Tensor) -> torch.Tensor:
-    gate, up = x.float().chunk(2, dim=-1)
-    return F.silu(gate) * up
-
-
-def _fused_gate_reference(
-    hidden_states: torch.Tensor,
-    gate_weight: torch.Tensor,
-    shared_output: torch.Tensor,
-    final_hidden_states: torch.Tensor,
-) -> torch.Tensor:
-    gate = (hidden_states.float() @ gate_weight.float().unsqueeze(1)).sigmoid()
-    return final_hidden_states.float() + gate * shared_output.float()
 
 
 def test_sigmoid_mul_generator_runs_kernel_dense(device: str) -> None:
@@ -79,7 +62,7 @@ def test_sigmoid_mul_generator_runs_kernel_dense(device: str) -> None:
     ).generate(seed=101, device=device)
 
     out = sigmoid_mul(values.x.clone(), values.gate)
-    ref = _sigmoid_mul_reference(values.x, values.gate)
+    ref = sigmoid_mul_reference(values.x, values.gate)
 
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
 
@@ -98,7 +81,7 @@ def test_sigmoid_mul_generator_runs_kernel_qkv_split(device: str) -> None:
     ).generate(seed=102, device=device)
 
     out = sigmoid_mul(values.x.clone(), values.gate)
-    ref = _sigmoid_mul_reference(values.x, values.gate)
+    ref = sigmoid_mul_reference(values.x, values.gate)
 
     assert not values.gate.is_contiguous()
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
@@ -115,7 +98,7 @@ def test_silu_and_mul_generator_runs_kernel(device: str) -> None:
     ).generate(seed=103, device=device)
 
     out = silu_and_mul(values.x)
-    ref = _silu_and_mul_reference(values.x)
+    ref = gated_activation_reference(values.x, activation="silu")
 
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
 
@@ -136,12 +119,7 @@ def test_fused_gate_sigmoid_mul_add_generator_runs_kernel(device: str) -> None:
         values.shared_output,
         final,
     )
-    ref = _fused_gate_reference(
-        values.hidden_states,
-        values.gate_weight,
-        values.shared_output,
-        values.final_hidden_states,
-    )
+    ref = fused_gate_sigmoid_mul_add_reference(values)
 
     assert out.data_ptr() == final.data_ptr()
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)

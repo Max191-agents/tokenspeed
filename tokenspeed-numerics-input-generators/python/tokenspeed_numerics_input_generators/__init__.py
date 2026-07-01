@@ -39,7 +39,10 @@ from tokenspeed_numerics_input_generators.activation import (
     SigmoidMulInputConfig,
     SigmoidMulInputs,
     SigmoidMulInputValues,
+    fused_gate_sigmoid_mul_add_reference,
     fused_swiglu_fp8_ue8m0_reference,
+    gated_activation_reference,
+    sigmoid_mul_reference,
 )
 from tokenspeed_numerics_input_generators.attention import (
     AttentionMergeStateInputConfig,
@@ -433,10 +436,12 @@ __all__ = [
     "expert_parallel_routing_reference",
     "fp8_kv_cache_write_reference",
     "fp8_scale_shape",
+    "fused_gate_sigmoid_mul_add_reference",
     "fused_qk_rmsnorm_rope_gate_reference",
     "fused_swiglu_fp8_ue8m0_reference",
     "gather_expand_scalars_reference",
     "gdn_qkv_split_reference",
+    "gated_activation_reference",
     "gemm_scale_shape",
     "kv_cache_store_reference",
     "kv_cache_transfer_reference",
@@ -461,5 +466,6 @@ __all__ = [
     "reduce_scatter_sum_reference",
     "rope_reference",
     "rmsnorm_reference",
+    "sigmoid_mul_reference",
     "top_k_top_p_renorm_reference",
 ]

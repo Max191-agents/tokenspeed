@@ -18,7 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Activation-family input generators for numerical correctness tests."""
+"""Activation-family input generators for numerical correctness tests.
+
+The activation family represented here is defined by pointwise gated
+transformations used in feed-forward and attention output paths:
+
+* ``sigmoid_mul`` computes ``x * sigmoid(gate)``. The gate may be a dense
+  matrix or a strided view into packed QKV-style storage, but both layouts
+  represent the same elementwise gate values after flattening.
+* split gated activations interpret a ``[..., 2 * hidden_dim]`` tensor as
+  ``[gate, up]`` and compute ``activation(gate) * up``.
+* fused gate-sigmoid-mul-add computes one scalar gate per token from a
+  hidden-state dot product, then adds the gated shared output to the final
+  hidden states.
+
+The generators choose bounded normally distributed values and scale wide
+dot-product weights where needed so references exercise the operations without
+being dominated by sigmoid saturation.
+"""
 
 from __future__ import annotations
 
@@ -44,12 +61,15 @@ __all__ = [
     "FusedSwiGLUFP8UE8M0Inputs",
     "FusedSwiGLUFP8UE8M0InputValues",
     "fused_swiglu_fp8_ue8m0_reference",
+    "fused_gate_sigmoid_mul_add_reference",
     "GatedActivationInputConfig",
     "GatedActivationInputs",
     "GatedActivationInputValues",
+    "gated_activation_reference",
     "SigmoidMulInputConfig",
     "SigmoidMulInputs",
     "SigmoidMulInputValues",
+    "sigmoid_mul_reference",
 ]
 
 GatedActivationKind = Literal["silu", "gelu", "gelu_tanh"]
@@ -91,6 +111,37 @@ class SigmoidMulInputValues:
     x: torch.Tensor
     gate: torch.Tensor
     gate_storage: torch.Tensor | None = None
+
+
+def sigmoid_mul_reference(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """Return a float32 reference for ``x * sigmoid(gate)``.
+
+    ``gate`` may be the dense ``[num_tokens, hidden_dim]`` form or the strided
+    ``[num_tokens, num_heads, head_dim]`` form. In the strided case the last
+    two dimensions must flatten to the same hidden width as ``x``.
+    """
+
+    if x.ndim != 2:
+        raise ValueError(f"x must be 2D, got {x.ndim}D")
+    if gate.ndim == 2:
+        if gate.shape != x.shape:
+            raise ValueError(f"gate shape must match x, got {gate.shape} and {x.shape}")
+        gate_values = gate
+    elif gate.ndim == 3:
+        gate_tokens, num_heads, head_dim = gate.shape
+        if gate_tokens != x.shape[0]:
+            raise ValueError(
+                f"gate token count must match x, got {gate_tokens} and {x.shape[0]}"
+            )
+        if num_heads * head_dim != x.shape[1]:
+            raise ValueError(
+                "flattened gate hidden width must match x, got "
+                f"{num_heads} * {head_dim} and {x.shape[1]}"
+            )
+        gate_values = gate.reshape_as(x)
+    else:
+        raise ValueError(f"gate must be 2D or 3D, got {gate.ndim}D")
+    return x.float() * gate_values.float().sigmoid()
 
 
 @dataclass
@@ -242,6 +293,27 @@ class GatedActivationInputValues:
     x: torch.Tensor
 
 
+def gated_activation_reference(
+    x: torch.Tensor,
+    *,
+    activation: GatedActivationKind = "silu",
+) -> torch.Tensor:
+    """Return a float32 reference for split gated activation inputs."""
+
+    if x.shape[-1] % 2 != 0:
+        raise ValueError(f"x last dimension must be even, got {x.shape[-1]}")
+    gate, up = x.float().chunk(2, dim=-1)
+    if activation == "silu":
+        activated = torch.nn.functional.silu(gate)
+    elif activation == "gelu":
+        activated = torch.nn.functional.gelu(gate)
+    elif activation == "gelu_tanh":
+        activated = torch.nn.functional.gelu(gate, approximate="tanh")
+    else:
+        raise ValueError(f"unsupported activation={activation!r}")
+    return activated * up
+
+
 @dataclass
 class GatedActivationInputConfig:
     """Initialization parameters for split gated activation inputs.
@@ -318,6 +390,38 @@ class FusedGateSigmoidMulAddInputValues:
     gate_weight: torch.Tensor
     shared_output: torch.Tensor
     final_hidden_states: torch.Tensor
+
+
+def fused_gate_sigmoid_mul_add_reference(
+    values: FusedGateSigmoidMulAddInputValues,
+) -> torch.Tensor:
+    """Return a float32 reference for fused gate-sigmoid-mul-add inputs."""
+
+    if values.hidden_states.ndim != 2:
+        raise ValueError(
+            f"hidden_states must be 2D, got {values.hidden_states.ndim}D"
+        )
+    num_tokens, hidden_dim = values.hidden_states.shape
+    if values.gate_weight.shape != (hidden_dim,):
+        raise ValueError(
+            f"gate_weight must have shape {(hidden_dim,)}, "
+            f"got {tuple(values.gate_weight.shape)}"
+        )
+    expected_matrix_shape = (num_tokens, hidden_dim)
+    if tuple(values.shared_output.shape) != expected_matrix_shape:
+        raise ValueError(
+            f"shared_output must have shape {expected_matrix_shape}, "
+            f"got {tuple(values.shared_output.shape)}"
+        )
+    if tuple(values.final_hidden_states.shape) != expected_matrix_shape:
+        raise ValueError(
+            f"final_hidden_states must have shape {expected_matrix_shape}, "
+            f"got {tuple(values.final_hidden_states.shape)}"
+        )
+    gate = (
+        values.hidden_states.float() @ values.gate_weight.float().unsqueeze(1)
+    ).sigmoid()
+    return values.final_hidden_states.float() + gate * values.shared_output.float()
 
 
 @dataclass
