@@ -6,6 +6,8 @@ from typing import Any
 import pytest
 import torch
 
+# ruff: noqa: E402
+
 
 def _is_gfx950() -> bool:
     if not torch.cuda.is_available():
@@ -28,6 +30,12 @@ from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
     triton_mxfp4_moe_process_weights,
 )
 from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950 as gluon_moe
+from tokenspeed_numerics_input_generators import (
+    CustomDType,
+    MoeInputConfig,
+    MoeInputs,
+    TensorInput,
+)
 from triton_kernels.matmul import FnSpecs, FusedActivation, matmul
 from triton_kernels.swiglu import swiglu_fn
 
@@ -35,16 +43,11 @@ HIDDEN_SIZE = 2880
 INTERMEDIATE_SIZE = 2880
 E = 128
 TOPK = 2
-MXFP4_BLOCK = 32
 GLUON_COMBINE_BLOCK_N = 128
 SWIGLU_ALPHA = 1.702
 SWIGLU_LIMIT = 7.0
 W13_ACT_SCALE = 0.125
 W2_ACT_SCALE = 0.125
-# E2M1 codes for 0, +0.5, +1, -0.5, -1.
-WEIGHT_NIBBLES = (0, 1, 2, 9, 10)
-# e8m0 block scales centered around the previous uniform exponent 124.
-WEIGHT_SCALE_EXPONENTS = (123, 124, 125)
 GEMM_ATOL = 0.05
 RTOL = 0.01
 
@@ -295,59 +298,33 @@ class TritonReference:
     gemm2_output: torch.Tensor
 
 
-def _make_mxfp4_weight_bytes(
-    shape: tuple[int, ...],
-    *,
-    device: str,
-    generator: torch.Generator,
-) -> torch.Tensor:
-    nibbles = torch.tensor(WEIGHT_NIBBLES, device=device, dtype=torch.uint8)
-    lo = nibbles[
-        torch.randint(0, len(WEIGHT_NIBBLES), shape, device=device, generator=generator)
-    ]
-    hi = nibbles[
-        torch.randint(0, len(WEIGHT_NIBBLES), shape, device=device, generator=generator)
-    ]
-    return lo | (hi << 4)
-
-
-def _make_e8m0_scales(
-    shape: tuple[int, ...],
-    *,
-    device: str,
-    generator: torch.Generator,
-) -> torch.Tensor:
-    exponents = torch.tensor(WEIGHT_SCALE_EXPONENTS, device=device, dtype=torch.uint8)
-    return exponents[
-        torch.randint(
-            0, len(WEIGHT_SCALE_EXPONENTS), shape, device=device, generator=generator
-        )
-    ]
-
-
 def _make_raw_mxfp4_weights() -> RawMxfp4Weights:
-    device = "cuda"
-    generator = torch.Generator(device=device).manual_seed(20260610)
+    values = MoeInputs(
+        MoeInputConfig(
+            num_tokens=1,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE,
+            num_experts=E,
+            top_k=TOPK,
+            hidden_dtype=torch.bfloat16,
+            router_dtype=torch.bfloat16,
+            weight_dtype=CustomDType.MXFP4,
+            weight_format="mxfp4",
+            weight_scale_dtype=None,
+            bias_dtype=torch.float32,
+            device="cuda",
+        )
+    ).generate(seed=20260610, device="cuda")
+    if values.w13.B is None or values.w13.B_scales is None:
+        raise ValueError("generated w13 MXFP4 weights are incomplete")
+    if values.w2.B is None or values.w2.B_scales is None:
+        raise ValueError("generated w2 MXFP4 weights are incomplete")
 
     return RawMxfp4Weights(
-        w13_weight=_make_mxfp4_weight_bytes(
-            (E, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE // 2),
-            device=device,
-            generator=generator,
-        ),
-        w13_scale=_make_e8m0_scales(
-            (E, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE // MXFP4_BLOCK),
-            device=device,
-            generator=generator,
-        ),
-        w2_weight=_make_mxfp4_weight_bytes(
-            (E, HIDDEN_SIZE, INTERMEDIATE_SIZE // 2), device=device, generator=generator
-        ),
-        w2_scale=_make_e8m0_scales(
-            (E, HIDDEN_SIZE, INTERMEDIATE_SIZE // MXFP4_BLOCK),
-            device=device,
-            generator=generator,
-        ),
+        w13_weight=values.w13.B,
+        w13_scale=values.w13.B_scales,
+        w2_weight=values.w2.B,
+        w2_scale=values.w2.B_scales,
     )
 
 
@@ -426,34 +403,40 @@ def test_gluon_preshuffle_keeps_w2_bias_logical_n(
 
 
 def _make_hidden_and_router(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
-    generator = torch.Generator(device="cuda").manual_seed(9000 + num_tokens)
     hidden_states = (
-        torch.randint(
-            -4, 5, (num_tokens, HIDDEN_SIZE), device="cuda", generator=generator
-        ).to(torch.float32)
-        / 16.0
-    ).to(torch.bfloat16)
-    router_logits = torch.randn(
-        (num_tokens, E),
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    ).to(torch.bfloat16)
+        TensorInput(
+            (num_tokens, HIDDEN_SIZE),
+            torch.float32,
+        )
+        .generate(seed=9000 + num_tokens, device="cuda")
+        .values
+    )
+    router_logits = (
+        TensorInput(
+            (num_tokens, E),
+            torch.bfloat16,
+        )
+        .generate(seed=10_000 + num_tokens, device="cuda")
+        .values
+    )
+    if hidden_states is None or router_logits is None:
+        raise ValueError("hidden/router generation unexpectedly returned None")
+    hidden_states = hidden_states.clamp(-1.0, 1.0).mul(0.25).to(torch.bfloat16)
     return hidden_states, router_logits
 
 
 def _make_gemm2_input(num_tokens: int, scale: torch.Tensor) -> torch.Tensor:
-    generator = torch.Generator(device="cuda").manual_seed(19000 + num_tokens)
     exact_values = (
-        torch.randint(
-            -4,
-            5,
+        TensorInput(
             (num_tokens * TOPK, INTERMEDIATE_SIZE),
-            device="cuda",
-            generator=generator,
-        ).to(torch.float32)
-        / 16.0
-    ).to(torch.bfloat16)
+            torch.float32,
+        )
+        .generate(seed=19_000 + num_tokens, device="cuda")
+        .values
+    )
+    if exact_values is None:
+        raise ValueError("gemm2 input generation unexpectedly returned None")
+    exact_values = exact_values.clamp(-1.0, 1.0).mul(0.25).to(torch.bfloat16)
     return fp8_quantize(
         exact_values,
         scale=scale,
