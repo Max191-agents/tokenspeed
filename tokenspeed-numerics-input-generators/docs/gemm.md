@@ -29,9 +29,10 @@ required and is always generated.
 
 `gemm_reference` computes the operation-level `A @ B.T` result from generated
 values. It normalizes dense operand layouts, applies scale sidecars for scaled
-tensors, and dequantizes MXFP4 storage with UE8M0 scales before multiplying.
-Kernel tests can use it as the semantic target while keeping backend-specific
-argument mapping in the adapter or test.
+tensors, dequantizes MXFP4 storage with UE8M0 scales, and dequantizes MXINT4
+storage with BF16 group scales before multiplying. Kernel tests can use it as
+the semantic target while keeping backend-specific argument mapping in the
+adapter or test.
 
 Some backend entry points consume a different physical layout than the
 operation-level default. For example, the TokenSpeed Triton scaled-FP8 GEMM path
@@ -45,8 +46,9 @@ boundary, not in the generator definition.
 
 Dense floating-point tensors use the core tensor generator. Scaled tensors use
 the same tensor generator with explicit scale shape and scale dtype. Custom
-dtypes, such as MXFP4 storage with UE8M0 scales, are represented through the
-shared custom dtype enum so the format-specific constraints are centralized.
+dtypes, such as MXFP4 storage with UE8M0 scales and MXINT4 storage with BF16
+group scales, are represented through the shared custom dtype enum so the
+format-specific constraints are centralized.
 
 The dense case is the baseline operation: `A` and `B` are generated as ordinary
 floating-point tensors with no sidecar scales, and `gemm_reference` computes the
@@ -56,7 +58,14 @@ and interpreted.
 
 `gemm_scale_shape` provides common scale-shape calculations for tensor,
 channel, and block granularities. `mxfp4_gemm_input_config` builds a GEMM config
-for MXFP4 operands with block scales.
+for MXFP4 operands with block scales. `mxint4_gemm_input_config` builds the
+same row-major operation-level layout for signed INT4 operands with BF16 group
+scales.
+
+MXINT4 is modeled as weight-like signed INT4 storage: every byte stores two
+two's-complement 4-bit values, and each BF16 scale covers one logical 32-value
+K group. This is the semantic representation before backend adapters perform
+checkpoint packing, block-major conversion, or scale interleaving.
 
 For block-scaled FP8 GEMM, generated storage values are interpreted as FP8
 values multiplied by a scale grid. `A` commonly uses one scale row per logical
@@ -91,11 +100,11 @@ family.
 
 The generator verifies logical dimensions, required output dtype, layout-derived
 physical shapes, and scale requirements. It rejects configurations that would
-produce meaningless inputs, such as scales for skipped operands or MXFP4 storage
-without compatible scales. Layout names are validated explicitly. The current
-MXFP4 GEMM definition is the row-major form consumed by the TokenSpeed Triton
-MXFP4 GEMM path, so MXFP4 `A` operands require `MK` layout and MXFP4 `B`
-operands require `NK` layout.
+produce meaningless inputs, such as scales for skipped operands, MXFP4 storage
+without compatible UE8M0 scales, or MXINT4 storage without compatible BF16
+group scales. Layout names are validated explicitly. The current MXFP4 and
+MXINT4 GEMM definitions are row-major operation layouts, so custom `A` operands
+require `MK` layout and custom `B` operands require `NK` layout.
 
 The fused NVFP4 generator also verifies the fixed NVFP4 scale group width,
 source dtype, divisibility of K and intermediate dimensions by the scale group,

@@ -53,12 +53,19 @@ class CustomDType(str, Enum):
     # by MXFP4 kernels as unsigned exponent-only FP8 scales.
     UE8M0 = "ue8m0"
 
+    # Weight-only signed INT4 values with group scales. Storage is torch.uint8
+    # with two two's-complement INT4 nibbles per byte; TensorInput requires a
+    # scale_shape and generates paired BF16 group scales.
+    MXINT4 = "mxint4"
+
 
 InputDType = torch.dtype | CustomDType | None
 
 _DEFAULT_DEVICE = torch.device("cpu")
 _MXFP4_VALUES_PER_BYTE = 2
 _MXFP4_SCALE_MAX = 0.125
+_MXINT4_VALUES_PER_BYTE = 2
+_MXINT4_SCALE_MAX = 0.25
 _UE8M0_SCALE_EXPONENTS = (121, 122, 123, 124)
 
 
@@ -123,6 +130,19 @@ def _packed_mxfp4_shape(
     return tuple(packed)
 
 
+def _packed_mxint4_shape(
+    shape: tuple[int, ...],
+    *,
+    packed_dim: int,
+) -> tuple[int, ...]:
+    if not shape:
+        raise ValueError("mxint4 tensors need at least one dimension to pack")
+    packed_dim = packed_dim % len(shape)
+    packed = list(shape)
+    packed[packed_dim] = math.ceil(packed[packed_dim] / _MXINT4_VALUES_PER_BYTE)
+    return tuple(packed)
+
+
 def _generate_mxfp4_packed(
     shape: tuple[int, ...],
     *,
@@ -146,6 +166,31 @@ def _generate_mxfp4_packed(
         generator=generator,
     )
     return low | (high << 4)
+
+
+def _generate_mxint4_packed(
+    shape: tuple[int, ...],
+    *,
+    device: torch.device,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    low = torch.randint(
+        -7,
+        8,
+        shape,
+        device=device,
+        dtype=torch.int8,
+        generator=generator,
+    )
+    high = torch.randint(
+        -7,
+        8,
+        shape,
+        device=device,
+        dtype=torch.int8,
+        generator=generator,
+    )
+    return ((low & 0xF) | ((high & 0xF) << 4)).to(torch.uint8)
 
 
 def _generate_torch_tensor(
@@ -289,6 +334,13 @@ class TensorInput(NumericsInputGenerator):
                 self.scale_dtype = CustomDType.UE8M0
             elif self.scale_dtype != CustomDType.UE8M0:
                 raise ValueError("mxfp4 scale_dtype must be CustomDType.UE8M0 or None")
+        elif self.dtype == CustomDType.MXINT4:
+            if self.scale_shape is None:
+                raise ValueError("mxint4 tensors require scale_shape")
+            if self.scale_dtype is None:
+                self.scale_dtype = torch.bfloat16
+            elif self.scale_dtype != torch.bfloat16:
+                raise ValueError("mxint4 scale_dtype must be torch.bfloat16 or None")
         elif (self.scale_shape is None) != (self.scale_dtype is None):
             raise ValueError("scale_shape and scale_dtype must be provided together")
         if self.scale_shape is not None:
@@ -314,6 +366,12 @@ class TensorInput(NumericsInputGenerator):
         generator = _rng_for_device(target_device, seed)
         if self.dtype == CustomDType.MXFP4:
             return _generate_mxfp4_packed(
+                self.shape,
+                device=target_device,
+                generator=generator,
+            )
+        if self.dtype == CustomDType.MXINT4:
+            return _generate_mxint4_packed(
                 self.shape,
                 device=target_device,
                 generator=generator,
@@ -358,4 +416,6 @@ class TensorInput(NumericsInputGenerator):
     def _scale_max_value(self) -> float:
         if self.dtype == CustomDType.MXFP4:
             return _MXFP4_SCALE_MAX
+        if self.dtype == CustomDType.MXINT4:
+            return _MXINT4_SCALE_MAX
         return 1.0

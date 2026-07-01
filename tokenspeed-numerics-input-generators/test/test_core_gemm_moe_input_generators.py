@@ -43,6 +43,7 @@ from tokenspeed_numerics_input_generators import (
     moe_align_block_size_reference,
     moe_reference,
     mxfp4_gemm_input_config,
+    mxint4_gemm_input_config,
     nvfp4_dequantization_reference,
     nvfp4_gemm_swiglu_nvfp4_quant_reference,
 )
@@ -164,6 +165,46 @@ def test_tensor_input_requires_ue8m0_scales_for_mxfp4() -> None:
 
     assert values.scales is not None
     assert values.scales.dtype == torch.uint8
+
+
+def test_tensor_input_generates_mxint4_values_and_scales() -> None:
+    tensor = TensorInput(
+        (4, 8),
+        CustomDType.MXINT4,
+        scale_shape=(4, 1),
+    ).generate(seed=128, device="cpu")
+
+    assert tensor.values is not None
+    assert tensor.scales is not None
+    assert tensor.values.shape == (4, 8)
+    assert tensor.values.dtype == torch.uint8
+    assert tensor.scales.shape == (4, 1)
+    assert tensor.scales.dtype == torch.bfloat16
+    assert torch.all(tensor.scales.float() > 0.0)
+    assert torch.all(tensor.scales.float() <= 0.25)
+
+
+def test_tensor_input_requires_bf16_scales_for_mxint4() -> None:
+    with pytest.raises(ValueError, match="mxint4 tensors require scale_shape"):
+        TensorInput((4, 8), CustomDType.MXINT4)
+
+    with pytest.raises(ValueError, match="mxint4 scale_dtype"):
+        TensorInput(
+            (4, 8),
+            CustomDType.MXINT4,
+            scale_shape=(4, 1),
+            scale_dtype=torch.float32,
+        )
+
+    values = TensorInput(
+        (4, 8),
+        CustomDType.MXINT4,
+        scale_shape=(4, 1),
+        scale_dtype=torch.bfloat16,
+    ).generate(seed=129, device="cpu")
+
+    assert values.scales is not None
+    assert values.scales.dtype == torch.bfloat16
 
 
 def test_tensor_input_requires_scale_shape_and_dtype_together() -> None:
@@ -464,6 +505,57 @@ def test_gemm_reference_dequantizes_mxfp4_inputs() -> None:
     assert ref.shape == (4, 8)
     assert ref.dtype == torch.float32
     assert torch.isfinite(ref).all()
+
+
+def test_gemm_inputs_support_mxint4_bf16_scales() -> None:
+    inputs = GemmInputs(
+        mxint4_gemm_input_config(
+            M=4,
+            N=8,
+            K=64,
+            c_dtype=torch.float32,
+        )
+    ).generate(seed=94, device="cpu")
+
+    assert inputs.A is not None
+    assert inputs.B is not None
+    assert inputs.A_scales is not None
+    assert inputs.B_scales is not None
+    assert inputs.A.shape == (4, 32)
+    assert inputs.B.shape == (8, 32)
+    assert inputs.A.dtype == torch.uint8
+    assert inputs.B.dtype == torch.uint8
+    assert inputs.A_scales.shape == (4, 2)
+    assert inputs.B_scales.shape == (8, 2)
+    assert inputs.A_scales.dtype == torch.bfloat16
+    assert inputs.B_scales.dtype == torch.bfloat16
+    assert inputs.C.shape == (4, 8)
+
+
+def test_gemm_reference_dequantizes_mxint4_inputs() -> None:
+    values = GemmInputValues(
+        A=torch.ones((1, 4), dtype=torch.float32),
+        B=torch.tensor([[0x21, 0xF0]], dtype=torch.uint8),
+        C=torch.zeros((1, 1), dtype=torch.float32),
+        B_scales=torch.tensor([[1.0]], dtype=torch.bfloat16),
+    )
+
+    ref = gemm_reference(values)
+
+    torch.testing.assert_close(ref, torch.tensor([[2.0]], dtype=torch.float32))
+
+
+def test_gemm_inputs_reject_mxint4_non_kernel_layouts() -> None:
+    with pytest.raises(ValueError, match="a_layout='MK'"):
+        GemmInputs(
+            mxint4_gemm_input_config(
+                M=4,
+                N=8,
+                K=64,
+                c_dtype=torch.float32,
+                a_layout="KM",
+            )
+        )
 
 
 def test_gemm_reference_applies_scaled_operands() -> None:
@@ -780,6 +872,35 @@ def test_moe_inputs_compose_mxfp4_weight_gemms() -> None:
     assert inputs.w13.B_scales.dtype == torch.uint8
 
 
+def test_moe_inputs_compose_mxint4_weight_gemms() -> None:
+    inputs = MoeInputs(
+        MoeInputConfig(
+            num_tokens=5,
+            hidden_size=64,
+            intermediate_size=32,
+            num_experts=4,
+            top_k=2,
+            hidden_dtype=torch.float16,
+            weight_format="mxint4",
+        )
+    ).generate(seed=34, device="cpu")
+
+    assert inputs.w13.A is None
+    assert inputs.w2.A is None
+    assert inputs.w13.B is not None
+    assert inputs.w2.B is not None
+    assert inputs.w13.B_scales is not None
+    assert inputs.w2.B_scales is not None
+    assert inputs.w13.B.shape == (4, 64, 32)
+    assert inputs.w13.B_scales.shape == (4, 64, 2)
+    assert inputs.w2.B.shape == (4, 64, 16)
+    assert inputs.w2.B_scales.shape == (4, 64, 1)
+    assert inputs.w13.B.dtype == torch.uint8
+    assert inputs.w2.B.dtype == torch.uint8
+    assert inputs.w13.B_scales.dtype == torch.bfloat16
+    assert inputs.w2.B_scales.dtype == torch.bfloat16
+
+
 def test_moe_inputs_generate_optional_activation_scales() -> None:
     inputs = MoeInputs(
         MoeInputConfig(
@@ -867,6 +988,26 @@ def test_moe_reference_handles_mxfp4_weight_values() -> None:
     assert ref.dtype == torch.float16
 
 
+def test_moe_reference_handles_mxint4_weight_values() -> None:
+    values = MoeInputs(
+        MoeInputConfig(
+            num_tokens=5,
+            hidden_size=64,
+            intermediate_size=32,
+            num_experts=4,
+            top_k=2,
+            hidden_dtype=torch.float16,
+            weight_format="mxint4",
+        )
+    ).generate(seed=35, device="cpu")
+
+    ref = moe_reference(values)
+
+    assert ref.shape == (5, 64)
+    assert ref.dtype == torch.float16
+    assert torch.isfinite(ref).all()
+
+
 def test_moe_reference_rejects_invalid_topk_weights() -> None:
     values = MoeInputs(
         MoeInputConfig(
@@ -933,6 +1074,36 @@ def test_moe_inputs_verify_activation_scale_config() -> None:
                 hidden_dtype=torch.float32,
                 activation_scale_dtype=torch.float32,
                 w13_activation_scale=0.0,
+            )
+        )
+
+
+def test_moe_inputs_verify_mxint4_weight_config() -> None:
+    with pytest.raises(ValueError, match="mxint4 MoE weights"):
+        MoeInputs(
+            MoeInputConfig(
+                num_tokens=4,
+                hidden_size=64,
+                intermediate_size=32,
+                num_experts=3,
+                top_k=2,
+                hidden_dtype=torch.float32,
+                weight_format="mxint4",
+                weight_dtype=torch.float32,
+            )
+        )
+
+    with pytest.raises(ValueError, match="mxint4 MoE weight_scale_dtype"):
+        MoeInputs(
+            MoeInputConfig(
+                num_tokens=4,
+                hidden_size=64,
+                intermediate_size=32,
+                num_experts=3,
+                top_k=2,
+                hidden_dtype=torch.float32,
+                weight_format="mxint4",
+                weight_scale_dtype=torch.float32,
             )
         )
 

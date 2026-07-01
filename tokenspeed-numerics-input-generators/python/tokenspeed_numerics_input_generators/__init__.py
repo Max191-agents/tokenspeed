@@ -239,6 +239,7 @@ from tokenspeed_numerics_input_generators.gemm import (
     gemm_reference,
     gemm_scale_shape,
     mxfp4_gemm_input_config,
+    mxint4_gemm_input_config,
     nvfp4_gemm_swiglu_nvfp4_quant_reference,
 )
 from tokenspeed_numerics_input_generators.kvcache import (
@@ -679,6 +680,7 @@ __all__ = [
     "moe_align_block_size_reference",
     "moe_reference",
     "mxfp4_gemm_input_config",
+    "mxint4_gemm_input_config",
     "mxfp4_quantization_reference",
     "mxfp4_scale_shape",
     "mxfp8_quantization_reference",

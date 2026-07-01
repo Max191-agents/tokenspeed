@@ -13,9 +13,10 @@ route weights.
 - `MoeAlignBlockSizeInputs`: generates top-k expert ids and block-size metadata
   for expert-local token grouping and padding.
 
-`MoeInputs` composes the GEMM generator for expert weights. Dense and MXFP4
-expert weights are operation-level choices; backend preprocessing such as
-preshuffling or registry precision configs belongs in adapters.
+`MoeInputs` composes the GEMM generator for expert weights. Dense, MXFP4, and
+MXINT4 expert weights are operation-level choices; backend preprocessing such
+as preshuffling, checkpoint repacking, or registry precision configs belongs in
+adapters.
 
 ## Generated Values
 
@@ -25,6 +26,10 @@ weights are finite and normalized, and expert weight shapes agree with hidden
 and intermediate dimensions. Optional activation scales are generated as
 positive per-expert tensors and are intended for adapters that quantize the
 projection activations before calling a backend kernel.
+
+MXINT4 MoE weights are generated as packed signed INT4 bytes with BF16 group
+scales. Backend adapters can repack those bytes into checkpoint or block-major
+layouts without changing the operation-level generator contract.
 
 The generator intentionally describes the layer-level routed computation rather
 than any one fused MoE kernel signature.

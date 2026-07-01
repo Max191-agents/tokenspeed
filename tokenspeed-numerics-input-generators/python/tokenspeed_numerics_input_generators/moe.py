@@ -42,6 +42,7 @@ from tokenspeed_numerics_input_generators.gemm import (
     _check_gemm_layout,
     _logical_operand,
     mxfp4_gemm_input_config,
+    mxint4_gemm_input_config,
 )
 
 __all__ = [
@@ -363,14 +364,15 @@ class MoeInputConfig:
     router_dtype: torch.dtype = torch.float32
 
     # Optional: generated expert-weight dtype. Defaults to hidden_dtype for
-    # dense weights and MXFP4 for mxfp4 weights.
+    # dense weights, MXFP4 for mxfp4 weights, and MXINT4 for mxint4 weights.
     weight_dtype: InputDType = None
 
     # Optional: expert-weight storage/scale format.
     weight_format: str = "dense"
 
     # Optional: expert-weight scale dtype for scaled formats. MXFP4 accepts
-    # ``None`` to infer raw UE8M0 scale storage.
+    # ``None`` to infer raw UE8M0 scale storage; MXINT4 accepts ``None`` to
+    # infer BF16 group scales.
     weight_scale_dtype: InputDType = None
 
     # Optional: output dtype metadata reserved for layer-level tests.
@@ -481,10 +483,21 @@ class MoeInputs(NumericsInputGenerator):
             self.config.weight_dtype = (
                 CustomDType.MXFP4
                 if self.config.weight_format == "mxfp4"
-                else self.config.hidden_dtype
+                else (
+                    CustomDType.MXINT4
+                    if self.config.weight_format == "mxint4"
+                    else self.config.hidden_dtype
+                )
             )
+        if self.config.weight_format == "mxint4":
+            if self.config.weight_dtype != CustomDType.MXINT4:
+                raise ValueError("mxint4 MoE weights require CustomDType.MXINT4")
+            if self.config.weight_scale_dtype not in (None, torch.bfloat16):
+                raise ValueError(
+                    "mxint4 MoE weight_scale_dtype must be torch.bfloat16 or None"
+                )
         if (
-            self.config.weight_format not in {"dense", "mxfp4"}
+            self.config.weight_format not in {"dense", "mxfp4", "mxint4"}
             and self.config.weight_scale_dtype is None
         ):
             self.config.weight_scale_dtype = torch.float8_e4m3fn
@@ -593,6 +606,18 @@ class MoeInputs(NumericsInputGenerator):
 
         if self.config.weight_format == "mxfp4":
             return mxfp4_gemm_input_config(
+                M=self.config.num_tokens,
+                N=N,
+                K=K,
+                a_dtype=None,
+                b_dtype=self.config.weight_dtype,
+                scale_dtype=self.config.weight_scale_dtype,
+                c_dtype=c_dtype,
+                batch_shape=(self.config.num_experts,),
+            )
+
+        if self.config.weight_format == "mxint4":
+            return mxint4_gemm_input_config(
                 M=self.config.num_tokens,
                 N=N,
                 K=K,
@@ -724,12 +749,22 @@ def _moe_weight_operand(
     if gemm_values.B is None:
         raise ValueError(f"{name}.B is required for moe_reference")
     layout = _check_gemm_layout(f"{name}_b_layout", layout)
-    is_mxfp4 = gemm_values.B.dtype == torch.uint8 and gemm_values.B_scales is not None
+    is_mxint4 = (
+        gemm_values.B.dtype == torch.uint8
+        and gemm_values.B_scales is not None
+        and gemm_values.B_scales.dtype == torch.bfloat16
+    )
+    is_mxfp4 = (
+        gemm_values.B.dtype == torch.uint8
+        and gemm_values.B_scales is not None
+        and not is_mxint4
+    )
     return _logical_operand(
         gemm_values.B,
         gemm_values.B_scales,
         layout=layout,
         is_mxfp4=is_mxfp4,
+        is_mxint4=is_mxint4,
     )
 
 

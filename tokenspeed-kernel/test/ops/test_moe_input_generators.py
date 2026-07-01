@@ -92,6 +92,21 @@ def _make_dense_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
     return layer
 
 
+def _mxint4_checkpoint_words_from_generator(packed: torch.Tensor) -> torch.Tensor:
+    """Convert generated signed INT4 bytes to checkpoint-style int32 words."""
+
+    low = packed & 0xF
+    high = packed >> 4
+    nibbles = packed.new_empty((*packed.shape[:-1], packed.shape[-1] * 2))
+    nibbles[..., 0::2] = low
+    nibbles[..., 1::2] = high
+    signed = nibbles.to(torch.int8)
+    signed = torch.where(signed >= 8, signed - 16, signed)
+    unsigned = (signed.to(torch.int32) + 8).reshape(*signed.shape[:-1], -1, 8)
+    shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=packed.device)
+    return ((unsigned << shifts).sum(dim=-1)).to(torch.int32)
+
+
 def test_moe_align_block_size_numerics_adapter_uses_generator() -> None:
     generated = get_input_generator(
         "moe",
@@ -173,6 +188,71 @@ def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None
 
     expected = moe_reference(values, output_dtype=torch.bfloat16).to(device=device)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=5.0e-2, atol=0.1)
+
+
+def test_mxint4_moe_generator_matches_flashinfer_trtllm_contract() -> None:
+    config = MoeInputConfig(
+        num_tokens=4,
+        hidden_size=64,
+        intermediate_size=64,
+        num_experts=4,
+        top_k=2,
+        hidden_dtype=torch.bfloat16,
+        router_dtype=torch.float32,
+        weight_format="mxint4",
+        weight_dtype=CustomDType.MXINT4,
+        weight_scale_dtype=None,
+        bias_dtype=None,
+    )
+    values = MoeInputs(config).generate(seed=44, device="cpu")
+    assert values.w13.B is not None
+    assert values.w13.B_scales is not None
+    assert values.w2.B is not None
+    assert values.w2.B_scales is not None
+
+    w13_weight_packed = _mxint4_checkpoint_words_from_generator(values.w13.B)
+    w2_weight_packed = _mxint4_checkpoint_words_from_generator(values.w2.B)
+    layer = torch.nn.Module()
+    layer.num_experts = config.num_experts
+    layer.num_local_experts = config.num_experts
+    layer.ep_size = 1
+    layer.ep_rank = 0
+    layer.tp_size = 1
+    layer.top_k = config.top_k
+    layer.intermediate_size = config.intermediate_size
+    layer.w13_weight_packed = torch.nn.Parameter(
+        w13_weight_packed,
+        requires_grad=False,
+    )
+    layer.w2_weight_packed = torch.nn.Parameter(
+        w2_weight_packed,
+        requires_grad=False,
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(
+        values.w13.B_scales.clone(),
+        requires_grad=False,
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        values.w2.B_scales.clone(),
+        requires_grad=False,
+    )
+
+    assert layer.w13_weight_packed.shape == (4, 128, 8)
+    assert layer.w2_weight_packed.shape == (4, 64, 8)
+    assert layer.w13_weight_packed.dtype == torch.int32
+    assert layer.w2_weight_packed.dtype == torch.int32
+    assert layer.w13_weight_scale.shape == (4, 128, 2)
+    assert layer.w2_weight_scale.shape == (4, 64, 2)
+    assert layer.w13_weight_scale.dtype == torch.bfloat16
+    assert layer.w2_weight_scale.dtype == torch.bfloat16
+    assert values.hidden_states is not None
+    assert values.hidden_states.shape == (4, 64)
+    assert values.hidden_states.dtype == torch.bfloat16
+    assert values.router_logits is not None
+    assert values.router_logits.shape == (4, 4)
+    assert values.topk_ids.shape == (4, 2)
+    assert values.topk_ids.dtype == torch.int32
+    assert moe_reference(values, output_dtype=torch.bfloat16).shape == (4, 64)
 
 
 def test_dense_moe_generator_runs_flashinfer_cutlass_kernel(device: str) -> None:

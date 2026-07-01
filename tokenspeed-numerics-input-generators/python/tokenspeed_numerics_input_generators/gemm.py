@@ -37,6 +37,7 @@ from tokenspeed_numerics_input_generators.core import (
     _child_seed,
     _normalize_shape,
     _packed_mxfp4_shape,
+    _packed_mxint4_shape,
 )
 from tokenspeed_numerics_input_generators.quantization import (
     nvfp4_dequantization_reference,
@@ -53,6 +54,7 @@ __all__ = [
     "gemm_reference",
     "gemm_scale_shape",
     "mxfp4_gemm_input_config",
+    "mxint4_gemm_input_config",
     "nvfp4_gemm_swiglu_nvfp4_quant_reference",
 ]
 
@@ -60,6 +62,7 @@ GemmLayout = Literal["MK", "KM", "NK", "KN"]
 ScaleGranularity = Literal["tensor", "channel", "block"]
 
 _DEFAULT_MXFP4_BLOCK_SIZE = 32
+_DEFAULT_MXINT4_BLOCK_SIZE = 32
 _DEFAULT_NVFP4_BLOCK_SIZE = 16
 _GEMM_LAYOUTS = frozenset({"MK", "KM", "NK", "KN"})
 
@@ -85,6 +88,8 @@ def _gemm_value_shape(
 
     if dtype == CustomDType.MXFP4:
         shape = _packed_mxfp4_shape(shape, packed_dim=packed_dim)
+    if dtype == CustomDType.MXINT4:
+        shape = _packed_mxint4_shape(shape, packed_dim=packed_dim)
     return batch_shape + shape
 
 
@@ -221,6 +226,45 @@ def _dequantize_mxfp4_linear(
     )
 
 
+def _signed_int4_values_from_packed(packed: torch.Tensor) -> torch.Tensor:
+    low = packed & 0xF
+    high = packed >> 4
+    nibbles = packed.new_empty((*packed.shape[:-1], packed.shape[-1] * 2))
+    nibbles[..., 0::2] = low
+    nibbles[..., 1::2] = high
+    signed = nibbles.to(torch.int8)
+    return torch.where(signed >= 8, signed - 16, signed).to(torch.float32)
+
+
+def _dequantize_mxint4_linear(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+) -> torch.Tensor:
+    if packed.dtype != torch.uint8 or scales.dtype != torch.bfloat16:
+        raise ValueError("MXINT4 values must be uint8 and scales must be bfloat16")
+    if packed.ndim < 2:
+        raise ValueError("MXINT4 GEMM operands must be at least 2D")
+    if scales.shape[:-1] != packed.shape[:-1]:
+        raise ValueError(
+            "MXINT4 scale rows must match packed value rows; "
+            f"packed={tuple(packed.shape)}, scales={tuple(scales.shape)}"
+        )
+
+    values = _signed_int4_values_from_packed(packed)
+    expected_groups = math.ceil(values.shape[-1] / _DEFAULT_MXINT4_BLOCK_SIZE)
+    if scales.shape[-1] != expected_groups:
+        raise ValueError(
+            "MXINT4 scale group count must match K dimension; "
+            f"got scales={tuple(scales.shape)}, values={tuple(values.shape)}"
+        )
+    return (
+        values
+        * scales.float().repeat_interleave(_DEFAULT_MXINT4_BLOCK_SIZE, dim=-1)[
+            ..., : values.shape[-1]
+        ]
+    )
+
+
 def _apply_regular_scales(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     scale_values = scales.float()
     if scale_values.numel() == 1:
@@ -282,7 +326,10 @@ def _logical_operand(
     *,
     layout: GemmLayout,
     is_mxfp4: bool,
+    is_mxint4: bool = False,
 ) -> torch.Tensor:
+    if is_mxfp4 and is_mxint4:
+        raise ValueError("GEMM operand cannot be both MXFP4 and MXINT4")
     if is_mxfp4:
         if layout not in ("MK", "NK"):
             raise ValueError(
@@ -291,6 +338,14 @@ def _logical_operand(
         if scales is None:
             raise ValueError("MXFP4 GEMM reference requires scales")
         logical = _dequantize_mxfp4_linear(values, scales)
+    elif is_mxint4:
+        if layout not in ("MK", "NK"):
+            raise ValueError(
+                "MXINT4 GEMM reference currently supports row-major MK/NK operands"
+            )
+        if scales is None:
+            raise ValueError("MXINT4 GEMM reference requires scales")
+        logical = _dequantize_mxint4_linear(values, scales)
     else:
         logical = values.float()
         if scales is not None:
@@ -424,6 +479,10 @@ class GemmInputs(NumericsInputGenerator):
             raise ValueError("MXFP4 A operands currently require a_layout='MK'")
         if self.config.b_dtype == CustomDType.MXFP4 and self.config.b_layout != "NK":
             raise ValueError("MXFP4 B operands currently require b_layout='NK'")
+        if self.config.a_dtype == CustomDType.MXINT4 and self.config.a_layout != "MK":
+            raise ValueError("MXINT4 A operands currently require a_layout='MK'")
+        if self.config.b_dtype == CustomDType.MXINT4 and self.config.b_layout != "NK":
+            raise ValueError("MXINT4 B operands currently require b_layout='NK'")
         if self.config.c_dtype is None:
             raise ValueError("c_dtype is required")
         if not isinstance(self.config.c_dtype, torch.dtype):
@@ -531,8 +590,10 @@ def gemm_reference(
 
     Dense and scaled torch tensors are converted to fp32 and multiplied by
     their scale sidecars before the matmul. MXFP4 operands are unpacked from
-    E2M1x2 bytes and dequantized with UE8M0 scales. The returned dtype defaults
-    to the generated ``C`` dtype, matching TokenSpeed's ``out_dtype`` role.
+    E2M1x2 bytes and dequantized with UE8M0 scales. MXINT4 operands are
+    unpacked from signed INT4 nibbles and dequantized with BF16 group scales.
+    The returned dtype defaults to the generated ``C`` dtype, matching
+    TokenSpeed's ``out_dtype`` role.
     """
 
     a_layout = _check_gemm_layout("a_layout", a_layout)
@@ -545,17 +606,31 @@ def gemm_reference(
 
     a_is_mxfp4 = values.A.dtype == torch.uint8 and values.A_scales is not None
     b_is_mxfp4 = values.B.dtype == torch.uint8 and values.B_scales is not None
+    a_is_mxint4 = (
+        values.A.dtype == torch.uint8
+        and values.A_scales is not None
+        and values.A_scales.dtype == torch.bfloat16
+    )
+    b_is_mxint4 = (
+        values.B.dtype == torch.uint8
+        and values.B_scales is not None
+        and values.B_scales.dtype == torch.bfloat16
+    )
+    a_is_mxfp4 = a_is_mxfp4 and not a_is_mxint4
+    b_is_mxfp4 = b_is_mxfp4 and not b_is_mxint4
     A = _logical_operand(
         values.A,
         values.A_scales,
         layout=a_layout,
         is_mxfp4=a_is_mxfp4,
+        is_mxint4=a_is_mxint4,
     )
     B = _logical_operand(
         values.B,
         values.B_scales,
         layout=b_layout,
         is_mxfp4=b_is_mxfp4,
+        is_mxint4=b_is_mxint4,
     )
     if A.shape[-1] != B.shape[-1]:
         raise ValueError(
@@ -596,6 +671,63 @@ def mxfp4_gemm_input_config(
     block_size: int = _DEFAULT_MXFP4_BLOCK_SIZE,
 ) -> GemmInputConfig:
     """Build a GEMM config for MXFP4 values with UE8M0 scales."""
+
+    return GemmInputConfig(
+        M=M,
+        N=N,
+        K=K,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        a_scale_dtype=None if a_dtype is None else scale_dtype,
+        b_scale_dtype=None if b_dtype is None else scale_dtype,
+        c_dtype=c_dtype,
+        a_layout=a_layout,
+        b_layout=b_layout,
+        batch_shape=batch_shape,
+        a_scale_shape=(
+            None
+            if a_dtype is None
+            else gemm_scale_shape(
+                "block",
+                "a",
+                M=M,
+                N=N,
+                K=K,
+                batch_shape=batch_shape,
+                block_shape=(block_size,),
+            )
+        ),
+        b_scale_shape=(
+            None
+            if b_dtype is None
+            else gemm_scale_shape(
+                "block",
+                "b",
+                M=M,
+                N=N,
+                K=K,
+                batch_shape=batch_shape,
+                block_shape=(block_size,),
+            )
+        ),
+    )
+
+
+def mxint4_gemm_input_config(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    c_dtype: torch.dtype,
+    scale_dtype: InputDType = None,
+    a_dtype: InputDType = CustomDType.MXINT4,
+    b_dtype: InputDType = CustomDType.MXINT4,
+    a_layout: GemmLayout = "MK",
+    b_layout: GemmLayout = "NK",
+    batch_shape: tuple[int, ...] = (),
+    block_size: int = _DEFAULT_MXINT4_BLOCK_SIZE,
+) -> GemmInputConfig:
+    """Build a GEMM config for signed INT4 values with BF16 group scales."""
 
     return GemmInputConfig(
         M=M,

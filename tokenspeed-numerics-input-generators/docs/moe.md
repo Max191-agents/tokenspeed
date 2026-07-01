@@ -31,10 +31,10 @@ default generated routing metadata consistent with the logits while still
 making the explicit top-k tensors available to consumers that test precomputed
 routing paths.
 
-The nested weight generators reuse the GEMM family so dense, scaled, and MXFP4
-weights share the same dtype and scale handling as standalone GEMMs. Activation
-operands are skipped for the nested weight GEMMs because the layer computation
-produces those intermediate activations.
+The nested weight generators reuse the GEMM family so dense, scaled, MXFP4, and
+MXINT4 weights share the same dtype and scale handling as standalone GEMMs.
+Activation operands are skipped for the nested weight GEMMs because the layer
+computation produces those intermediate activations.
 
 Quantized MoE implementations may need scale tensors for activations entering
 the gate/up projection and the down projection. `MoeInputs` can generate those
@@ -55,8 +55,8 @@ processed by each expert-local GEMM block.
 values. For each token and selected expert it applies the expert gate/up
 projection, computes the gated activation, applies the expert down projection,
 scales the result by the selected routing weight, and sums across selected
-experts. Dense weights and generated scaled/MXFP4 weight values are normalized
-through the GEMM operand semantics before the reference matmuls.
+experts. Dense weights and generated scaled, MXFP4, or MXINT4 weight values are
+normalized through the GEMM operand semantics before the reference matmuls.
 
 `moe_align_block_size_reference` implements the block-alignment metadata
 semantics directly:
@@ -96,14 +96,22 @@ weight tensors. `MoeInputs` provides the semantic expert weights in
 against `moe_reference(values)`. Backend-specific gate/up reordering is owned
 by `moe_process_weights`, not by the generator.
 
+The FlashInfer TRT-LLM MXINT4 path is a weight-only INT4 variant with BF16
+group scales. `MoeInputs(weight_format="mxint4")` generates the operation-level
+packed signed INT4 bytes and BF16 scales. A TokenSpeed adapter can convert
+those bytes into checkpoint-style int32 words, attach the BF16 scale tensors to
+the runtime weight module, and let `moe_process_weights` handle backend block
+layout conversion and scale interleaving.
+
 ## Verification
 
 MoE configs verify token counts, hidden/intermediate widths, expert counts,
 top-k constraints, block sizes, integer routing dtypes, and generated id
 ranges. Optional activation scales must use regular floating dtypes and
-positive finite scalar fill values. The layer reference checks that selected
-expert ids and weights are rank-2, shape-consistent, finite, non-negative,
-duplicate-free per token, and normalized across each token's selected experts.
-The align-block-size reference also checks that provided top-k ids are rank-2
-and within `[0, num_experts)`, so invalid routing metadata fails before
-reaching a kernel adapter.
+positive finite scalar fill values. MXINT4 weights require BF16 group scales
+with shapes derived from the expert projection widths. The layer reference
+checks that selected expert ids and weights are rank-2, shape-consistent,
+finite, non-negative, duplicate-free per token, and normalized across each
+token's selected experts. The align-block-size reference also checks that
+provided top-k ids are rank-2 and within `[0, num_experts)`, so invalid routing
+metadata fails before reaching a kernel adapter.

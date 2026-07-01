@@ -7,13 +7,14 @@ optional scale sidecars that define the represented numerical values.
 
 ## Generators
 
-- `GemmInputs`: generates dense, scaled, FP8, MXFP4, or skipped operands for
-  GEMM-style tests.
+- `GemmInputs`: generates dense, scaled, FP8, MXFP4, MXINT4, or skipped
+  operands for GEMM-style tests.
 - `NVFP4GemmSwiGLUNVFP4QuantInputs`: generates inputs for a fused NVFP4 GEMM,
   SwiGLU activation, and NVFP4 output quantization operation.
 
-Helper functions such as `gemm_scale_shape` and `mxfp4_gemm_input_config` build
-valid scale shapes and MXFP4 operand configs from the logical GEMM dimensions.
+Helper functions such as `gemm_scale_shape`, `mxfp4_gemm_input_config`, and
+`mxint4_gemm_input_config` build valid scale shapes and custom operand configs
+from the logical GEMM dimensions.
 
 ## Generated Values
 
