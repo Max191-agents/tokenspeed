@@ -23,7 +23,10 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.sampling import argmax
-from tokenspeed_kernel.ops.sampling.cuda import fused_topk_topp_renorm
+from tokenspeed_kernel.ops.sampling.cuda import (
+    fused_topk_topp_renorm,
+    verify_chain_greedy,
+)
 from tokenspeed_kernel.ops.sampling.cute_dsl import argmax_pair
 from tokenspeed_kernel.ops.sampling.flashinfer import softmax as flashinfer_softmax
 from tokenspeed_kernel.ops.sampling.flashinfer import (
@@ -48,6 +51,8 @@ from tokenspeed_numerics_input_generators import (
     MinPRenormInputs,
     SoftmaxInputConfig,
     SoftmaxInputs,
+    SpeculativeGreedyVerifyInputConfig,
+    SpeculativeGreedyVerifyInputs,
     TopKTopPRenormInputConfig,
     TopKTopPRenormInputs,
     argmax_pair_reference,
@@ -55,6 +60,7 @@ from tokenspeed_numerics_input_generators import (
     gather_expand_scalars_reference,
     min_p_renorm_reference,
     softmax_reference,
+    speculative_greedy_verify_reference,
     top_k_top_p_renorm_reference,
 )
 
@@ -234,3 +240,49 @@ def test_top_k_top_p_generator_runs_flashinfer_renorm_sequence(device: str) -> N
 
     ref = top_k_top_p_renorm_reference(values.probs, values.top_k, values.top_p)
     torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
+
+
+@requires_nvidia
+def test_speculative_greedy_verify_generator_runs_cuda_kernel(device: str) -> None:
+    config = SpeculativeGreedyVerifyInputConfig(
+        batch_size=6,
+        num_draft_tokens=4,
+        vocab_size=4096,
+        min_accepted_tokens=0,
+        max_accepted_tokens=3,
+    )
+    values = SpeculativeGreedyVerifyInputs(config).generate(
+        seed=101,
+        metadata_seed=102,
+        device=device,
+    )
+    expected = speculative_greedy_verify_reference(values)
+
+    try:
+        verify_chain_greedy(
+            predicts=values.predicts,
+            accept_index=values.accept_index,
+            accept_token_num=values.accept_token_num,
+            candidates=values.candidates,
+            target_predict=values.target_predict,
+            batch_size=config.batch_size,
+            num_draft_tokens=config.num_draft_tokens,
+            enable_pdl=False,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"CUDA verify_chain_greedy unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(values.predicts, expected.predicts, atol=0, rtol=0)
+    torch.testing.assert_close(
+        values.accept_index,
+        expected.accept_index,
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        values.accept_token_num,
+        expected.accept_token_num,
+        atol=0,
+        rtol=0,
+    )

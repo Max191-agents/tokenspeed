@@ -51,6 +51,10 @@ __all__ = [
     "SoftmaxInputConfig",
     "SoftmaxInputs",
     "SoftmaxInputValues",
+    "SpeculativeGreedyVerifyInputConfig",
+    "SpeculativeGreedyVerifyInputs",
+    "SpeculativeGreedyVerifyInputValues",
+    "SpeculativeGreedyVerifyReferenceValues",
     "TopKTopPRenormInputConfig",
     "TopKTopPRenormInputs",
     "TopKTopPRenormInputValues",
@@ -59,6 +63,7 @@ __all__ = [
     "gather_expand_scalars_reference",
     "min_p_renorm_reference",
     "softmax_reference",
+    "speculative_greedy_verify_reference",
     "top_k_top_p_renorm_reference",
 ]
 
@@ -85,6 +90,13 @@ def _check_positive(name: str, value: int) -> int:
     value = int(value)
     if value <= 0:
         raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _check_minimum(name: str, value: int, minimum: int) -> int:
+    value = int(value)
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")
     return value
 
 
@@ -159,6 +171,31 @@ class SoftmaxInputValues:
 
     logits: torch.Tensor
     temperature: float | torch.Tensor | None
+
+
+@dataclass
+class SpeculativeGreedyVerifyInputValues:
+    """Generated values for ``SpeculativeGreedyVerifyInputs``.
+
+    ``predicts``, ``accept_index``, and ``accept_token_num`` are output buffers.
+    ``candidates`` and ``target_predict`` are the proposed draft-token chain
+    and target greedy predictions that determine the accepted prefix.
+    """
+
+    predicts: torch.Tensor
+    accept_index: torch.Tensor
+    accept_token_num: torch.Tensor
+    candidates: torch.Tensor
+    target_predict: torch.Tensor
+
+
+@dataclass
+class SpeculativeGreedyVerifyReferenceValues:
+    """Reference outputs for speculative greedy chain verification."""
+
+    predicts: torch.Tensor
+    accept_index: torch.Tensor
+    accept_token_num: torch.Tensor
 
 
 @dataclass
@@ -243,6 +280,42 @@ class SoftmaxInputConfig:
 
     # Optional: upper bound for generated positive temperatures.
     max_temperature: float = 1.5
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass
+class SpeculativeGreedyVerifyInputConfig:
+    """Initialization parameters for greedy speculative-chain verification.
+
+    The represented operation verifies a chain of proposed draft token IDs
+    against target-model greedy predictions. For row ``b``, draft token
+    ``candidates[b, i + 1]`` is accepted while it matches
+    ``target_predict[b, i]``. The accepted prefix stops at the first mismatch.
+    The verifier writes all target predictions into ``predicts``, writes flat
+    output indices for accepted positions plus the final bonus token, and
+    writes the number of accepted draft tokens per row.
+    """
+
+    # Required: number of independent speculative requests.
+    batch_size: int
+
+    # Required: number of target predictions/draft-chain slots per request.
+    # The maximum accepted draft-token count is num_draft_tokens - 1 because
+    # the final slot is the target-side bonus token.
+    num_draft_tokens: int
+
+    # Required: number of possible token IDs. Must be at least 2 so generated
+    # rows can force both matching and mismatching prefixes.
+    vocab_size: int
+
+    # Optional: minimum generated accepted draft-token count per row.
+    min_accepted_tokens: int = 0
+
+    # Optional: maximum generated accepted draft-token count per row. ``None``
+    # means ``num_draft_tokens - 1``.
+    max_accepted_tokens: int | None = None
 
     # Optional: generated tensor device override.
     device: DeviceLike = None
@@ -481,6 +554,119 @@ class SoftmaxInputs(NumericsInputGenerator):
             else:
                 temperature = temp.view(self.config.num_rows, 1).contiguous()
         return SoftmaxInputValues(logits=logits, temperature=temperature)
+
+
+@dataclass(init=False)
+class SpeculativeGreedyVerifyInputs(NumericsInputGenerator):
+    """Generator for greedy verification of chain speculative decoding."""
+
+    config: SpeculativeGreedyVerifyInputConfig
+
+    def __init__(self, config: SpeculativeGreedyVerifyInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.batch_size = _check_nonnegative(
+            "batch_size", self.config.batch_size
+        )
+        self.config.num_draft_tokens = _check_positive(
+            "num_draft_tokens", self.config.num_draft_tokens
+        )
+        self.config.vocab_size = _check_minimum("vocab_size", self.config.vocab_size, 2)
+        self.config.min_accepted_tokens = _check_nonnegative(
+            "min_accepted_tokens", self.config.min_accepted_tokens
+        )
+        max_allowed = self.config.num_draft_tokens - 1
+        if self.config.max_accepted_tokens is None:
+            self.config.max_accepted_tokens = max_allowed
+        else:
+            self.config.max_accepted_tokens = _check_nonnegative(
+                "max_accepted_tokens", self.config.max_accepted_tokens
+            )
+        if self.config.min_accepted_tokens > self.config.max_accepted_tokens:
+            raise ValueError(
+                "min_accepted_tokens must be <= max_accepted_tokens; got "
+                f"{self.config.min_accepted_tokens} > "
+                f"{self.config.max_accepted_tokens}"
+            )
+        if self.config.max_accepted_tokens > max_allowed:
+            raise ValueError(
+                "max_accepted_tokens must be <= num_draft_tokens - 1; got "
+                f"{self.config.max_accepted_tokens} > {max_allowed}"
+            )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> SpeculativeGreedyVerifyInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        shape = (self.config.batch_size, self.config.num_draft_tokens)
+        candidates = _randint(
+            low=0,
+            high=self.config.vocab_size,
+            shape=shape,
+            dtype=torch.int32,
+            seed=_child_seed(seed, 1),
+            device=device,
+            configured_device=self.config.device,
+        )
+        target_predict = _randint(
+            low=0,
+            high=self.config.vocab_size,
+            shape=shape,
+            dtype=torch.int64,
+            seed=_child_seed(seed, 2),
+            device=device,
+            configured_device=self.config.device,
+        )
+        accept_counts = _randint(
+            low=self.config.min_accepted_tokens,
+            high=self.config.max_accepted_tokens + 1,
+            shape=(self.config.batch_size,),
+            dtype=torch.int32,
+            seed=_child_seed(metadata_base_seed, 1),
+            device=device,
+            configured_device=self.config.device,
+        )
+
+        for row in range(self.config.batch_size):
+            accepted = int(accept_counts[row].item())
+            for position in range(accepted):
+                target_predict[row, position] = candidates[row, position + 1].to(
+                    torch.int64
+                )
+            if accepted < self.config.num_draft_tokens - 1:
+                mismatch = (
+                    candidates[row, accepted + 1].to(torch.int64) + 1
+                ) % self.config.vocab_size
+                target_predict[row, accepted] = mismatch
+
+        return SpeculativeGreedyVerifyInputValues(
+            predicts=torch.empty(
+                (self.config.batch_size * self.config.num_draft_tokens,),
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            accept_index=torch.full(
+                shape,
+                -1,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            accept_token_num=torch.empty(
+                (self.config.batch_size,),
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            candidates=candidates.contiguous(),
+            target_predict=target_predict.contiguous(),
+        )
 
 
 @dataclass
@@ -873,6 +1059,87 @@ def argmax_pair_reference(logits: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"argmax_pair expects 2D input, got {logits.dim()}D")
     max_vals, max_indices = torch.max(logits, dim=-1, keepdim=True)
     return torch.cat((max_vals.to(torch.float32), max_indices.to(torch.float32)), dim=1)
+
+
+def speculative_greedy_verify_reference(
+    values: SpeculativeGreedyVerifyInputValues,
+) -> SpeculativeGreedyVerifyReferenceValues:
+    """Reference for greedy chain speculative verification."""
+
+    candidates = values.candidates
+    target_predict = values.target_predict
+    if candidates.dim() != 2:
+        raise ValueError(f"candidates must be 2D, got {candidates.dim()}D")
+    if target_predict.shape != candidates.shape:
+        raise ValueError(
+            "target_predict must have the same shape as candidates; got "
+            f"{tuple(target_predict.shape)} vs {tuple(candidates.shape)}"
+        )
+    if candidates.dtype != torch.int32:
+        raise ValueError(f"candidates must be int32, got {candidates.dtype}")
+    if target_predict.dtype != torch.int64:
+        raise ValueError(f"target_predict must be int64, got {target_predict.dtype}")
+    if values.predicts.dtype != torch.int32:
+        raise ValueError(f"predicts must be int32, got {values.predicts.dtype}")
+    if values.accept_index.dtype != torch.int32:
+        raise ValueError(f"accept_index must be int32, got {values.accept_index.dtype}")
+    if values.accept_token_num.dtype != torch.int32:
+        raise ValueError(
+            f"accept_token_num must be int32, got {values.accept_token_num.dtype}"
+        )
+
+    batch_size, num_draft_tokens = candidates.shape
+    if values.predicts.numel() != batch_size * num_draft_tokens:
+        raise ValueError(
+            "predicts must have batch_size * num_draft_tokens elements; got "
+            f"{values.predicts.numel()} for {batch_size} * {num_draft_tokens}"
+        )
+    if values.accept_index.shape != candidates.shape:
+        raise ValueError(
+            "accept_index must have the same shape as candidates; got "
+            f"{tuple(values.accept_index.shape)} vs {tuple(candidates.shape)}"
+        )
+    if values.accept_token_num.shape != (batch_size,):
+        raise ValueError(
+            "accept_token_num must have shape [batch_size]; got "
+            f"{tuple(values.accept_token_num.shape)}"
+        )
+
+    if num_draft_tokens == 1:
+        accepted = torch.zeros(
+            (batch_size,),
+            dtype=torch.int32,
+            device=candidates.device,
+        )
+    else:
+        match = candidates[:, 1:] == target_predict[:, :-1].to(candidates.dtype)
+        leading = torch.cumprod(match.to(torch.int32), dim=1)
+        accepted = leading.sum(dim=1).to(torch.int32)
+
+    positions = torch.arange(
+        num_draft_tokens,
+        dtype=torch.int32,
+        device=candidates.device,
+    ).unsqueeze(0)
+    row_offsets = (
+        torch.arange(batch_size, dtype=torch.int32, device=candidates.device)
+        .unsqueeze(1)
+        .mul(num_draft_tokens)
+    )
+    flat_indices = row_offsets + positions
+    valid = positions <= accepted.unsqueeze(1)
+    accept_index = torch.where(
+        valid,
+        flat_indices,
+        torch.full_like(flat_indices, -1),
+    )
+    return SpeculativeGreedyVerifyReferenceValues(
+        predicts=target_predict.reshape(-1)
+        .to(torch.int32)
+        .reshape(values.predicts.shape),
+        accept_index=accept_index,
+        accept_token_num=accepted,
+    )
 
 
 def gather_expand_scalars_reference(

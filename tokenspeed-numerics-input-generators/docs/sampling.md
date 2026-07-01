@@ -4,8 +4,8 @@ Sampling generators cover deterministic helper operations used around token
 selection. They do not generate stochastic draws from a distribution. Instead,
 they model the tensor transforms that TokenSpeed kernels currently implement:
 row-wise argmax, packed max/index argmax pairs, scalar metadata
-gather/broadcast, softmax, min-p renormalization, and top-k/top-p
-renormalization.
+gather/broadcast, softmax, speculative greedy verification, min-p
+renormalization, and top-k/top-p renormalization.
 
 ## Operation Semantics
 
@@ -41,6 +41,22 @@ out = softmax(logits / temperature)
 `temperature` can be omitted, shared by every row as a scalar, or generated as
 one positive fp32 value per row. The reference always returns fp32 normalized
 probability rows.
+
+### Speculative Greedy Verification
+
+`SpeculativeGreedyVerifyInputs` represents deterministic verification of a
+chain-speculative draft sequence under greedy target-model sampling. For each
+request row, the accepted draft-token count is the length of the matching
+prefix:
+
+```text
+candidates[row, i + 1] == target_predict[row, i]
+```
+
+The verifier writes the target predictions into the `predicts` output buffer,
+writes flat accepted positions plus the final bonus-token position into
+`accept_index`, and writes the accepted draft-token count into
+`accept_token_num`.
 
 ### Gather And Expand Scalars
 
@@ -83,12 +99,17 @@ The generators reject invalid sampling inputs before values are returned:
 - probability tensors are generated as fp32 normalized rows
 - output/index dtypes must be int32 or int64 where relevant
 - argmax-pair output buffers are float32 with shape `[rows, 2]`
+- speculative greedy verification token IDs are in range and force coherent
+  matching/mismatching prefixes
+- speculative greedy output buffers have int32 storage and shapes matching the
+  accepted-prefix contract
 - min-p and top-p values are generated in valid probability ranges
 - planted argmax rows have a unique known maximum
 
 Metadata such as argmax planted indices, scalar gather indices, top-k/top-p
-controls, and min-p thresholds are generated from `metadata_seed`. Tensor values
-such as logits and probability distributions are generated from `seed`.
+controls, speculative accepted-prefix lengths, and min-p thresholds are
+generated from `metadata_seed`. Tensor values such as logits, probability
+distributions, and generated token IDs are generated from `seed`.
 
 ## TokenSpeed API Mapping
 
@@ -100,6 +121,8 @@ TokenSpeed exposes sampling kernels through several modules:
   optional `.temperature`
 - `sampling.triton.gather_and_expand_scalars`
 - `sampling.triton.min_p_renorm_prob`
+- NVIDIA-only CUDA `verify_chain_greedy` consumes
+  `SpeculativeGreedyVerifyInputValues`
 - NVIDIA-only fused top-k/top-p renormalization helpers
 - FlashInfer `top_k_renorm_prob` followed by deterministic
   `top_p_renorm_prob` consumes `TopKTopPRenormInputValues.probs`, `.top_k`,

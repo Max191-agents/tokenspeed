@@ -33,6 +33,9 @@ from tokenspeed_numerics_input_generators import (
     MinPRenormInputs,
     SoftmaxInputConfig,
     SoftmaxInputs,
+    SpeculativeGreedyVerifyInputConfig,
+    SpeculativeGreedyVerifyInputs,
+    SpeculativeGreedyVerifyInputValues,
     TopKTopPRenormInputConfig,
     TopKTopPRenormInputs,
     argmax_pair_reference,
@@ -40,6 +43,7 @@ from tokenspeed_numerics_input_generators import (
     gather_expand_scalars_reference,
     min_p_renorm_reference,
     softmax_reference,
+    speculative_greedy_verify_reference,
     top_k_top_p_renorm_reference,
 )
 
@@ -176,6 +180,88 @@ def test_softmax_metadata_seed_controls_temperature_only() -> None:
     assert values1.temperature.shape == (5, 1)
     torch.testing.assert_close(values1.temperature, values2.temperature)
     assert not torch.equal(values1.logits, values2.logits)
+
+
+def test_speculative_greedy_verify_inputs_generate_values_and_reference() -> None:
+    config = SpeculativeGreedyVerifyInputConfig(
+        batch_size=5,
+        num_draft_tokens=4,
+        vocab_size=97,
+        min_accepted_tokens=0,
+        max_accepted_tokens=3,
+    )
+    values = SpeculativeGreedyVerifyInputs(config).generate(
+        seed=141,
+        metadata_seed=142,
+        device="cpu",
+    )
+    refs = speculative_greedy_verify_reference(values)
+
+    assert values.predicts.shape == (20,)
+    assert values.predicts.dtype == torch.int32
+    assert values.accept_index.shape == (5, 4)
+    assert values.accept_token_num.shape == (5,)
+    assert values.candidates.dtype == torch.int32
+    assert values.target_predict.dtype == torch.int64
+    assert torch.all(refs.accept_token_num >= 0)
+    assert torch.all(refs.accept_token_num <= 3)
+
+    positions = torch.arange(config.num_draft_tokens).unsqueeze(0)
+    expected_valid = positions <= refs.accept_token_num.unsqueeze(1)
+    assert torch.equal(refs.accept_index >= 0, expected_valid)
+    torch.testing.assert_close(
+        refs.predicts,
+        values.target_predict.reshape(-1).to(torch.int32),
+    )
+
+
+def test_speculative_greedy_verify_metadata_seed_controls_acceptance() -> None:
+    generator = SpeculativeGreedyVerifyInputs(
+        SpeculativeGreedyVerifyInputConfig(
+            batch_size=7,
+            num_draft_tokens=5,
+            vocab_size=101,
+        )
+    )
+
+    values1 = generator.generate(seed=143, metadata_seed=900, device="cpu")
+    values2 = generator.generate(seed=144, metadata_seed=900, device="cpu")
+    refs1 = speculative_greedy_verify_reference(values1)
+    refs2 = speculative_greedy_verify_reference(values2)
+
+    torch.testing.assert_close(refs1.accept_token_num, refs2.accept_token_num)
+    assert not torch.equal(values1.candidates, values2.candidates)
+
+
+def test_speculative_greedy_verify_reference_known_prefixes() -> None:
+    values = SpeculativeGreedyVerifyInputValues(
+        predicts=torch.empty((8,), dtype=torch.int32),
+        accept_index=torch.full((2, 4), -1, dtype=torch.int32),
+        accept_token_num=torch.empty((2,), dtype=torch.int32),
+        candidates=torch.tensor(
+            [[10, 20, 30, 40], [11, 12, 13, 14]],
+            dtype=torch.int32,
+        ),
+        target_predict=torch.tensor(
+            [[20, 30, 99, 7], [99, 12, 13, 14]],
+            dtype=torch.int64,
+        ),
+    )
+
+    refs = speculative_greedy_verify_reference(values)
+
+    torch.testing.assert_close(
+        refs.predicts,
+        torch.tensor([20, 30, 99, 7, 99, 12, 13, 14], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        refs.accept_token_num,
+        torch.tensor([2, 0], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        refs.accept_index,
+        torch.tensor([[0, 1, 2, -1], [4, -1, -1, -1]], dtype=torch.int32),
+    )
 
 
 def test_gather_expand_scalars_inputs_generate_values_and_reference() -> None:
@@ -333,5 +419,35 @@ def test_top_k_top_p_rejects_too_large_max_top_k() -> None:
                 num_rows=1,
                 vocab_size=8,
                 max_top_k=9,
+            )
+        )
+
+
+def test_speculative_greedy_verify_rejects_invalid_accept_range() -> None:
+    with pytest.raises(ValueError, match="vocab_size"):
+        SpeculativeGreedyVerifyInputs(
+            SpeculativeGreedyVerifyInputConfig(
+                batch_size=1,
+                num_draft_tokens=4,
+                vocab_size=1,
+            )
+        )
+    with pytest.raises(ValueError, match="max_accepted_tokens"):
+        SpeculativeGreedyVerifyInputs(
+            SpeculativeGreedyVerifyInputConfig(
+                batch_size=1,
+                num_draft_tokens=4,
+                vocab_size=16,
+                max_accepted_tokens=4,
+            )
+        )
+    with pytest.raises(ValueError, match="min_accepted_tokens"):
+        SpeculativeGreedyVerifyInputs(
+            SpeculativeGreedyVerifyInputConfig(
+                batch_size=1,
+                num_draft_tokens=4,
+                vocab_size=16,
+                min_accepted_tokens=3,
+                max_accepted_tokens=2,
             )
         )
