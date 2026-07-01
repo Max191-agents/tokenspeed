@@ -77,10 +77,12 @@ objects.
 
 ## Verification
 
-Input generators should perform enough validation that using the library cannot
-silently produce invalid operation inputs. A caller should be able to trust that
-if a generator accepts a config and returns values, those values satisfy the
-operation-level constraints documented for that generator.
+Input generators should perform just enough verification that using the library
+cannot silently produce invalid operation inputs. A caller should be able to
+trust that if a generator accepts a config and returns values, those values
+satisfy the operation-level constraints documented for that generator. In other
+words, correctness tests should get well-formed inputs by construction as long
+as they use the generator API.
 
 Verification belongs at the same semantic level as generation. It should check
 shape relationships, datatype compatibility, required metadata, cache/page
@@ -89,6 +91,17 @@ generated inputs are meaningful. Examples include rejecting an MXFP4 tensor
 without scales, rejecting incompatible scale shapes, ensuring page-table
 metadata is consistent with cache layout, and requiring attention head counts or
 request-length metadata to satisfy the operation contract.
+
+The useful verification boundary is the point where misuse would create broken
+or meaningless inputs:
+
+- Config objects should reject impossible or contradictory operation
+  descriptions.
+- `generate(...)` should verify relationships that are only known after child
+  configs, inferred defaults, devices, dtypes, or generated metadata are
+  resolved.
+- Values returned by a generator should not need additional generic validity
+  checks before being passed to a reference implementation or kernel adapter.
 
 The goal is not to duplicate every assertion a kernel might make about its
 private ABI. Kernel-specific requirements still belong in adapters or tests.
