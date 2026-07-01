@@ -41,6 +41,8 @@ from tokenspeed_numerics_input_generators import (
     SpeculativeGreedyVerifyInputValues,
     TopKTopPRenormInputConfig,
     TopKTopPRenormInputs,
+    TopPRenormInputConfig,
+    TopPRenormInputs,
     argmax_pair_reference,
     argmax_reference,
     gather_expand_scalars_reference,
@@ -49,6 +51,7 @@ from tokenspeed_numerics_input_generators import (
     speculative_chain_sampling_reference,
     speculative_greedy_verify_reference,
     top_k_top_p_renorm_reference,
+    top_p_renorm_reference,
 )
 
 
@@ -439,6 +442,53 @@ def test_min_p_renorm_inputs_generate_probabilities_and_reference() -> None:
     assert torch.count_nonzero(ref == 0) > 0
 
 
+def test_top_p_renorm_inputs_generate_values_and_reference() -> None:
+    config = TopPRenormInputConfig(
+        num_rows=5,
+        vocab_size=29,
+        dtype=torch.float32,
+        min_top_p=0.4,
+        max_top_p=0.9,
+    )
+    values = TopPRenormInputs(config).generate(
+        seed=52,
+        metadata_seed=53,
+        device="cpu",
+    )
+
+    assert values.probs.shape == (5, 29)
+    assert values.probs.dtype == torch.float32
+    torch.testing.assert_close(
+        values.probs.float().sum(dim=-1),
+        torch.ones(5),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert values.top_p.shape == (5,)
+    assert values.top_p.min() >= 0.4
+    assert values.top_p.max() <= 0.9
+    ref = top_p_renorm_reference(values.probs, values.top_p)
+    torch.testing.assert_close(
+        ref.float().sum(dim=-1),
+        torch.ones(5),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert torch.count_nonzero(ref == 0) > 0
+
+
+def test_top_p_renorm_reference_known_threshold() -> None:
+    probs = torch.tensor([[0.5, 0.3, 0.2]], dtype=torch.float32)
+    top_p = torch.tensor([0.6], dtype=torch.float32)
+
+    ref = top_p_renorm_reference(probs, top_p)
+
+    torch.testing.assert_close(
+        ref,
+        torch.tensor([[0.625, 0.375, 0.0]], dtype=torch.float32),
+    )
+
+
 def test_top_k_top_p_renorm_inputs_generate_values_and_reference() -> None:
     config = TopKTopPRenormInputConfig(
         num_rows=6,
@@ -525,6 +575,22 @@ def test_top_k_top_p_rejects_too_large_max_top_k() -> None:
                 vocab_size=8,
                 max_top_k=9,
             )
+        )
+
+
+def test_top_p_renorm_rejects_invalid_threshold_bounds() -> None:
+    with pytest.raises(ValueError, match="top-p bounds"):
+        TopPRenormInputs(
+            TopPRenormInputConfig(
+                num_rows=1,
+                vocab_size=8,
+                min_top_p=0.0,
+            )
+        )
+    with pytest.raises(ValueError, match="top_p thresholds"):
+        top_p_renorm_reference(
+            torch.full((1, 4), 0.25),
+            torch.tensor([1.1]),
         )
 
 

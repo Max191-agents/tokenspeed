@@ -5,7 +5,8 @@ selection. They do not generate stochastic draws from a distribution. Instead,
 they model the tensor transforms that TokenSpeed kernels currently implement:
 row-wise argmax, packed max/index argmax pairs, scalar metadata
 gather/broadcast, softmax, speculative greedy verification, target-only chain
-speculative sampling, min-p renormalization, and top-k/top-p renormalization.
+speculative sampling, min-p renormalization, top-p renormalization, and
+top-k/top-p renormalization.
 
 ## Operation Semantics
 
@@ -103,6 +104,21 @@ out = out / sum(out)
 
 Generated probability rows are positive and normalized before filtering.
 
+### Top-P Renormalization
+
+`TopPRenormInputs` represents nucleus filtering and renormalization:
+
+```text
+sorted = sort(probs[row], descending=True)
+keep = smallest prefix whose cumulative probability reaches top_p[row]
+out = where(probs is in keep, probs, 0)
+out = out / sum(out)
+```
+
+The generated `top_p` tensor has one threshold per probability row. This
+operation is deterministic filtering only; stochastic token sampling from the
+renormalized row is outside this generator's contract.
+
 ### Top-K + Top-P Renormalization
 
 `TopKTopPRenormInputs` represents top-k filtering followed by top-p filtering
@@ -130,6 +146,8 @@ The generators reject invalid sampling inputs before values are returned:
 - chain speculative sampling output buffers use int32 storage and invalid slots
   are initialized to a sentinel so consumers can mask with `accept_index`
 - min-p and top-p values are generated in valid probability ranges
+- standalone top-p thresholds have one value per probability row and are in
+  `(0, 1]`
 - planted argmax rows have a unique known maximum
 
 Metadata such as argmax planted indices, scalar gather indices, top-k/top-p
@@ -152,6 +170,8 @@ TokenSpeed exposes sampling kernels through several modules:
 - NVIDIA-only CUDA `chain_speculative_sampling_target_only` consumes
   `SpeculativeChainSamplingInputValues`
 - NVIDIA-only fused top-k/top-p renormalization helpers
+- FlashInfer `top_p_renorm_probs` consumes `TopPRenormInputValues.probs` and
+  `.top_p`
 - FlashInfer `top_k_renorm_prob` followed by deterministic
   `top_p_renorm_prob` consumes `TopKTopPRenormInputValues.probs`, `.top_k`,
   and `.top_p`

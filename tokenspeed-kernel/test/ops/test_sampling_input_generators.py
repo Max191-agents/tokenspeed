@@ -36,6 +36,9 @@ from tokenspeed_kernel.ops.sampling.flashinfer import (
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_p_renorm_prob as flashinfer_top_p_renorm_prob,
 )
+from tokenspeed_kernel.ops.sampling.flashinfer import (
+    top_p_renorm_probs as flashinfer_top_p_renorm_probs,
+)
 from tokenspeed_kernel.ops.sampling.triton import (
     gather_and_expand_scalars,
     min_p_renorm_prob,
@@ -58,6 +61,8 @@ from tokenspeed_numerics_input_generators import (
     SpeculativeGreedyVerifyInputs,
     TopKTopPRenormInputConfig,
     TopKTopPRenormInputs,
+    TopPRenormInputConfig,
+    TopPRenormInputs,
     argmax_pair_reference,
     argmax_reference,
     gather_expand_scalars_reference,
@@ -66,6 +71,7 @@ from tokenspeed_numerics_input_generators import (
     speculative_chain_sampling_reference,
     speculative_greedy_verify_reference,
     top_k_top_p_renorm_reference,
+    top_p_renorm_reference,
 )
 
 requires_nvidia = pytest.mark.skipif(
@@ -243,6 +249,31 @@ def test_top_k_top_p_generator_runs_flashinfer_renorm_sequence(device: str) -> N
     torch.cuda.synchronize()
 
     ref = top_k_top_p_renorm_reference(values.probs, values.top_k, values.top_p)
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
+
+
+@requires_nvidia
+def test_top_p_generator_runs_flashinfer_renorm_kernel(device: str) -> None:
+    values = TopPRenormInputs(
+        TopPRenormInputConfig(
+            num_rows=4,
+            vocab_size=4096,
+            min_top_p=0.5,
+            max_top_p=0.95,
+        )
+    ).generate(seed=101, metadata_seed=102, device=device)
+
+    try:
+        out = flashinfer_top_p_renorm_probs(
+            values.probs,
+            values.top_p,
+            is_deterministic=True,
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"FlashInfer top-p renormalization unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    ref = top_p_renorm_reference(values.probs, values.top_p)
     torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
 
 

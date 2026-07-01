@@ -48,6 +48,9 @@ __all__ = [
     "MinPRenormInputConfig",
     "MinPRenormInputs",
     "MinPRenormInputValues",
+    "TopPRenormInputConfig",
+    "TopPRenormInputs",
+    "TopPRenormInputValues",
     "SoftmaxInputConfig",
     "SoftmaxInputs",
     "SoftmaxInputValues",
@@ -69,6 +72,7 @@ __all__ = [
     "softmax_reference",
     "speculative_chain_sampling_reference",
     "speculative_greedy_verify_reference",
+    "top_p_renorm_reference",
     "top_k_top_p_renorm_reference",
 ]
 
@@ -1153,6 +1157,105 @@ class TopKTopPRenormInputValues:
 
 
 @dataclass
+class TopPRenormInputValues:
+    """Generated values for ``TopPRenormInputs``."""
+
+    probs: torch.Tensor
+    top_p: torch.Tensor
+
+
+@dataclass
+class TopPRenormInputConfig:
+    """Initialization parameters for top-p probability renormalization.
+
+    The represented operation is nucleus filtering followed by row-wise
+    renormalization. Each row keeps the smallest set of highest-probability
+    tokens whose cumulative probability reaches ``top_p[row]``.
+    """
+
+    # Required: number of probability rows.
+    num_rows: int
+
+    # Required: vocabulary width.
+    vocab_size: int
+
+    # Optional: dtype for generated probabilities.
+    dtype: torch.dtype = torch.float32
+
+    # Optional: lower bound for generated top-p thresholds.
+    min_top_p: float = 0.5
+
+    # Optional: upper bound for generated top-p thresholds.
+    max_top_p: float = 1.0
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class TopPRenormInputs(NumericsInputGenerator):
+    """Generator for top-p probability filtering and renormalization."""
+
+    config: TopPRenormInputConfig
+
+    def __init__(self, config: TopPRenormInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_rows = _check_nonnegative("num_rows", self.config.num_rows)
+        self.config.vocab_size = _check_positive("vocab_size", self.config.vocab_size)
+        self.config.dtype = _check_float_dtype(
+            "dtype", self.config.dtype, allowed=_PROB_DTYPES
+        )
+        self.config.min_top_p = float(self.config.min_top_p)
+        self.config.max_top_p = float(self.config.max_top_p)
+        if not 0.0 < self.config.min_top_p <= self.config.max_top_p <= 1.0:
+            raise ValueError(
+                "top-p bounds must satisfy 0 < min_top_p <= max_top_p <= 1; "
+                f"got min_top_p={self.config.min_top_p}, "
+                f"max_top_p={self.config.max_top_p}"
+            )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> TopPRenormInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        generator = _rng_for_device(target_device, _child_seed(seed, 1))
+        raw = torch.rand(
+            self.config.num_rows,
+            self.config.vocab_size,
+            dtype=torch.float32,
+            device=target_device,
+            generator=generator,
+        )
+        probs = raw / raw.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        metadata_base_seed = seed if metadata_seed is None else metadata_seed
+        top_p_generator = _rng_for_device(
+            target_device, _child_seed(metadata_base_seed, 1)
+        )
+        top_p = torch.rand(
+            self.config.num_rows,
+            dtype=torch.float32,
+            device=target_device,
+            generator=top_p_generator,
+        )
+        top_p = (
+            top_p * (self.config.max_top_p - self.config.min_top_p)
+            + self.config.min_top_p
+        )
+        return TopPRenormInputValues(
+            probs=probs.to(self.config.dtype).contiguous(),
+            top_p=top_p.contiguous(),
+        )
+
+
+@dataclass
 class TopKTopPRenormInputConfig:
     """Initialization parameters for top-k/top-p probability renormalization."""
 
@@ -1589,6 +1692,40 @@ def min_p_renorm_reference(probs: torch.Tensor, min_p: torch.Tensor) -> torch.Te
     return out / out.sum(dim=-1, keepdim=True).clamp_min(1e-20)
 
 
+def top_p_renorm_reference(probs: torch.Tensor, top_p: torch.Tensor) -> torch.Tensor:
+    """Reference top-p filter and renormalization."""
+
+    if probs.dim() != 2:
+        raise ValueError(f"probs must be 2D, got {probs.dim()}D")
+    if top_p.dim() != 1:
+        raise ValueError(f"top_p must be 1D, got {top_p.dim()}D")
+    if top_p.numel() != probs.shape[0]:
+        raise ValueError(
+            "top_p must have one threshold per probability row; got "
+            f"{top_p.numel()} for {probs.shape[0]} rows"
+        )
+    if torch.any(top_p <= 0.0) or torch.any(top_p > 1.0):
+        raise ValueError("top_p thresholds must be in (0, 1]")
+
+    out = probs.clone()
+    batch_size, vocab_size = out.shape
+    for row in range(batch_size):
+        sorted_values, _indices = torch.sort(out[row], descending=True)
+        cumsum = torch.cumsum(sorted_values, dim=0)
+        p = float(top_p[row].item())
+        keep = min(int((cumsum < p).sum().item()) + 1, vocab_size)
+        threshold = sorted_values[keep - 1]
+        out[row] = torch.where(
+            out[row] >= threshold,
+            out[row],
+            torch.zeros_like(out[row]),
+        )
+        denom = out[row].sum()
+        if denom > 0:
+            out[row] = out[row] / denom
+    return out
+
+
 def top_k_top_p_renorm_reference(
     probs: torch.Tensor,
     top_k: torch.Tensor,
@@ -1609,17 +1746,4 @@ def top_k_top_p_renorm_reference(
             if denom > 0:
                 out[row] = out[row] / denom
 
-        sorted_values, _indices = torch.sort(out[row], descending=True)
-        cumsum = torch.cumsum(sorted_values, dim=0)
-        p = float(top_p[row].item())
-        keep = min(int((cumsum < p).sum().item()) + 1, vocab_size)
-        threshold = sorted_values[keep - 1]
-        out[row] = torch.where(
-            out[row] >= threshold,
-            out[row],
-            torch.zeros_like(out[row]),
-        )
-        denom = out[row].sum()
-        if denom > 0:
-            out[row] = out[row] / denom
-    return out
+    return top_p_renorm_reference(out, top_p)
