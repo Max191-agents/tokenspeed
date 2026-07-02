@@ -39,11 +39,21 @@ _FP8_TENSOR_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="tensor",
 )
+_FP8_CHANNEL_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="channel",
+)
 _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {fp8_dtype}, scale=_FP8_BLOCK_SCALE
 )
 _FP8_TENSOR_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "scaled-fp8", {fp8_dtype}, scale=_FP8_TENSOR_SCALE
+)
+_FP8_CHANNEL_FORMAT_SIGNATURES = format_signatures(
+    ("a", "b"), "scaled-fp8", {fp8_dtype}, scale=_FP8_CHANNEL_SCALE
+)
+_FP8_SCALED_FORMAT_SIGNATURES = (
+    _FP8_TENSOR_FORMAT_SIGNATURES | _FP8_CHANNEL_FORMAT_SIGNATURES
 )
 _MXFP4_SCALE = ScaleFormat(
     storage_dtype=torch.uint8,
@@ -206,7 +216,7 @@ def torch_mm_nvfp4(
     "mm",
     name="torch_mm_fp8_scaled_mnk",
     solution="reference",
-    signatures=_FP8_TENSOR_FORMAT_SIGNATURES,
+    signatures=_FP8_SCALED_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"NK"}),
     },
@@ -224,25 +234,18 @@ def torch_mm_fp8_scaled_mnk(
     block_size: list[int] | None = None,
     C: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    del C
-    assert block_size is None, "block_size is not supported for fp8 scaled reference"
-    assert (
-        A_scales is not None and B_scales is not None
-    ), "A_scales and B_scales are required for fp8 scaled reference"
-    assert A_scales.shape == (1,), "A_scales must have shape (1,)"
-    assert B_scales.shape == (1,), "B_scales must have shape (1,)"
-
-    assert (
-        A.shape[1] == B.shape[1]
-    ), f"Expected A and B to have the same K dimension, got {tuple(A.shape)} and {tuple(B.shape)}"
-
-    A_scales = float(A_scales.item())
-    B_scales = float(B_scales.item())
-    output = (A.float() * A_scales) @ (B.float() * B_scales).T
-
-    if alpha is not None:
-        output = output * alpha.float()
-    return output.to(out_dtype)
+    if block_size is not None:
+        raise ValueError("block_size is not supported for fp8 scaled reference")
+    if A_scales is None or B_scales is None:
+        raise ValueError("A_scales and B_scales are required for fp8 scaled reference")
+    if C is None:
+        C = torch.empty((A.shape[0], B.shape[0]), dtype=out_dtype, device=A.device)
+    return gemm_reference(
+        GemmInputValues(A=A, B=B, C=C, A_scales=A_scales, B_scales=B_scales),
+        b_layout="NK",
+        out_dtype=out_dtype,
+        alpha=alpha,
+    )
 
 
 @register_kernel(
@@ -250,7 +253,7 @@ def torch_mm_fp8_scaled_mnk(
     "mm",
     name="torch_mm_fp8_scaled_nkm",
     solution="reference",
-    signatures=_FP8_TENSOR_FORMAT_SIGNATURES,
+    signatures=_FP8_SCALED_FORMAT_SIGNATURES,
     traits={
         "b_layout": frozenset({"KN"}),
     },
@@ -268,23 +271,18 @@ def torch_mm_fp8_scaled_nkm(
     block_size: list[int] | None = None,
     C: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    del C
-    assert block_size is None, "block_size is not supported for fp8 scaled reference"
-    assert (
-        A_scales is not None and B_scales is not None
-    ), "A_scales and B_scales are required for fp8 scaled reference"
-    assert A_scales.shape == (1,), "A_scales must have shape (1,)"
-    assert B_scales.shape == (1,), "B_scales must have shape (1,)"
-
-    assert (
-        A.shape[1] == B.shape[0]
-    ), f"Expected A and B to have the same K dimension, got {tuple(A.shape)} and {tuple(B.shape)}"
-
-    output = (A.float() * float(A_scales.item())) @ (B.float() * float(B_scales.item()))
-
-    if alpha is not None:
-        output = output * alpha.float()
-    return output.to(out_dtype)
+    if block_size is not None:
+        raise ValueError("block_size is not supported for fp8 scaled reference")
+    if A_scales is None or B_scales is None:
+        raise ValueError("A_scales and B_scales are required for fp8 scaled reference")
+    if C is None:
+        C = torch.empty((A.shape[0], B.shape[1]), dtype=out_dtype, device=A.device)
+    return gemm_reference(
+        GemmInputValues(A=A, B=B, C=C, A_scales=A_scales, B_scales=B_scales),
+        b_layout="KN",
+        out_dtype=out_dtype,
+        alpha=alpha,
+    )
 
 
 @register_kernel(

@@ -713,6 +713,36 @@ def test_gemm_reference_applies_scaled_operands() -> None:
     torch.testing.assert_close(ref, manual)
 
 
+def test_gemm_reference_applies_channel_scales_to_transposed_layouts() -> None:
+    values = GemmInputs(
+        GemmInputConfig(
+            M=3,
+            N=5,
+            K=7,
+            a_dtype=torch.float32,
+            b_dtype=torch.float32,
+            c_dtype=torch.float32,
+            a_layout="KM",
+            b_layout="KN",
+            a_scale_shape=(3,),
+            b_scale_shape=(5,),
+            a_scale_dtype=torch.float32,
+            b_scale_dtype=torch.float32,
+        )
+    ).generate(seed=98, device="cpu")
+    assert values.A is not None
+    assert values.B is not None
+    assert values.A_scales is not None
+    assert values.B_scales is not None
+
+    ref = gemm_reference(values, a_layout="KM", b_layout="KN")
+    manual = (values.A.float() * values.A_scales.float().view(1, 3)).T @ (
+        values.B.float() * values.B_scales.float().view(1, 5)
+    )
+
+    torch.testing.assert_close(ref, manual)
+
+
 def test_gemm_reference_applies_2d_block_scales() -> None:
     block_shape = (128, 128)
     values = GemmInputs(

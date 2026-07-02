@@ -290,6 +290,42 @@ def test_gemm_nvfp4_reference_matches_package_reference() -> None:
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+def test_gemm_fp8_channel_scaled_reference_matches_package_reference() -> None:
+    from tokenspeed_kernel.numerics.reference.gemm import torch_mm_fp8_scaled_nkm
+    from tokenspeed_numerics_input_generators import GemmInputValues, gemm_reference
+
+    scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
+    signature = next(
+        iter(format_signatures(("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=scale))
+    )
+    inputs = get_input_generator(
+        "gemm",
+        "mm",
+        dtype=_fp8_dtype,
+        traits={"b_layout": frozenset({"KN"})},
+        format_signature=signature,
+        device="cpu",
+    ).generate(M=4, N=6, K=8)
+
+    assert inputs["A_scales"].shape == (4,)
+    assert inputs["B_scales"].shape == (6,)
+    actual = torch_mm_fp8_scaled_nkm(**inputs)
+    expected = gemm_reference(
+        GemmInputValues(
+            A=inputs["A"],
+            B=inputs["B"],
+            C=inputs["C"],
+            A_scales=inputs["A_scales"],
+            B_scales=inputs["B_scales"],
+        ),
+        b_layout="KN",
+        out_dtype=inputs["out_dtype"],
+        alpha=inputs["alpha"],
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_gemm_input_generator_requires_mxfp8_block_shape() -> None:
     scale = ScaleFormat(
         storage_dtype=torch.float32,

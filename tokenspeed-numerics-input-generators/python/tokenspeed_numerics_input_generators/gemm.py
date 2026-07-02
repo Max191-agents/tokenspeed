@@ -35,10 +35,13 @@ from tokenspeed_numerics_input_generators.core import (
     TensorInput,
     TensorValues,
     _child_seed,
+    _generate_scale_tensor,
     _normalize_shape,
     _packed_mxfp4_shape,
     _packed_mxint4_shape,
     _packed_nvfp4_shape,
+    _resolve_device,
+    _rng_for_device,
 )
 from tokenspeed_numerics_input_generators.quantization import (
     nvfp4_dequantization_reference,
@@ -184,6 +187,20 @@ def _generate_tensor(
             .values
         )
     raise TypeError(f"unsupported GEMM dtype={dtype!r}")
+
+
+def _scale_shape_prefix_compatible(
+    shape: tuple[int, ...],
+    scale_shape: tuple[int, ...],
+) -> bool:
+    if len(scale_shape) > len(shape):
+        return False
+    for scale_dim, value_dim in zip(scale_shape, shape, strict=False):
+        if scale_dim == value_dim or scale_dim == 1:
+            continue
+        if scale_dim <= 0 or scale_dim > value_dim or value_dim % scale_dim != 0:
+            return False
+    return True
 
 
 def _check_gemm_layout(name: str, layout: GemmLayout) -> GemmLayout:
@@ -392,7 +409,17 @@ def _logical_operand(
     else:
         logical = values.float()
         if scales is not None:
-            logical = _apply_regular_scales(logical, scales)
+            scale_values = scales.float()
+            if (
+                layout in ("KM", "KN")
+                and scale_values.ndim == 1
+                and scale_values.shape[0] == logical.shape[-1]
+            ):
+                logical = logical * scale_values.reshape(
+                    (1,) * (logical.ndim - 1) + (logical.shape[-1],)
+                )
+            else:
+                logical = _apply_regular_scales(logical, scales)
 
     if layout in ("KM", "KN"):
         logical = logical.transpose(-1, -2)
@@ -588,19 +615,51 @@ class GemmInputs(NumericsInputGenerator):
         device: DeviceLike,
     ) -> TensorValues:
         is_a = role == "a"
+        value_shape = self._value_shape(role)
+        dtype = self.config.a_dtype if is_a else self.config.b_dtype
+        scale_shape = self.config.a_scale_shape if is_a else self.config.b_scale_shape
+        scale_dtype = self.config.a_scale_dtype if is_a else self.config.b_scale_dtype
+        value_device = self.config.a_device if is_a else self.config.b_device
+        scale_device = (
+            self.config.a_scale_device if is_a else self.config.b_scale_device
+        )
+        if (
+            dtype is not None
+            and not isinstance(dtype, CustomDType)
+            and scale_shape is not None
+            and not _scale_shape_prefix_compatible(value_shape, scale_shape)
+        ):
+            if scale_dtype is None:
+                raise ValueError(
+                    "scale_shape and scale_dtype must be provided together"
+                )
+            values = TensorInput(
+                value_shape,
+                dtype,
+                device=value_device,
+            ).generate(seed=seed, device=device)
+            scale_target_device = _resolve_device(scale_device, device)
+            scale_generator = _rng_for_device(
+                scale_target_device,
+                _child_seed(seed, 2),
+            )
+            return TensorValues(
+                values=values.values,
+                scales=_generate_scale_tensor(
+                    scale_shape,
+                    scale_dtype,
+                    device=scale_target_device,
+                    generator=scale_generator,
+                    max_value=1.0,
+                ),
+            )
         return TensorInput(
-            self._value_shape(role),
-            self.config.a_dtype if is_a else self.config.b_dtype,
-            scale_shape=(
-                self.config.a_scale_shape if is_a else self.config.b_scale_shape
-            ),
-            scale_dtype=(
-                self.config.a_scale_dtype if is_a else self.config.b_scale_dtype
-            ),
-            device=self.config.a_device if is_a else self.config.b_device,
-            scale_device=(
-                self.config.a_scale_device if is_a else self.config.b_scale_device
-            ),
+            value_shape,
+            dtype,
+            scale_shape=scale_shape,
+            scale_dtype=scale_dtype,
+            device=value_device,
+            scale_device=scale_device,
         ).generate(seed=seed, device=device)
 
     def generate(self, *, seed: int, device: DeviceLike = None) -> GemmInputValues:
