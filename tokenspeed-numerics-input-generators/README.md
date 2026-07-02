@@ -77,64 +77,34 @@ objects.
 
 ## Verification
 
-Input generators should perform just enough verification that they cannot be
-misused to silently produce invalid operation inputs. If a generator accepts a
-config and returns values, those values should satisfy the operation-level
-constraints documented for that generator. Correctness tests should get
-well-formed inputs by construction as long as they stay inside the public
-generator API.
+Input generators should include enough verification that the public API cannot
+be used to silently produce broken operation inputs. A valid generator call
+should either fail before returning or return values that satisfy the documented
+operation-level constraints for that generator.
 
 This is a misuse-resistance contract. The library should reject invalid
 configuration choices, inconsistent child generator overrides, impossible
-metadata layouts, unsupported dtype/scale combinations, and generated values
-that violate the operation definition. A consumer should not need private
-knowledge of a generator's internals to avoid broken inputs; using the public
-generator API correctly should be enough to get operation-valid tensors and
-metadata.
+metadata layouts, unsupported dtype/scale combinations, and generated metadata
+or tensor relationships that violate the operation definition. Consumers should
+not need private knowledge of generator internals to avoid malformed inputs.
+Using the public generator API correctly should be enough to get
+operation-valid tensors and metadata.
 
-Verification in this layer is about input validity, not proving numerical
-agreement. It should establish that the generated inputs make sense for the
-operation being represented: shapes line up, dtypes are supported, quantized
-values have the scale tensors they require, ragged metadata is coherent,
-indices are in range, caches agree with their page tables, and optional inputs
-are present only in combinations that define a valid computation. Numerical
-validators and kernel tests can then focus on comparing reference and test
-outputs instead of defending against malformed generated inputs.
+Verification in this layer is about input validity, not numerical agreement. It
+should establish that generated inputs make sense for the operation being
+represented: shapes line up, dtypes are supported, quantized values have the
+scale tensors they require, ragged metadata is coherent, indices are in range,
+caches agree with their page tables, and optional inputs are present only in
+combinations that define a valid computation. Numerical validators and kernel
+tests can then focus on comparing reference and test outputs instead of
+defending against malformed generated inputs.
 
-The scope should be deliberate: add enough verification to make misuse of the
-public generator API fail early, but do not turn input generators into complete
-kernel validators. A generator should reject configurations or generated
-metadata that would make the operation invalid. It does not need to enforce
-every backend-specific precondition, preferred tile size, launch constraint, or
-performance-oriented layout choice. Those checks belong in the consuming
-adapter or test when they are tied to one implementation rather than to the
-operation itself.
-
-That makes the generator library the trust boundary for input validity. The
-goal is confidence by construction: a consumer that uses the public input
-generator API should be able to assume that generated shapes, dtypes, metadata,
-scales, routing state, cache state, and index structures are internally
-coherent for the operation being represented. Consumers may still check
-implementation-specific ABI details, but they should not need to rediscover
-whether an operation-family config is coherent, whether metadata can describe a
-valid computation, or whether generated tensors satisfy generic shape and dtype
-relationships.
-
-Verification is therefore part of the public contract, not an optional debug
-aid. Configs should reject impossible or contradictory operation descriptions
-before generation starts. `generate(...)` should validate relationships that
-depend on inferred defaults, nested generators, devices, dtypes, random
-metadata, scale tensors, or cache/page structures. Returned values should be
-ready for reference implementations or kernel adapters without each consumer
-repeating generic validity checks.
-
-The practical bar is that a valid generator call should either fail before
-returning or return internally consistent, operation-valid inputs. It should not
-return partially valid values with hidden assumptions that a downstream test has
-to know how to repair. This lets tests, references, and kernel adapters treat
-the input generator library as the shared source of truth for input validity:
-when they use a public generator API, they can focus on numerical agreement and
-implementation adaptation instead of rechecking generic operation invariants.
+The scope should be deliberate. Input generators should enforce invariants that
+belong to the operation family, but they should not become complete validators
+for every consuming backend. Backend-specific preconditions, preferred tile
+sizes, launch constraints, ABI quirks, and performance-oriented layout choices
+belong in adapters or tests when they are tied to one implementation rather
+than to the operation itself.
 
 Checks should be placed where the invariant is owned:
 
@@ -152,8 +122,8 @@ should instead prevent misuse of the operation-family API itself: missing
 required fields, incompatible shapes, unsupported dtype combinations, invalid
 quantized scale requirements, impossible request lengths, out-of-range metadata,
 and cache or page state that does not match the generated tensors should fail in
-the generator library. If a generator can produce broken operation inputs for a
-publicly accepted configuration, that is a bug in the generator.
+the generator library. If a public generator call can produce broken operation
+inputs, that is a bug in the generator.
 
 Tests for generators should cover that contract directly. Each family should
 include focused tests for invalid configurations that must be rejected and for
