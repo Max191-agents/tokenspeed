@@ -38,9 +38,11 @@ from tokenspeed_kernel.numerics.inputs import (
     set_input_generator,
     set_standard_shapes,
 )
+from tokenspeed_kernel.numerics.outputs import set_output_extractor
 from tokenspeed_kernel.numerics.tolerance import Tolerance, set_family_tolerance
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
-from tokenspeed_kernel.signature import format_signature
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_numerics_input_generators import (
     CustomDType,
     MoeAlignBlockSizeInputConfig,
@@ -54,7 +56,7 @@ from tokenspeed_numerics_input_generators import (
 
 
 def tolerance(dtype: torch.dtype, *, mode: str | None = None, **_: Any) -> Tolerance:
-    if mode == "apply":
+    if mode in {"apply", "process_weights"}:
         return Tolerance(atol=0.1, rtol=5.0e-2)
     # int32 outputs — both implementations must match exactly.
     return Tolerance(atol=0.0, rtol=0.0)
@@ -222,7 +224,33 @@ class MoeApplyInputGenerator(InputGenerator):
         plan["process_weights_kernel_name"] = process_kernel.name
         process_kernel(plan=plan, w=layer)
 
-    def generate(
+    def _select_apply_kernel_name(
+        self,
+        *,
+        weight_dtype: str,
+        activation: str,
+        internal_activation_dtype: str | None,
+    ) -> str:
+        solution = getattr(self.kernel_spec, "solution", None)
+        if solution in {None, "reference"}:
+            return "reference"
+        traits: dict[str, Any] = {
+            "weight_dtype": weight_dtype,
+            "activation": activation,
+            "internal_activation_dtype": internal_activation_dtype or "input",
+        }
+        if weight_dtype == "mxfp4":
+            traits["routing_mode"] = "precomputed_topk"
+        apply_kernel = select_kernel(
+            "moe",
+            "apply",
+            format_signature(x=dense_tensor_format(self.dtype)),
+            traits=traits,
+            solution=solution,
+        )
+        return apply_kernel.name
+
+    def _build_moe_components(
         self,
         *,
         num_tokens: int,
@@ -230,10 +258,11 @@ class MoeApplyInputGenerator(InputGenerator):
         intermediate_size: int,
         num_experts: int,
         top_k: int,
-        weight_dtype: str | None = None,
-        activation: str | None = None,
-        internal_activation_dtype: str | None = None,
-    ) -> dict[str, Any]:
+        weight_dtype: str | None,
+        activation: str | None,
+        internal_activation_dtype: str | None,
+        apply_kernel_name: str | None,
+    ) -> tuple[MoeInputValues, torch.nn.Module, dict[str, Any], str, str]:
         resolved_weight_dtype = self._weight_dtype(weight_dtype)
         resolved_activation = self._activation(activation)
         if resolved_weight_dtype == "unquant":
@@ -246,7 +275,7 @@ class MoeApplyInputGenerator(InputGenerator):
             weight_scale_dtype = None
         else:
             raise ValueError(
-                "MoE apply numerics generator currently supports "
+                "MoE numerics generator currently supports "
                 f"weight_dtype='unquant' or 'mxfp4', got {resolved_weight_dtype!r}"
             )
 
@@ -273,7 +302,7 @@ class MoeApplyInputGenerator(InputGenerator):
             )
         ).generate(seed=self.seed, device=self.device)
         if values.hidden_states is None or values.router_logits is None:
-            raise ValueError("generated MoE apply inputs must include activations")
+            raise ValueError("generated MoE inputs must include activations")
 
         layer = _make_moe_weight_module(
             values,
@@ -282,7 +311,11 @@ class MoeApplyInputGenerator(InputGenerator):
         )
         plan = {
             "weight_dtype": resolved_weight_dtype,
-            "apply_kernel_name": getattr(self.kernel_spec, "name", "reference"),
+            "apply_kernel_name": (
+                apply_kernel_name
+                if apply_kernel_name is not None
+                else getattr(self.kernel_spec, "name", "reference")
+            ),
             "process_weights_kernel_name": None,
             "a2a_backend": None,
             "deepep_group": None,
@@ -291,6 +324,31 @@ class MoeApplyInputGenerator(InputGenerator):
             "solution": getattr(self.kernel_spec, "solution", "reference"),
             "internal_activation_dtype": internal_activation_dtype,
         }
+        return values, layer, plan, resolved_weight_dtype, resolved_activation
+
+    def generate(
+        self,
+        *,
+        num_tokens: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        top_k: int,
+        weight_dtype: str | None = None,
+        activation: str | None = None,
+        internal_activation_dtype: str | None = None,
+    ) -> dict[str, Any]:
+        values, layer, plan, resolved_weight_dtype, _ = self._build_moe_components(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            weight_dtype=weight_dtype,
+            activation=activation,
+            internal_activation_dtype=internal_activation_dtype,
+            apply_kernel_name=None,
+        )
         self._process_weights_if_needed(
             plan,
             layer,
@@ -311,6 +369,95 @@ class MoeApplyInputGenerator(InputGenerator):
 
 
 set_input_generator("moe", "apply", MoeApplyInputGenerator)
+
+
+class MoeProcessWeightsInputGenerator(MoeApplyInputGenerator):
+    """Adapter for observing MoE weight preprocessing through MoE apply.
+
+    ``process_weights`` mutates backend-specific module attributes and returns
+    ``None``. The operation-level invariant is that applying the processed
+    weights still computes the same routed MoE layer represented by the
+    generated values.
+    """
+
+    def generate(
+        self,
+        *,
+        num_tokens: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        top_k: int,
+        weight_dtype: str | None = None,
+        activation: str | None = None,
+        internal_activation_dtype: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_weight_dtype = self._weight_dtype(weight_dtype)
+        resolved_activation = self._activation(activation)
+        apply_kernel_name = self._select_apply_kernel_name(
+            weight_dtype=resolved_weight_dtype,
+            activation=resolved_activation,
+            internal_activation_dtype=internal_activation_dtype,
+        )
+        _, layer, plan, _, _ = self._build_moe_components(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+            weight_dtype=resolved_weight_dtype,
+            activation=resolved_activation,
+            internal_activation_dtype=internal_activation_dtype,
+            apply_kernel_name=apply_kernel_name,
+        )
+        plan["process_weights_kernel_name"] = getattr(
+            self.kernel_spec,
+            "name",
+            None,
+        )
+        return {"plan": plan, "w": layer}
+
+
+set_input_generator("moe", "process_weights", MoeProcessWeightsInputGenerator)
+
+
+def _process_weights_output(
+    inputs: dict[str, Any],
+    result: Any,
+) -> torch.Tensor:
+    if isinstance(result, torch.Tensor):
+        return result
+    if result is not None:
+        raise TypeError(
+            "MoE process_weights output extractor expects None or tensor result, "
+            f"got {type(result)!r}"
+        )
+
+    plan = inputs["plan"]
+    w = inputs["w"]
+    values = getattr(w, "_tokenspeed_numerics_values", None)
+    if values is None or values.hidden_states is None or values.router_logits is None:
+        raise ValueError("processed MoE module must carry generated MoE values")
+
+    apply_kernel_name = plan.get("apply_kernel_name")
+    apply_kernel = KernelRegistry.get().get_impl(apply_kernel_name)
+    if apply_kernel is None:
+        raise ValueError(f"MoE apply kernel {apply_kernel_name!r} is not registered")
+    return apply_kernel(
+        plan=plan,
+        x=values.hidden_states,
+        w=w,
+        router_logits=values.router_logits,
+        topk_weights=values.topk_weights,
+        topk_ids=values.topk_ids,
+        num_tokens_global=values.hidden_states.shape[0],
+        max_num_tokens_per_gpu=values.hidden_states.shape[0],
+        do_finalize=True,
+        enable_pdl=False,
+    )
+
+
+set_output_extractor("moe", "process_weights", _process_weights_output)
 
 
 _MOE_ALIGN_STANDARD_SHAPES: list[dict[str, int]] = [
@@ -352,6 +499,8 @@ _MOE_APPLY_STANDARD_SHAPES: list[dict[str, int | str]] = [
 
 set_standard_shapes("moe", "apply", _MOE_APPLY_STANDARD_SHAPES)
 set_benchmark_shapes("moe", "apply", _MOE_APPLY_STANDARD_SHAPES)
+set_standard_shapes("moe", "process_weights", _MOE_APPLY_STANDARD_SHAPES)
+set_benchmark_shapes("moe", "process_weights", _MOE_APPLY_STANDARD_SHAPES)
 
 
 def compute_align_block_size_buffer_dims(

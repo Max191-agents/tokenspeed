@@ -100,6 +100,15 @@ def _verification_signature_and_reference(
         ref_spec = _compatible_reference_for_signature(registry, spec, signature)
         if ref_spec is not None:
             return signature, ref_spec
+    empty_signature = FormatSignature(())
+    if empty_signature in spec.format_signatures:
+        ref_spec = _compatible_reference_for_signature(
+            registry,
+            spec,
+            empty_signature,
+        )
+        if ref_spec is not None:
+            return empty_signature, ref_spec
     return (signatures[0], None) if signatures else (None, None)
 
 

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import format_signature, format_signatures
 from tokenspeed_numerics_input_generators import moe_reference
 
 
@@ -61,6 +61,29 @@ def torch_moe_apply(
     del max_num_tokens_per_gpu
     del do_finalize
     del enable_pdl
+    values = getattr(w, "_tokenspeed_numerics_values", None)
+    if values is None:
+        raise ValueError("MoE reference requires generated values on weight module")
+    return moe_reference(values, output_dtype=values.hidden_states.dtype)
+
+
+@register_kernel(
+    "moe",
+    "process_weights",
+    name="torch_moe_process_weights",
+    solution="reference",
+    signatures=frozenset({format_signature()}),
+    traits={"weight_dtype": frozenset({"mxfp4"})},
+    priority=Priority.REFERENCE,
+    tags={"determinism", "portability"},
+)
+def torch_moe_process_weights(
+    plan: dict,
+    w: torch.nn.Module,
+) -> torch.Tensor:
+    """Reference MoE output for the weights before backend preprocessing."""
+
+    del plan
     values = getattr(w, "_tokenspeed_numerics_values", None)
     if values is None:
         raise ValueError("MoE reference requires generated values on weight module")

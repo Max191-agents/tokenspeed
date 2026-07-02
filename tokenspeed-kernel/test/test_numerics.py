@@ -514,6 +514,49 @@ def test_moe_apply_numerics_registration_matches_kernel_family() -> None:
     assert get_standard_shapes("moe", "apply")
 
 
+def test_moe_process_weights_generator_observes_moe_reference() -> None:
+    inputs = get_input_generator(
+        "moe",
+        "process_weights",
+        dtype=torch.bfloat16,
+        traits={"weight_dtype": frozenset({"mxfp4"})},
+        device="cpu",
+        seed=94,
+    ).generate(
+        num_tokens=3,
+        hidden_size=64,
+        intermediate_size=64,
+        num_experts=4,
+        top_k=2,
+        weight_dtype="mxfp4",
+        activation="silu",
+    )
+    values = inputs["w"]._tokenspeed_numerics_values
+
+    assert set(inputs) == {"plan", "w"}
+    assert inputs["plan"]["weight_dtype"] == "mxfp4"
+    assert inputs["plan"]["apply_kernel_name"] == "reference"
+    assert inputs["w"].w13_weight.shape == (4, 128, 32)
+    assert inputs["w"].w2_weight.shape == (4, 64, 32)
+
+    from tokenspeed_kernel.numerics.reference.moe import torch_moe_process_weights
+
+    actual = torch_moe_process_weights(**inputs)
+    expected = moe_reference(values, output_dtype=torch.bfloat16)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_moe_process_weights_numerics_registration_matches_kernel_family() -> None:
+    load_builtin_kernels()
+    registry = KernelRegistry.get()
+
+    specs = registry.get_for_operator("moe", "process_weights")
+    assert any(spec.name == "torch_moe_process_weights" for spec in specs)
+    assert any(spec.name == "triton_mxfp4_moe_process_weights" for spec in specs)
+    assert get_standard_shapes("moe", "process_weights")
+    assert get_output_extractor("moe", "process_weights") is not None
+
+
 def test_verification_uses_signature_with_compatible_reference(fresh_registry) -> None:
     tensor_scale = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
     channel_scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
@@ -556,6 +599,41 @@ def test_verification_uses_signature_with_compatible_reference(fresh_registry) -
     )
 
     assert signature == tensor_signature
+    assert reference is ref_spec
+
+
+def test_verification_uses_empty_signature_with_compatible_reference(
+    fresh_registry,
+) -> None:
+    signature = format_signature()
+    ref_spec = KernelSpec(
+        name="test_empty_signature_reference",
+        family="moe",
+        mode="process_weights",
+        solution="reference",
+        format_signatures=frozenset({signature}),
+        traits={"weight_dtype": frozenset({"mxfp4"})},
+    )
+    test_spec = KernelSpec(
+        name="test_empty_signature_process_weights",
+        family="moe",
+        mode="process_weights",
+        solution="triton",
+        format_signatures=frozenset({signature}),
+        traits={"weight_dtype": frozenset({"mxfp4"})},
+    )
+    registry = KernelRegistry.get()
+    registry.register(ref_spec, lambda **_kwargs: None)
+    registry.register(test_spec, lambda **_kwargs: None)
+
+    selected_signature, reference = _verification_signature_and_reference(
+        registry,
+        test_spec,
+        torch.bfloat16,
+        "x",
+    )
+
+    assert selected_signature == signature
     assert reference is ref_spec
 
 
@@ -659,6 +737,15 @@ class TestNumericsVerification:
         spec = registry.get_by_name(kernel_name)
         if spec is None or not spec.capability.satisfied_by(platform):
             pytest.skip(f"{kernel_name} is not available on this platform")
+        self._verify(spec, torch.bfloat16, "x")
+
+    def test_moe_process_weights_mxfp4_triton_bf16(self):
+        load_builtin_kernels()
+        registry = KernelRegistry.get()
+        platform = Platform.get()
+        spec = registry.get_by_name("triton_mxfp4_moe_process_weights")
+        if spec is None or not spec.capability.satisfied_by(platform):
+            pytest.skip("triton_mxfp4_moe_process_weights is not available")
         self._verify(spec, torch.bfloat16, "x")
 
     @pytest.mark.parametrize(
