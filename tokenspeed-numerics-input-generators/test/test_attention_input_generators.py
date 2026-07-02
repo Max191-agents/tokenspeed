@@ -96,6 +96,7 @@ from tokenspeed_numerics_input_generators import (
     dsa_sparse_decode_row_bytes,
     gdn_chunk_prefill_reference,
     gdn_qkv_split_reference,
+    mha_reference,
     mla_kv_pack_quantize_fp8_reference,
     mla_prefill_fp8_reference,
     mla_reference,
@@ -2855,6 +2856,99 @@ def test_mha_inputs_generate_dense_qkv_view() -> None:
     assert k.shape == (3, 4, 2, 8)
     assert v.shape == (3, 4, 2, 8)
     assert inputs.metadata.cu_seqlens_q_cpu == [0, 4, 8, 12]
+
+
+def test_mha_reference_matches_manual_causal_prefill() -> None:
+    inputs = MHAInputs(
+        _mha_config(
+            batch_size=2,
+            total_cached_tokens=0,
+            total_new_q_tokens=6,
+            num_q_heads=2,
+            num_kv_heads=1,
+            head_dim=4,
+            q_dtype=torch.float32,
+            cache_layout="none",
+            metadata_kwargs={"new_q_length_mode": "fixed_per_request"},
+        )
+    ).generate(metadata_seed=31, value_seed=41, device="cpu")
+    assert inputs.q is not None and inputs.k is not None and inputs.v is not None
+
+    ref = mha_reference(inputs)
+
+    manual_outputs = []
+    manual_lses = []
+    scale = inputs.q.shape[-1] ** -0.5
+    for request_idx in range(2):
+        start = request_idx * 3
+        end = start + 3
+        q = inputs.q[start:end].float()
+        k = inputs.k[start:end].float().expand(-1, 2, -1)
+        v = inputs.v[start:end].float().expand(-1, 2, -1)
+        scores = torch.einsum("qhd,khd->qkh", q, k) * scale
+        causal_mask = torch.triu(
+            torch.ones((3, 3), dtype=torch.bool),
+            diagonal=1,
+        )
+        scores = scores.masked_fill(causal_mask.unsqueeze(-1), float("-inf"))
+        probs = torch.softmax(scores, dim=1)
+        manual_outputs.append(torch.einsum("qkh,khd->qhd", probs, v))
+        manual_lses.append(torch.logsumexp(scores, dim=1))
+
+    torch.testing.assert_close(ref.out, torch.cat(manual_outputs, dim=0))
+    torch.testing.assert_close(ref.lse, torch.cat(manual_lses, dim=0))
+
+
+def test_mha_reference_uses_paged_cache_values() -> None:
+    inputs = MHAInputs(
+        _mha_config(
+            batch_size=2,
+            total_cached_tokens=6,
+            total_new_q_tokens=2,
+            num_q_heads=2,
+            num_kv_heads=1,
+            head_dim=4,
+            q_dtype=torch.float32,
+            cache_layout="paged",
+            page_size=2,
+            indexing="identity",
+            metadata_kwargs={
+                "cached_length_mode": "regular",
+                "new_q_length_mode": "fixed_per_request",
+            },
+        )
+    ).generate(metadata_seed=7, value_seed=9, device="cpu")
+    assert inputs.q is not None
+    assert inputs.cache is not None
+    assert inputs.cache.k_cache is not None
+    assert inputs.cache.v_cache is not None
+    assert inputs.cache.page_table_cpu is not None
+
+    ref = mha_reference(inputs, is_causal=True)
+
+    manual_outputs = []
+    manual_lses = []
+    scale = inputs.q.shape[-1] ** -0.5
+    page_size = inputs.cache.k_cache.shape[1]
+    for batch_idx in range(2):
+        q = inputs.q[batch_idx : batch_idx + 1].float()
+        rows_k = []
+        rows_v = []
+        for pos in range(int(inputs.metadata.cache_seqlens[batch_idx].item())):
+            page_col = pos // page_size
+            page_offset = pos % page_size
+            physical_page = inputs.cache.page_table_cpu[batch_idx][page_col]
+            rows_k.append(inputs.cache.k_cache[physical_page, page_offset])
+            rows_v.append(inputs.cache.v_cache[physical_page, page_offset])
+        k = torch.stack(rows_k, dim=0).float().expand(-1, 2, -1)
+        v = torch.stack(rows_v, dim=0).float().expand(-1, 2, -1)
+        scores = torch.einsum("qhd,khd->qkh", q, k) * scale
+        probs = torch.softmax(scores, dim=1)
+        manual_outputs.append(torch.einsum("qkh,khd->qhd", probs, v))
+        manual_lses.append(torch.logsumexp(scores, dim=1))
+
+    torch.testing.assert_close(ref.out, torch.cat(manual_outputs, dim=0))
+    torch.testing.assert_close(ref.lse, torch.cat(manual_lses, dim=0))
 
 
 def test_mha_inputs_generate_bounded_ragged_request_lengths() -> None:

@@ -143,6 +143,8 @@ __all__ = [
     "MHAInputConfig",
     "MHAInputValues",
     "MHAInputs",
+    "MHAReferenceValues",
+    "mha_reference",
     "MLAInputConfig",
     "MLAInputValues",
     "MLAInputs",
@@ -7884,6 +7886,14 @@ class MHAInputValues:
 
 
 @dataclass
+class MHAReferenceValues:
+    """Reference output tensors for ``MHAInputValues``."""
+
+    out: torch.Tensor
+    lse: torch.Tensor
+
+
+@dataclass
 class MHAInputConfig:
     """Initialization parameters for ``MHAInputs``.
 
@@ -8892,6 +8902,243 @@ def _expand_kv_heads_for_queries(
             f"{num_q_heads} and {num_kv_heads}"
         )
     return tensor.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+
+
+def _attention_scores_with_optional_sink(
+    scores: torch.Tensor,
+    sinks: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if sinks is None:
+        probs = torch.softmax(scores, dim=1)
+        lse = torch.logsumexp(scores, dim=1)
+        return probs, lse
+    if sinks.ndim != 1 or sinks.shape[0] != scores.shape[-1]:
+        raise ValueError(
+            "sinks must have shape [num_q_heads], got " f"{tuple(sinks.shape)}"
+        )
+    sink_scores = (
+        sinks.to(torch.float32)
+        .view(1, 1, -1)
+        .expand(
+            scores.shape[0],
+            1,
+            scores.shape[-1],
+        )
+    )
+    scores_with_sink = torch.cat((scores, sink_scores), dim=1)
+    probs_with_sink = torch.softmax(scores_with_sink, dim=1)
+    return probs_with_sink[:, :-1], torch.logsumexp(scores_with_sink, dim=1)
+
+
+def _apply_attention_mask(
+    scores: torch.Tensor,
+    *,
+    q_len: int,
+    kv_len: int,
+    is_causal: bool,
+    window_left: int,
+) -> torch.Tensor:
+    if window_left < -1:
+        raise ValueError(f"window_left must be -1 or non-negative, got {window_left}")
+    if not is_causal and window_left < 0:
+        return scores
+
+    q_idx = torch.arange(q_len, device=scores.device).view(-1, 1)
+    k_idx = torch.arange(kv_len, device=scores.device).view(1, -1)
+    offset = kv_len - q_len
+    mask = torch.zeros((q_len, kv_len), dtype=torch.bool, device=scores.device)
+    if is_causal:
+        mask |= k_idx > q_idx + offset
+    if window_left >= 0:
+        mask |= k_idx < q_idx + offset - window_left
+    return scores.masked_fill(mask.unsqueeze(-1), float("-inf"))
+
+
+def _mha_attention_reference(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sinks: torch.Tensor | None,
+    is_causal: bool,
+    window_left: int,
+    logit_cap: float,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+        raise ValueError("MHA q, k, and v must be rank-3 tensors")
+    if q.shape[-1] != k.shape[-1] or v.shape[-1] != q.shape[-1]:
+        raise ValueError("MHA q, k, and v head dimensions must match")
+    if k.shape[:2] != v.shape[:2]:
+        raise ValueError("MHA k and v token/head dimensions must match")
+    if softmax_scale <= 0.0:
+        raise ValueError("softmax_scale must be positive")
+
+    expanded_k = _expand_kv_heads_for_queries(
+        k.float(),
+        num_q_heads=q.shape[1],
+        name="k",
+    )
+    expanded_v = _expand_kv_heads_for_queries(
+        v.float(),
+        num_q_heads=q.shape[1],
+        name="v",
+    )
+    scores = torch.einsum("qhd,khd->qkh", q.float(), expanded_k) * softmax_scale
+    scores = _apply_attention_logit_cap(scores, logit_cap)
+    scores = _apply_attention_mask(
+        scores,
+        q_len=q.shape[0],
+        kv_len=k.shape[0],
+        is_causal=is_causal,
+        window_left=window_left,
+    )
+    probs, lse = _attention_scores_with_optional_sink(scores, sinks)
+    out = torch.einsum("qkh,khd->qhd", probs, expanded_v)
+    return out.to(_attention_output_dtype(q.dtype)), lse.to(torch.float32)
+
+
+def _gather_mha_cache_rows(
+    cache: KVCacheValues,
+    *,
+    batch_idx: int,
+    cache_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if cache.k_cache is None or cache.v_cache is None:
+        raise ValueError("MHA cache reference requires k_cache and v_cache")
+    if cache_len <= 0:
+        raise ValueError("MHA cached attention requires positive cache lengths")
+    if cache.k_cache.shape != cache.v_cache.shape:
+        raise ValueError("MHA k_cache and v_cache shapes must match")
+
+    if cache.page_table_cpu is None:
+        if cache.k_cache.ndim != 4:
+            raise ValueError("dense MHA cache must have shape [batch, max_k, heads, d]")
+        return (
+            cache.k_cache[batch_idx, :cache_len],
+            cache.v_cache[batch_idx, :cache_len],
+        )
+
+    if cache.k_cache.ndim != 4:
+        raise ValueError("paged MHA cache must have shape [pages, page, heads, d]")
+    page_size = cache.k_cache.shape[1]
+    k_rows = []
+    v_rows = []
+    for pos in range(cache_len):
+        page_col = pos // page_size
+        page_offset = pos % page_size
+        physical_page = cache.page_table_cpu[batch_idx][page_col]
+        k_rows.append(cache.k_cache[physical_page, page_offset])
+        v_rows.append(cache.v_cache[physical_page, page_offset])
+    return torch.stack(k_rows, dim=0), torch.stack(v_rows, dim=0)
+
+
+def _mha_prefill_reference(
+    values: MHAInputValues,
+    *,
+    window_left: int,
+    logit_cap: float,
+) -> MHAReferenceValues:
+    if values.q is None or values.k is None or values.v is None:
+        raise ValueError("MHA prefill reference requires q, k, and v tensors")
+    metadata = values.metadata
+    if metadata.new_q_lens_cpu != metadata.new_kv_lens_cpu:
+        raise ValueError("MHA prefill reference requires matching Q and KV lengths")
+    q_offsets = metadata.cu_seqlens_q_cpu
+    kv_offsets = metadata.cu_seqlens_q_cpu
+    if q_offsets[0] != 0 or q_offsets[-1] != values.q.shape[0]:
+        raise ValueError("MHA prefill q offsets must cover q")
+    if kv_offsets[-1] != values.k.shape[0] or values.k.shape[0] != values.v.shape[0]:
+        raise ValueError("MHA prefill kv offsets must cover k/v")
+
+    outputs = []
+    lses = []
+    softmax_scale = 1.0 / math.sqrt(values.q.shape[-1])
+    for request_idx in range(len(q_offsets) - 1):
+        q_start, q_end = q_offsets[request_idx], q_offsets[request_idx + 1]
+        kv_start, kv_end = kv_offsets[request_idx], kv_offsets[request_idx + 1]
+        out_i, lse_i = _mha_attention_reference(
+            q=values.q[q_start:q_end],
+            k=values.k[kv_start:kv_end],
+            v=values.v[kv_start:kv_end],
+            sinks=values.sinks,
+            is_causal=True,
+            window_left=window_left,
+            logit_cap=logit_cap,
+            softmax_scale=softmax_scale,
+        )
+        outputs.append(out_i)
+        lses.append(lse_i)
+    return MHAReferenceValues(
+        out=torch.cat(outputs, dim=0),
+        lse=torch.cat(lses, dim=0).to(torch.float32),
+    )
+
+
+def _mha_cached_reference(
+    values: MHAInputValues,
+    *,
+    is_causal: bool,
+    window_left: int,
+    logit_cap: float,
+) -> MHAReferenceValues:
+    if values.q is None or values.cache is None:
+        raise ValueError("MHA cached reference requires q and cache tensors")
+    metadata = values.metadata
+    q_offsets = metadata.cu_seqlens_q_cpu
+    if q_offsets[0] != 0 or q_offsets[-1] != values.q.shape[0]:
+        raise ValueError("MHA cached q offsets must cover q")
+    cache_lens = metadata.cache_seqlens.detach().cpu().tolist()
+
+    outputs = []
+    lses = []
+    softmax_scale = 1.0 / math.sqrt(values.q.shape[-1])
+    for batch_idx, cache_len_raw in enumerate(cache_lens):
+        q_start, q_end = q_offsets[batch_idx], q_offsets[batch_idx + 1]
+        k_i, v_i = _gather_mha_cache_rows(
+            values.cache,
+            batch_idx=batch_idx,
+            cache_len=int(cache_len_raw),
+        )
+        out_i, lse_i = _mha_attention_reference(
+            q=values.q[q_start:q_end],
+            k=k_i,
+            v=v_i,
+            sinks=values.sinks,
+            is_causal=is_causal,
+            window_left=window_left,
+            logit_cap=logit_cap,
+            softmax_scale=softmax_scale,
+        )
+        outputs.append(out_i)
+        lses.append(lse_i)
+    return MHAReferenceValues(
+        out=torch.cat(outputs, dim=0),
+        lse=torch.cat(lses, dim=0).to(torch.float32),
+    )
+
+
+def mha_reference(
+    values: MHAInputValues,
+    *,
+    is_causal: bool = True,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+) -> MHAReferenceValues:
+    """Reference MHA output for generated prefill, extend, or decode inputs."""
+
+    if values.cache is None:
+        return _mha_prefill_reference(
+            values,
+            window_left=window_left,
+            logit_cap=logit_cap,
+        )
+    return _mha_cached_reference(
+        values,
+        is_causal=is_causal,
+        window_left=window_left,
+        logit_cap=logit_cap,
+    )
 
 
 def _mla_prefill_reference(

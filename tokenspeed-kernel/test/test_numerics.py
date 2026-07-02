@@ -491,6 +491,92 @@ def test_attention_merge_state_numerics_registration_matches_kernel_family() -> 
     assert get_standard_shapes("attention", "attn_merge_state")
 
 
+def test_attention_mha_prefill_generator_uses_package_inputs() -> None:
+    inputs = get_input_generator(
+        "attention",
+        "mha_prefill",
+        dtype=torch.bfloat16,
+        traits={},
+        device="cpu",
+        seed=102,
+    ).generate(
+        batch_size=2,
+        total_new_q_tokens=6,
+        num_q_heads=2,
+        num_kv_heads=1,
+        head_dim=64,
+    )
+
+    assert inputs["q"].shape == (6, 2, 64)
+    assert inputs["k"].shape == (6, 1, 64)
+    assert inputs["v"].shape == (6, 1, 64)
+    assert inputs["cu_seqlens_q_cpu"] == [0, 3, 6]
+    assert inputs["return_lse"] is False
+
+    from tokenspeed_kernel.numerics.reference.attention import torch_mha_prefill
+
+    out = torch_mha_prefill(**inputs)
+    assert isinstance(out, torch.Tensor)
+    assert out.shape == inputs["q"].shape
+
+
+def test_attention_mha_decode_generator_uses_package_inputs() -> None:
+    inputs = get_input_generator(
+        "attention",
+        "mha_decode_with_kvcache",
+        dtype=torch.bfloat16,
+        traits={},
+        device="cpu",
+        seed=103,
+    ).generate(
+        batch_size=2,
+        total_cached_tokens=8,
+        total_new_q_tokens=2,
+        num_q_heads=2,
+        num_kv_heads=1,
+        head_dim=64,
+        page_size=64,
+    )
+
+    assert inputs["q"].shape == (2, 2, 64)
+    assert inputs["k_cache"].shape[1:] == (64, 1, 64)
+    assert inputs["v_cache"].shape == inputs["k_cache"].shape
+    assert inputs["page_table"].shape[0] == 2
+    assert inputs["cache_seqlens"].shape == (2,)
+    assert inputs["return_lse"] is False
+
+    from tokenspeed_kernel.numerics.reference.attention import (
+        torch_mha_decode_with_kvcache,
+    )
+
+    out = torch_mha_decode_with_kvcache(**inputs)
+    assert isinstance(out, torch.Tensor)
+    assert out.shape == inputs["q"].shape
+
+
+def test_attention_mha_numerics_registration_matches_kernel_family() -> None:
+    load_builtin_kernels()
+    registry = KernelRegistry.get()
+
+    for mode, reference_name, triton_name in (
+        ("mha_prefill", "torch_mha_prefill", "triton_mha_prefill"),
+        (
+            "mha_extend_with_kvcache",
+            "torch_mha_extend_with_kvcache",
+            "triton_mha_extend_with_kvcache",
+        ),
+        (
+            "mha_decode_with_kvcache",
+            "torch_mha_decode_with_kvcache",
+            "triton_mha_decode_with_kvcache_cached",
+        ),
+    ):
+        specs = registry.get_for_operator("attention", mode)
+        assert any(spec.name == reference_name for spec in specs)
+        assert any(spec.name == triton_name for spec in specs)
+        assert get_standard_shapes("attention", mode)
+
+
 def test_moe_align_block_size_generator_uses_typed_tensor_input() -> None:
     first = get_input_generator(
         "moe",
@@ -803,6 +889,23 @@ class TestNumericsVerification:
     )
     def test_attention_merge_state_bf16(self, spec: KernelSpec):
         self._verify(spec, torch.bfloat16, "out_a")
+
+    @pytest.mark.parametrize(
+        "kernel_name",
+        [
+            "triton_mha_prefill",
+            "triton_mha_extend_with_kvcache",
+            "triton_mha_decode_with_kvcache_cached",
+        ],
+    )
+    def test_attention_mha_triton_bf16(self, kernel_name: str):
+        load_builtin_kernels()
+        registry = KernelRegistry.get()
+        platform = Platform.get()
+        spec = registry.get_by_name(kernel_name)
+        if spec is None or not spec.capability.satisfied_by(platform):
+            pytest.skip(f"{kernel_name} is not available on this platform")
+        self._verify(spec, torch.bfloat16, "q")
 
     @pytest.mark.parametrize(
         "spec",
