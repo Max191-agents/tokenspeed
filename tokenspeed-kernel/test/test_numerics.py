@@ -39,7 +39,9 @@ from tokenspeed_kernel.signature import (
     tensor_format,
 )
 from tokenspeed_numerics_input_generators import (
+    AttentionMergeStateInputValues,
     argmax_reference,
+    attention_merge_state_reference,
     moe_reference,
     mxfp4_quantization_reference,
     rope_reference,
@@ -443,6 +445,52 @@ def test_embedding_rope_numerics_registration_matches_kernel_family() -> None:
     assert get_standard_shapes("embedding", "rope")
 
 
+def test_attention_merge_state_generator_uses_package_inputs() -> None:
+    inputs = get_input_generator(
+        "attention",
+        "attn_merge_state",
+        dtype=torch.bfloat16,
+        traits={},
+        device="cpu",
+        seed=101,
+    ).generate(total_q=5, num_heads=2, head_dim=16, lse_bound=2.0)
+
+    assert set(inputs) == {"out_a", "lse_a", "out_b", "lse_b", "lse_scale_log2"}
+    assert inputs["out_a"].shape == (5, 2, 16)
+    assert inputs["out_b"].shape == (5, 2, 16)
+    assert inputs["out_a"].dtype == torch.bfloat16
+    assert inputs["out_b"].dtype == torch.bfloat16
+    assert inputs["lse_a"].shape == (5, 2)
+    assert inputs["lse_b"].shape == (5, 2)
+    assert inputs["lse_a"].dtype == torch.float32
+    assert inputs["lse_b"].dtype == torch.float32
+
+    from tokenspeed_kernel.numerics.reference.attention import torch_attn_merge_state
+
+    actual = torch_attn_merge_state(**inputs)
+    expected = attention_merge_state_reference(
+        AttentionMergeStateInputValues(
+            out_a=inputs["out_a"],
+            lse_a=inputs["lse_a"],
+            out_b=inputs["out_b"],
+            lse_b=inputs["lse_b"],
+            lse_scale_log2=inputs["lse_scale_log2"],
+        )
+    )
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_tensor, expected_tensor, atol=0, rtol=0)
+
+
+def test_attention_merge_state_numerics_registration_matches_kernel_family() -> None:
+    load_builtin_kernels()
+    registry = KernelRegistry.get()
+
+    specs = registry.get_for_operator("attention", "attn_merge_state")
+    assert any(spec.name == "torch_attn_merge_state" for spec in specs)
+    assert any(spec.name == "triton_attn_merge_state" for spec in specs)
+    assert get_standard_shapes("attention", "attn_merge_state")
+
+
 def test_moe_align_block_size_generator_uses_typed_tensor_input() -> None:
     first = get_input_generator(
         "moe",
@@ -747,6 +795,14 @@ class TestNumericsVerification:
         if spec is None or not spec.capability.satisfied_by(platform):
             pytest.skip("triton_mxfp4_moe_process_weights is not available")
         self._verify(spec, torch.bfloat16, "x")
+
+    @pytest.mark.parametrize(
+        "spec",
+        _get_verifiable_specs(torch.bfloat16, "out_a", family="attention"),
+        ids=lambda s: f"{s.family}.{s.mode}:{s.name}",
+    )
+    def test_attention_merge_state_bf16(self, spec: KernelSpec):
+        self._verify(spec, torch.bfloat16, "out_a")
 
     @pytest.mark.parametrize(
         "spec",

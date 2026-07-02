@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.numerics.reference.attention  # noqa: F401
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401

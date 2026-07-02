@@ -48,6 +48,7 @@ from tokenspeed_kernel.selection import (
 from tokenspeed_kernel.signature import FormatSignature
 
 # isort: split
+import tokenspeed_kernel.numerics.attention  # noqa: F401
 import tokenspeed_kernel.numerics.embedding  # noqa: F401
 import tokenspeed_kernel.numerics.gemm  # noqa: F401
 import tokenspeed_kernel.numerics.moe  # noqa: F401
