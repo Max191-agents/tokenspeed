@@ -1196,15 +1196,26 @@ def nvfp4_dequantization_reference(
         raise ValueError(
             f"NVFP4 reference currently supports scale_layout='linear', got {scale_layout!r}"
         )
-    if packed.dtype != torch.uint8:
+    if packed.dtype == torch.uint8:
+        packed_bytes = packed
+    elif packed.dtype == torch.float4_e2m1fn_x2:
+        packed_bytes = packed.view(torch.uint8)
+    else:
         raise ValueError(
-            f"packed NVFP4 values must use torch.uint8, got {packed.dtype}"
+            "packed NVFP4 values must use torch.uint8 or "
+            f"torch.float4_e2m1fn_x2, got {packed.dtype}"
         )
-    if scales.dtype != torch.float8_e4m3fn:
+
+    if scales.dtype in (torch.float8_e4m3fn, torch.float32):
+        scale_values = scales.float()
+    elif scales.dtype == torch.uint8:
+        scale_values = scales.view(torch.float8_e4m3fn).float()
+    else:
         raise ValueError(
-            f"NVFP4 scale values must use torch.float8_e4m3fn, got {scales.dtype}"
+            "NVFP4 scale values must use torch.float8_e4m3fn, torch.float32, "
+            f"or torch.uint8 FP8-byte storage, got {scales.dtype}"
         )
-    shape = _check_shape((*packed.shape[:-1], packed.shape[-1] * 2))
+    shape = _check_shape((*packed_bytes.shape[:-1], packed_bytes.shape[-1] * 2))
     expected_scale_shape = nvfp4_scale_shape(shape, scale_size=scale_size)
     if tuple(scales.shape) != expected_scale_shape:
         raise ValueError(
@@ -1218,11 +1229,11 @@ def nvfp4_dequantization_reference(
     if scale_value.item() <= 0.0:
         raise ValueError("NVFP4 scale must be positive")
 
-    unpacked = packed.new_empty(shape, dtype=torch.float32)
-    unpacked[..., 0::2] = _e2m1_values_from_nibbles(packed & 0xF)
-    unpacked[..., 1::2] = _e2m1_values_from_nibbles(packed >> 4)
+    unpacked = packed_bytes.new_empty(shape, dtype=torch.float32)
+    unpacked[..., 0::2] = _e2m1_values_from_nibbles(packed_bytes & 0xF)
+    unpacked[..., 1::2] = _e2m1_values_from_nibbles(packed_bytes >> 4)
     return (
         unpacked
-        * scales.float().repeat_interleave(scale_size, dim=-1)
+        * scale_values.repeat_interleave(scale_size, dim=-1)
         * scale_value.reshape((1,) * unpacked.ndim)
     )

@@ -53,8 +53,10 @@ class CustomDType(str, Enum):
     # by MXFP4 kernels as unsigned exponent-only FP8 scales.
     UE8M0 = "ue8m0"
 
-    # Packed NVFP4 values. Storage is torch.uint8 with two E2M1 nibbles per byte;
-    # TensorInput requires a scale_shape and generates paired FP8 E4M3 scales.
+    # Packed NVFP4 values. Storage defaults to torch.uint8 with two E2M1
+    # nibbles per byte; TensorInput requires a scale_shape and generates paired
+    # block scales. Kernel adapters may request torch.float4_e2m1fn_x2 storage
+    # directly, which uses the same packed byte representation.
     NVFP4 = "nvfp4"
 
     # Weight-only signed INT4 values with group scales. Storage is torch.uint8
@@ -72,6 +74,7 @@ _NVFP4_VALUES_PER_BYTE = 2
 _MXINT4_VALUES_PER_BYTE = 2
 _MXINT4_SCALE_MAX = 0.25
 _NVFP4_E2M1_NIBBLES = (0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15)
+_NVFP4_SCALE_DTYPES = frozenset({torch.float32, torch.float8_e4m3fn, torch.uint8})
 _UE8M0_SCALE_EXPONENTS = (121, 122, 123, 124)
 
 
@@ -314,6 +317,31 @@ def _generate_scale_tensor(
     return values.to(dtype)
 
 
+def _generate_nvfp4_scale_tensor(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    *,
+    device: torch.device,
+    generator: torch.Generator,
+    max_value: float,
+) -> torch.Tensor:
+    if dtype == torch.uint8:
+        return _generate_scale_tensor(
+            shape,
+            torch.float8_e4m3fn,
+            device=device,
+            generator=generator,
+            max_value=max_value,
+        ).view(torch.uint8)
+    return _generate_scale_tensor(
+        shape,
+        dtype,
+        device=device,
+        generator=generator,
+        max_value=max_value,
+    )
+
+
 def _check_scale_shape(
     shape: tuple[int, ...],
     scale_shape: tuple[int, ...],
@@ -384,9 +412,20 @@ class TensorInput(NumericsInputGenerator):
                 raise ValueError("nvfp4 tensors require scale_shape")
             if self.scale_dtype is None:
                 self.scale_dtype = torch.float8_e4m3fn
-            elif self.scale_dtype != torch.float8_e4m3fn:
+            elif self.scale_dtype not in _NVFP4_SCALE_DTYPES:
                 raise ValueError(
-                    "nvfp4 scale_dtype must be torch.float8_e4m3fn or None"
+                    "nvfp4 scale_dtype must be torch.float8_e4m3fn, "
+                    "torch.float32, torch.uint8, or None"
+                )
+        elif self.dtype == torch.float4_e2m1fn_x2:
+            if self.scale_shape is None:
+                raise ValueError("torch.float4_e2m1fn_x2 tensors require scale_shape")
+            if self.scale_dtype is None:
+                self.scale_dtype = torch.float8_e4m3fn
+            elif self.scale_dtype not in _NVFP4_SCALE_DTYPES:
+                raise ValueError(
+                    "torch.float4_e2m1fn_x2 scale_dtype must be "
+                    "torch.float8_e4m3fn, torch.float32, torch.uint8, or None"
                 )
         elif self.dtype == CustomDType.MXINT4:
             if self.scale_shape is None:
@@ -430,6 +469,12 @@ class TensorInput(NumericsInputGenerator):
                 device=target_device,
                 generator=generator,
             )
+        if self.dtype == torch.float4_e2m1fn_x2:
+            return _generate_nvfp4_packed(
+                self.shape,
+                device=target_device,
+                generator=generator,
+            ).view(torch.float4_e2m1fn_x2)
         if self.dtype == CustomDType.MXINT4:
             return _generate_mxint4_packed(
                 self.shape,
@@ -465,6 +510,16 @@ class TensorInput(NumericsInputGenerator):
 
         scale_device = _resolve_device(self.scale_device, device)
         scale_generator = _rng_for_device(scale_device, seed)
+        if self.dtype in (CustomDType.NVFP4, torch.float4_e2m1fn_x2):
+            if not isinstance(self.scale_dtype, torch.dtype):
+                raise ValueError("NVFP4 scale dtype must be a torch dtype")
+            return _generate_nvfp4_scale_tensor(
+                self.scale_shape,
+                self.scale_dtype,
+                device=scale_device,
+                generator=scale_generator,
+                max_value=self._scale_max_value(),
+            )
         return _generate_scale_tensor(
             self.scale_shape,
             self.scale_dtype,

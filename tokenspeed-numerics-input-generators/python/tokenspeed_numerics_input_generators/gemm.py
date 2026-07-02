@@ -79,6 +79,7 @@ _DEFAULT_MXFP4_BLOCK_SIZE = 32
 _DEFAULT_MXINT4_BLOCK_SIZE = 32
 _DEFAULT_NVFP4_BLOCK_SIZE = 16
 _GEMM_LAYOUTS = frozenset({"MK", "KM", "NK", "KN"})
+_NVFP4_SCALE_DTYPES = frozenset({torch.float32, torch.float8_e4m3fn, torch.uint8})
 _PROJECTION_DTYPES = frozenset(
     {torch.float16, torch.bfloat16, torch.float32, torch.float64}
 )
@@ -105,7 +106,7 @@ def _gemm_value_shape(
 
     if dtype == CustomDType.MXFP4:
         shape = _packed_mxfp4_shape(shape, packed_dim=packed_dim)
-    if dtype == CustomDType.NVFP4:
+    if dtype in (CustomDType.NVFP4, torch.float4_e2m1fn_x2):
         shape = _packed_nvfp4_shape(shape, packed_dim=packed_dim)
     if dtype == CustomDType.MXINT4:
         shape = _packed_mxint4_shape(shape, packed_dim=packed_dim)
@@ -295,6 +296,70 @@ def _dequantize_mxint4_linear(
         * scales.float().repeat_interleave(_DEFAULT_MXINT4_BLOCK_SIZE, dim=-1)[
             ..., : values.shape[-1]
         ]
+    )
+
+
+def _linear_block_scale_shape_matches(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    block_size: int,
+) -> bool:
+    if packed.ndim < 2 or scales.ndim < 1:
+        return False
+    logical_k = packed.shape[-1] * 2
+    expected_groups = math.ceil(logical_k / block_size)
+    return (
+        scales.shape[:-1] == packed.shape[:-1] and scales.shape[-1] == expected_groups
+    )
+
+
+def _infer_packed_gemm_format(
+    values: torch.Tensor,
+    scales: torch.Tensor | None,
+) -> Literal["mxfp4", "nvfp4", "mxint4"] | None:
+    if scales is None:
+        return None
+    if values.dtype == torch.float4_e2m1fn_x2:
+        if scales.dtype not in _NVFP4_SCALE_DTYPES:
+            raise ValueError(
+                "torch.float4_e2m1fn_x2 GEMM operands require NVFP4 scale "
+                f"storage, got {scales.dtype}"
+            )
+        return "nvfp4"
+    if values.dtype != torch.uint8:
+        return None
+    if scales.dtype == torch.bfloat16:
+        return "mxint4"
+    if scales.dtype in (torch.float32, torch.float8_e4m3fn):
+        return "nvfp4"
+    if scales.dtype != torch.uint8:
+        return None
+
+    matches_mxfp4 = _linear_block_scale_shape_matches(
+        values,
+        scales,
+        block_size=_DEFAULT_MXFP4_BLOCK_SIZE,
+    )
+    matches_nvfp4 = _linear_block_scale_shape_matches(
+        values,
+        scales,
+        block_size=_DEFAULT_NVFP4_BLOCK_SIZE,
+    )
+    if matches_nvfp4 and not matches_mxfp4:
+        return "nvfp4"
+    if matches_mxfp4 and not matches_nvfp4:
+        return "mxfp4"
+    if matches_mxfp4 and matches_nvfp4:
+        raise ValueError(
+            "uint8 FP4 GEMM scales are ambiguous between MXFP4 block size "
+            f"{_DEFAULT_MXFP4_BLOCK_SIZE} and NVFP4 block size "
+            f"{_DEFAULT_NVFP4_BLOCK_SIZE}; use a larger K dimension or a "
+            "non-uint8 NVFP4 scale dtype"
+        )
+    raise ValueError(
+        "uint8 FP4 GEMM scale shape does not match MXFP4 or NVFP4 block "
+        f"groups; values={tuple(values.shape)}, scales={tuple(scales.shape)}"
     )
 
 
@@ -549,9 +614,17 @@ class GemmInputs(NumericsInputGenerator):
             raise ValueError("MXFP4 A operands currently require a_layout='MK'")
         if self.config.b_dtype == CustomDType.MXFP4 and self.config.b_layout != "NK":
             raise ValueError("MXFP4 B operands currently require b_layout='NK'")
-        if self.config.a_dtype == CustomDType.NVFP4 and self.config.a_layout != "MK":
+        a_is_nvfp4 = self.config.a_dtype in (
+            CustomDType.NVFP4,
+            torch.float4_e2m1fn_x2,
+        )
+        b_is_nvfp4 = self.config.b_dtype in (
+            CustomDType.NVFP4,
+            torch.float4_e2m1fn_x2,
+        )
+        if a_is_nvfp4 and self.config.a_layout != "MK":
             raise ValueError("NVFP4 A operands currently require a_layout='MK'")
-        if self.config.b_dtype == CustomDType.NVFP4 and self.config.b_layout != "NK":
+        if b_is_nvfp4 and self.config.b_layout != "NK":
             raise ValueError("NVFP4 B operands currently require b_layout='NK'")
         if self.config.a_dtype == CustomDType.MXINT4 and self.config.a_layout != "MK":
             raise ValueError("MXINT4 A operands currently require a_layout='MK'")
@@ -711,45 +784,23 @@ def gemm_reference(
     if not isinstance(out_dtype, torch.dtype):
         raise TypeError("out_dtype must be a torch.dtype")
 
-    a_is_mxfp4 = values.A.dtype == torch.uint8 and values.A_scales is not None
-    b_is_mxfp4 = values.B.dtype == torch.uint8 and values.B_scales is not None
-    a_is_mxint4 = (
-        values.A.dtype == torch.uint8
-        and values.A_scales is not None
-        and values.A_scales.dtype == torch.bfloat16
-    )
-    b_is_mxint4 = (
-        values.B.dtype == torch.uint8
-        and values.B_scales is not None
-        and values.B_scales.dtype == torch.bfloat16
-    )
-    a_is_nvfp4 = (
-        values.A.dtype == torch.uint8
-        and values.A_scales is not None
-        and values.A_scales.dtype == torch.float8_e4m3fn
-    )
-    b_is_nvfp4 = (
-        values.B.dtype == torch.uint8
-        and values.B_scales is not None
-        and values.B_scales.dtype == torch.float8_e4m3fn
-    )
-    a_is_mxfp4 = a_is_mxfp4 and not a_is_nvfp4 and not a_is_mxint4
-    b_is_mxfp4 = b_is_mxfp4 and not b_is_nvfp4 and not b_is_mxint4
+    a_format = _infer_packed_gemm_format(values.A, values.A_scales)
+    b_format = _infer_packed_gemm_format(values.B, values.B_scales)
     A = _logical_operand(
         values.A,
         values.A_scales,
         layout=a_layout,
-        is_mxfp4=a_is_mxfp4,
-        is_nvfp4=a_is_nvfp4,
-        is_mxint4=a_is_mxint4,
+        is_mxfp4=a_format == "mxfp4",
+        is_nvfp4=a_format == "nvfp4",
+        is_mxint4=a_format == "mxint4",
     )
     B = _logical_operand(
         values.B,
         values.B_scales,
         layout=b_layout,
-        is_mxfp4=b_is_mxfp4,
-        is_nvfp4=b_is_nvfp4,
-        is_mxint4=b_is_mxint4,
+        is_mxfp4=b_format == "mxfp4",
+        is_nvfp4=b_format == "nvfp4",
+        is_mxint4=b_format == "mxint4",
     )
     if A.shape[-1] != B.shape[-1]:
         raise ValueError(
@@ -1425,7 +1476,7 @@ def nvfp4_gemm_input_config(
     batch_shape: tuple[int, ...] = (),
     block_size: int = _DEFAULT_NVFP4_BLOCK_SIZE,
 ) -> GemmInputConfig:
-    """Build a GEMM config for packed NVFP4 values with FP8 E4M3 scales."""
+    """Build a GEMM config for packed NVFP4 values with block scales."""
 
     M = int(M)
     N = int(N)

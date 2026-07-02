@@ -26,7 +26,12 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    format_signature,
+    format_signatures,
+    tensor_format,
+)
 from tokenspeed_numerics_input_generators import GemmInputValues, gemm_reference
 
 fp8_dtype = Platform.get().fp8e4m3fn.dtype
@@ -63,13 +68,32 @@ _MXFP4_SCALE = ScaleFormat(
 _MXFP4_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp4", {torch.uint8}, scale=_MXFP4_SCALE
 )
-_NVFP4_SCALE = ScaleFormat(
-    storage_dtype=torch.float8_e4m3fn,
-    granularity="block",
-    block_shape=(16,),
-)
-_NVFP4_FORMAT_SIGNATURES = format_signatures(
-    ("a", "b"), "nvfp4", {torch.uint8}, scale=_NVFP4_SCALE
+_FP4_DTYPES = frozenset({torch.uint8, torch.float4_e2m1fn_x2})
+_NVFP4_SCALE_DTYPES = frozenset({torch.float32, torch.float8_e4m3fn, torch.uint8})
+_NVFP4_FORMAT_SIGNATURES = frozenset(
+    format_signature(
+        a=tensor_format(
+            "nvfp4",
+            storage_dtype,
+            scale=ScaleFormat(
+                storage_dtype=a_scale_dtype,
+                granularity="block",
+                block_shape=(16,),
+            ),
+        ),
+        b=tensor_format(
+            "nvfp4",
+            storage_dtype,
+            scale=ScaleFormat(
+                storage_dtype=b_scale_dtype,
+                granularity="block",
+                block_shape=(16,),
+            ),
+        ),
+    )
+    for storage_dtype in _FP4_DTYPES
+    for a_scale_dtype in _NVFP4_SCALE_DTYPES
+    for b_scale_dtype in _NVFP4_SCALE_DTYPES
 )
 _DENSE_GEMM_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "dense", {torch.bfloat16, torch.float16, torch.float32}

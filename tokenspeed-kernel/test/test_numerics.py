@@ -54,6 +54,8 @@ _mla_fp8_dtypes = (
     torch.float8_e4m3fnuz,
     torch.float8_e5m2,
 )
+_nvfp4_storage_dtypes = (torch.uint8, torch.float4_e2m1fn_x2)
+_nvfp4_scale_dtypes = (torch.float8_e4m3fn, torch.float32, torch.uint8)
 
 
 class TestCompareOutputs:
@@ -184,6 +186,53 @@ def test_gemm_input_generator_supports_nvfp4_fp8_scales() -> None:
     assert inputs["block_size"] == [16]
 
 
+@pytest.mark.parametrize("storage_dtype", _nvfp4_storage_dtypes)
+@pytest.mark.parametrize("a_scale_dtype", _nvfp4_scale_dtypes)
+@pytest.mark.parametrize("b_scale_dtype", _nvfp4_scale_dtypes)
+def test_gemm_input_generator_supports_all_nvfp4_signatures(
+    storage_dtype: torch.dtype,
+    a_scale_dtype: torch.dtype,
+    b_scale_dtype: torch.dtype,
+) -> None:
+    a_scale = ScaleFormat(
+        storage_dtype=a_scale_dtype,
+        granularity="block",
+        block_shape=(16,),
+    )
+    b_scale = ScaleFormat(
+        storage_dtype=b_scale_dtype,
+        granularity="block",
+        block_shape=(16,),
+    )
+    signature = format_signature(
+        a=tensor_format("nvfp4", storage_dtype, scale=a_scale),
+        b=tensor_format("nvfp4", storage_dtype, scale=b_scale),
+    )
+    generator = get_input_generator(
+        "gemm",
+        "mm",
+        dtype=storage_dtype,
+        traits={},
+        format_signature=signature,
+        device="cpu",
+    )
+
+    inputs = generator.generate(M=4, N=8, K=64)
+
+    assert inputs["A"].shape == (4, 32)
+    assert inputs["B"].shape == (8, 32)
+    assert inputs["A"].dtype == storage_dtype
+    assert inputs["B"].dtype == storage_dtype
+    assert inputs["A_scales"].shape == (4, 4)
+    assert inputs["B_scales"].shape == (8, 4)
+    assert inputs["A_scales"].dtype == a_scale_dtype
+    assert inputs["B_scales"].dtype == b_scale_dtype
+    if a_scale_dtype == torch.uint8:
+        assert torch.all(inputs["A_scales"].view(torch.float8_e4m3fn).float() > 0.0)
+    if b_scale_dtype == torch.uint8:
+        assert torch.all(inputs["B_scales"].view(torch.float8_e4m3fn).float() > 0.0)
+
+
 def test_gemm_input_generator_output_dict_accepts_generated_c() -> None:
     from tokenspeed_kernel.numerics.reference.gemm import torch_mm
 
@@ -255,7 +304,12 @@ def test_gemm_nvfp4_numerics_registration_matches_kernel_family() -> None:
 
     specs = registry.get_for_operator("gemm", "mm")
     assert any(spec.name == "torch_mm_nvfp4" for spec in specs)
-    assert any(spec.name == "cublaslt_mm_nvfp4" for spec in specs)
+    cublaslt_spec = next(spec for spec in specs if spec.name == "cublaslt_mm_nvfp4")
+    for signature in cublaslt_spec.format_signatures:
+        assert (
+            _compatible_reference_for_signature(registry, cublaslt_spec, signature)
+            is not None
+        )
 
 
 def test_gemm_nvfp4_reference_matches_package_reference() -> None:
@@ -275,6 +329,56 @@ def test_gemm_nvfp4_reference_matches_package_reference() -> None:
         "gemm",
         "mm",
         dtype=torch.uint8,
+        traits={},
+        format_signature=signature,
+        device="cpu",
+    ).generate(M=4, N=8, K=64)
+
+    actual = torch_mm_nvfp4(**inputs)
+    expected = gemm_reference(
+        GemmInputValues(
+            A=inputs["A"],
+            B=inputs["B"],
+            C=inputs["C"],
+            A_scales=inputs["A_scales"],
+            B_scales=inputs["B_scales"],
+        ),
+        out_dtype=inputs["out_dtype"],
+        alpha=inputs["alpha"],
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("storage_dtype", _nvfp4_storage_dtypes)
+@pytest.mark.parametrize("a_scale_dtype", _nvfp4_scale_dtypes)
+@pytest.mark.parametrize("b_scale_dtype", _nvfp4_scale_dtypes)
+def test_gemm_nvfp4_reference_matches_package_reference_for_all_storage(
+    storage_dtype: torch.dtype,
+    a_scale_dtype: torch.dtype,
+    b_scale_dtype: torch.dtype,
+) -> None:
+    from tokenspeed_kernel.numerics.reference.gemm import torch_mm_nvfp4
+    from tokenspeed_numerics_input_generators import GemmInputValues, gemm_reference
+
+    a_scale = ScaleFormat(
+        storage_dtype=a_scale_dtype,
+        granularity="block",
+        block_shape=(16,),
+    )
+    b_scale = ScaleFormat(
+        storage_dtype=b_scale_dtype,
+        granularity="block",
+        block_shape=(16,),
+    )
+    signature = format_signature(
+        a=tensor_format("nvfp4", storage_dtype, scale=a_scale),
+        b=tensor_format("nvfp4", storage_dtype, scale=b_scale),
+    )
+    inputs = get_input_generator(
+        "gemm",
+        "mm",
+        dtype=storage_dtype,
         traits={},
         format_signature=signature,
         device="cpu",

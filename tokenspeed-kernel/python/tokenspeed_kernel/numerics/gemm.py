@@ -52,6 +52,7 @@ _ATOL = {
     torch.bfloat16: 1.5e-2,
     torch.float8_e4m3fn: 5e-3,
     torch.float8_e4m3fnuz: 5e-3,
+    torch.float4_e2m1fn_x2: 1.0e-1,
     # Packed quantized GEMM formats such as MXFP4/NVFP4 use uint8 storage for
     # the value tensor. The represented values are determined by the paired
     # format-specific scales.
@@ -61,6 +62,7 @@ _ATOL = {
 _QUANTIZED_DTYPES: set[torch.dtype] = {
     torch.float8_e4m3fn,
     torch.float8_e4m3fnuz,
+    torch.float4_e2m1fn_x2,
     torch.uint8,
 }
 
@@ -141,11 +143,14 @@ class GemmInputGenerator(InputGenerator):
                 raise ValueError("mxfp4 values must use torch.uint8 storage")
             return CustomDType.MXFP4
         if tensor_format.format == "nvfp4":
-            if tensor_format.storage_dtype != torch.uint8:
-                raise ValueError(
-                    "nvfp4 input generation currently supports torch.uint8 storage"
-                )
-            return CustomDType.NVFP4
+            if tensor_format.storage_dtype == torch.uint8:
+                return CustomDType.NVFP4
+            if tensor_format.storage_dtype == torch.float4_e2m1fn_x2:
+                return torch.float4_e2m1fn_x2
+            raise ValueError(
+                "nvfp4 input generation supports torch.uint8 or "
+                "torch.float4_e2m1fn_x2 storage"
+            )
         return tensor_format.storage_dtype
 
     def _scale_dtype(self, tensor_format: Any | None) -> InputDType:
@@ -157,9 +162,14 @@ class GemmInputGenerator(InputGenerator):
                 raise ValueError("mxfp4 scales must use torch.uint8 UE8M0 storage")
             return CustomDType.UE8M0
         if tensor_format.format == "nvfp4":
-            if scale.storage_dtype != torch.float8_e4m3fn:
+            if scale.storage_dtype not in (
+                torch.float32,
+                torch.float8_e4m3fn,
+                torch.uint8,
+            ):
                 raise ValueError(
-                    "nvfp4 input generation currently supports FP8 E4M3 scales"
+                    "nvfp4 input generation supports torch.float32, "
+                    "torch.float8_e4m3fn, or torch.uint8 scales"
                 )
         return scale.storage_dtype
 

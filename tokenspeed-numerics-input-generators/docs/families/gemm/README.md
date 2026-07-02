@@ -26,8 +26,11 @@ shapes and custom operand configs from the logical GEMM dimensions.
 
 `GemmInputValues` returns `A`, `B`, always-generated `C`, and optional scale
 tensors. Plain tensors are returned directly; quantized packed formats use
-storage tensors plus scale sidecars. References dequantize or apply scales at
-the operation level before computing the mathematical result.
+storage tensors plus scale sidecars. NVFP4 storage may be returned as raw
+`uint8` packed bytes or `torch.float4_e2m1fn_x2` storage, with block scales
+stored as `float32`, `float8_e4m3fn`, or FP8-byte `uint8` tensors. References
+dequantize or apply scales at the operation level before computing the
+mathematical result.
 
 The generator verifies layout compatibility, custom dtype scale requirements,
 and shape relationships so tests do not need to reconstruct GEMM validity rules.

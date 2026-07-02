@@ -29,10 +29,10 @@ required and is always generated.
 
 `gemm_reference` computes the operation-level `A @ B.T` result from generated
 values. It normalizes dense operand layouts, applies scale sidecars for scaled
-tensors, dequantizes MXFP4 storage with UE8M0 scales, and dequantizes MXINT4
-storage with BF16 group scales before multiplying. Kernel tests can use it as
-the semantic target while keeping backend-specific argument mapping in the
-adapter or test.
+tensors, dequantizes MXFP4 storage with UE8M0 scales, dequantizes NVFP4
+storage with per-block local scales, and dequantizes MXINT4 storage with BF16
+group scales before multiplying. Kernel tests can use it as the semantic target
+while keeping backend-specific argument mapping in the adapter or test.
 
 Some backend entry points consume a different physical layout than the
 operation-level default. For example, the TokenSpeed Triton scaled-FP8 GEMM path
@@ -93,9 +93,10 @@ LM-head wrapper.
 
 Dense floating-point tensors use the core tensor generator. Scaled tensors use
 the same tensor generator with explicit scale shape and scale dtype. Custom
-dtypes, such as MXFP4 storage with UE8M0 scales and MXINT4 storage with BF16
-group scales, are represented through the shared custom dtype enum so the
-format-specific constraints are centralized.
+dtypes, such as MXFP4 storage with UE8M0 scales, NVFP4 storage with per-block
+local scales, and MXINT4 storage with BF16 group scales, are represented through
+the shared custom dtype enum so the format-specific constraints are
+centralized.
 
 The dense case is the baseline operation: `A` and `B` are generated as ordinary
 floating-point tensors with no sidecar scales, and `gemm_reference` computes the

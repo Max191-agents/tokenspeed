@@ -222,18 +222,36 @@ def test_tensor_input_requires_fp8_scales_for_nvfp4() -> None:
             (4, 8),
             CustomDType.NVFP4,
             scale_shape=(4, 1),
-            scale_dtype=torch.float32,
+            scale_dtype=torch.bfloat16,
         )
 
+    for scale_dtype in (torch.float8_e4m3fn, torch.float32, torch.uint8):
+        values = TensorInput(
+            (4, 8),
+            CustomDType.NVFP4,
+            scale_shape=(4, 1),
+            scale_dtype=scale_dtype,
+        ).generate(seed=131, device="cpu")
+
+        assert values.scales is not None
+        assert values.scales.dtype == scale_dtype
+
+
+def test_tensor_input_generates_float4_nvfp4_storage() -> None:
     values = TensorInput(
         (4, 8),
-        CustomDType.NVFP4,
+        torch.float4_e2m1fn_x2,
         scale_shape=(4, 1),
-        scale_dtype=torch.float8_e4m3fn,
-    ).generate(seed=131, device="cpu")
+        scale_dtype=torch.uint8,
+    ).generate(seed=132, device="cpu")
 
+    assert values.values is not None
     assert values.scales is not None
-    assert values.scales.dtype == torch.float8_e4m3fn
+    assert values.values.shape == (4, 8)
+    assert values.values.dtype == torch.float4_e2m1fn_x2
+    assert values.values.view(torch.uint8).dtype == torch.uint8
+    assert values.scales.dtype == torch.uint8
+    assert torch.all(values.scales.view(torch.float8_e4m3fn).float() > 0.0)
 
 
 def test_tensor_input_generates_mxint4_values_and_scales() -> None:
@@ -599,6 +617,44 @@ def test_gemm_inputs_support_nvfp4_fp8_scales() -> None:
     assert inputs.A_scales.dtype == torch.float8_e4m3fn
     assert inputs.B_scales.dtype == torch.float8_e4m3fn
     assert inputs.C.shape == (4, 8)
+
+
+@pytest.mark.parametrize("storage_dtype", [CustomDType.NVFP4, torch.float4_e2m1fn_x2])
+@pytest.mark.parametrize(
+    "scale_dtype",
+    [torch.float8_e4m3fn, torch.float32, torch.uint8],
+)
+def test_gemm_inputs_support_nvfp4_storage_and_scale_dtypes(
+    storage_dtype: object,
+    scale_dtype: torch.dtype,
+) -> None:
+    inputs = GemmInputs(
+        nvfp4_gemm_input_config(
+            M=4,
+            N=8,
+            K=64,
+            c_dtype=torch.float32,
+            a_dtype=storage_dtype,  # type: ignore[arg-type]
+            b_dtype=storage_dtype,  # type: ignore[arg-type]
+            scale_dtype=scale_dtype,
+        )
+    ).generate(seed=98, device="cpu")
+
+    assert inputs.A is not None
+    assert inputs.B is not None
+    assert inputs.A_scales is not None
+    assert inputs.B_scales is not None
+    expected_storage_dtype = (
+        torch.uint8 if storage_dtype == CustomDType.NVFP4 else torch.float4_e2m1fn_x2
+    )
+    assert inputs.A.dtype == expected_storage_dtype
+    assert inputs.B.dtype == expected_storage_dtype
+    assert inputs.A_scales.dtype == scale_dtype
+    assert inputs.B_scales.dtype == scale_dtype
+
+    ref = gemm_reference(inputs, alpha=torch.tensor([1.0], dtype=torch.float32))
+    assert ref.shape == (4, 8)
+    assert torch.isfinite(ref).all()
 
 
 def test_gemm_reference_dequantizes_nvfp4_inputs() -> None:

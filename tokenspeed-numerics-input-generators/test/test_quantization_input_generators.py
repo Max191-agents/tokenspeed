@@ -41,6 +41,7 @@ from tokenspeed_numerics_input_generators import (
     mxfp4_scale_shape,
     mxfp8_quantization_reference,
     mxfp8_scale_shape,
+    nvfp4_dequantization_reference,
     nvfp4_quantization_reference,
     nvfp4_scale_shape,
 )
@@ -361,6 +362,29 @@ def test_nvfp4_quantization_inputs_generate_representable_values() -> None:
         atol=0,
         rtol=0,
     )
+
+
+def test_nvfp4_dequantization_accepts_float4_storage_and_scale_bytes() -> None:
+    x = torch.tensor(
+        [[0.0, 0.5, -0.5, 1.0, -1.0, 1.5, -1.5, 2.0] * 2],
+        dtype=torch.bfloat16,
+    )
+    packed, scales = nvfp4_quantization_reference(x, scale=0.125, scale_size=16)
+
+    expected = nvfp4_dequantization_reference(
+        packed,
+        scales,
+        scale=0.125,
+        scale_size=16,
+    )
+    actual = nvfp4_dequantization_reference(
+        packed.view(torch.float4_e2m1fn_x2),
+        scales.view(torch.uint8),
+        scale=0.125,
+        scale_size=16,
+    )
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_mxfp4_quantization_reference_matches_known_values() -> None:
