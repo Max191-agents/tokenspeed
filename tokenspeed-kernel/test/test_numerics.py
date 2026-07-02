@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
-from tokenspeed_kernel.numerics.inputs import get_input_generator
+from tokenspeed_kernel.numerics.inputs import get_input_generator, get_standard_shapes
 from tokenspeed_kernel.numerics.tolerance import Tolerance
 from tokenspeed_kernel.numerics.verify import (
     _verification_signature_and_reference,
@@ -174,34 +174,57 @@ def test_gemm_input_generator_requires_mxfp8_block_shape() -> None:
         generator.generate(M=4, N=256, K=128)
 
 
-def test_quantize_input_generator_uses_package_fp8_inputs() -> None:
-    first = get_input_generator(
-        "quantize",
-        "fp8_token_group_128",
+def test_quantization_fp8_generator_uses_package_inputs() -> None:
+    unscaled = get_input_generator(
+        "quantization",
+        "fp8",
         dtype=torch.bfloat16,
         traits={},
         device="cpu",
         seed=71,
-    ).generate(M=3, K=256)
-    second = get_input_generator(
-        "quantize",
-        "fp8_token_group_128",
+    ).generate(M=3, K=256, has_scale=False)
+    scaled = get_input_generator(
+        "quantization",
+        "fp8",
         dtype=torch.bfloat16,
         traits={},
         device="cpu",
         seed=71,
-    ).generate(M=3, K=256)
+    ).generate(M=3, K=256, has_scale=True)
 
-    assert set(first) == {"x"}
-    assert first["x"].shape == (3, 256)
-    assert first["x"].dtype == torch.bfloat16
-    assert torch.equal(first["x"], second["x"])
+    assert set(unscaled) == {"x"}
+    assert unscaled["x"].shape == (3, 256)
+    assert unscaled["x"].dtype == torch.bfloat16
+    assert set(scaled) == {"x", "scale"}
+    assert scaled["x"].shape == (3, 256)
+    assert scaled["x"].dtype == torch.bfloat16
+    assert scaled["scale"].shape == (1,)
+    assert scaled["scale"].dtype == torch.float32
+    assert torch.equal(unscaled["x"], scaled["x"])
 
 
-def test_quantize_input_generator_rejects_unsupported_mode() -> None:
+def test_quantization_fp8_numerics_registration_matches_kernel_family() -> None:
+    load_builtin_kernels()
+    registry = KernelRegistry.get()
+
+    specs = registry.get_for_operator("quantization", "fp8")
+    assert any(spec.name == "torch_quantization_fp8" for spec in specs)
+    assert any(spec.name == "triton_quantize_fp8" for spec in specs)
+    assert get_standard_shapes("quantization", "fp8")
     generator = get_input_generator(
-        "quantize",
-        "fp8_tensor",
+        "quantization",
+        "fp8",
+        dtype=torch.bfloat16,
+        traits={},
+        device="cpu",
+    )
+    assert generator.generate(M=2, K=128)["x"].shape == (2, 128)
+
+
+def test_quantization_input_generator_rejects_unsupported_mode() -> None:
+    generator = get_input_generator(
+        "quantization",
+        "fp8",
         dtype=torch.bfloat16,
         traits={},
         device="cpu",
@@ -355,10 +378,10 @@ class TestNumericsVerification:
 
     @pytest.mark.parametrize(
         "spec",
-        _get_verifiable_specs(torch.bfloat16, "x", family="quantize"),
+        _get_verifiable_specs(torch.bfloat16, "x", family="quantization"),
         ids=lambda s: f"{s.family}.{s.mode}:{s.name}",
     )
-    def test_quantize_bf16(self, spec: KernelSpec):
+    def test_quantization_bf16(self, spec: KernelSpec):
         self._verify(spec, torch.bfloat16, "x")
 
     @pytest.mark.parametrize(

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+import tokenspeed_kernel.numerics.reference.quantize  # noqa: F401
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel

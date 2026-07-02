@@ -46,6 +46,29 @@ def _quantize_fp8(x_fp32: torch.Tensor, max_abs: torch.Tensor) -> torch.Tensor:
 
 
 @register_kernel(
+    "quantization",
+    "fp8",
+    name="torch_quantization_fp8",
+    solution="reference",
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={},
+    priority=10,
+    tags={"determinism", "portability"},
+)
+def torch_quantization_fp8(
+    x: torch.Tensor,
+    scale: float | torch.Tensor | None = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Static FP8 quantization reference for ``tokenspeed_kernel.quantize_fp8``."""
+
+    del enable_pdl
+    if scale is None:
+        return x.to(_FP8_DTYPE).float()
+    return (x.float() / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE).float()
+
+
+@register_kernel(
     "quantize",
     "fp8_token_group_128",
     name="torch_fp8_token_group_128",

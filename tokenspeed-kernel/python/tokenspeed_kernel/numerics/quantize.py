@@ -59,6 +59,7 @@ def tolerance(
     return Tolerance(atol=0.2, rtol=0.2)
 
 
+set_family_tolerance("quantization", tolerance)
 set_family_tolerance("quantize", tolerance)
 
 # ---------------------------------------------------------------------------
@@ -69,7 +70,19 @@ set_family_tolerance("quantize", tolerance)
 class QuantizeInputGenerator(InputGenerator):
     """Generates a 2D activation tensor [M, K] for fp8 quantize kernels."""
 
-    def _mode_config(self, *, M: int, K: int) -> FP8QuantizationInputConfig:
+    def _mode_config(
+        self,
+        *,
+        M: int,
+        K: int,
+        has_scale: bool = False,
+    ) -> FP8QuantizationInputConfig:
+        if self.op_mode == "fp8":
+            return FP8QuantizationInputConfig(
+                shape=(M, K),
+                dtype=self.dtype,
+                granularity="tensor" if has_scale else "none",
+            )
         if self.op_mode == "fp8_token_group_128":
             return FP8QuantizationInputConfig(
                 shape=(M, K),
@@ -91,14 +104,22 @@ class QuantizeInputGenerator(InputGenerator):
             )
         raise ValueError(f"unsupported quantize input mode={self.op_mode!r}")
 
-    def generate(self, M: int, K: int) -> dict[str, Any]:
-        values = FP8QuantizationInputs(self._mode_config(M=M, K=K)).generate(
+    def generate(self, M: int, K: int, has_scale: bool = False) -> dict[str, Any]:
+        values = FP8QuantizationInputs(
+            self._mode_config(M=M, K=K, has_scale=has_scale)
+        ).generate(
             seed=self.seed,
             device=self.device,
         )
-        return {"x": values.x}
+        inputs: dict[str, Any] = {"x": values.x}
+        if has_scale:
+            if values.scale is None:
+                raise ValueError("generated scaled FP8 inputs must include scale")
+            inputs["scale"] = values.scale
+        return inputs
 
 
+set_input_generator("quantization", "fp8", QuantizeInputGenerator)
 set_input_generator("quantize", "fp8_token_group_128", QuantizeInputGenerator)
 set_input_generator("quantize", "fp8_token", QuantizeInputGenerator)
 set_input_generator("quantize", "fp8_tensor", QuantizeInputGenerator)
@@ -120,6 +141,18 @@ _QUANTIZE_STANDARD_SHAPES: list[dict[str, int]] = [
     {"M": 128, "K": 7168},
     {"M": 512, "K": 4096},
 ]
+
+_QUANTIZATION_FP8_STANDARD_SHAPES: list[dict[str, int | bool]] = [
+    {"M": 1, "K": 128, "has_scale": False},
+    {"M": 1, "K": 128, "has_scale": True},
+    {"M": 8, "K": 7168, "has_scale": False},
+    {"M": 8, "K": 7168, "has_scale": True},
+    {"M": 128, "K": 4096, "has_scale": False},
+    {"M": 128, "K": 4096, "has_scale": True},
+]
+
+set_standard_shapes("quantization", "fp8", _QUANTIZATION_FP8_STANDARD_SHAPES)
+set_benchmark_shapes("quantization", "fp8", _QUANTIZATION_FP8_STANDARD_SHAPES)
 
 for _mode in ("fp8_token_group_128", "fp8_token", "fp8_tensor"):
     set_standard_shapes("quantize", _mode, _QUANTIZE_STANDARD_SHAPES)

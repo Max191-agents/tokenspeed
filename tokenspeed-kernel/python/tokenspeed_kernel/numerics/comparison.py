@@ -111,14 +111,16 @@ def compare_outputs(
             worst_values=[],
         )
 
-    diff = (actual.float() - expected.float()).abs()
-    abs_expected = expected.float().abs()
+    actual_float = actual.float()
+    expected_float = expected.float()
+    diff = (actual_float - expected_float).abs()
+    abs_expected = expected_float.abs()
     rel_diff = diff / (abs_expected + 1e-12)
 
     exceeds = (diff > tolerance.atol) & (rel_diff > tolerance.rtol)
     non_finite = (
-        ~torch.isfinite(actual)
-        | ~torch.isfinite(expected)
+        ~torch.isfinite(actual_float)
+        | ~torch.isfinite(expected_float)
         | ~torch.isfinite(diff)
         | ~torch.isfinite(rel_diff)
     )
