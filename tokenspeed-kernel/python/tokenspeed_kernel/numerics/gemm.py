@@ -52,11 +52,16 @@ _ATOL = {
     torch.bfloat16: 1.5e-2,
     torch.float8_e4m3fn: 5e-3,
     torch.float8_e4m3fnuz: 5e-3,
+    # Packed quantized GEMM formats such as MXFP4/NVFP4 use uint8 storage for
+    # the value tensor. The represented values are determined by the paired
+    # format-specific scales.
+    torch.uint8: 1.0e-1,
 }
 
-_FP8_DTYPES: set[torch.dtype] = {
+_QUANTIZED_DTYPES: set[torch.dtype] = {
     torch.float8_e4m3fn,
     torch.float8_e4m3fnuz,
+    torch.uint8,
 }
 
 _BF16_FP16_DTYPES: set[torch.dtype] = {
@@ -89,7 +94,7 @@ def tolerance(
         raise ValueError("GEMM tolerance requires K or inputs['A']")
 
     base = _ATOL[dtype]
-    if dtype in _FP8_DTYPES:
+    if dtype in _QUANTIZED_DTYPES:
         scale = max(K, 1) / 128.0
     elif dtype in _BF16_FP16_DTYPES:
         scale = 1.0
