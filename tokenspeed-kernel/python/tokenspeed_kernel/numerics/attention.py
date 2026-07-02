@@ -30,6 +30,8 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mha_decode_with_kvcache_kwargs,
     mha_extend_with_kvcache_kwargs,
     mha_prefill_kwargs,
+    mla_decode_with_kvcache_kwargs,
+    mla_prefill_kwargs,
 )
 from tokenspeed_kernel.numerics.inputs import (
     InputGenerator,
@@ -44,6 +46,8 @@ from tokenspeed_numerics_input_generators import (
     MHAInputConfig,
     MHAInputs,
     MHARequestMetadataInputConfig,
+    MLAInputConfig,
+    MLAInputs,
 )
 
 
@@ -273,6 +277,191 @@ for _mha_mode, _mha_shapes in (
 ):
     set_standard_shapes("attention", _mha_mode, _mha_shapes)
     set_benchmark_shapes("attention", _mha_mode, _mha_shapes)
+
+
+class MLAInputGenerator(InputGenerator):
+    """Adapter from operation-level ``MLAInputs`` to TokenSpeed MLA kwargs."""
+
+    def _values(
+        self,
+        *,
+        batch_size: int,
+        total_cached_tokens: int,
+        total_new_q_tokens: int,
+        num_q_heads: int,
+        num_kv_heads: int | None,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        kv_lora_rank: int,
+        v_head_dim: int,
+        cache_layout: str,
+        page_size: int | None,
+        cached_length_mode: str = "regular",
+        new_q_length_mode: str = "fixed_per_request",
+        max_seqlen_k: int | None = None,
+    ):
+        metadata_input = MHARequestMetadataInputConfig(
+            batch_size=batch_size,
+            total_cached_tokens=total_cached_tokens,
+            total_new_q_tokens=total_new_q_tokens,
+            cached_length_mode=cached_length_mode,  # type: ignore[arg-type]
+            new_q_length_mode=new_q_length_mode,  # type: ignore[arg-type]
+            cache_layout=cache_layout,  # type: ignore[arg-type]
+            max_seqlen_k=max_seqlen_k,
+            allow_untied_non_cached_kv=True,
+        )
+        return MLAInputs(
+            MLAInputConfig(
+                batch_size=batch_size,
+                total_cached_tokens=total_cached_tokens,
+                total_new_q_tokens=total_new_q_tokens,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                v_head_dim=v_head_dim,
+                q_dtype=self.dtype,
+                cache_layout=cache_layout,  # type: ignore[arg-type]
+                page_size=page_size,
+                metadata_input=metadata_input,
+            )
+        ).generate(
+            metadata_seed=self.seed,
+            value_seed=self.seed + 1,
+            device=self.device,
+        )
+
+    def generate(
+        self,
+        *,
+        batch_size: int,
+        total_cached_tokens: int = 0,
+        total_new_q_tokens: int,
+        num_q_heads: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        kv_lora_rank: int,
+        v_head_dim: int,
+        num_kv_heads: int | None = None,
+        page_size: int | None = None,
+        is_causal: bool = True,
+        logit_cap: float = 0.0,
+        return_lse: bool = False,
+        cached_length_mode: str = "regular",
+        new_q_length_mode: str = "fixed_per_request",
+        max_seqlen_k: int | None = None,
+    ) -> dict[str, Any]:
+        if self.op_mode == "mla_prefill":
+            values = self._values(
+                batch_size=batch_size,
+                total_cached_tokens=0,
+                total_new_q_tokens=total_new_q_tokens,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                v_head_dim=v_head_dim,
+                cache_layout="none",
+                page_size=None,
+                cached_length_mode="regular",
+                new_q_length_mode=new_q_length_mode,
+            )
+            return mla_prefill_kwargs(
+                values,
+                is_causal=is_causal,
+                logit_cap=logit_cap,
+                return_lse=return_lse,
+            )
+        if self.op_mode == "mla_decode_with_kvcache":
+            values = self._values(
+                batch_size=batch_size,
+                total_cached_tokens=total_cached_tokens,
+                total_new_q_tokens=total_new_q_tokens,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                v_head_dim=v_head_dim,
+                cache_layout="paged",
+                page_size=page_size,
+                cached_length_mode=cached_length_mode,
+                new_q_length_mode=new_q_length_mode,
+                max_seqlen_k=max_seqlen_k,
+            )
+            return mla_decode_with_kvcache_kwargs(
+                values,
+                logit_cap=logit_cap,
+                return_lse=return_lse,
+            )
+        raise ValueError(f"unsupported MLA input mode {self.op_mode!r}")
+
+
+set_input_generator("attention", "mla_prefill", MLAInputGenerator)
+set_input_generator("attention", "mla_decode_with_kvcache", MLAInputGenerator)
+
+_MLA_PREFILL_STANDARD_SHAPES: list[dict[str, int | bool | float]] = [
+    {
+        "batch_size": 2,
+        "total_new_q_tokens": 6,
+        "num_q_heads": 4,
+        "num_kv_heads": 2,
+        "qk_nope_head_dim": 8,
+        "qk_rope_head_dim": 4,
+        "kv_lora_rank": 16,
+        "v_head_dim": 8,
+        "is_causal": True,
+        "return_lse": False,
+    },
+    {
+        "batch_size": 1,
+        "total_new_q_tokens": 3,
+        "num_q_heads": 2,
+        "num_kv_heads": 1,
+        "qk_nope_head_dim": 8,
+        "qk_rope_head_dim": 4,
+        "kv_lora_rank": 16,
+        "v_head_dim": 8,
+        "is_causal": True,
+        "return_lse": False,
+    },
+]
+
+_MLA_DECODE_STANDARD_SHAPES: list[dict[str, int | bool | float]] = [
+    {
+        "batch_size": 2,
+        "total_cached_tokens": 8,
+        "total_new_q_tokens": 2,
+        "num_q_heads": 4,
+        "qk_nope_head_dim": 8,
+        "qk_rope_head_dim": 4,
+        "kv_lora_rank": 16,
+        "v_head_dim": 8,
+        "page_size": 64,
+        "return_lse": False,
+    },
+    {
+        "batch_size": 1,
+        "total_cached_tokens": 4,
+        "total_new_q_tokens": 1,
+        "num_q_heads": 2,
+        "qk_nope_head_dim": 8,
+        "qk_rope_head_dim": 4,
+        "kv_lora_rank": 16,
+        "v_head_dim": 8,
+        "page_size": 64,
+        "return_lse": False,
+    },
+]
+
+for _mla_mode, _mla_shapes in (
+    ("mla_prefill", _MLA_PREFILL_STANDARD_SHAPES),
+    ("mla_decode_with_kvcache", _MLA_DECODE_STANDARD_SHAPES),
+):
+    set_standard_shapes("attention", _mla_mode, _mla_shapes)
+    set_benchmark_shapes("attention", _mla_mode, _mla_shapes)
 
 
 class AttentionMergeStateInputGenerator(InputGenerator):
