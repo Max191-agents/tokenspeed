@@ -31,8 +31,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.platform import Platform
-from tokenspeed_kernel.registry import register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_numerics_input_generators import mxfp4_quantization_reference
 
 _FP8_DTYPE = Platform.get().fp8e4m3fn.dtype
 _FP8_FINFO = torch.finfo(_FP8_DTYPE)
@@ -120,3 +121,32 @@ def torch_fp8_tensor(x: torch.Tensor) -> torch.Tensor:
     assert x.dim() == 2, f"expected 2D input, got {x.shape}"
     x_fp32 = x.float()
     return _quantize_fp8(x_fp32, x_fp32.abs().amax())
+
+
+@register_kernel(
+    "quantization",
+    "mxfp4",
+    name="torch_quantization_mxfp4",
+    solution="reference",
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={},
+    priority=Priority.REFERENCE,
+    tags={"determinism", "portability"},
+)
+def torch_quantization_mxfp4(
+    x: torch.Tensor,
+    global_scale: float | None = None,
+    scale_size: int = 32,
+    scale_layout: str = "linear",
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP4 quantization reference with packed E2M1 and UE8M0 scales."""
+
+    del enable_pdl
+    if global_scale is not None:
+        raise ValueError("MXFP4 reference does not support global_scale")
+    return mxfp4_quantization_reference(
+        x,
+        scale_size=scale_size,
+        scale_layout=scale_layout,  # type: ignore[arg-type]
+    )

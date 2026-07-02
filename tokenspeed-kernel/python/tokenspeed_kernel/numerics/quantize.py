@@ -33,6 +33,8 @@ from tokenspeed_kernel.numerics.tolerance import Tolerance, set_family_tolerance
 from tokenspeed_numerics_input_generators import (
     FP8QuantizationInputConfig,
     FP8QuantizationInputs,
+    MXFP4QuantizationInputConfig,
+    MXFP4QuantizationInputs,
 )
 
 # ---------------------------------------------------------------------------
@@ -50,9 +52,12 @@ from tokenspeed_numerics_input_generators import (
 def tolerance(
     dtype: torch.dtype,
     *,
+    mode: str | None = None,
     inputs: dict[str, Any] | None = None,
     **_: Any,
 ) -> Tolerance:
+    if mode == "mxfp4":
+        return Tolerance(atol=0.0, rtol=0.0)
     # 1 fp8 e4m3 ulp at the values we actually compare. fp8_e4m3 has 3 mantissa
     # bits, so the relative gap between adjacent representable values is 2^-3
     # = 0.125. Allow that plus a small safety margin.
@@ -68,7 +73,7 @@ set_family_tolerance("quantize", tolerance)
 
 
 class QuantizeInputGenerator(InputGenerator):
-    """Generates a 2D activation tensor [M, K] for fp8 quantize kernels."""
+    """Generates a 2D activation tensor [M, K] for quantize kernels."""
 
     def _mode_config(
         self,
@@ -104,7 +109,33 @@ class QuantizeInputGenerator(InputGenerator):
             )
         raise ValueError(f"unsupported quantize input mode={self.op_mode!r}")
 
-    def generate(self, M: int, K: int, has_scale: bool = False) -> dict[str, Any]:
+    def generate(
+        self,
+        M: int,
+        K: int,
+        has_scale: bool = False,
+        scale_size: int = 32,
+        scale_layout: str = "linear",
+    ) -> dict[str, Any]:
+        if self.op_mode == "mxfp4":
+            values = MXFP4QuantizationInputs(
+                MXFP4QuantizationInputConfig(
+                    shape=(M, K),
+                    dtype=self.dtype,
+                    scale_size=scale_size,
+                    scale_layout=scale_layout,  # type: ignore[arg-type]
+                )
+            ).generate(
+                seed=self.seed,
+                device=self.device,
+            )
+            return {
+                "x": values.x,
+                "global_scale": values.global_scale,
+                "scale_size": values.scale_size,
+                "scale_layout": values.scale_layout,
+            }
+
         values = FP8QuantizationInputs(
             self._mode_config(M=M, K=K, has_scale=has_scale)
         ).generate(
@@ -120,6 +151,7 @@ class QuantizeInputGenerator(InputGenerator):
 
 
 set_input_generator("quantization", "fp8", QuantizeInputGenerator)
+set_input_generator("quantization", "mxfp4", QuantizeInputGenerator)
 set_input_generator("quantize", "fp8_token_group_128", QuantizeInputGenerator)
 set_input_generator("quantize", "fp8_token", QuantizeInputGenerator)
 set_input_generator("quantize", "fp8_tensor", QuantizeInputGenerator)
@@ -151,8 +183,17 @@ _QUANTIZATION_FP8_STANDARD_SHAPES: list[dict[str, int | bool]] = [
     {"M": 128, "K": 4096, "has_scale": True},
 ]
 
+_MXFP4_STANDARD_SHAPES: list[dict[str, int | str]] = [
+    {"M": 1, "K": 32, "scale_size": 32, "scale_layout": "linear"},
+    {"M": 2, "K": 64, "scale_size": 32, "scale_layout": "linear"},
+    {"M": 8, "K": 128, "scale_size": 32, "scale_layout": "linear"},
+    {"M": 32, "K": 4096, "scale_size": 32, "scale_layout": "linear"},
+]
+
 set_standard_shapes("quantization", "fp8", _QUANTIZATION_FP8_STANDARD_SHAPES)
 set_benchmark_shapes("quantization", "fp8", _QUANTIZATION_FP8_STANDARD_SHAPES)
+set_standard_shapes("quantization", "mxfp4", _MXFP4_STANDARD_SHAPES)
+set_benchmark_shapes("quantization", "mxfp4", _MXFP4_STANDARD_SHAPES)
 
 for _mode in ("fp8_token_group_128", "fp8_token", "fp8_tensor"):
     set_standard_shapes("quantize", _mode, _QUANTIZE_STANDARD_SHAPES)

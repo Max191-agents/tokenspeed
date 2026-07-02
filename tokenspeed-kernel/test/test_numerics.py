@@ -38,7 +38,11 @@ from tokenspeed_kernel.signature import (
     format_signatures,
     tensor_format,
 )
-from tokenspeed_numerics_input_generators import argmax_reference, rope_reference
+from tokenspeed_numerics_input_generators import (
+    argmax_reference,
+    mxfp4_quantization_reference,
+    rope_reference,
+)
 
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
 
@@ -221,6 +225,68 @@ def test_quantization_fp8_numerics_registration_matches_kernel_family() -> None:
         device="cpu",
     )
     assert generator.generate(M=2, K=128)["x"].shape == (2, 128)
+
+
+def test_quantization_mxfp4_generator_uses_package_inputs() -> None:
+    inputs = get_input_generator(
+        "quantization",
+        "mxfp4",
+        dtype=torch.bfloat16,
+        traits={},
+        device="cpu",
+        seed=83,
+    ).generate(M=3, K=64)
+
+    assert set(inputs) == {"x", "global_scale", "scale_size", "scale_layout"}
+    assert inputs["x"].shape == (3, 64)
+    assert inputs["x"].dtype == torch.bfloat16
+    assert inputs["global_scale"] is None
+    assert inputs["scale_size"] == 32
+    assert inputs["scale_layout"] == "linear"
+
+    packed, scales = mxfp4_quantization_reference(
+        inputs["x"],
+        scale_size=inputs["scale_size"],
+        scale_layout=inputs["scale_layout"],
+    )
+    assert packed.shape == (3, 32)
+    assert packed.dtype == torch.uint8
+    assert scales.shape == (3, 2)
+    assert scales.dtype == torch.uint8
+
+
+def test_quantization_mxfp4_numerics_registration_matches_kernel_family() -> None:
+    load_builtin_kernels()
+    registry = KernelRegistry.get()
+
+    specs = registry.get_for_operator("quantization", "mxfp4")
+    assert any(spec.name == "torch_quantization_mxfp4" for spec in specs)
+    assert any(spec.name == "triton_quantize_mxfp4" for spec in specs)
+    assert get_standard_shapes("quantization", "mxfp4")
+
+
+def test_quantization_mxfp4_reference_matches_package_reference() -> None:
+    from tokenspeed_kernel.numerics.reference.quantize import torch_quantization_mxfp4
+
+    inputs = get_input_generator(
+        "quantization",
+        "mxfp4",
+        dtype=torch.float16,
+        traits={},
+        device="cpu",
+        seed=84,
+    ).generate(M=2, K=64)
+
+    actual = torch_quantization_mxfp4(**inputs)
+    expected = mxfp4_quantization_reference(
+        inputs["x"],
+        scale_size=inputs["scale_size"],
+        scale_layout=inputs["scale_layout"],
+    )
+
+    assert len(actual) == len(expected) == 2
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_tensor, expected_tensor, atol=0, rtol=0)
 
 
 def test_quantization_input_generator_rejects_unsupported_mode() -> None:

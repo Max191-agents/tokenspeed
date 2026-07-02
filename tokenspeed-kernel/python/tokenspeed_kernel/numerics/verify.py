@@ -196,7 +196,7 @@ def verify_kernel(
                 f"actual={len(actual_outputs)} expected={len(expected_outputs)}"
             )
 
-        tol = tol_fn(dtype, inputs=inputs, **shape)
+        tol = tol_fn(dtype, family=spec.family, mode=spec.mode, inputs=inputs, **shape)
         for output_index, (actual_tensor, expected_tensor) in enumerate(
             zip(actual_outputs, expected_outputs, strict=True)
         ):
