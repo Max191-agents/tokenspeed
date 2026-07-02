@@ -31,14 +31,117 @@ from tokenspeed_kernel.ops.attention.flashinfer import (
     trtllm_ragged_attention_deepseek,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_numerics_input_generators import (
+    KVCacheValues,
+    MHAInputConfig,
+    MHAInputs,
+    MHAInputValues,
+    MHARequestMetadataInputConfig,
+    MLAInputConfig,
+    MLAInputs,
+    MLAInputValues,
+    MLAKVCacheValues,
+)
 
 platform = current_platform()
-torch.manual_seed(42)
 
 pytestmark = pytest.mark.skipif(
     not (platform.is_blackwell),
     reason="FlashInfer TRTLLM tests require Blackwell GPU.",
 )
+
+
+def _mha_values(
+    *,
+    batch_size: int,
+    total_cached_tokens: int,
+    total_new_q_tokens: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    cache_layout: str = "none",
+    page_size: int | None = None,
+    indexing: str | None = None,
+    metadata_kwargs: dict[str, object] | None = None,
+    metadata_seed: int = 42,
+    value_seed: int = 43,
+    device: str,
+) -> MHAInputValues:
+    return MHAInputs(
+        MHAInputConfig(
+            batch_size=batch_size,
+            total_cached_tokens=total_cached_tokens,
+            total_new_q_tokens=total_new_q_tokens,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_dtype=dtype,
+            cache_layout=cache_layout,  # type: ignore[arg-type]
+            page_size=page_size,
+            indexing=indexing,  # type: ignore[arg-type]
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=batch_size,
+                total_cached_tokens=total_cached_tokens,
+                total_new_q_tokens=total_new_q_tokens,
+                cache_layout=cache_layout,  # type: ignore[arg-type]
+                **(metadata_kwargs or {}),
+            ),
+        )
+    ).generate(metadata_seed=metadata_seed, value_seed=value_seed, device=device)
+
+
+def _mla_values(
+    *,
+    batch_size: int,
+    total_cached_tokens: int,
+    total_new_q_tokens: int,
+    num_q_heads: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    kv_lora_rank: int,
+    v_head_dim: int,
+    dtype: torch.dtype,
+    page_size: int,
+    metadata_kwargs: dict[str, object],
+    device: str,
+) -> MLAInputValues:
+    return MLAInputs(
+        MLAInputConfig(
+            batch_size=batch_size,
+            total_cached_tokens=total_cached_tokens,
+            total_new_q_tokens=total_new_q_tokens,
+            num_q_heads=num_q_heads,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            v_head_dim=v_head_dim,
+            q_dtype=dtype,
+            cache_layout="paged",
+            page_size=page_size,
+            indexing="identity",
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=batch_size,
+                total_cached_tokens=total_cached_tokens,
+                total_new_q_tokens=total_new_q_tokens,
+                cache_layout="paged",
+                **metadata_kwargs,
+            ),
+        )
+    ).generate(metadata_seed=42, value_seed=43, device=device)
+
+
+def _flashinfer_mha_cache(cache: KVCacheValues) -> tuple[torch.Tensor, torch.Tensor]:
+    if cache.k_cache is None or cache.v_cache is None:
+        raise ValueError("MHA cache values must include K and V cache tensors")
+    return (
+        cache.k_cache.transpose(1, 2).contiguous(),
+        cache.v_cache.transpose(1, 2).contiguous(),
+    )
+
+
+def _flashinfer_mla_cache(cache: MLAKVCacheValues) -> torch.Tensor:
+    return cache.kv_cache.transpose(1, 2).contiguous()
 
 
 @pytest.mark.parametrize(
@@ -56,39 +159,46 @@ def test_mha_prefill(
     num_kv_heads: int,
 ) -> None:
     batch_size = 3
-    seqlens = torch.tensor([834, 278, 768], device=device, dtype=torch.int32)
-    total_len = int(seqlens.sum().item())
-    max_len = int(seqlens.max().item())
     workspace_buffer = torch.empty(150 * 1024 * 1024, device=device, dtype=torch.uint8)
-
-    query = torch.randn(total_len, num_q_heads, head_dim, device=device, dtype=dtype)
-    key = torch.randn(total_len, num_kv_heads, head_dim, device=device, dtype=dtype)
-    value = torch.randn(total_len, num_kv_heads, head_dim, device=device, dtype=dtype)
-
-    cum_seq_lens = torch.cumsum(seqlens, dim=0, dtype=torch.int32)
-    cum_seq_lens = torch.nn.functional.pad(cum_seq_lens, (1, 0))
+    values = _mha_values(
+        batch_size=batch_size,
+        total_cached_tokens=0,
+        total_new_q_tokens=1880,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        metadata_kwargs={
+            "new_q_length_mode": "ragged",
+            "max_new_q_tokens_per_request": 834,
+        },
+        device=device,
+    )
+    assert values.q is not None
+    assert values.k is not None
+    assert values.v is not None
 
     out = trtllm_ragged_attention_deepseek(
-        query=query,
-        key=key,
-        value=value,
+        query=values.q,
+        key=values.k,
+        value=values.v,
         workspace_buffer=workspace_buffer,
-        seq_lens=seqlens,
-        max_q_len=max_len,
-        max_kv_len=max_len,
+        seq_lens=values.metadata.cache_seqlens,
+        max_q_len=values.metadata.max_seqlen_q,
+        max_kv_len=values.metadata.max_seqlen_q,
         bmm1_scale=1.0 / math.sqrt(head_dim),
         bmm2_scale=1.0,
         o_sf_scale=-1.0,
         batch_size=batch_size,
         window_left=-1,
-        cum_seq_lens_q=cum_seq_lens,
-        cum_seq_lens_kv=cum_seq_lens,
+        cum_seq_lens_q=values.metadata.cu_seqlens_q,
+        cum_seq_lens_kv=values.metadata.cu_seqlens_kv,
         enable_pdl=False,
         is_causal=True,
         return_lse=False,
     )
 
-    assert out.shape == query.shape
+    assert out.shape == values.q.shape
 
 
 @pytest.mark.parametrize(
@@ -109,87 +219,45 @@ def test_mha_prefill_with_kvcache(
     page_size = 64
     max_kv_len = 1024
     workspace_buffer = torch.empty(512 * 1024 * 1024, device=device, dtype=torch.uint8)
-    seq_lens = torch.tensor([834, 278, 768], device=device, dtype=torch.int32)
-    total_q = int(seq_lens.sum().item())
-    max_q_len = int(seq_lens.max().item())
-    num_blocks_per_seq = (seq_lens + page_size - 1) // page_size
-    max_num_blocks_per_seq = (max_kv_len + page_size - 1) // page_size
-    total_num_blocks = int(num_blocks_per_seq.sum().item())
-
-    query = torch.randn(total_q, num_q_heads, head_dim, device=device, dtype=dtype)
-    cum_seq_lens = torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
-    cum_seq_lens = torch.nn.functional.pad(cum_seq_lens, (1, 0))
-
-    block_tables = torch.zeros(
-        batch_size,
-        max_num_blocks_per_seq,
-        device=device,
-        dtype=torch.int32,
-    )
-    next_block = 0
-    for batch_idx, num_blocks in enumerate(num_blocks_per_seq.tolist()):
-        block_tables[batch_idx, :num_blocks] = torch.arange(
-            next_block,
-            next_block + num_blocks,
-            device=device,
-            dtype=torch.int32,
-        )
-        next_block += num_blocks
-
-    k_cache = torch.zeros(
-        total_num_blocks,
-        num_kv_heads,
-        page_size,
-        head_dim,
-        device=device,
+    values = _mha_values(
+        batch_size=batch_size,
+        total_cached_tokens=0,
+        total_new_q_tokens=1880,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
         dtype=dtype,
-    )
-    v_cache = torch.zeros(
-        total_num_blocks,
-        num_kv_heads,
-        page_size,
-        head_dim,
+        cache_layout="paged",
+        page_size=page_size,
+        indexing="identity",
+        metadata_kwargs={
+            "new_q_length_mode": "ragged",
+            "max_new_q_tokens_per_request": 834,
+            "max_seqlen_k": max_kv_len,
+        },
         device=device,
-        dtype=dtype,
     )
-    for batch_idx, total_kv_len in enumerate(seq_lens.tolist()):
-        num_blocks = int(num_blocks_per_seq[batch_idx].item())
-        for block_idx in range(num_blocks):
-            physical_block = int(block_tables[batch_idx, block_idx].item())
-            block_start = block_idx * page_size
-            tokens_in_block = min(page_size, total_kv_len - block_start)
-            k_cache[physical_block, :, :tokens_in_block] = torch.randn(
-                num_kv_heads,
-                tokens_in_block,
-                head_dim,
-                device=device,
-                dtype=dtype,
-            )
-            v_cache[physical_block, :, :tokens_in_block] = torch.randn(
-                num_kv_heads,
-                tokens_in_block,
-                head_dim,
-                device=device,
-                dtype=dtype,
-            )
+    assert values.q is not None
+    assert values.cache is not None
+    assert values.cache.page_table is not None
 
     out = trtllm_batch_context_with_kv_cache(
-        query=query,
-        kv_cache=(k_cache, v_cache),
+        query=values.q,
+        kv_cache=_flashinfer_mha_cache(values.cache),
         workspace_buffer=workspace_buffer,
-        block_tables=block_tables,
-        seq_lens=seq_lens,
-        max_q_len=max_q_len,
+        block_tables=values.cache.page_table,
+        seq_lens=values.metadata.cache_seqlens,
+        max_q_len=values.metadata.max_seqlen_q,
         max_kv_len=max_kv_len,
         bmm1_scale=1.0 / math.sqrt(head_dim),
         bmm2_scale=1.0,
         batch_size=batch_size,
-        cum_seq_lens_q=cum_seq_lens,
-        cum_seq_lens_kv=cum_seq_lens,
+        cum_seq_lens_q=values.metadata.cu_seqlens_q,
+        cum_seq_lens_kv=values.metadata.cu_seqlens_kv,
         out_dtype=dtype,
     )
 
-    assert out.shape == query.shape
+    assert out.shape == values.q.shape
 
 
 @pytest.mark.parametrize(
@@ -207,79 +275,42 @@ def test_mha_decode_with_kvcache(
     page_size = 64
     max_seq_len = 1024
     workspace_buffer = torch.empty(512 * 1024 * 1024, device=device, dtype=torch.uint8)
-    seq_lens = torch.tensor([424, 531, 851, 987], device=device, dtype=torch.int32)
-    num_blocks_per_seq = (seq_lens + page_size - 1) // page_size
-    max_num_blocks_per_seq = (max_seq_len + page_size - 1) // page_size
-    total_num_blocks = int(num_blocks_per_seq.sum().item())
-
-    query = torch.randn(batch_size, num_q_heads, head_dim, device=device, dtype=dtype)
-
-    block_tables = torch.zeros(
-        batch_size,
-        max_num_blocks_per_seq,
-        device=device,
-        dtype=torch.int32,
-    )
-    next_block = 0
-    for batch_idx, num_blocks in enumerate(num_blocks_per_seq.tolist()):
-        block_tables[batch_idx, :num_blocks] = torch.arange(
-            next_block,
-            next_block + num_blocks,
-            device=device,
-            dtype=torch.int32,
-        )
-        next_block += num_blocks
-
-    k_cache = torch.zeros(
-        total_num_blocks,
-        num_kv_heads,
-        page_size,
-        head_dim,
-        device=device,
+    values = _mha_values(
+        batch_size=batch_size,
+        total_cached_tokens=2789,
+        total_new_q_tokens=batch_size,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
         dtype=dtype,
-    )
-    v_cache = torch.zeros(
-        total_num_blocks,
-        num_kv_heads,
-        page_size,
-        head_dim,
+        cache_layout="paged",
+        page_size=page_size,
+        indexing="identity",
+        metadata_kwargs={
+            "cached_length_mode": "ragged",
+            "max_cached_tokens_per_request": max_seq_len - 1,
+            "new_q_length_mode": "fixed_per_request",
+            "max_seqlen_k": max_seq_len,
+        },
         device=device,
-        dtype=dtype,
     )
-    for batch_idx, total_kv_len in enumerate(seq_lens.tolist()):
-        num_blocks = int(num_blocks_per_seq[batch_idx].item())
-        for block_idx in range(num_blocks):
-            physical_block = int(block_tables[batch_idx, block_idx].item())
-            block_start = block_idx * page_size
-            tokens_in_block = min(page_size, total_kv_len - block_start)
-            k_cache[physical_block, :, :tokens_in_block] = torch.randn(
-                num_kv_heads,
-                tokens_in_block,
-                head_dim,
-                device=device,
-                dtype=dtype,
-            )
-            v_cache[physical_block, :, :tokens_in_block] = torch.randn(
-                num_kv_heads,
-                tokens_in_block,
-                head_dim,
-                device=device,
-                dtype=dtype,
-            )
+    assert values.q is not None
+    assert values.cache is not None
+    assert values.cache.page_table is not None
 
     out = trtllm_batch_decode_with_kv_cache(
-        query=query,
-        kv_cache=(k_cache, v_cache),
+        query=values.q,
+        kv_cache=_flashinfer_mha_cache(values.cache),
         workspace_buffer=workspace_buffer,
-        block_tables=block_tables,
-        seq_lens=seq_lens,
+        block_tables=values.cache.page_table,
+        seq_lens=values.metadata.cache_seqlens,
         max_seq_len=max_seq_len,
         bmm1_scale=1.0 / math.sqrt(head_dim),
         bmm2_scale=1.0,
         out_dtype=dtype,
     )
 
-    assert out.shape == query.shape
+    assert out.shape == values.q.shape
 
 
 @pytest.mark.parametrize(
@@ -303,66 +334,40 @@ def test_mla_decode_with_kvcache(
     query_head_dim = kv_lora_rank + qk_rope_head_dim
     output_head_dim = kv_lora_rank
     workspace_buffer = torch.empty(150 * 1024 * 1024, device=device, dtype=torch.uint8)
-    seq_lens = torch.tensor([424, 531, 851, 987], device=device, dtype=torch.int32)
-    num_blocks_per_seq = (seq_lens + page_size - 1) // page_size
-    max_num_blocks_per_seq = (max_seq_len + page_size - 1) // page_size
-    total_num_blocks = int(num_blocks_per_seq.sum().item())
-
-    query = torch.randn(
-        batch_size,
-        q_len_per_req,
-        num_q_heads,
-        query_head_dim,
-        device=device,
+    values = _mla_values(
+        batch_size=batch_size,
+        total_cached_tokens=2789,
+        total_new_q_tokens=batch_size * q_len_per_req,
+        num_q_heads=num_q_heads,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        v_head_dim=output_head_dim,
         dtype=dtype,
-    )
-
-    block_tables = torch.zeros(
-        batch_size,
-        max_num_blocks_per_seq,
+        page_size=page_size,
+        metadata_kwargs={
+            "cached_length_mode": "ragged",
+            "max_cached_tokens_per_request": max_seq_len - q_len_per_req,
+            "new_q_length_mode": "fixed_per_request",
+            "max_seqlen_k": max_seq_len,
+        },
         device=device,
-        dtype=torch.int32,
     )
-    next_block = 0
-    for batch_idx, num_blocks in enumerate(num_blocks_per_seq.tolist()):
-        block_tables[batch_idx, :num_blocks] = torch.arange(
-            next_block,
-            next_block + num_blocks,
-            device=device,
-            dtype=torch.int32,
-        )
-        next_block += num_blocks
-
-    kv_cache = torch.zeros(
-        total_num_blocks,
-        1,
-        page_size,
-        kv_cache_dim,
-        device=device,
-        dtype=dtype,
-    )
-    for batch_idx, total_kv_len in enumerate(seq_lens.tolist()):
-        num_blocks = int(num_blocks_per_seq[batch_idx].item())
-        for block_idx in range(num_blocks):
-            physical_block = int(block_tables[batch_idx, block_idx].item())
-            block_start = block_idx * page_size
-            tokens_in_block = min(page_size, total_kv_len - block_start)
-            kv_cache[physical_block, 0, :tokens_in_block] = torch.randn(
-                tokens_in_block,
-                kv_cache_dim,
-                device=device,
-                dtype=dtype,
-            )
+    assert values.q is not None
+    assert values.cache is not None
+    assert values.cache.page_table is not None
+    assert values.q.shape[-1] == query_head_dim
+    assert values.cache.kv_cache.shape[-1] == kv_cache_dim
 
     out = trtllm_batch_decode_with_kv_cache_mla(
-        query=query,
-        kv_cache=kv_cache,
+        query=values.q,
+        kv_cache=_flashinfer_mla_cache(values.cache),
         workspace_buffer=workspace_buffer,
         qk_nope_head_dim=qk_nope_head_dim,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
-        block_tables=block_tables,
-        seq_lens=seq_lens,
+        block_tables=values.cache.page_table,
+        seq_lens=values.metadata.cache_seqlens,
         max_seq_len=max_seq_len,
         bmm1_scale=1.0 / math.sqrt(query_head_dim),
     )
