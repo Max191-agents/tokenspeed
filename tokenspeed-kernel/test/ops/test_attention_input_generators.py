@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 from tokenspeed_kernel import (
@@ -36,6 +38,14 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mha_prefill_kwargs,
     mla_decode_with_kvcache_kwargs,
     mla_prefill_kwargs,
+)
+from tokenspeed_kernel.ops.attention.flash_attn import (
+    flash_attn_func,
+    flash_attn_varlen_func,
+)
+from tokenspeed_kernel.ops.attention.flash_mla import (
+    flash_mla_with_kvcache,
+    get_mla_metadata,
 )
 from tokenspeed_kernel.ops.attention.flashinfer import (
     gated_delta_rule as flashinfer_gdn,
@@ -224,6 +234,29 @@ def _mla_config(
     )
 
 
+def _skip_if_attention_extension_unavailable(exc: BaseException) -> None:
+    message = str(exc)
+    skip_fragments = (
+        "Kernel implementation not found",
+        "No module named",
+        "requires Hopper",
+        "requires SM",
+    )
+    if any(fragment in message for fragment in skip_fragments):
+        pytest.skip(message)
+    raise exc
+
+
+def _attention_output(result: object) -> torch.Tensor:
+    if isinstance(result, tuple):
+        return result[0]
+    if not isinstance(result, torch.Tensor):
+        raise TypeError(
+            f"attention result must be a tensor or tuple, got {type(result)}"
+        )
+    return result
+
+
 def test_attention_merge_state_generator_runs_triton_kernel(
     device: str,
     require,
@@ -324,6 +357,92 @@ def test_mha_paged_extend_generator_runs_triton_attention_kernel(
     assert not torch.isnan(out.float()).any()
 
 
+def test_mha_generator_runs_direct_flash_attn_dense_kernel(device: str) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or not platform.is_hopper_plus:
+        pytest.skip("FlashAttention dense smoke test requires NVIDIA Hopper+")
+
+    dtype = torch.bfloat16
+    head_dim = 64
+    inputs = MHAInputs(
+        _mha_config(
+            batch_size=2,
+            total_cached_tokens=0,
+            total_new_q_tokens=16,
+            num_q_heads=8,
+            num_kv_heads=2,
+            head_dim=head_dim,
+            q_dtype=dtype,
+            cache_layout="none",
+            metadata_kwargs={"new_q_length_mode": "fixed_per_request"},
+        )
+    ).generate(metadata_seed=111, value_seed=211, device=device)
+    q, k, v = inputs.dense_qkv()
+
+    try:
+        result = flash_attn_func(
+            q=q,
+            k=k,
+            v=v,
+            softmax_scale=1.0 / math.sqrt(head_dim),
+            causal=True,
+        )
+    except (RuntimeError, ModuleNotFoundError) as exc:
+        _skip_if_attention_extension_unavailable(exc)
+    out = _attention_output(result)
+    if out.is_cuda:
+        torch.cuda.synchronize()
+
+    assert out.shape == q.shape
+    assert not torch.isnan(out.float()).any()
+
+
+def test_mha_generator_runs_direct_flash_attn_varlen_kernel(device: str) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or not platform.is_hopper_plus:
+        pytest.skip("FlashAttention varlen smoke test requires NVIDIA Hopper+")
+
+    dtype = torch.bfloat16
+    head_dim = 64
+    inputs = MHAInputs(
+        _mha_config(
+            batch_size=3,
+            total_cached_tokens=0,
+            total_new_q_tokens=29,
+            num_q_heads=8,
+            num_kv_heads=2,
+            head_dim=head_dim,
+            q_dtype=dtype,
+            cache_layout="none",
+            metadata_kwargs={"new_q_length_mode": "ragged"},
+        )
+    ).generate(metadata_seed=112, value_seed=212, device=device)
+    assert inputs.q is not None
+    assert inputs.k is not None
+    assert inputs.v is not None
+
+    try:
+        result = flash_attn_varlen_func(
+            q=inputs.q,
+            k=inputs.k,
+            v=inputs.v,
+            cu_seqlens_q=inputs.metadata.cu_seqlens_q,
+            cu_seqlens_k=inputs.metadata.cu_seqlens_q,
+            max_seqlen_q=inputs.metadata.max_seqlen_q,
+            max_seqlen_k=inputs.metadata.max_seqlen_q,
+            softmax_scale=1.0 / math.sqrt(head_dim),
+            causal=True,
+        )
+    except (RuntimeError, ModuleNotFoundError) as exc:
+        _skip_if_attention_extension_unavailable(exc)
+    out = _attention_output(result)
+    if out.is_cuda:
+        torch.cuda.synchronize()
+
+    assert out.shape == inputs.q.shape
+    assert not torch.isnan(out.float()).any()
+
+
 def test_mla_prefill_generator_runs_attention_kernel(
     device: str,
     require,
@@ -398,6 +517,63 @@ def test_mla_paged_decode_generator_runs_attention_kernel(
     assert inputs.q is not None
     assert out.shape == (inputs.q.shape[0], inputs.q.shape[1], inputs.q.shape[2], 128)
     assert not torch.isnan(out.float()).any()
+
+
+def test_mla_generator_runs_direct_flash_mla_paged_decode_kernel(device: str) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or not platform.is_hopper_plus:
+        pytest.skip("FlashMLA paged decode smoke test requires NVIDIA Hopper+")
+
+    dtype = torch.bfloat16
+    head_dim_v = 512
+    qk_rope_head_dim = 64
+    kv_cache_dim = head_dim_v + qk_rope_head_dim
+    inputs = MLAInputs(
+        _mla_config(
+            batch_size=4,
+            total_cached_tokens=128,
+            total_new_q_tokens=4,
+            num_q_heads=16,
+            qk_nope_head_dim=head_dim_v,
+            qk_rope_head_dim=qk_rope_head_dim,
+            kv_lora_rank=head_dim_v,
+            v_head_dim=head_dim_v,
+            q_dtype=dtype,
+            cache_layout="paged",
+            page_size=64,
+            indexing="identity",
+            metadata_kwargs={
+                "cached_length_mode": "regular",
+                "new_q_length_mode": "fixed_per_request",
+                "max_seqlen_k": 64,
+            },
+        )
+    ).generate(metadata_seed=113, value_seed=213, device=device)
+    assert inputs.q is not None
+    assert inputs.cache is not None
+    assert inputs.cache.page_table is not None
+
+    try:
+        tile_scheduler_metadata, _ = get_mla_metadata()
+        out, lse = flash_mla_with_kvcache(
+            q=inputs.q,
+            k_cache=inputs.cache.kv_cache,
+            block_table=inputs.cache.page_table,
+            cache_seqlens=inputs.metadata.cache_seqlens,
+            head_dim_v=head_dim_v,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            softmax_scale=1.0 / math.sqrt(kv_cache_dim),
+            causal=True,
+        )
+    except (RuntimeError, ModuleNotFoundError) as exc:
+        _skip_if_attention_extension_unavailable(exc)
+    if out.is_cuda:
+        torch.cuda.synchronize()
+
+    assert out.shape == (4, 1, 16, head_dim_v)
+    assert lse.shape == (4, 16, 1)
+    assert not torch.isnan(out.float()).any()
+    assert not torch.isnan(lse.float()).any()
 
 
 def test_mla_kv_pack_quantize_fp8_generator_runs_tokenspeed_mla_kernel(
