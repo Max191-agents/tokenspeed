@@ -53,6 +53,10 @@ class CustomDType(str, Enum):
     # by MXFP4 kernels as unsigned exponent-only FP8 scales.
     UE8M0 = "ue8m0"
 
+    # Packed NVFP4 values. Storage is torch.uint8 with two E2M1 nibbles per byte;
+    # TensorInput requires a scale_shape and generates paired FP8 E4M3 scales.
+    NVFP4 = "nvfp4"
+
     # Weight-only signed INT4 values with group scales. Storage is torch.uint8
     # with two two's-complement INT4 nibbles per byte; TensorInput requires a
     # scale_shape and generates paired BF16 group scales.
@@ -64,8 +68,10 @@ InputDType = torch.dtype | CustomDType | None
 _DEFAULT_DEVICE = torch.device("cpu")
 _MXFP4_VALUES_PER_BYTE = 2
 _MXFP4_SCALE_MAX = 0.125
+_NVFP4_VALUES_PER_BYTE = 2
 _MXINT4_VALUES_PER_BYTE = 2
 _MXINT4_SCALE_MAX = 0.25
+_NVFP4_E2M1_NIBBLES = (0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15)
 _UE8M0_SCALE_EXPONENTS = (121, 122, 123, 124)
 
 
@@ -143,6 +149,19 @@ def _packed_mxint4_shape(
     return tuple(packed)
 
 
+def _packed_nvfp4_shape(
+    shape: tuple[int, ...],
+    *,
+    packed_dim: int,
+) -> tuple[int, ...]:
+    if not shape:
+        raise ValueError("nvfp4 tensors need at least one dimension to pack")
+    packed_dim = packed_dim % len(shape)
+    packed = list(shape)
+    packed[packed_dim] = math.ceil(packed[packed_dim] / _NVFP4_VALUES_PER_BYTE)
+    return tuple(packed)
+
+
 def _generate_mxfp4_packed(
     shape: tuple[int, ...],
     *,
@@ -166,6 +185,32 @@ def _generate_mxfp4_packed(
         generator=generator,
     )
     return low | (high << 4)
+
+
+def _generate_nvfp4_packed(
+    shape: tuple[int, ...],
+    *,
+    device: torch.device,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    nibble_table = torch.tensor(_NVFP4_E2M1_NIBBLES, dtype=torch.uint8, device=device)
+    low_indices = torch.randint(
+        0,
+        len(_NVFP4_E2M1_NIBBLES),
+        shape,
+        device=device,
+        dtype=torch.int64,
+        generator=generator,
+    )
+    high_indices = torch.randint(
+        0,
+        len(_NVFP4_E2M1_NIBBLES),
+        shape,
+        device=device,
+        dtype=torch.int64,
+        generator=generator,
+    )
+    return nibble_table[low_indices] | (nibble_table[high_indices] << 4)
 
 
 def _generate_mxint4_packed(
@@ -334,6 +379,15 @@ class TensorInput(NumericsInputGenerator):
                 self.scale_dtype = CustomDType.UE8M0
             elif self.scale_dtype != CustomDType.UE8M0:
                 raise ValueError("mxfp4 scale_dtype must be CustomDType.UE8M0 or None")
+        elif self.dtype == CustomDType.NVFP4:
+            if self.scale_shape is None:
+                raise ValueError("nvfp4 tensors require scale_shape")
+            if self.scale_dtype is None:
+                self.scale_dtype = torch.float8_e4m3fn
+            elif self.scale_dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "nvfp4 scale_dtype must be torch.float8_e4m3fn or None"
+                )
         elif self.dtype == CustomDType.MXINT4:
             if self.scale_shape is None:
                 raise ValueError("mxint4 tensors require scale_shape")
@@ -366,6 +420,12 @@ class TensorInput(NumericsInputGenerator):
         generator = _rng_for_device(target_device, seed)
         if self.dtype == CustomDType.MXFP4:
             return _generate_mxfp4_packed(
+                self.shape,
+                device=target_device,
+                generator=generator,
+            )
+        if self.dtype == CustomDType.NVFP4:
+            return _generate_nvfp4_packed(
                 self.shape,
                 device=target_device,
                 generator=generator,

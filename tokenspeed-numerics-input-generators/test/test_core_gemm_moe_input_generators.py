@@ -73,6 +73,7 @@ from tokenspeed_numerics_input_generators import (
     mxfp8_gemm_input_config,
     mxint4_gemm_input_config,
     nvfp4_dequantization_reference,
+    nvfp4_gemm_input_config,
     nvfp4_gemm_swiglu_nvfp4_quant_reference,
     router_projection_reference,
 )
@@ -194,6 +195,45 @@ def test_tensor_input_requires_ue8m0_scales_for_mxfp4() -> None:
 
     assert values.scales is not None
     assert values.scales.dtype == torch.uint8
+
+
+def test_tensor_input_generates_nvfp4_values_and_scales() -> None:
+    tensor = TensorInput(
+        (4, 8),
+        CustomDType.NVFP4,
+        scale_shape=(4, 1),
+    ).generate(seed=130, device="cpu")
+
+    assert tensor.values is not None
+    assert tensor.scales is not None
+    assert tensor.values.shape == (4, 8)
+    assert tensor.values.dtype == torch.uint8
+    assert tensor.scales.shape == (4, 1)
+    assert tensor.scales.dtype == torch.float8_e4m3fn
+    assert torch.all(tensor.scales.float() > 0.0)
+
+
+def test_tensor_input_requires_fp8_scales_for_nvfp4() -> None:
+    with pytest.raises(ValueError, match="nvfp4 tensors require scale_shape"):
+        TensorInput((4, 8), CustomDType.NVFP4)
+
+    with pytest.raises(ValueError, match="nvfp4 scale_dtype"):
+        TensorInput(
+            (4, 8),
+            CustomDType.NVFP4,
+            scale_shape=(4, 1),
+            scale_dtype=torch.float32,
+        )
+
+    values = TensorInput(
+        (4, 8),
+        CustomDType.NVFP4,
+        scale_shape=(4, 1),
+        scale_dtype=torch.float8_e4m3fn,
+    ).generate(seed=131, device="cpu")
+
+    assert values.scales is not None
+    assert values.scales.dtype == torch.float8_e4m3fn
 
 
 def test_tensor_input_generates_mxint4_values_and_scales() -> None:
@@ -534,6 +574,64 @@ def test_gemm_reference_dequantizes_mxfp4_inputs() -> None:
     assert ref.shape == (4, 8)
     assert ref.dtype == torch.float32
     assert torch.isfinite(ref).all()
+
+
+def test_gemm_inputs_support_nvfp4_fp8_scales() -> None:
+    inputs = GemmInputs(
+        nvfp4_gemm_input_config(
+            M=4,
+            N=8,
+            K=64,
+            c_dtype=torch.float32,
+        )
+    ).generate(seed=96, device="cpu")
+
+    assert inputs.A is not None
+    assert inputs.B is not None
+    assert inputs.A_scales is not None
+    assert inputs.B_scales is not None
+    assert inputs.A.shape == (4, 32)
+    assert inputs.B.shape == (8, 32)
+    assert inputs.A.dtype == torch.uint8
+    assert inputs.B.dtype == torch.uint8
+    assert inputs.A_scales.shape == (4, 4)
+    assert inputs.B_scales.shape == (8, 4)
+    assert inputs.A_scales.dtype == torch.float8_e4m3fn
+    assert inputs.B_scales.dtype == torch.float8_e4m3fn
+    assert inputs.C.shape == (4, 8)
+
+
+def test_gemm_reference_dequantizes_nvfp4_inputs() -> None:
+    values = GemmInputs(
+        nvfp4_gemm_input_config(
+            M=4,
+            N=8,
+            K=64,
+            c_dtype=torch.float32,
+        )
+    ).generate(seed=97, device="cpu")
+
+    ref = gemm_reference(values, alpha=torch.tensor([0.5], dtype=torch.float32))
+
+    assert ref.shape == (4, 8)
+    assert ref.dtype == torch.float32
+    assert torch.isfinite(ref).all()
+
+
+def test_nvfp4_gemm_input_config_rejects_invalid_config() -> None:
+    with pytest.raises(ValueError, match="divisible by block_size"):
+        nvfp4_gemm_input_config(M=4, N=8, K=68, c_dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="a_layout='MK'"):
+        GemmInputs(
+            nvfp4_gemm_input_config(
+                M=4,
+                N=8,
+                K=64,
+                c_dtype=torch.float32,
+                a_layout="KM",
+            )
+        )
 
 
 def test_gemm_inputs_support_mxint4_bf16_scales() -> None:

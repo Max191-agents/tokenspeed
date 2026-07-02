@@ -53,6 +53,14 @@ _MXFP4_SCALE = ScaleFormat(
 _MXFP4_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp4", {torch.uint8}, scale=_MXFP4_SCALE
 )
+_NVFP4_SCALE = ScaleFormat(
+    storage_dtype=torch.float8_e4m3fn,
+    granularity="block",
+    block_shape=(16,),
+)
+_NVFP4_FORMAT_SIGNATURES = format_signatures(
+    ("a", "b"), "nvfp4", {torch.uint8}, scale=_NVFP4_SCALE
+)
 _DENSE_GEMM_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "dense", {torch.bfloat16, torch.float16, torch.float32}
 )
@@ -122,7 +130,7 @@ def torch_mm_fp8_blockscale(
     solution="reference",
     signatures=_MXFP4_FORMAT_SIGNATURES,
     traits={"quant": frozenset({"mxfp4"})},
-    priority=Priority.PORTABLE,
+    priority=Priority.REFERENCE,
     tags={"portability"},
 )
 def torch_mm_mxfp4(
@@ -140,6 +148,46 @@ def torch_mm_mxfp4(
         raise ValueError(f"MXFP4 reference expects block_size=[32], got {block_size}")
     if C is None:
         raise ValueError("C is required for MXFP4 reference dtype/shape metadata")
+    return gemm_reference(
+        GemmInputValues(
+            A=A,
+            B=B,
+            C=C,
+            A_scales=A_scales,
+            B_scales=B_scales,
+        ),
+        out_dtype=out_dtype,
+        alpha=alpha,
+    )
+
+
+@register_kernel(
+    "gemm",
+    "mm",
+    name="torch_mm_nvfp4",
+    solution="reference",
+    signatures=_NVFP4_FORMAT_SIGNATURES,
+    traits={},
+    priority=Priority.REFERENCE,
+    tags={"portability"},
+)
+def torch_mm_nvfp4(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    C: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if block_size != [16]:
+        raise ValueError(f"NVFP4 reference expects block_size=[16], got {block_size}")
+    if C is None:
+        raise ValueError("C is required for NVFP4 reference dtype/shape metadata")
+    if alpha is None:
+        raise ValueError("alpha is required for NVFP4 GEMM reference")
     return gemm_reference(
         GemmInputValues(
             A=A,

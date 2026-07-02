@@ -140,6 +140,12 @@ class GemmInputGenerator(InputGenerator):
             if tensor_format.storage_dtype != torch.uint8:
                 raise ValueError("mxfp4 values must use torch.uint8 storage")
             return CustomDType.MXFP4
+        if tensor_format.format == "nvfp4":
+            if tensor_format.storage_dtype != torch.uint8:
+                raise ValueError(
+                    "nvfp4 input generation currently supports torch.uint8 storage"
+                )
+            return CustomDType.NVFP4
         return tensor_format.storage_dtype
 
     def _scale_dtype(self, tensor_format: Any | None) -> InputDType:
@@ -150,6 +156,11 @@ class GemmInputGenerator(InputGenerator):
             if scale.storage_dtype != torch.uint8:
                 raise ValueError("mxfp4 scales must use torch.uint8 UE8M0 storage")
             return CustomDType.UE8M0
+        if tensor_format.format == "nvfp4":
+            if scale.storage_dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "nvfp4 input generation currently supports FP8 E4M3 scales"
+                )
         return scale.storage_dtype
 
     def _scale_shape(
@@ -212,6 +223,11 @@ class GemmInputGenerator(InputGenerator):
         C = gemm_inputs.C
 
         alpha = None
+        if any(
+            tensor_format is not None and tensor_format.format == "nvfp4"
+            for tensor_format in (a_tensor_format, b_tensor_format)
+        ):
+            alpha = torch.ones((1,), dtype=torch.float32, device=A.device)
 
         return {
             "A": A,

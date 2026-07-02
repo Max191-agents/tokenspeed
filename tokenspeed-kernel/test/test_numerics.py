@@ -143,6 +143,41 @@ def test_gemm_input_generator_supports_mxfp4_ue8m0_scales() -> None:
     assert inputs["block_size"] == [32]
 
 
+def test_gemm_input_generator_supports_nvfp4_fp8_scales() -> None:
+    scale = ScaleFormat(
+        storage_dtype=torch.float8_e4m3fn,
+        granularity="block",
+        block_shape=(16,),
+    )
+    signature = format_signature(
+        a=tensor_format("nvfp4", torch.uint8, scale=scale),
+        b=tensor_format("nvfp4", torch.uint8, scale=scale),
+    )
+    generator = get_input_generator(
+        "gemm",
+        "mm",
+        dtype=torch.uint8,
+        traits={},
+        format_signature=signature,
+        device="cpu",
+    )
+
+    inputs = generator.generate(M=4, N=8, K=64)
+
+    assert inputs["A"].shape == (4, 32)
+    assert inputs["B"].shape == (8, 32)
+    assert inputs["C"].shape == (4, 8)
+    assert inputs["A"].dtype == torch.uint8
+    assert inputs["B"].dtype == torch.uint8
+    assert inputs["A_scales"].shape == (4, 4)
+    assert inputs["B_scales"].shape == (8, 4)
+    assert inputs["A_scales"].dtype == torch.float8_e4m3fn
+    assert inputs["B_scales"].dtype == torch.float8_e4m3fn
+    assert inputs["alpha"].shape == (1,)
+    assert inputs["alpha"].dtype == torch.float32
+    assert inputs["block_size"] == [16]
+
+
 def test_gemm_input_generator_output_dict_accepts_generated_c() -> None:
     from tokenspeed_kernel.numerics.reference.gemm import torch_mm
 
@@ -193,6 +228,53 @@ def test_gemm_mxfp4_reference_matches_package_reference() -> None:
     ).generate(M=4, N=8, K=64)
 
     actual = torch_mm_mxfp4(**inputs)
+    expected = gemm_reference(
+        GemmInputValues(
+            A=inputs["A"],
+            B=inputs["B"],
+            C=inputs["C"],
+            A_scales=inputs["A_scales"],
+            B_scales=inputs["B_scales"],
+        ),
+        out_dtype=inputs["out_dtype"],
+        alpha=inputs["alpha"],
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_gemm_nvfp4_numerics_registration_matches_kernel_family() -> None:
+    load_builtin_kernels()
+    registry = KernelRegistry.get()
+
+    specs = registry.get_for_operator("gemm", "mm")
+    assert any(spec.name == "torch_mm_nvfp4" for spec in specs)
+    assert any(spec.name == "cublaslt_mm_nvfp4" for spec in specs)
+
+
+def test_gemm_nvfp4_reference_matches_package_reference() -> None:
+    from tokenspeed_kernel.numerics.reference.gemm import torch_mm_nvfp4
+    from tokenspeed_numerics_input_generators import GemmInputValues, gemm_reference
+
+    scale = ScaleFormat(
+        storage_dtype=torch.float8_e4m3fn,
+        granularity="block",
+        block_shape=(16,),
+    )
+    signature = format_signature(
+        a=tensor_format("nvfp4", torch.uint8, scale=scale),
+        b=tensor_format("nvfp4", torch.uint8, scale=scale),
+    )
+    inputs = get_input_generator(
+        "gemm",
+        "mm",
+        dtype=torch.uint8,
+        traits={},
+        format_signature=signature,
+        device="cpu",
+    ).generate(M=4, N=8, K=64)
+
+    actual = torch_mm_nvfp4(**inputs)
     expected = gemm_reference(
         GemmInputValues(
             A=inputs["A"],
@@ -982,6 +1064,40 @@ class TestNumericsVerification:
         spec = registry.get_by_name("triton_mm_mxfp4")
         if spec is None or not spec.capability.satisfied_by(platform):
             pytest.skip("triton_mm_mxfp4 is not available on this platform")
+
+        try:
+            results = verify_kernel(
+                spec.name,
+                dtype=torch.uint8,
+                dtype_role="a",
+                shapes=[
+                    {"M": 4, "N": 32, "K": 64},
+                    {"M": 17, "N": 64, "K": 128},
+                ],
+                tolerance=Tolerance(atol=1.0e-1, rtol=1.0e-1),
+                verbose=False,
+            )
+        except Exception as exc:
+            pytest.fail(
+                f"Kernel {spec.name} raised an exception during verification: {exc}"
+            )
+
+        for i, result in enumerate(results):
+            if not result.passed:
+                pytest.fail(
+                    f"Kernel {spec.name} failed numerics verification for shape set {i}:\n"
+                    f"{format_comparison(result, kernel_name=spec.name)}"
+                )
+
+    def test_gemm_nvfp4_cublaslt_uint8(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is required for numerics verification")
+        load_builtin_kernels()
+        registry = KernelRegistry.get()
+        platform = Platform.get()
+        spec = registry.get_by_name("cublaslt_mm_nvfp4")
+        if spec is None or not spec.capability.satisfied_by(platform):
+            pytest.skip("cublaslt_mm_nvfp4 is not available on this platform")
 
         try:
             results = verify_kernel(

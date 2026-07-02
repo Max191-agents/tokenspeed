@@ -258,6 +258,7 @@ from tokenspeed_numerics_input_generators.gemm import (
     mxfp4_gemm_input_config,
     mxfp8_gemm_input_config,
     mxint4_gemm_input_config,
+    nvfp4_gemm_input_config,
     nvfp4_gemm_swiglu_nvfp4_quant_reference,
     router_projection_reference,
 )
@@ -786,6 +787,7 @@ __all__ = [
     "mxfp4_gemm_input_config",
     "mxfp8_gemm_input_config",
     "mxint4_gemm_input_config",
+    "nvfp4_gemm_input_config",
     "mxfp4_quantization_reference",
     "mxfp4_scale_shape",
     "mxfp8_quantization_reference",
