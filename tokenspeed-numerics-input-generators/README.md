@@ -77,16 +77,17 @@ objects.
 
 ## Verification
 
-Input generators should include just enough verification that the public API
-cannot be used to silently produce invalid operation inputs. A generator call
+Input generators should include the minimum verification needed to make invalid
+operation inputs unrepresentable through normal generator use. A generator call
 should either fail before returning or return values that satisfy the documented
 operation-level constraints for that family.
 
 This is a misuse-resistance contract. Once a caller chooses the appropriate
-operation-family generator, they should not need private knowledge of hidden
-shape, dtype, metadata, cache, or quantization rules to avoid malformed inputs.
-Using the generator library correctly should be enough to produce coherent
-tensors and metadata for the represented operation.
+operation-family generator and provides a valid configuration, they should not
+need private knowledge of hidden shape, dtype, metadata, cache, or quantization
+rules to avoid malformed inputs. The point of using the generator library is to
+have confidence that input generation was done correctly because the relevant
+operation and datatype constraints were checked in one well-defined place.
 
 Verification in this layer is about input validity, not numerical agreement. It
 should reject invalid configuration choices, inconsistent child generator
@@ -113,10 +114,12 @@ Checks should be placed where the invariant is owned:
 - Values objects describe already-valid generated inputs; they should not
   become second configuration objects that consumers must repair or normalize.
 
-If a public generator call can produce broken operation inputs, that is a bug in
-the generator. Generator tests should cover that contract directly with both
-invalid configurations that must be rejected and valid generated values that
-satisfy the documented invariants.
+The amount of verification should be enough to prevent misuse, but not so broad
+that the generator becomes a backend conformance suite. If a public generator
+call can produce broken operation inputs for the operation it claims to model,
+that is a bug in the generator. Generator tests should cover that contract
+directly with both invalid configurations that must be rejected and valid
+generated values that satisfy the documented invariants.
 
 ## Configuration Ownership
 
@@ -274,5 +277,7 @@ The standard for adding a generator is therefore:
 1. Define the operation and inputs clearly.
 2. Document the config and generated values.
 3. Compose existing core/family generators when that simplifies the code.
-4. Keep implementation-specific kwargs and registry details in adapters.
-5. Add tests for both generated invariants and at least one realistic consumer.
+4. Add verification for the operation and datatype invariants that prevent
+   malformed generated inputs.
+5. Keep implementation-specific kwargs and registry details in adapters.
+6. Add tests for both generated invariants and at least one realistic consumer.
