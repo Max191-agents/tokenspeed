@@ -40,6 +40,7 @@ from tokenspeed_kernel.signature import (
 )
 from tokenspeed_numerics_input_generators import (
     argmax_reference,
+    moe_reference,
     mxfp4_quantization_reference,
     rope_reference,
 )
@@ -469,6 +470,50 @@ def test_moe_align_block_size_generator_uses_typed_tensor_input() -> None:
     assert first["num_experts"] == 4
 
 
+def test_moe_apply_generator_uses_package_inputs() -> None:
+    inputs = get_input_generator(
+        "moe",
+        "apply",
+        dtype=torch.bfloat16,
+        traits={"weight_dtype": frozenset({"mxfp4"})},
+        device="cpu",
+        seed=93,
+    ).generate(
+        num_tokens=3,
+        hidden_size=64,
+        intermediate_size=64,
+        num_experts=4,
+        top_k=2,
+        weight_dtype="mxfp4",
+        activation="silu",
+    )
+    values = inputs["w"]._tokenspeed_numerics_values
+
+    assert inputs["x"].shape == (3, 64)
+    assert inputs["router_logits"].shape == (3, 4)
+    assert inputs["topk_ids"].shape == (3, 2)
+    assert inputs["topk_weights"].shape == (3, 2)
+    assert values.w13.B.shape == (4, 128, 32)
+    assert values.w2.B.shape == (4, 64, 32)
+    expected = moe_reference(values, output_dtype=torch.bfloat16)
+    assert expected.shape == (3, 64)
+
+    from tokenspeed_kernel.numerics.reference.moe import torch_moe_apply
+
+    actual = torch_moe_apply(**inputs)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_moe_apply_numerics_registration_matches_kernel_family() -> None:
+    load_builtin_kernels()
+    registry = KernelRegistry.get()
+
+    specs = registry.get_for_operator("moe", "apply")
+    assert any(spec.name == "torch_moe_apply" for spec in specs)
+    assert any(spec.name == "triton_mxfp4_moe_apply" for spec in specs)
+    assert get_standard_shapes("moe", "apply")
+
+
 def test_verification_uses_signature_with_compatible_reference(fresh_registry) -> None:
     tensor_scale = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
     channel_scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
@@ -598,6 +643,23 @@ class TestNumericsVerification:
     )
     def test_moe_int32(self, spec: KernelSpec):
         self._verify(spec, torch.int32, "indices")
+
+    @pytest.mark.parametrize(
+        "kernel_name",
+        [
+            "triton_mxfp4_precomputed_moe_apply",
+            "triton_mxfp4_ep_precomputed_moe_apply",
+            "triton_mxfp4_moe_apply",
+        ],
+    )
+    def test_moe_apply_mxfp4_triton_bf16(self, kernel_name: str):
+        load_builtin_kernels()
+        registry = KernelRegistry.get()
+        platform = Platform.get()
+        spec = registry.get_by_name(kernel_name)
+        if spec is None or not spec.capability.satisfied_by(platform):
+            pytest.skip(f"{kernel_name} is not available on this platform")
+        self._verify(spec, torch.bfloat16, "x")
 
     @pytest.mark.parametrize(
         "spec",

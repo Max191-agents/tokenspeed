@@ -162,6 +162,7 @@ def verify_kernel(
         dtype=dtype,
         traits=spec.traits,
         format_signature=signature,
+        kernel_spec=spec,
         device=device,
         seed=seed,
     )

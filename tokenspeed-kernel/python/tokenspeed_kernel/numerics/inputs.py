@@ -53,6 +53,7 @@ class InputGenerator:
         traits: dict,
         *,
         format_signature: FormatSignature | None = None,
+        kernel_spec: Any | None = None,
         device: str | None = None,
         seed: int = 42,
     ) -> None:
@@ -61,6 +62,7 @@ class InputGenerator:
         self.dtype = dtype
         self.traits = traits
         self.format_signature = format_signature
+        self.kernel_spec = kernel_spec
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.seed = seed
 
@@ -102,6 +104,7 @@ def get_input_generator(
     traits: dict,
     *,
     format_signature: FormatSignature | None = None,
+    kernel_spec: Any | None = None,
     device: str | None = None,
     seed: int = 42,
 ) -> InputGenerator:
@@ -117,6 +120,7 @@ def get_input_generator(
         dtype,
         traits,
         format_signature=format_signature,
+        kernel_spec=kernel_spec,
         device=device,
         seed=seed,
     )
