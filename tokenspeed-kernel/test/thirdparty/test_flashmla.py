@@ -29,9 +29,13 @@ from tokenspeed_kernel.ops.attention.flash_mla import (
     get_mla_metadata,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_numerics_input_generators import (
+    MHARequestMetadataInputConfig,
+    MLAInputConfig,
+    MLAInputs,
+)
 
 platform = current_platform()
-torch.manual_seed(42)
 
 
 @pytest.mark.skipif(not platform.is_hopper, reason="Requires Hopper GPU")
@@ -51,65 +55,46 @@ def test_mla_decode_with_paged_kvcache(
     page_size = 64
     max_seq_len = 1024
     kv_cache_dim = head_dim_v + qk_rope_head_dim
-    cache_seqlens = torch.tensor([424, 531, 851, 987], device=device, dtype=torch.int32)
-    num_blocks_per_seq = (cache_seqlens + page_size - 1) // page_size
-    max_num_blocks_per_seq = (max_seq_len + page_size - 1) // page_size
-    total_num_blocks = int(num_blocks_per_seq.sum().item())
-
-    q = torch.randn(
-        batch_size,
-        q_len_per_req,
-        num_q_heads,
-        kv_cache_dim,
-        device=device,
-        dtype=dtype,
-    )
-
-    block_table = torch.zeros(
-        batch_size,
-        max_num_blocks_per_seq,
-        device=device,
-        dtype=torch.int32,
-    )
-    next_block = 0
-    for batch_idx, num_blocks in enumerate(num_blocks_per_seq.tolist()):
-        block_table[batch_idx, :num_blocks] = torch.arange(
-            next_block,
-            next_block + num_blocks,
-            device=device,
-            dtype=torch.int32,
+    values = MLAInputs(
+        MLAInputConfig(
+            batch_size=batch_size,
+            total_cached_tokens=2789,
+            total_new_q_tokens=batch_size * q_len_per_req,
+            num_q_heads=num_q_heads,
+            qk_nope_head_dim=head_dim_v,
+            qk_rope_head_dim=qk_rope_head_dim,
+            kv_lora_rank=head_dim_v,
+            v_head_dim=head_dim_v,
+            q_dtype=dtype,
+            cache_layout="paged",
+            page_size=page_size,
+            indexing="identity",
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=batch_size,
+                total_cached_tokens=2789,
+                total_new_q_tokens=batch_size * q_len_per_req,
+                cached_length_mode="ragged",
+                max_cached_tokens_per_request=max_seq_len - q_len_per_req,
+                new_q_length_mode="fixed_per_request",
+                cache_layout="paged",
+                max_seqlen_k=max_seq_len,
+            ),
         )
-        next_block += num_blocks
-
-    k_cache = torch.zeros(
-        total_num_blocks,
-        page_size,
-        1,
-        kv_cache_dim,
-        device=device,
-        dtype=dtype,
-    )
-    for batch_idx, total_kv_len in enumerate(cache_seqlens.tolist()):
-        num_blocks = int(num_blocks_per_seq[batch_idx].item())
-        for block_idx in range(num_blocks):
-            physical_block = int(block_table[batch_idx, block_idx].item())
-            block_start = block_idx * page_size
-            tokens_in_block = min(page_size, total_kv_len - block_start)
-            k_cache[physical_block, :tokens_in_block] = torch.randn(
-                tokens_in_block,
-                1,
-                kv_cache_dim,
-                device=device,
-                dtype=dtype,
-            )
+    ).generate(metadata_seed=42, value_seed=43, device=device)
+    assert values.q is not None
+    assert values.cache is not None
+    assert values.cache.page_table is not None
+    assert values.q.shape == (batch_size, q_len_per_req, num_q_heads, kv_cache_dim)
+    assert values.cache.kv_cache.shape[1:] == (page_size, 1, kv_cache_dim)
+    assert values.cache.page_table.shape == (batch_size, max_seq_len // page_size)
 
     tile_scheduler_metadata, _ = get_mla_metadata()
 
     out, lse = flash_mla_with_kvcache(
-        q=q,
-        k_cache=k_cache,
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
+        q=values.q,
+        k_cache=values.cache.kv_cache,
+        block_table=values.cache.page_table,
+        cache_seqlens=values.metadata.cache_seqlens,
         head_dim_v=head_dim_v,
         tile_scheduler_metadata=tile_scheduler_metadata,
         softmax_scale=1.0 / math.sqrt(kv_cache_dim),

@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import math
-from typing import Tuple
 
 import pytest
 import torch
@@ -31,6 +30,11 @@ from tokenspeed_kernel.thirdparty.cuda.merge_state import (
     LSE_LOG2,
     merge_state,
 )
+from tokenspeed_numerics_input_generators import (
+    AttentionMergeStateInputConfig,
+    AttentionMergeStateInputs,
+    attention_merge_state_reference,
+)
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia,
@@ -38,41 +42,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _reference_merge(
-    v_a: torch.Tensor,
-    s_a: torch.Tensor,
-    v_b: torch.Tensor,
-    s_b: torch.Tensor,
-    lse_scale_log2: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pure-PyTorch reference mirroring the kernel's log2-internal arithmetic.
-
-    The merge math is base-agnostic — using log2 internally and rebasing input/
-    output via ``lse_scale_log2`` matches the kernel exactly so tolerances stay
-    tight (no exp vs exp2 lib-call drift).
-    """
-    s_a_log2 = s_a.float() * lse_scale_log2
-    s_b_log2 = s_b.float() * lse_scale_log2
-    s_max = torch.maximum(s_a_log2, s_b_log2)
-    w_a = torch.exp2(s_a_log2 - s_max)
-    w_b = torch.exp2(s_b_log2 - s_max)
-    sum_w = w_a + w_b
-    v_merged = (
-        w_a.unsqueeze(-1) * v_a.float() + w_b.unsqueeze(-1) * v_b.float()
-    ) / sum_w.unsqueeze(-1)
-    s_merged = (torch.log2(sum_w) + s_max) * (1.0 / lse_scale_log2)
-    return v_merged.to(v_a.dtype), s_merged
-
-
 def _make_inputs(
-    T: int, H: int, D: int, device: str, v_dtype: torch.dtype, seed: int = 0
+    T: int,
+    H: int,
+    D: int,
+    device: str,
+    v_dtype: torch.dtype,
+    seed: int = 0,
+    lse_scale_log2: float = LSE_LN,
 ):
-    torch.manual_seed(seed)
-    v_a = torch.randn(T, H, D, device=device, dtype=v_dtype)
-    v_b = torch.randn(T, H, D, device=device, dtype=v_dtype)
-    s_a = torch.randn(T, H, device=device, dtype=torch.float32)
-    s_b = torch.randn(T, H, device=device, dtype=torch.float32)
-    return v_a, s_a, v_b, s_b
+    return AttentionMergeStateInputs(
+        AttentionMergeStateInputConfig(
+            total_q=T,
+            num_heads=H,
+            head_dim=D,
+            dtype=v_dtype,
+            lse_scale_log2=lse_scale_log2,
+        )
+    ).generate(seed=seed, device=device)
 
 
 def test_lse_constants() -> None:
@@ -102,12 +89,12 @@ def test_natural_log_default(
     device: str, T: int, H: int, D: int, v_dtype: torch.dtype
 ) -> None:
     """Default kwargs: natural-log LSE in, natural-log LSE out."""
-    v_a, s_a, v_b, s_b = _make_inputs(T, H, D, device, v_dtype)
+    values = _make_inputs(T, H, D, device, v_dtype)
 
-    v_out, s_out = merge_state(v_a, s_a, v_b, s_b)
+    v_out, s_out = merge_state(values.out_a, values.lse_a, values.out_b, values.lse_b)
     torch.cuda.synchronize()
 
-    v_ref, s_ref = _reference_merge(v_a, s_a, v_b, s_b, LSE_LN)
+    v_ref, s_ref = attention_merge_state_reference(values)
 
     # bf16/fp16 V accumulator drift scales with H*D — ~5e-2 abs is normal.
     # LSE is fp32 throughout so a tighter bound is fine.
@@ -118,12 +105,25 @@ def test_natural_log_default(
 @pytest.mark.parametrize("T,H,D", SHAPES)
 def test_log2_basis(device: str, T: int, H: int, D: int) -> None:
     """Explicit log2 basis: lse_scale_log2=1.0 means "input is already log2"."""
-    v_a, s_a, v_b, s_b = _make_inputs(T, H, D, device, torch.bfloat16)
+    values = _make_inputs(
+        T,
+        H,
+        D,
+        device,
+        torch.bfloat16,
+        lse_scale_log2=LSE_LOG2,
+    )
 
-    v_out, s_out = merge_state(v_a, s_a, v_b, s_b, lse_scale_log2=LSE_LOG2)
+    v_out, s_out = merge_state(
+        values.out_a,
+        values.lse_a,
+        values.out_b,
+        values.lse_b,
+        lse_scale_log2=LSE_LOG2,
+    )
     torch.cuda.synchronize()
 
-    v_ref, s_ref = _reference_merge(v_a, s_a, v_b, s_b, LSE_LOG2)
+    v_ref, s_ref = attention_merge_state_reference(values)
 
     assert torch.allclose(v_out.float(), v_ref.float(), atol=5e-2, rtol=1e-2)
     assert torch.allclose(s_out, s_ref, atol=1e-4, rtol=1e-5)
@@ -136,13 +136,24 @@ def test_basis_round_trip(device: str) -> None:
     PyTorch pre-multiply), so 1-ULP fp32 drift is expected; allclose with a
     tight tolerance is the right bar."""
     T, H, D = 256, 16, 128
-    v_a, s_a, v_b, s_b = _make_inputs(T, H, D, device, torch.bfloat16)
+    values = _make_inputs(T, H, D, device, torch.bfloat16)
 
-    s_a_log2 = (s_a * LSE_LN).contiguous()
-    s_b_log2 = (s_b * LSE_LN).contiguous()
+    s_a_log2 = (values.lse_a * LSE_LN).contiguous()
+    s_b_log2 = (values.lse_b * LSE_LN).contiguous()
 
-    v_ln, s_ln = merge_state(v_a, s_a, v_b, s_b)  # default LSE_LN
-    v_log2, s_log2 = merge_state(v_a, s_a_log2, v_b, s_b_log2, lse_scale_log2=LSE_LOG2)
+    v_ln, s_ln = merge_state(
+        values.out_a,
+        values.lse_a,
+        values.out_b,
+        values.lse_b,
+    )  # default LSE_LN
+    v_log2, s_log2 = merge_state(
+        values.out_a,
+        s_a_log2,
+        values.out_b,
+        s_b_log2,
+        lse_scale_log2=LSE_LOG2,
+    )
     torch.cuda.synchronize()
 
     # bf16 V: 1 ULP at this scale ≈ 4e-3 abs. Tighter than the cross-reference
@@ -156,13 +167,19 @@ def test_arbitrary_lse_base(device: str) -> None:
     """A non-canonical base (log10 here) must work too — the runtime knob is
     the whole point of the parameter, not just LSE_LN/LSE_LOG2."""
     T, H, D = 128, 16, 128
-    v_a, s_a, v_b, s_b = _make_inputs(T, H, D, device, torch.bfloat16)
 
     scale = math.log2(10.0)  # caller's LSE is in log10
-    v_out, s_out = merge_state(v_a, s_a, v_b, s_b, lse_scale_log2=scale)
+    values = _make_inputs(T, H, D, device, torch.bfloat16, lse_scale_log2=scale)
+    v_out, s_out = merge_state(
+        values.out_a,
+        values.lse_a,
+        values.out_b,
+        values.lse_b,
+        lse_scale_log2=scale,
+    )
     torch.cuda.synchronize()
 
-    v_ref, s_ref = _reference_merge(v_a, s_a, v_b, s_b, scale)
+    v_ref, s_ref = attention_merge_state_reference(values)
     assert torch.allclose(v_out.float(), v_ref.float(), atol=5e-2, rtol=1e-2)
     assert torch.allclose(s_out, s_ref, atol=1e-4, rtol=1e-5)
 
@@ -183,8 +200,13 @@ def test_output_dtypes_and_shapes(device: str) -> None:
     """V output mirrors V input dtype; LSE output is always fp32."""
     T, H, D = 64, 16, 128
     for v_dtype in (torch.bfloat16, torch.float16):
-        v_a, s_a, v_b, s_b = _make_inputs(T, H, D, device, v_dtype)
-        v_out, s_out = merge_state(v_a, s_a, v_b, s_b)
+        values = _make_inputs(T, H, D, device, v_dtype)
+        v_out, s_out = merge_state(
+            values.out_a,
+            values.lse_a,
+            values.out_b,
+            values.lse_b,
+        )
         torch.cuda.synchronize()
         assert v_out.dtype == v_dtype
         assert v_out.shape == (T, H, D)
@@ -196,6 +218,6 @@ def test_rejects_fp32_v(device: str) -> None:
     """The CUDA kernel only dispatches fp16/bf16 V; fp32 must raise rather than
     silently fall through."""
     T, H, D = 64, 16, 128
-    v_a, s_a, v_b, s_b = _make_inputs(T, H, D, device, torch.float32)
+    values = _make_inputs(T, H, D, device, torch.float32)
     with pytest.raises(AssertionError, match="V must be bf16/fp16"):
-        merge_state(v_a, s_a, v_b, s_b)
+        merge_state(values.out_a, values.lse_a, values.out_b, values.lse_b)

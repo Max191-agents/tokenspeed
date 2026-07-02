@@ -28,6 +28,11 @@ deep_gemm_utils = pytest.importorskip("deep_gemm.utils")
 
 from tokenspeed_kernel.ops.gemm import deep_gemm as deep_gemm_ops
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_numerics_input_generators import (
+    GemmInputConfig,
+    GemmInputs,
+    gemm_reference,
+)
 
 platform = current_platform()
 
@@ -41,21 +46,30 @@ def test_deep_gemm_mm_fp8_blockscale_matches_reference(device: str) -> None:
     if kernel is None:
         pytest.skip("DeepGEMM kernel is not available")
 
-    torch.manual_seed(0)
     m, n, k = 128, 128, 256
     use_ue8m0 = torch.cuda.get_device_capability()[0] >= 10
 
-    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
-    b = torch.randn((n, k), device=device, dtype=torch.bfloat16)
-    expected = (a.float() @ b.float().T).to(torch.bfloat16)
+    values = GemmInputs(
+        GemmInputConfig(
+            M=m,
+            N=n,
+            K=k,
+            a_dtype=torch.bfloat16,
+            b_dtype=torch.bfloat16,
+            c_dtype=torch.bfloat16,
+        )
+    ).generate(seed=0, device=device)
+    assert values.A is not None
+    assert values.B is not None
+    expected = gemm_reference(values)
 
     a_fp8, a_scales = deep_gemm_utils.per_token_cast_to_fp8(
-        a,
+        values.A,
         use_ue8m0=use_ue8m0,
         gran_k=128,
     )
     b_fp8, b_scales = deep_gemm_utils.per_block_cast_to_fp8(
-        b,
+        values.B,
         use_ue8m0=use_ue8m0,
         gran_k=128,
     )
