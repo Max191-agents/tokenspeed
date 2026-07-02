@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.flashinfer import (
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
+    CacheLayout,
     KVCacheValues,
     MHAInputConfig,
     MHAInputs,
@@ -41,6 +42,7 @@ from tokenspeed_numerics_input_generators import (
     MLAInputs,
     MLAInputValues,
     MLAKVCacheValues,
+    PageTableIndexing,
 )
 
 platform = current_platform()
@@ -60,9 +62,9 @@ def _mha_values(
     num_kv_heads: int,
     head_dim: int,
     dtype: torch.dtype,
-    cache_layout: str = "none",
+    cache_layout: CacheLayout = "none",
     page_size: int | None = None,
-    indexing: str | None = None,
+    indexing: PageTableIndexing | None = None,
     metadata_kwargs: dict[str, object] | None = None,
     metadata_seed: int = 42,
     value_seed: int = 43,
@@ -77,14 +79,14 @@ def _mha_values(
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             q_dtype=dtype,
-            cache_layout=cache_layout,  # type: ignore[arg-type]
+            cache_layout=cache_layout,
             page_size=page_size,
-            indexing=indexing,  # type: ignore[arg-type]
+            indexing=indexing,
             metadata_input=MHARequestMetadataInputConfig(
                 batch_size=batch_size,
                 total_cached_tokens=total_cached_tokens,
                 total_new_q_tokens=total_new_q_tokens,
-                cache_layout=cache_layout,  # type: ignore[arg-type]
+                cache_layout=cache_layout,
                 **(metadata_kwargs or {}),
             ),
         )
