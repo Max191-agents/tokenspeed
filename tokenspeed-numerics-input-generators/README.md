@@ -77,72 +77,46 @@ objects.
 
 ## Verification
 
-Input generators should include enough verification that the public API cannot
-be used to silently produce broken operation inputs. A valid generator call
+Input generators should include just enough verification that the public API
+cannot be used to silently produce invalid operation inputs. A generator call
 should either fail before returning or return values that satisfy the documented
-operation-level constraints for that generator.
+operation-level constraints for that family.
 
-The target is just enough verification to make the generator safe to rely on:
-callers should not need to remember hidden shape, dtype, metadata, cache, or
-quantization rules after choosing the appropriate operation-family generator.
-Using the input generator library should be the point where malformed generated
-inputs are ruled out.
-
-This should be treated as a trusted boundary for tests and adapters. If a
-consumer uses the generator library, it should be able to assume that the
-returned inputs are internally coherent for the represented operation. The
-generator should make invalid operation states unrepresentable at the public
-API boundary whenever practical, and should reject them explicitly when they
-cannot be avoided by construction.
-
-This is a misuse-resistance contract. The library should reject invalid
-configuration choices, inconsistent child generator overrides, impossible
-metadata layouts, unsupported dtype/scale combinations, and generated metadata
-or tensor relationships that violate the operation definition. Consumers should
-not need private knowledge of generator internals to avoid malformed inputs.
-Using the public generator API correctly should be enough to get
-operation-valid tensors and metadata.
+This is a misuse-resistance contract. Once a caller chooses the appropriate
+operation-family generator, they should not need private knowledge of hidden
+shape, dtype, metadata, cache, or quantization rules to avoid malformed inputs.
+Using the generator library correctly should be enough to produce coherent
+tensors and metadata for the represented operation.
 
 Verification in this layer is about input validity, not numerical agreement. It
-should establish that generated inputs make sense for the operation being
-represented: shapes line up, dtypes are supported, quantized values have the
-scale tensors they require, ragged metadata is coherent, indices are in range,
-caches agree with their page tables, and optional inputs are present only in
-combinations that define a valid computation. Numerical validators and kernel
-tests can then focus on comparing reference and test outputs instead of
-defending against malformed generated inputs.
+should reject invalid configuration choices, inconsistent child generator
+overrides, impossible metadata layouts, unsupported dtype/scale combinations,
+out-of-range indices, cache/page-table mismatches, and optional input
+combinations that do not define a valid computation. Numerical validators and
+kernel tests can then focus on comparing reference and test outputs instead of
+defending against broken generated inputs.
 
-The scope should be deliberate. Input generators should enforce invariants that
-belong to the operation family, but they should not become complete validators
-for every consuming backend. Backend-specific preconditions, preferred tile
-sizes, launch constraints, ABI quirks, and performance-oriented layout choices
-belong in adapters or tests when they are tied to one implementation rather
-than to the operation itself.
+The scope should stay operation-level. Input generators should enforce
+invariants that belong to the operation or datatype, but they should not become
+complete validators for every backend that consumes the values. Backend-specific
+preconditions, launch constraints, ABI details, preferred tile sizes, and
+performance-oriented layout choices belong in adapters or tests when they are
+tied to one implementation rather than to the operation itself.
 
 Checks should be placed where the invariant is owned:
 
-- A config should validate static operation constraints, such as required
-  dimensions, supported dtype combinations, cache layout choices, and
-  quantized scale requirements.
-- A generator should validate constraints that are only known after defaults,
-  random metadata, nested generators, or device selection have been resolved.
-- A values object should describe already-valid generated inputs, not become a
-  second configuration object that consumers must repair or normalize.
+- Config objects validate static operation constraints, such as required
+  dimensions, supported dtype combinations, cache layout choices, and quantized
+  scale requirements.
+- Generators validate constraints that are only known after defaults, random
+  metadata, nested generators, or device selection have been resolved.
+- Values objects describe already-valid generated inputs; they should not
+  become second configuration objects that consumers must repair or normalize.
 
-The standard is misuse resistance, not duplicating every kernel assertion.
-Kernel-specific requirements still belong in adapters or tests. The generator
-should instead prevent misuse of the operation-family API itself: missing
-required fields, incompatible shapes, unsupported dtype combinations, invalid
-quantized scale requirements, impossible request lengths, out-of-range metadata,
-and cache or page state that does not match the generated tensors should fail in
-the generator library. If a public generator call can produce broken operation
-inputs, that is a bug in the generator.
-
-Tests for generators should cover that contract directly. Each family should
-include focused tests for invalid configurations that must be rejected and for
-valid generated values satisfying the documented invariants. Consumer tests can
-then rely on the library to provide well-formed inputs and spend their checks on
-reference agreement or implementation-specific adaptation.
+If a public generator call can produce broken operation inputs, that is a bug in
+the generator. Generator tests should cover that contract directly with both
+invalid configurations that must be rejected and valid generated values that
+satisfy the documented invariants.
 
 ## Configuration Ownership
 
