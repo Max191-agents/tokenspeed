@@ -39,6 +39,9 @@ from tokenspeed_numerics_input_generators import (
     MoEDeepSeekV4MegaMoEStagingInputConfig,
     MoEDeepSeekV4MegaMoEStagingInputs,
     MoEDeepSeekV4MegaMoEStagingInputValues,
+    MoEFinalizeFuseSharedInputConfig,
+    MoEFinalizeFuseSharedInputs,
+    MoEFinalizeFuseSharedInputValues,
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
@@ -62,6 +65,7 @@ from tokenspeed_numerics_input_generators import (
     moe_align_block_size_reference,
     moe_biased_grouped_topk_reference,
     moe_deepseek_v4_mega_moe_staging_reference,
+    moe_finalize_fuse_shared_reference,
     moe_reference,
     moe_softmax_topk_routing_reference,
     moe_softplus_sqrt_topk_routing_reference,
@@ -1696,6 +1700,129 @@ def test_moe_deepseek_v4_mega_moe_staging_verifies_config_and_values() -> None:
 
     with pytest.raises(ValueError, match="less than num_experts"):
         moe_deepseek_v4_mega_moe_staging_reference(values)
+
+
+def test_moe_finalize_fuse_shared_inputs_generate_values_and_reference() -> None:
+    values = MoEFinalizeFuseSharedInputs(
+        MoEFinalizeFuseSharedInputConfig(
+            num_tokens=3,
+            hidden_size=8,
+            top_k=2,
+            hidden_size_padded=12,
+            total_num_padded_tokens=8,
+            num_dropped_slots=1,
+            include_shared_output=True,
+            expert_weights_dtype=torch.float32,
+        )
+    ).generate(seed=57, device="cpu")
+
+    ref = moe_finalize_fuse_shared_reference(values)
+
+    assert values.gemm2_out.shape == (8, 12)
+    assert values.gemm2_out.dtype == torch.bfloat16
+    assert values.expanded_idx_to_permuted_idx.shape == (6,)
+    assert values.expanded_idx_to_permuted_idx.dtype == torch.int32
+    assert int((values.expanded_idx_to_permuted_idx == -1).sum().item()) == 1
+    assert values.expert_weights.shape == (3, 2)
+    assert values.expert_weights.dtype == torch.float32
+    torch.testing.assert_close(
+        values.expert_weights.sum(dim=-1),
+        torch.ones(3),
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    )
+    assert values.shared_output is not None
+    assert values.shared_output.shape == (3, 8)
+    assert values.shared_output.dtype == torch.bfloat16
+    assert ref.shape == (3, 8)
+    assert ref.dtype == torch.bfloat16
+    assert torch.isfinite(ref.float()).all()
+
+
+def test_moe_finalize_fuse_shared_reference_matches_manual_sum() -> None:
+    values = MoEFinalizeFuseSharedInputValues(
+        gemm2_out=torch.tensor(
+            [
+                [1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0],
+                [7.0, 8.0, 9.0],
+            ],
+            dtype=torch.bfloat16,
+        ),
+        expanded_idx_to_permuted_idx=torch.tensor([0, 2, -1, 1], dtype=torch.int32),
+        expert_weights=torch.tensor(
+            [[0.25, 0.75], [0.5, 0.5]],
+            dtype=torch.float32,
+        ),
+        shared_output=torch.tensor(
+            [[1.0, -1.0], [0.5, 0.25]],
+            dtype=torch.bfloat16,
+        ),
+    )
+
+    ref = moe_finalize_fuse_shared_reference(values)
+    expected = torch.stack(
+        [
+            0.25 * values.gemm2_out[0, :2].float()
+            + 0.75 * values.gemm2_out[2, :2].float()
+            + values.shared_output[0].float(),
+            0.5 * values.gemm2_out[1, :2].float() + values.shared_output[1].float(),
+        ]
+    ).to(torch.bfloat16)
+
+    torch.testing.assert_close(ref, expected)
+
+
+def test_moe_finalize_fuse_shared_inputs_support_no_shared_output() -> None:
+    values = MoEFinalizeFuseSharedInputs(
+        MoEFinalizeFuseSharedInputConfig(
+            num_tokens=2,
+            hidden_size=8,
+            top_k=2,
+            include_shared_output=False,
+            expert_weights_dtype=torch.bfloat16,
+        )
+    ).generate(seed=58, device="cpu")
+
+    ref = moe_finalize_fuse_shared_reference(values)
+
+    assert values.shared_output is None
+    assert values.gemm2_out.shape == (4, 8)
+    assert values.expert_weights.dtype == torch.bfloat16
+    assert ref.shape == (2, 8)
+    assert ref.dtype == torch.bfloat16
+
+
+def test_moe_finalize_fuse_shared_verifies_config_and_values() -> None:
+    with pytest.raises(ValueError, match="top_k"):
+        MoEFinalizeFuseSharedInputs(
+            MoEFinalizeFuseSharedInputConfig(
+                num_tokens=2,
+                hidden_size=8,
+                top_k=65,
+            )
+        )
+    with pytest.raises(ValueError, match="total_num_padded_tokens"):
+        MoEFinalizeFuseSharedInputs(
+            MoEFinalizeFuseSharedInputConfig(
+                num_tokens=2,
+                hidden_size=8,
+                top_k=2,
+                total_num_padded_tokens=3,
+            )
+        )
+
+    values = MoEFinalizeFuseSharedInputs(
+        MoEFinalizeFuseSharedInputConfig(
+            num_tokens=2,
+            hidden_size=8,
+            top_k=2,
+        )
+    ).generate(seed=59, device="cpu")
+    values.expanded_idx_to_permuted_idx[0] = values.gemm2_out.shape[0]
+
+    with pytest.raises(ValueError, match="less than gemm2_out rows"):
+        moe_finalize_fuse_shared_reference(values)
 
 
 def test_moe_align_block_size_inputs_generate_topk_ids() -> None:

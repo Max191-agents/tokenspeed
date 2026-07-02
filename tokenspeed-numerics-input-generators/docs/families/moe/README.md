@@ -24,6 +24,9 @@ route weights.
 - `MoEDeepSeekV4MegaMoEStagingInputs`: generates hidden states, precomputed
   top-k routing tensors, and staging buffers for FP8 hidden-state quantization
   and packed scale output.
+- `MoEFinalizeFuseSharedInputs`: generates permuted expert outputs, flattened
+  token/top-k to permuted-row maps, route weights, and optional shared residuals
+  for routed-output finalization.
 
 `MoeInputs` composes the GEMM generator for expert weights. Dense, MXFP4, and
 MXINT4 expert weights are operation-level choices; backend preprocessing such
@@ -60,6 +63,10 @@ correction-biased top-k scores or from a generated hash table keyed by token id.
 DeepSeek V4 MegaMoE staging values describe the preparation step that converts
 hidden-state rows into FP8 E4M3 blocks with packed 32-channel scale exponents
 and copies precomputed routing tensors into GEMM staging buffers.
+
+Finalize-fuse-shared values describe the epilogue that gathers permuted expert
+down-projection outputs, weights them by the selected route weights, sums them
+per token, and optionally adds a shared-expert residual.
 
 These generators intentionally describe operation-level routed computations
 rather than any one fused MoE kernel signature.

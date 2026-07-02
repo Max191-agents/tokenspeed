@@ -35,6 +35,8 @@ from tokenspeed_numerics_input_generators import (
     MoEBiasedGroupedTopKInputs,
     MoEDeepSeekV4MegaMoEStagingInputConfig,
     MoEDeepSeekV4MegaMoEStagingInputs,
+    MoEFinalizeFuseSharedInputConfig,
+    MoEFinalizeFuseSharedInputs,
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
@@ -46,6 +48,7 @@ from tokenspeed_numerics_input_generators import (
     moe_align_block_size_reference,
     moe_biased_grouped_topk_reference,
     moe_deepseek_v4_mega_moe_staging_reference,
+    moe_finalize_fuse_shared_reference,
     moe_reference,
     moe_softmax_topk_routing_reference,
     moe_softplus_sqrt_topk_routing_reference,
@@ -348,6 +351,45 @@ def test_moe_deepseek_v4_mega_moe_staging_generator_runs_triton_helper() -> None
     torch.testing.assert_close(values.x_sf, expected.x_sf)
     torch.testing.assert_close(values.topk_idx_out, expected.topk_idx_out)
     torch.testing.assert_close(values.topk_weights_out, expected.topk_weights_out)
+
+
+def test_moe_finalize_fuse_shared_generator_runs_cuda_helper() -> None:
+    platform = current_platform()
+    if (
+        not torch.cuda.is_available()
+        or not platform.is_nvidia
+        or not platform.is_hopper_plus
+    ):
+        pytest.skip("moe_finalize_fuse_shared compatibility test requires NVIDIA SM90+")
+
+    from tokenspeed_kernel.thirdparty.cuda import moe_finalize_fuse_shared
+
+    values = MoEFinalizeFuseSharedInputs(
+        MoEFinalizeFuseSharedInputConfig(
+            num_tokens=4,
+            hidden_size=64,
+            top_k=2,
+            include_shared_output=True,
+            expert_weights_dtype=torch.float32,
+        )
+    ).generate(seed=50, device="cuda")
+    expected = moe_finalize_fuse_shared_reference(values)
+
+    try:
+        actual = moe_finalize_fuse_shared(
+            values.gemm2_out,
+            values.expanded_idx_to_permuted_idx,
+            values.expert_weights,
+            values.shared_output,
+            values.expert_weights.shape[1],
+        )
+    except (RuntimeError, ModuleNotFoundError) as exc:
+        pytest.skip(f"moe_finalize_fuse_shared extension unavailable: {exc}")
+    torch.cuda.synchronize()
+
+    assert actual.shape == expected.shape
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=5.0e-2, atol=0.1)
 
 
 def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None:

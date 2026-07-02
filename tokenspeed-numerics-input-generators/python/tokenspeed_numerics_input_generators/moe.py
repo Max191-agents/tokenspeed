@@ -62,6 +62,9 @@ __all__ = [
     "MoEDeepSeekV4MegaMoEStagingInputs",
     "MoEDeepSeekV4MegaMoEStagingInputValues",
     "MoEDeepSeekV4MegaMoEStagingReferenceValues",
+    "MoEFinalizeFuseSharedInputConfig",
+    "MoEFinalizeFuseSharedInputs",
+    "MoEFinalizeFuseSharedInputValues",
     "MoESoftplusSqrtTopKRoutingInputConfig",
     "MoESoftplusSqrtTopKRoutingInputs",
     "MoESoftplusSqrtTopKRoutingInputValues",
@@ -74,6 +77,7 @@ __all__ = [
     "moe_align_block_size_reference",
     "moe_biased_grouped_topk_reference",
     "moe_deepseek_v4_mega_moe_staging_reference",
+    "moe_finalize_fuse_shared_reference",
     "moe_reference",
     "moe_softplus_sqrt_topk_routing_reference",
     "moe_softmax_topk_routing_reference",
@@ -90,6 +94,7 @@ _REGULAR_FLOAT_DTYPES = {
 _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE = 128
 _DEEPSEEK_V4_MEGAMOE_FP8_GROUP_SIZE = 32
 _DEEPSEEK_V4_MEGAMOE_FP8_MAX = 448.0
+_MOE_FINALIZE_MAX_TOPK = 64
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -203,6 +208,76 @@ class MoEDeepSeekV4MegaMoEStagingReferenceValues:
     x_sf: torch.Tensor
     topk_idx_out: torch.Tensor
     topk_weights_out: torch.Tensor
+
+
+@dataclass
+class MoEFinalizeFuseSharedInputValues:
+    """Generated values for MoE routed-output finalization.
+
+    ``gemm2_out`` contains permuted expert down-projection outputs.
+    ``expanded_idx_to_permuted_idx`` maps each flattened token/top-k slot to a
+    row in ``gemm2_out``; ``-1`` drops the slot. ``expert_weights`` contains
+    route weights for each token/top-k slot. ``shared_output`` is an optional
+    per-token residual that is added after routed expert accumulation.
+    """
+
+    gemm2_out: torch.Tensor
+    expanded_idx_to_permuted_idx: torch.Tensor
+    expert_weights: torch.Tensor
+    shared_output: torch.Tensor | None
+
+
+@dataclass
+class MoEFinalizeFuseSharedInputConfig:
+    """Initialization parameters for MoE finalize + shared residual inputs.
+
+    The represented operation computes, for each token ``t``:
+
+    ``sum_k expert_weights[t, k] * gemm2_out[permuted_idx(t, k)]``
+
+    and optionally adds ``shared_output[t]``. Dropped top-k slots use permute
+    index ``-1`` and do not contribute to the sum.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of token rows to finalize. Zero is valid for idle ranks.
+    num_tokens: int
+
+    # Required: logical output hidden width.
+    hidden_size: int
+
+    # Required: number of routed expert outputs combined per token.
+    top_k: int
+
+    # ------------------------------------------------------------------
+    # Optional shape and routing metadata configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: physical width of rows in gemm2_out. This may be larger than
+    # hidden_size when the expert GEMM pads the hidden dimension.
+    hidden_size_padded: int | None = None
+
+    # Optional: physical number of rows in gemm2_out. When omitted, the
+    # generator uses the number of non-dropped token/top-k slots.
+    total_num_padded_tokens: int | None = None
+
+    # Optional: number of flattened token/top-k slots marked as dropped with
+    # permute index -1.
+    num_dropped_slots: int = 0
+
+    # Optional: generate shared_output and make the logical output width equal
+    # hidden_size. When false, the output width is hidden_size_padded.
+    include_shared_output: bool = True
+
+    # Optional: route-weight dtype. TokenSpeed's CUDA helper supports FP32 and
+    # BF16 expert weights.
+    expert_weights_dtype: torch.dtype = torch.float32
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
 
 
 @dataclass
@@ -811,6 +886,164 @@ class MoEDeepSeekV4MegaMoEStagingInputs(NumericsInputGenerator):
 
 
 @dataclass(init=False)
+class MoEFinalizeFuseSharedInputs(NumericsInputGenerator):
+    """Input generator for MoE routed-output finalization."""
+
+    config: MoEFinalizeFuseSharedInputConfig
+    gemm2_out_input: TensorInput | None
+    shared_output_input: TensorInput | None
+
+    def __init__(self, config: MoEFinalizeFuseSharedInputConfig) -> None:
+        self.config = config
+        self.gemm2_out_input = None
+        self.shared_output_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens", self.config.num_tokens
+        )
+        self.config.hidden_size = int(self.config.hidden_size)
+        self.config.top_k = int(self.config.top_k)
+        self.config.num_dropped_slots = int(self.config.num_dropped_slots)
+        if self.config.hidden_size <= 0:
+            raise ValueError("hidden_size must be positive")
+        if self.config.top_k <= 0:
+            raise ValueError("top_k must be positive")
+        if self.config.top_k > _MOE_FINALIZE_MAX_TOPK:
+            raise ValueError(f"top_k must be <= {_MOE_FINALIZE_MAX_TOPK}")
+        total_slots = self.config.num_tokens * self.config.top_k
+        if not 0 <= self.config.num_dropped_slots <= total_slots:
+            raise ValueError("num_dropped_slots must be in [0, num_tokens * top_k]")
+        if self.config.hidden_size_padded is not None:
+            self.config.hidden_size_padded = int(self.config.hidden_size_padded)
+            if self.config.hidden_size_padded < self.config.hidden_size:
+                raise ValueError("hidden_size_padded must be >= hidden_size")
+        if self.config.total_num_padded_tokens is not None:
+            self.config.total_num_padded_tokens = int(
+                self.config.total_num_padded_tokens
+            )
+            if self.config.total_num_padded_tokens < self._active_slot_count():
+                raise ValueError(
+                    "total_num_padded_tokens must be at least the number of "
+                    "non-dropped token/top-k slots"
+                )
+        if self.config.expert_weights_dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(
+                "expert_weights_dtype must be torch.float32 or torch.bfloat16"
+            )
+        self.gemm2_out_input = self.gemm2_out_input or TensorInput(
+            (self._total_num_padded_tokens(), self._hidden_size_padded()),
+            torch.bfloat16,
+            device=self.config.device,
+        )
+        self.gemm2_out_input.shape = (
+            self._total_num_padded_tokens(),
+            self._hidden_size_padded(),
+        )
+        self.gemm2_out_input.dtype = torch.bfloat16
+        self.gemm2_out_input.device = self.config.device
+        if self.config.include_shared_output:
+            self.shared_output_input = self.shared_output_input or TensorInput(
+                (self.config.num_tokens, self.config.hidden_size),
+                torch.bfloat16,
+                device=self.config.device,
+            )
+            self.shared_output_input.shape = (
+                self.config.num_tokens,
+                self.config.hidden_size,
+            )
+            self.shared_output_input.dtype = torch.bfloat16
+            self.shared_output_input.device = self.config.device
+        else:
+            self.shared_output_input = None
+
+    def _hidden_size_padded(self) -> int:
+        return self.config.hidden_size_padded or self.config.hidden_size
+
+    def _active_slot_count(self) -> int:
+        return (
+            self.config.num_tokens * self.config.top_k - self.config.num_dropped_slots
+        )
+
+    def _total_num_padded_tokens(self) -> int:
+        if self.config.total_num_padded_tokens is not None:
+            return self.config.total_num_padded_tokens
+        return self._active_slot_count()
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> MoEFinalizeFuseSharedInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        if self.gemm2_out_input is None:
+            raise ValueError("gemm2_out_input must be initialized")
+        gemm2_out = self.gemm2_out_input.generate(
+            seed=_child_seed(seed, 1),
+            device=target_device,
+        ).values
+        if gemm2_out is None:
+            raise ValueError("gemm2_out generation was skipped")
+
+        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=rng_device).manual_seed(_child_seed(seed, 2))
+        total_slots = self.config.num_tokens * self.config.top_k
+        expanded_idx_to_permuted_idx = torch.full(
+            (total_slots,),
+            -1,
+            dtype=torch.int32,
+            device=target_device,
+        )
+        if total_slots > 0 and self._active_slot_count() > 0:
+            slot_order = torch.randperm(
+                total_slots,
+                dtype=torch.int64,
+                device=target_device,
+                generator=generator,
+            )
+            active_slots = slot_order[self.config.num_dropped_slots :]
+            permuted_rows = torch.randperm(
+                self._total_num_padded_tokens(),
+                dtype=torch.int32,
+                device=target_device,
+                generator=generator,
+            )[: self._active_slot_count()]
+            expanded_idx_to_permuted_idx[active_slots] = permuted_rows
+
+        raw_weights = torch.rand(
+            (self.config.num_tokens, self.config.top_k),
+            dtype=torch.float32,
+            device=target_device,
+            generator=generator,
+        )
+        expert_weights = raw_weights / raw_weights.sum(dim=-1, keepdim=True).clamp_min(
+            1.0e-12
+        )
+        expert_weights = expert_weights.to(self.config.expert_weights_dtype)
+
+        shared_output = None
+        if self.shared_output_input is not None:
+            shared_output = self.shared_output_input.generate(
+                seed=_child_seed(seed, 3),
+                device=target_device,
+            ).values
+            if shared_output is None:
+                raise ValueError("shared_output generation was skipped")
+
+        values = MoEFinalizeFuseSharedInputValues(
+            gemm2_out=gemm2_out.contiguous(),
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx.contiguous(),
+            expert_weights=expert_weights.contiguous(),
+            shared_output=None if shared_output is None else shared_output.contiguous(),
+        )
+        _validate_moe_finalize_fuse_shared_values(values)
+        return values
+
+
+@dataclass(init=False)
 class MoESoftplusSqrtTopKRoutingInputs(NumericsInputGenerator):
     """Input generator for softplus-sqrt top-k MoE routing."""
 
@@ -1156,6 +1389,73 @@ def _validate_moe_deepseek_v4_mega_moe_staging_values(
         raise ValueError("topk_weights must be finite")
     if torch.any(values.topk_weights < 0.0):
         raise ValueError("topk_weights must be non-negative")
+
+
+def _validate_moe_finalize_fuse_shared_values(
+    values: MoEFinalizeFuseSharedInputValues,
+) -> None:
+    if values.gemm2_out.ndim != 2:
+        raise ValueError("gemm2_out must be rank-2")
+    if values.gemm2_out.dtype != torch.bfloat16:
+        raise TypeError("gemm2_out must use torch.bfloat16")
+    total_num_padded_tokens, hidden_size_padded = values.gemm2_out.shape
+    if hidden_size_padded <= 0:
+        raise ValueError("gemm2_out hidden dimension must be positive")
+    if values.expert_weights.ndim != 2:
+        raise ValueError("expert_weights must be rank-2")
+    if values.expert_weights.dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError("expert_weights must use torch.float32 or torch.bfloat16")
+    num_tokens, top_k = values.expert_weights.shape
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if top_k > _MOE_FINALIZE_MAX_TOPK:
+        raise ValueError(f"top_k must be <= {_MOE_FINALIZE_MAX_TOPK}")
+    if values.expanded_idx_to_permuted_idx.ndim != 1:
+        raise ValueError("expanded_idx_to_permuted_idx must be rank-1")
+    if values.expanded_idx_to_permuted_idx.dtype != torch.int32:
+        raise TypeError("expanded_idx_to_permuted_idx must use torch.int32")
+    if values.expanded_idx_to_permuted_idx.shape[0] != num_tokens * top_k:
+        raise ValueError(
+            "expanded_idx_to_permuted_idx length must equal num_tokens * top_k"
+        )
+    if values.expert_weights.device != values.gemm2_out.device:
+        raise ValueError("expert_weights must share device with gemm2_out")
+    if values.expanded_idx_to_permuted_idx.device != values.gemm2_out.device:
+        raise ValueError(
+            "expanded_idx_to_permuted_idx must share device with gemm2_out"
+        )
+    if values.shared_output is not None:
+        if values.shared_output.ndim != 2:
+            raise ValueError("shared_output must be rank-2 when present")
+        if values.shared_output.dtype != torch.bfloat16:
+            raise TypeError("shared_output must use torch.bfloat16")
+        if values.shared_output.shape[0] != num_tokens:
+            raise ValueError("shared_output rows must match expert_weights rows")
+        if values.shared_output.shape[1] <= 0:
+            raise ValueError("shared_output hidden dimension must be positive")
+        if values.shared_output.shape[1] > hidden_size_padded:
+            raise ValueError("shared_output hidden dimension cannot exceed gemm2_out")
+        if values.shared_output.device != values.gemm2_out.device:
+            raise ValueError("shared_output must share device with gemm2_out")
+        if not torch.isfinite(values.shared_output.float()).all():
+            raise ValueError("shared_output must be finite")
+    indices = values.expanded_idx_to_permuted_idx
+    if indices.numel() > 0:
+        if indices.min().item() < -1:
+            raise ValueError("expanded indices must be -1 or non-negative")
+        if total_num_padded_tokens == 0:
+            if torch.any(indices >= 0):
+                raise ValueError("non-dropped indices require gemm2_out rows")
+        elif indices.max().item() >= total_num_padded_tokens:
+            raise ValueError("expanded indices must be less than gemm2_out rows")
+        active = indices[indices >= 0].detach().cpu().to(torch.long)
+        if active.numel() > 1:
+            if torch.unique(active).numel() != active.numel():
+                raise ValueError("non-dropped expanded indices must be unique")
+    if not torch.isfinite(values.gemm2_out.float()).all():
+        raise ValueError("gemm2_out must be finite")
+    if not torch.isfinite(values.expert_weights.float()).all():
+        raise ValueError("expert_weights must be finite")
 
 
 def _validate_moe_biased_grouped_topk_values(
@@ -1939,6 +2239,38 @@ def moe_deepseek_v4_mega_moe_staging_reference(
         topk_idx_out=values.topk_ids.clone(),
         topk_weights_out=values.topk_weights.clone(),
     )
+
+
+def moe_finalize_fuse_shared_reference(
+    values: MoEFinalizeFuseSharedInputValues,
+) -> torch.Tensor:
+    """Reference implementation for MoE routed-output finalization."""
+
+    _validate_moe_finalize_fuse_shared_values(values)
+    num_tokens, top_k = values.expert_weights.shape
+    hidden_size = (
+        values.shared_output.shape[1]
+        if values.shared_output is not None
+        else values.gemm2_out.shape[1]
+    )
+    output = torch.zeros(
+        (num_tokens, hidden_size),
+        dtype=torch.float32,
+        device=values.gemm2_out.device,
+    )
+    indices = values.expanded_idx_to_permuted_idx.reshape(num_tokens, top_k)
+    for token_idx in range(num_tokens):
+        for topk_idx in range(top_k):
+            permuted_idx = int(indices[token_idx, topk_idx].item())
+            if permuted_idx == -1:
+                continue
+            output[token_idx] += (
+                values.expert_weights[token_idx, topk_idx].float()
+                * values.gemm2_out[permuted_idx, :hidden_size].float()
+            )
+    if values.shared_output is not None:
+        output += values.shared_output.float()
+    return output.to(torch.bfloat16)
 
 
 def _moe_weight_operand(

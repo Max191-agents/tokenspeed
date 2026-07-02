@@ -118,6 +118,22 @@ inputs before an FP8/FP4 MegaMoE GEMM:
 This generator treats top-k routing ids and weights as already-computed routing
 metadata. It does not define how routing was produced.
 
+`MoEFinalizeFuseSharedInputs` generates inputs for the routed-output finalize
+epilogue after expert-local down projections have already run. The operation
+takes permuted expert outputs `gemm2_out`, a flattened
+`expanded_idx_to_permuted_idx` map from token/top-k slots to rows in
+`gemm2_out`, per-slot `expert_weights`, and an optional `shared_output`
+residual. It computes:
+
+```text
+out[t] = sum_k expert_weights[t, k] * gemm2_out[permuted_idx(t, k)]
+       + shared_output[t]  # when present
+```
+
+Dropped token/top-k slots use permute index `-1` and do not contribute to the
+sum. `gemm2_out` may use a padded hidden width; when `shared_output` is
+present, the logical output width is the shared-output width.
+
 ## References
 
 `moe_reference` implements the routed layer computation for generated MoE
@@ -158,6 +174,12 @@ order stored in the selected table row.
 `moe_deepseek_v4_mega_moe_staging_reference` implements the 128-wide FP8 hidden
 quantization, packed exponent-scale output, and top-k tensor copy semantics
 described above.
+
+`moe_finalize_fuse_shared_reference` implements routed-output finalization by
+gathering active `gemm2_out` rows through the flattened permute map, applying
+the per-slot expert weights, summing across `top_k`, and optionally adding the
+shared residual. The reference returns BF16 output to match the TokenSpeed CUDA
+helper.
 
 ## TokenSpeed API Mapping
 
@@ -222,6 +244,13 @@ helper arguments. The helper's requirement that hidden size is a multiple of
 128 is an operation invariant because scale words are packed once per 128-wide
 block.
 
+The CUDA `moe_finalize_fuse_shared` helper maps directly to
+`MoEFinalizeFuseSharedInputs`: generated `gemm2_out`,
+`expanded_idx_to_permuted_idx`, `expert_weights`, optional `shared_output`, and
+`top_k` derived from `expert_weights.shape[1]` become the helper arguments. The
+helper's SM90 requirement and extension-loading details remain adapter
+concerns.
+
 ## Verification
 
 MoE configs verify token counts, hidden/intermediate widths, expert counts,
@@ -259,3 +288,9 @@ by 128, rank-2 matching top-k ids and weights, in-range top-k ids, non-negative
 finite FP32 route weights, FP8 E4M3 hidden output buffers, int32 packed scale
 buffers with one scale word per 128 hidden channels, and staged top-k output
 buffers matching the input top-k tensors.
+
+Finalize-fuse-shared verifies BF16 permuted expert outputs, int32 flattened
+permute maps, unique non-dropped active indices, in-range or `-1` permute
+entries, FP32/BF16 expert weights, `top_k <= 64`, optional BF16 shared output
+with matching token rows and width no larger than `gemm2_out`, shared devices,
+and finite generated values.
