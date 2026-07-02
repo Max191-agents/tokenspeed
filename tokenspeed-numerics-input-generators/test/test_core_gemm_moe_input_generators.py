@@ -70,6 +70,7 @@ from tokenspeed_numerics_input_generators import (
     moe_softmax_topk_routing_reference,
     moe_softplus_sqrt_topk_routing_reference,
     mxfp4_gemm_input_config,
+    mxfp8_gemm_input_config,
     mxint4_gemm_input_config,
     nvfp4_dequantization_reference,
     nvfp4_gemm_swiglu_nvfp4_quant_reference,
@@ -617,31 +618,12 @@ def test_gemm_reference_applies_scaled_operands() -> None:
 def test_gemm_reference_applies_2d_block_scales() -> None:
     block_shape = (128, 128)
     values = GemmInputs(
-        GemmInputConfig(
+        mxfp8_gemm_input_config(
             M=4,
             N=256,
             K=256,
-            a_dtype=_fp8_dtype,
-            b_dtype=_fp8_dtype,
             c_dtype=torch.float32,
-            a_scale_shape=gemm_scale_shape(
-                "block",
-                "a",
-                M=4,
-                N=256,
-                K=256,
-                block_shape=block_shape,
-            ),
-            b_scale_shape=gemm_scale_shape(
-                "block",
-                "b",
-                M=4,
-                N=256,
-                K=256,
-                block_shape=block_shape,
-            ),
-            a_scale_dtype=torch.float32,
-            b_scale_dtype=torch.float32,
+            block_shape=block_shape,
         )
     ).generate(seed=93, device="cpu")
     assert values.A is not None
@@ -661,6 +643,33 @@ def test_gemm_reference_applies_2d_block_scales() -> None:
     )
 
     torch.testing.assert_close(gemm_reference(values), expected)
+
+
+def test_mxfp8_gemm_input_config_rejects_irregular_block_grid() -> None:
+    with pytest.raises(ValueError, match="K to be divisible"):
+        mxfp8_gemm_input_config(
+            M=4,
+            N=256,
+            K=192,
+            c_dtype=torch.float32,
+        )
+
+    with pytest.raises(ValueError, match="N to be divisible"):
+        mxfp8_gemm_input_config(
+            M=4,
+            N=192,
+            K=256,
+            c_dtype=torch.float32,
+        )
+
+    with pytest.raises(ValueError, match="a_layout='MK'"):
+        mxfp8_gemm_input_config(
+            M=4,
+            N=256,
+            K=256,
+            c_dtype=torch.float32,
+            a_layout="KM",
+        )
 
 
 def test_router_projection_inputs_generate_useful_logits() -> None:

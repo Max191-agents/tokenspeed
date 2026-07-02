@@ -61,6 +61,7 @@ __all__ = [
     "gemm_scale_shape",
     "lm_head_projection_reference",
     "mxfp4_gemm_input_config",
+    "mxfp8_gemm_input_config",
     "mxint4_gemm_input_config",
     "nvfp4_gemm_swiglu_nvfp4_quant_reference",
     "router_projection_reference",
@@ -1174,6 +1175,93 @@ def mxfp4_gemm_input_config(
                 block_shape=(block_size,),
             )
         ),
+    )
+
+
+def mxfp8_gemm_input_config(
+    *,
+    M: int,
+    N: int,
+    K: int,
+    c_dtype: torch.dtype,
+    fp8_dtype: torch.dtype = torch.float8_e4m3fn,
+    scale_dtype: torch.dtype = torch.float32,
+    block_shape: tuple[int, int] = (128, 128),
+    a_layout: GemmLayout = "MK",
+    b_layout: GemmLayout = "NK",
+    batch_shape: tuple[int, ...] = (),
+    a_device: DeviceLike = None,
+    b_device: DeviceLike = None,
+    a_scale_device: DeviceLike = None,
+    b_scale_device: DeviceLike = None,
+    c_device: DeviceLike = None,
+) -> GemmInputConfig:
+    """Build a standard block-scaled FP8 GEMM input config.
+
+    The represented operation is still the logical row-major ``A @ B.T`` GEMM.
+    ``A_scales`` contains one scale per logical ``M`` row and ``K`` block.
+    ``B_scales`` contains one scale per logical ``N`` block and ``K`` block.
+    The helper enforces regular block grids so references can expand scales
+    without backend-specific padding rules.
+    """
+
+    M = int(M)
+    N = int(N)
+    K = int(K)
+    block_shape = tuple(int(dim) for dim in block_shape)
+    if len(block_shape) != 2 or any(dim <= 0 for dim in block_shape):
+        raise ValueError("mxfp8 block_shape must contain two positive dimensions")
+    block_n, block_k = block_shape
+    if K % block_k != 0:
+        raise ValueError(
+            "mxfp8 GEMM requires K to be divisible by block_shape[1]; "
+            f"got K={K}, block_k={block_k}"
+        )
+    if N % block_n != 0:
+        raise ValueError(
+            "mxfp8 GEMM requires N to be divisible by block_shape[0]; "
+            f"got N={N}, block_n={block_n}"
+        )
+    if a_layout != "MK":
+        raise ValueError("mxfp8 A operands require a_layout='MK'")
+    if b_layout != "NK":
+        raise ValueError("mxfp8 B operands require b_layout='NK'")
+
+    return GemmInputConfig(
+        M=M,
+        N=N,
+        K=K,
+        a_dtype=fp8_dtype,
+        b_dtype=fp8_dtype,
+        c_dtype=c_dtype,
+        a_layout=a_layout,
+        b_layout=b_layout,
+        batch_shape=batch_shape,
+        a_scale_shape=gemm_scale_shape(
+            "block",
+            "a",
+            M=M,
+            N=N,
+            K=K,
+            batch_shape=batch_shape,
+            block_shape=block_shape,
+        ),
+        b_scale_shape=gemm_scale_shape(
+            "block",
+            "b",
+            M=M,
+            N=N,
+            K=K,
+            batch_shape=batch_shape,
+            block_shape=block_shape,
+        ),
+        a_scale_dtype=scale_dtype,
+        b_scale_dtype=scale_dtype,
+        a_device=a_device,
+        b_device=b_device,
+        a_scale_device=a_scale_device,
+        b_scale_device=b_scale_device,
+        c_device=c_device,
     )
 
 

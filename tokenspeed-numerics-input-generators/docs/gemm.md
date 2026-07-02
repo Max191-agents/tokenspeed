@@ -121,6 +121,14 @@ logical `N` blocks and `K` blocks. The reference expands those grids over the
 logical operand before computing `A @ B.T`. The current generator path expects
 regular scale grids that evenly partition the generated physical operand shape.
 
+`mxfp8_gemm_input_config` builds this standard row-major block-scaled FP8
+configuration. It requires `K` to be divisible by the K block and `N` to be
+divisible by the N block so the scale grids describe complete logical operand
+regions without backend-specific padding. TokenSpeed Triton and DeepGEMM
+adapters can consume the generated `A`, `B`, `A_scales`, and `B_scales`
+directly, while keeping any required scale-layout conversion at the adapter
+boundary.
+
 ## Fused NVFP4 GEMM And SwiGLU
 
 `NVFP4GemmSwiGLUNVFP4QuantInputs` represents the fused dense MLP primitive:

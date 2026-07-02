@@ -32,9 +32,9 @@ from tokenspeed_numerics_input_generators import (
     RouterProjectionInputConfig,
     RouterProjectionInputs,
     gemm_reference,
-    gemm_scale_shape,
     lm_head_projection_reference,
     mxfp4_gemm_input_config,
+    mxfp8_gemm_input_config,
     router_projection_reference,
 )
 
@@ -281,31 +281,12 @@ def test_mxfp8_blockscale_gemm_generator_runs_triton_kernel(
     block_size = [128, 128]
     M, N, K = 8, 256, 256
     values = GemmInputs(
-        GemmInputConfig(
+        mxfp8_gemm_input_config(
             M=M,
             N=N,
             K=K,
-            a_dtype=torch.float8_e4m3fn,
-            b_dtype=torch.float8_e4m3fn,
             c_dtype=torch.float16,
-            a_scale_shape=gemm_scale_shape(
-                "block",
-                "a",
-                M=M,
-                N=N,
-                K=K,
-                block_shape=tuple(block_size),
-            ),
-            b_scale_shape=gemm_scale_shape(
-                "block",
-                "b",
-                M=M,
-                N=N,
-                K=K,
-                block_shape=tuple(block_size),
-            ),
-            a_scale_dtype=torch.float32,
-            b_scale_dtype=torch.float32,
+            block_shape=tuple(block_size),
         )
     ).generate(seed=41, device=device)
     assert values.A is not None
@@ -324,6 +305,51 @@ def test_mxfp8_blockscale_gemm_generator_runs_triton_kernel(
         quant="mxfp8",
         expected_kernel_name="triton_mm_fp8_blockscale",
     )
+    expected = gemm_reference(values).to(device=device)
+    torch.cuda.synchronize()
+
+    assert actual.shape == values.C.shape
+    assert actual.dtype == values.C.dtype
+    torch.testing.assert_close(actual.float(), expected.float(), atol=0.25, rtol=0.25)
+
+
+def test_mxfp8_gemm_generator_runs_deep_gemm_kernel(device: str) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or not platform.is_hopper_plus:
+        pytest.skip("deep_gemm_mm_fp8_blockscale requires NVIDIA SM90+")
+
+    from tokenspeed_kernel.ops.gemm import deep_gemm as deep_gemm_ops
+
+    kernel = getattr(deep_gemm_ops, "deep_gemm_mm_fp8_blockscale", None)
+    if kernel is None:
+        pytest.skip("DeepGEMM kernel is not available")
+
+    block_size = [128, 128]
+    values = GemmInputs(
+        mxfp8_gemm_input_config(
+            M=128,
+            N=128,
+            K=256,
+            c_dtype=torch.bfloat16,
+            block_shape=tuple(block_size),
+        )
+    ).generate(seed=53, device=device)
+    assert values.A is not None
+    assert values.B is not None
+    assert values.A_scales is not None
+    assert values.B_scales is not None
+
+    try:
+        actual = kernel(
+            values.A,
+            values.B,
+            values.A_scales,
+            values.B_scales,
+            values.C.dtype,
+            block_size=block_size,
+        )
+    except (RuntimeError, ModuleNotFoundError) as exc:
+        _skip_if_cuda_extension_gemm_unavailable(exc)
     expected = gemm_reference(values).to(device=device)
     torch.cuda.synchronize()
 

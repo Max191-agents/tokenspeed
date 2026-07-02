@@ -18,9 +18,9 @@ optional scale sidecars that define the represented numerical values.
 - `NVFP4GemmSwiGLUNVFP4QuantInputs`: generates inputs for a fused NVFP4 GEMM,
   SwiGLU activation, and NVFP4 output quantization operation.
 
-Helper functions such as `gemm_scale_shape`, `mxfp4_gemm_input_config`, and
-`mxint4_gemm_input_config` build valid scale shapes and custom operand configs
-from the logical GEMM dimensions.
+Helper functions such as `gemm_scale_shape`, `mxfp8_gemm_input_config`,
+`mxfp4_gemm_input_config`, and `mxint4_gemm_input_config` build valid scale
+shapes and custom operand configs from the logical GEMM dimensions.
 
 ## Generated Values
 
