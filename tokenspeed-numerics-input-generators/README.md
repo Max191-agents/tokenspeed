@@ -82,6 +82,13 @@ be used to silently produce broken operation inputs. A valid generator call
 should either fail before returning or return values that satisfy the documented
 operation-level constraints for that generator.
 
+This should be treated as a trusted boundary for tests and adapters. If a
+consumer uses the generator library, it should be able to assume that the
+returned inputs are internally coherent for the represented operation. The
+generator should make invalid operation states unrepresentable at the public
+API boundary whenever practical, and should reject them explicitly when they
+cannot be avoided by construction.
+
 This is a misuse-resistance contract. The library should reject invalid
 configuration choices, inconsistent child generator overrides, impossible
 metadata layouts, unsupported dtype/scale combinations, and generated metadata
