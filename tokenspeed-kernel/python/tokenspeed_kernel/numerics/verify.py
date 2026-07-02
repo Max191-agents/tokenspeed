@@ -49,6 +49,7 @@ from tokenspeed_kernel.signature import FormatSignature
 import tokenspeed_kernel.numerics.gemm  # noqa: F401
 import tokenspeed_kernel.numerics.moe  # noqa: F401
 import tokenspeed_kernel.numerics.quantize  # noqa: F401
+import tokenspeed_kernel.numerics.sampling  # noqa: F401
 
 __all__ = ["verify_kernel"]
 

@@ -37,6 +37,7 @@ from tokenspeed_kernel.signature import (
     format_signatures,
     tensor_format,
 )
+from tokenspeed_numerics_input_generators import argmax_reference
 
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
 
@@ -235,6 +236,63 @@ def test_quantization_input_generator_rejects_unsupported_mode() -> None:
         generator.generate(M=2, K=128)
 
 
+def test_sampling_argmax_generator_uses_package_inputs() -> None:
+    inputs = get_input_generator(
+        "sampling",
+        "argmax",
+        dtype=torch.float32,
+        traits={},
+        device="cpu",
+        seed=81,
+    ).generate(M=4, N=17, max_pattern="tied")
+
+    assert set(inputs) == {"logits"}
+    assert inputs["logits"].shape == (4, 17)
+    assert inputs["logits"].dtype == torch.float32
+    expected = argmax_reference(inputs["logits"])
+    assert expected.shape == (4,)
+    assert torch.all(expected >= 0)
+
+    nan_inputs = get_input_generator(
+        "sampling",
+        "argmax",
+        dtype=torch.float32,
+        traits={},
+        device="cpu",
+        seed=82,
+    ).generate(M=4, N=17, nan_pattern="mixed")
+    nan_expected = argmax_reference(nan_inputs["logits"])
+    assert (nan_expected == -1).any()
+
+
+def test_sampling_argmax_numerics_registration_matches_kernel_family() -> None:
+    load_builtin_kernels()
+    registry = KernelRegistry.get()
+
+    specs = registry.get_for_operator("sampling", "argmax")
+    assert any(spec.name == "torch_sampling_argmax" for spec in specs)
+    assert get_standard_shapes("sampling", "argmax")
+
+
+def test_sampling_argmax_reference_honors_out_buffer() -> None:
+    from tokenspeed_kernel.numerics.reference.sampling import torch_sampling_argmax
+
+    logits = torch.tensor(
+        [
+            [0.0, 2.0, 2.0],
+            [float("nan"), -1.0, -2.0],
+            [float("nan"), float("nan"), float("nan")],
+        ],
+        dtype=torch.float32,
+    )
+    out = torch.empty((3,), dtype=torch.int32)
+
+    returned = torch_sampling_argmax(logits, out=out)
+
+    assert returned.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out, torch.tensor([1, 1, -1], dtype=torch.int32))
+
+
 def test_moe_align_block_size_generator_uses_typed_tensor_input() -> None:
     first = get_input_generator(
         "moe",
@@ -391,3 +449,11 @@ class TestNumericsVerification:
     )
     def test_moe_int32(self, spec: KernelSpec):
         self._verify(spec, torch.int32, "indices")
+
+    @pytest.mark.parametrize(
+        "spec",
+        _get_verifiable_specs(torch.float32, "logits", family="sampling"),
+        ids=lambda s: f"{s.family}.{s.mode}:{s.name}",
+    )
+    def test_sampling_argmax_float32(self, spec: KernelSpec):
+        self._verify(spec, torch.float32, "logits")

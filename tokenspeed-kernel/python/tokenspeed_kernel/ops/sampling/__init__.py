@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import tokenspeed_kernel.numerics.reference.sampling  # noqa: F401
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
