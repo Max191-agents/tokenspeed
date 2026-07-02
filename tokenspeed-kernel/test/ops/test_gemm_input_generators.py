@@ -27,10 +27,13 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
     GemmInputConfig,
     GemmInputs,
+    LMHeadProjectionInputConfig,
+    LMHeadProjectionInputs,
     RouterProjectionInputConfig,
     RouterProjectionInputs,
     gemm_reference,
     gemm_scale_shape,
+    lm_head_projection_reference,
     mxfp4_gemm_input_config,
     router_projection_reference,
 )
@@ -41,13 +44,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _skip_if_router_gemm_unavailable(exc: BaseException) -> None:
+def _skip_if_cuda_extension_gemm_unavailable(exc: BaseException) -> None:
     message = str(exc)
     skip_fragments = (
         "library not found",
         "No module named 'tvm_ffi'",
         "requires SM90",
         "required CUDA ARCH",
+        "unsupported (hd_in",
     )
     if any(fragment in message for fragment in skip_fragments):
         pytest.skip(message)
@@ -183,7 +187,7 @@ def test_router_projection_generator_runs_fp32_router_gemm(device: str) -> None:
     try:
         actual = fp32_router_gemm(values.hidden_states, values.router_weights)
     except (RuntimeError, ModuleNotFoundError) as exc:
-        _skip_if_router_gemm_unavailable(exc)
+        _skip_if_cuda_extension_gemm_unavailable(exc)
 
     expected = router_projection_reference(values).to(device=device)
     torch.cuda.synchronize()
@@ -217,7 +221,7 @@ def test_router_projection_generator_runs_dsv3_router_gemm(device: str) -> None:
             out_dtype=torch.float32,
         )
     except (RuntimeError, ModuleNotFoundError) as exc:
-        _skip_if_router_gemm_unavailable(exc)
+        _skip_if_cuda_extension_gemm_unavailable(exc)
 
     expected = router_projection_reference(values).to(device=device)
     torch.cuda.synchronize()
@@ -225,6 +229,45 @@ def test_router_projection_generator_runs_dsv3_router_gemm(device: str) -> None:
     assert actual.shape == expected.shape
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected, atol=1e-1, rtol=1e-2)
+
+
+def test_lm_head_projection_generator_runs_fused_lm_head_gemm(device: str) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or not platform.is_hopper_plus:
+        pytest.skip("lm_head_gemm requires NVIDIA SM90+")
+
+    try:
+        from tokenspeed_kernel.thirdparty.cuda.lm_head_gemm import (
+            is_supported,
+            lm_head_gemm,
+        )
+    except (RuntimeError, ModuleNotFoundError) as exc:
+        _skip_if_cuda_extension_gemm_unavailable(exc)
+
+    values = LMHeadProjectionInputs(
+        LMHeadProjectionInputConfig(
+            num_tokens=1,
+            hidden_dim=7168,
+            vocab_size=16160,
+            hidden_dtype=torch.bfloat16,
+            weight_dtype=torch.bfloat16,
+        )
+    ).generate(seed=49, device=device)
+
+    if not is_supported(values.hidden_states, values.weight):
+        pytest.skip("lm_head_gemm reports generated shape as unsupported")
+
+    try:
+        actual = lm_head_gemm(values.hidden_states, values.weight)
+    except (RuntimeError, ModuleNotFoundError) as exc:
+        _skip_if_cuda_extension_gemm_unavailable(exc)
+
+    expected = lm_head_projection_reference(values).to(device=device)
+    torch.cuda.synchronize()
+
+    assert actual.shape == expected.shape
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual.float(), expected.float(), atol=0.1, rtol=0.1)
 
 
 def test_mxfp8_blockscale_gemm_generator_runs_triton_kernel(

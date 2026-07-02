@@ -48,6 +48,9 @@ __all__ = [
     "GemmInputs",
     "GemmInputConfig",
     "GemmInputValues",
+    "LMHeadProjectionInputConfig",
+    "LMHeadProjectionInputs",
+    "LMHeadProjectionInputValues",
     "NVFP4GemmSwiGLUNVFP4QuantInputConfig",
     "NVFP4GemmSwiGLUNVFP4QuantInputs",
     "NVFP4GemmSwiGLUNVFP4QuantInputValues",
@@ -56,6 +59,7 @@ __all__ = [
     "RouterProjectionInputValues",
     "gemm_reference",
     "gemm_scale_shape",
+    "lm_head_projection_reference",
     "mxfp4_gemm_input_config",
     "mxint4_gemm_input_config",
     "nvfp4_gemm_swiglu_nvfp4_quant_reference",
@@ -69,7 +73,7 @@ _DEFAULT_MXFP4_BLOCK_SIZE = 32
 _DEFAULT_MXINT4_BLOCK_SIZE = 32
 _DEFAULT_NVFP4_BLOCK_SIZE = 16
 _GEMM_LAYOUTS = frozenset({"MK", "KM", "NK", "KN"})
-_ROUTER_PROJECTION_DTYPES = frozenset(
+_PROJECTION_DTYPES = frozenset(
     {torch.float16, torch.bfloat16, torch.float32, torch.float64}
 )
 
@@ -315,12 +319,12 @@ def _check_nvfp4_source_dtype(dtype: torch.dtype) -> torch.dtype:
     return dtype
 
 
-def _check_router_projection_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+def _check_projection_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
     if not isinstance(dtype, torch.dtype):
         raise TypeError(f"{name} must be a torch.dtype")
-    if dtype not in _ROUTER_PROJECTION_DTYPES:
+    if dtype not in _PROJECTION_DTYPES:
         raise ValueError(
-            f"{name} must be one of {sorted(str(d) for d in _ROUTER_PROJECTION_DTYPES)}, "
+            f"{name} must be one of {sorted(str(d) for d in _PROJECTION_DTYPES)}, "
             f"got {dtype}"
         )
     return dtype
@@ -775,11 +779,11 @@ class RouterProjectionInputs(NumericsInputGenerator):
             raise ValueError("hidden_dim must be positive")
         if self.config.num_experts <= 0:
             raise ValueError("num_experts must be positive")
-        self.config.hidden_dtype = _check_router_projection_dtype(
+        self.config.hidden_dtype = _check_projection_dtype(
             "hidden_dtype",
             self.config.hidden_dtype,
         )
-        self.config.router_weight_dtype = _check_router_projection_dtype(
+        self.config.router_weight_dtype = _check_projection_dtype(
             "router_weight_dtype",
             self.config.router_weight_dtype,
         )
@@ -878,8 +882,8 @@ def _check_router_projection_values(values: RouterProjectionInputValues) -> None
             f"hidden_states={tuple(values.hidden_states.shape)}, "
             f"router_weights={tuple(values.router_weights.shape)}"
         )
-    _check_router_projection_dtype("hidden_states dtype", values.hidden_states.dtype)
-    _check_router_projection_dtype(
+    _check_projection_dtype("hidden_states dtype", values.hidden_states.dtype)
+    _check_projection_dtype(
         "router_weights dtype",
         values.router_weights.dtype,
     )
@@ -896,6 +900,224 @@ def router_projection_reference(
 
     _check_router_projection_values(values)
     return (values.hidden_states.float() @ values.router_weights.float().T).float()
+
+
+@dataclass
+class LMHeadProjectionInputValues:
+    """Generated values for LM-head projection.
+
+    ``hidden_states`` contains token activations. ``weight`` contains one row
+    per vocabulary entry, or per vocabulary shard for tensor-parallel adapters.
+    The represented operation computes logits as ``hidden_states @ weight.T``.
+    """
+
+    hidden_states: torch.Tensor
+    weight: torch.Tensor
+
+
+@dataclass
+class LMHeadProjectionInputConfig:
+    """Initialization parameters for ``LMHeadProjectionInputs``.
+
+    The generator models the final language-model head projection from hidden
+    states to vocabulary logits. Generated weights are scaled by
+    ``1 / sqrt(hidden_dim)`` by default so logits remain in a numerically useful
+    range as the reduction dimension changes.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of token rows to project.
+    num_tokens: int
+
+    # Required: hidden-state width and projection reduction dimension.
+    hidden_dim: int
+
+    # Required: number of vocabulary rows generated. Tensor-parallel adapters
+    # can use this as the local vocabulary shard size.
+    vocab_size: int
+
+    # ------------------------------------------------------------------
+    # Optional dtype and value-distribution configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: dtype for generated hidden-state activations.
+    hidden_dtype: torch.dtype = torch.bfloat16
+
+    # Optional: dtype for generated LM-head weights.
+    weight_dtype: torch.dtype = torch.bfloat16
+
+    # Optional: multiplicative scale applied to generated hidden states.
+    hidden_scale: float = 1.0
+
+    # Optional: multiplicative scale applied to generated weights. When
+    # omitted, generation uses 1 / sqrt(hidden_dim).
+    weight_scale: float | None = None
+
+    # ------------------------------------------------------------------
+    # Optional device configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class LMHeadProjectionInputs(NumericsInputGenerator):
+    """Generator for LM-head projection inputs.
+
+    The represented operation is:
+
+    ``logits = hidden_states @ weight.T``
+
+    The generator does not encode backend-specific constraints such as compiled
+    vocab-shard sizes or fused-kernel token limits. Those checks belong in the
+    adapter for a specific implementation.
+    """
+
+    config: LMHeadProjectionInputConfig
+    hidden_states_input: TensorInput | None
+    weight_input: TensorInput | None
+
+    def __init__(self, config: LMHeadProjectionInputConfig) -> None:
+        self.config = config
+        self.hidden_states_input = None
+        self.weight_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_tokens = int(self.config.num_tokens)
+        self.config.hidden_dim = int(self.config.hidden_dim)
+        self.config.vocab_size = int(self.config.vocab_size)
+        if self.config.num_tokens <= 0:
+            raise ValueError("num_tokens must be positive")
+        if self.config.hidden_dim <= 0:
+            raise ValueError("hidden_dim must be positive")
+        if self.config.vocab_size <= 0:
+            raise ValueError("vocab_size must be positive")
+        self.config.hidden_dtype = _check_projection_dtype(
+            "hidden_dtype",
+            self.config.hidden_dtype,
+        )
+        self.config.weight_dtype = _check_projection_dtype(
+            "weight_dtype",
+            self.config.weight_dtype,
+        )
+        self.config.hidden_scale = _check_positive_float(
+            "hidden_scale",
+            self.config.hidden_scale,
+        )
+        if self.config.weight_scale is not None:
+            self.config.weight_scale = _check_positive_float(
+                "weight_scale",
+                self.config.weight_scale,
+            )
+        self.hidden_states_input = self.hidden_states_input or TensorInput(
+            (self.config.num_tokens, self.config.hidden_dim),
+            self.config.hidden_dtype,
+            device=self.config.device,
+        )
+        self.weight_input = self.weight_input or TensorInput(
+            (self.config.vocab_size, self.config.hidden_dim),
+            self.config.weight_dtype,
+            device=self.config.device,
+        )
+        self.hidden_states_input.shape = (
+            self.config.num_tokens,
+            self.config.hidden_dim,
+        )
+        self.hidden_states_input.dtype = self.config.hidden_dtype
+        self.hidden_states_input.device = self.config.device
+        self.weight_input.shape = (
+            self.config.vocab_size,
+            self.config.hidden_dim,
+        )
+        self.weight_input.dtype = self.config.weight_dtype
+        self.weight_input.device = self.config.device
+
+    def _weight_scale(self) -> float:
+        if self.config.weight_scale is not None:
+            return self.config.weight_scale
+        return 1.0 / math.sqrt(self.config.hidden_dim)
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> LMHeadProjectionInputValues:
+        self.__post_init__()
+        if self.hidden_states_input is None or self.weight_input is None:
+            raise ValueError("LM-head projection child generators must be initialized")
+
+        hidden_states = self.hidden_states_input.generate(
+            seed=_child_seed(seed, 1),
+            device=device,
+        ).values
+        weight = self.weight_input.generate(
+            seed=_child_seed(seed, 2),
+            device=device,
+        ).values
+        if hidden_states is None or weight is None:
+            raise ValueError("LM-head projection tensors must not be skipped")
+
+        hidden_states = (
+            hidden_states.float()
+            .mul(self.config.hidden_scale)
+            .to(self.config.hidden_dtype)
+            .contiguous()
+        )
+        weight = (
+            weight.float()
+            .mul(self._weight_scale())
+            .to(self.config.weight_dtype)
+            .contiguous()
+        )
+        values = LMHeadProjectionInputValues(
+            hidden_states=hidden_states,
+            weight=weight,
+        )
+        _check_lm_head_projection_values(values)
+        return values
+
+
+def _check_lm_head_projection_values(values: LMHeadProjectionInputValues) -> None:
+    if values.hidden_states.ndim != 2:
+        raise ValueError("hidden_states must be rank-2 [num_tokens, hidden_dim]")
+    if values.weight.ndim != 2:
+        raise ValueError("weight must be rank-2 [vocab_size, hidden_dim]")
+    if values.hidden_states.shape[0] <= 0:
+        raise ValueError("hidden_states must contain at least one token row")
+    if values.hidden_states.shape[1] <= 0:
+        raise ValueError("hidden_dim must be positive")
+    if values.weight.shape[0] <= 0:
+        raise ValueError("weight must contain at least one vocabulary row")
+    if values.weight.shape[1] != values.hidden_states.shape[1]:
+        raise ValueError(
+            "LM-head projection hidden dimensions must match; "
+            f"hidden_states={tuple(values.hidden_states.shape)}, "
+            f"weight={tuple(values.weight.shape)}"
+        )
+    _check_projection_dtype("hidden_states dtype", values.hidden_states.dtype)
+    _check_projection_dtype("weight dtype", values.weight.dtype)
+    if not torch.isfinite(values.hidden_states.float()).all():
+        raise ValueError("hidden_states must be finite")
+    if not torch.isfinite(values.weight.float()).all():
+        raise ValueError("weight must be finite")
+
+
+def lm_head_projection_reference(
+    values: LMHeadProjectionInputValues,
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Return LM-head logits for ``hidden_states @ weight.T``."""
+
+    _check_lm_head_projection_values(values)
+    _check_projection_dtype("out_dtype", out_dtype)
+    return (values.hidden_states.float() @ values.weight.float().T).to(out_dtype)
 
 
 def mxfp4_gemm_input_config(

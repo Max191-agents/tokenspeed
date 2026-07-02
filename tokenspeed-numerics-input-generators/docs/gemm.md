@@ -66,6 +66,29 @@ scale when intentionally testing a different distribution.
 `router_projection_reference` computes the fp32 projection reference directly
 from the generated values.
 
+`LMHeadProjectionInputs` represents the final language-model head projection:
+
+```text
+logits = hidden_states @ weight.T
+```
+
+`hidden_states` has shape `[num_tokens, hidden_dim]`, `weight` has shape
+`[vocab_size, hidden_dim]`, and the reference returns logits with shape
+`[num_tokens, vocab_size]`. Tensor-parallel consumers can interpret
+`vocab_size` as the local vocabulary shard size. TokenSpeed's fused CUDA
+LM-head path currently consumes contiguous BF16 tensors and returns BF16 output,
+but the generator describes the projection operation rather than baking in the
+compiled backend shape table.
+
+Like router projection, LM-head generation scales weights by
+`1 / sqrt(hidden_dim)` by default so logits stay O(1) as hidden width changes.
+This keeps sampled vocabulary projections numerically useful without requiring
+tests to manually tune distributions for each model shape.
+
+`lm_head_projection_reference` computes the projection in fp32 and casts to the
+requested output dtype, defaulting to BF16 to match the fused TokenSpeed
+LM-head wrapper.
+
 ## Scale And Quantized Storage
 
 Dense floating-point tensors use the core tensor generator. Scaled tensors use
@@ -138,3 +161,8 @@ Router projection verification checks positive token, hidden, and expert
 dimensions; supported floating-point dtypes for hidden states and weights;
 finite positive generation scales; rank-2 generated tensors; matching hidden
 dimensions; and finite generated values.
+
+LM-head projection verification checks positive token, hidden, and vocabulary
+dimensions; supported floating-point dtypes for hidden states, weights, and
+reference output; finite positive generation scales; rank-2 generated tensors;
+matching hidden dimensions; and finite generated values.

@@ -27,6 +27,9 @@ from tokenspeed_numerics_input_generators import (
     GemmInputConfig,
     GemmInputs,
     GemmInputValues,
+    LMHeadProjectionInputConfig,
+    LMHeadProjectionInputs,
+    LMHeadProjectionInputValues,
     MoeAlignBlockSizeInputConfig,
     MoeAlignBlockSizeInputs,
     MoeAlignBlockSizeInputValues,
@@ -54,6 +57,7 @@ from tokenspeed_numerics_input_generators import (
     canonicalize_moe_align_block_size,
     gemm_reference,
     gemm_scale_shape,
+    lm_head_projection_reference,
     moe_align_block_size_buffer_dims,
     moe_align_block_size_reference,
     moe_biased_grouped_topk_reference,
@@ -734,6 +738,87 @@ def test_router_projection_reference_rejects_invalid_values() -> None:
 
     with pytest.raises(ValueError, match="hidden dimensions"):
         router_projection_reference(values)
+
+
+def test_lm_head_projection_inputs_generate_useful_logits() -> None:
+    values = LMHeadProjectionInputs(
+        LMHeadProjectionInputConfig(
+            num_tokens=4,
+            hidden_dim=64,
+            vocab_size=11,
+            hidden_dtype=torch.bfloat16,
+            weight_dtype=torch.bfloat16,
+        )
+    ).generate(seed=96, device="cpu")
+
+    assert values.hidden_states.shape == (4, 64)
+    assert values.weight.shape == (11, 64)
+    assert values.hidden_states.dtype == torch.bfloat16
+    assert values.weight.dtype == torch.bfloat16
+
+    logits = lm_head_projection_reference(values)
+
+    assert logits.shape == (4, 11)
+    assert logits.dtype == torch.bfloat16
+    assert torch.isfinite(logits.float()).all()
+    assert logits.float().std() > 0.0
+    assert logits.float().abs().max() < 10.0
+
+
+def test_lm_head_projection_reference_matches_matmul() -> None:
+    values = LMHeadProjectionInputValues(
+        hidden_states=torch.tensor(
+            [[1.0, 2.0, -1.0], [0.5, -0.25, 2.0]],
+            dtype=torch.float32,
+        ),
+        weight=torch.tensor(
+            [[0.5, 1.0, 2.0], [1.5, -1.0, 0.25]],
+            dtype=torch.float32,
+        ),
+    )
+
+    logits = lm_head_projection_reference(values, out_dtype=torch.float32)
+
+    torch.testing.assert_close(logits, values.hidden_states @ values.weight.T)
+
+
+def test_lm_head_projection_inputs_reject_invalid_configs() -> None:
+    with pytest.raises(ValueError, match="vocab_size"):
+        LMHeadProjectionInputs(
+            LMHeadProjectionInputConfig(
+                num_tokens=4,
+                hidden_dim=64,
+                vocab_size=0,
+            )
+        )
+    with pytest.raises(ValueError, match="weight_dtype"):
+        LMHeadProjectionInputs(
+            LMHeadProjectionInputConfig(
+                num_tokens=4,
+                hidden_dim=64,
+                vocab_size=11,
+                weight_dtype=torch.int32,  # type: ignore[arg-type]
+            )
+        )
+    with pytest.raises(ValueError, match="weight_scale"):
+        LMHeadProjectionInputs(
+            LMHeadProjectionInputConfig(
+                num_tokens=4,
+                hidden_dim=64,
+                vocab_size=11,
+                weight_scale=0.0,
+            )
+        )
+
+
+def test_lm_head_projection_reference_rejects_invalid_values() -> None:
+    values = LMHeadProjectionInputValues(
+        hidden_states=torch.randn(2, 4),
+        weight=torch.randn(3, 5),
+    )
+
+    with pytest.raises(ValueError, match="hidden dimensions"):
+        lm_head_projection_reference(values)
 
 
 def test_nvfp4_gemm_swiglu_inputs_generate_values_and_reference() -> None:

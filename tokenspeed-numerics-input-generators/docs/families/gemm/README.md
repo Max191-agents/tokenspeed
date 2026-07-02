@@ -12,6 +12,9 @@ optional scale sidecars that define the represented numerical values.
 - `RouterProjectionInputs`: generates hidden states and router weights for the
   MoE router projection `hidden_states @ router_weights.T`, with default weight
   scaling chosen to keep fp32 router logits in a useful range.
+- `LMHeadProjectionInputs`: generates hidden states and vocabulary projection
+  weights for `hidden_states @ weight.T`, with default weight scaling chosen to
+  keep LM-head logits in a useful range.
 - `NVFP4GemmSwiGLUNVFP4QuantInputs`: generates inputs for a fused NVFP4 GEMM,
   SwiGLU activation, and NVFP4 output quantization operation.
 
@@ -30,4 +33,5 @@ The generator verifies layout compatibility, custom dtype scale requirements,
 and shape relationships so tests do not need to reconstruct GEMM validity rules.
 Router projection generation additionally verifies positive token, hidden, and
 expert dimensions, supported floating-point dtypes, finite positive generation
-scales, and matching hidden dimensions.
+scales, and matching hidden dimensions. LM-head projection generation verifies
+the same projection invariants with vocabulary rows in place of expert rows.
