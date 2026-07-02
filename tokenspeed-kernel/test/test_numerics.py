@@ -24,6 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
 from tokenspeed_kernel.numerics.inputs import get_input_generator, get_standard_shapes
+from tokenspeed_kernel.numerics.outputs import get_output_extractor
 from tokenspeed_kernel.numerics.tolerance import Tolerance
 from tokenspeed_kernel.numerics.verify import (
     _verification_signature_and_reference,
@@ -37,7 +38,7 @@ from tokenspeed_kernel.signature import (
     format_signatures,
     tensor_format,
 )
-from tokenspeed_numerics_input_generators import argmax_reference
+from tokenspeed_numerics_input_generators import argmax_reference, rope_reference
 
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
 
@@ -293,6 +294,88 @@ def test_sampling_argmax_reference_honors_out_buffer() -> None:
     torch.testing.assert_close(out, torch.tensor([1, 1, -1], dtype=torch.int32))
 
 
+def test_embedding_rope_generator_uses_package_inputs() -> None:
+    inputs = get_input_generator(
+        "embedding",
+        "rope",
+        dtype=torch.bfloat16,
+        traits={},
+        device="cpu",
+        seed=91,
+    ).generate(
+        num_tokens=4,
+        num_q_heads=2,
+        num_kv_heads=1,
+        head_size=64,
+        rotary_dim=32,
+        with_q_output=True,
+        with_k_output=True,
+    )
+
+    assert inputs["query"].shape == (4, 128)
+    assert inputs["key"].shape == (4, 64)
+    assert inputs["query"].dtype == torch.bfloat16
+    assert inputs["key"].dtype == torch.bfloat16
+    assert inputs["output_q_rope"].shape == inputs["query"].shape
+    assert inputs["output_k_rope"].shape == inputs["key"].shape
+    assert inputs["positions"].shape == (4,)
+    assert int(inputs["positions"].min().item()) >= 0
+    assert int(inputs["positions"].max().item()) < inputs["cos_sin_cache"].shape[0]
+
+    q_ref, k_ref = rope_reference(
+        inputs["query"],
+        inputs["key"],
+        inputs["positions"],
+        head_size=inputs["head_size"],
+        cos_sin_cache=inputs["cos_sin_cache"],
+        is_neox=inputs["is_neox"],
+        rotary_dim=inputs["rotary_dim"],
+    )
+    assert q_ref.shape == inputs["query"].shape
+    assert k_ref.shape == inputs["key"].shape
+
+
+def test_embedding_rope_output_extractor_collects_mutated_outputs() -> None:
+    extractor = get_output_extractor("embedding", "rope")
+    assert extractor is not None
+    inputs = get_input_generator(
+        "embedding",
+        "rope",
+        dtype=torch.bfloat16,
+        traits={},
+        device="cpu",
+        seed=92,
+    ).generate(
+        num_tokens=3,
+        num_q_heads=2,
+        num_kv_heads=1,
+        head_size=64,
+        rotary_dim=64,
+        with_fused_kv=True,
+        cache_size=8,
+        with_q_output=True,
+    )
+    assert inputs["fused_set_kv_buffer_arg"] is not None
+
+    outputs = extractor(inputs, None)
+
+    assert len(outputs) == 4
+    assert outputs[0].shape == inputs["query"].shape
+    assert outputs[1].shape == inputs["key"].shape
+    assert outputs[2].shape == inputs["key"].shape
+    assert outputs[3].shape == inputs["key"].shape
+
+
+def test_embedding_rope_numerics_registration_matches_kernel_family() -> None:
+    load_builtin_kernels()
+    registry = KernelRegistry.get()
+
+    specs = registry.get_for_operator("embedding", "rope")
+    assert any(spec.name == "torch_embedding_rope" for spec in specs)
+    assert any(spec.name == "triton_embedding_rope" for spec in specs)
+    assert get_standard_shapes("embedding", "rope")
+
+
 def test_moe_align_block_size_generator_uses_typed_tensor_input() -> None:
     first = get_input_generator(
         "moe",
@@ -457,3 +540,11 @@ class TestNumericsVerification:
     )
     def test_sampling_argmax_float32(self, spec: KernelSpec):
         self._verify(spec, torch.float32, "logits")
+
+    @pytest.mark.parametrize(
+        "spec",
+        _get_verifiable_specs(torch.bfloat16, "query", family="embedding"),
+        ids=lambda s: f"{s.family}.{s.mode}:{s.name}",
+    )
+    def test_embedding_rope_bf16(self, spec: KernelSpec):
+        self._verify(spec, torch.bfloat16, "query")

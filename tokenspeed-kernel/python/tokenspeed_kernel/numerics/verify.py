@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Iterable
 
 import torch
@@ -32,6 +33,7 @@ from tokenspeed_kernel.numerics.inputs import (
     get_input_generator,
     get_standard_shapes,
 )
+from tokenspeed_kernel.numerics.outputs import get_output_extractor
 from tokenspeed_kernel.numerics.tolerance import (
     Tolerance,
     ToleranceFn,
@@ -46,6 +48,7 @@ from tokenspeed_kernel.selection import (
 from tokenspeed_kernel.signature import FormatSignature
 
 # isort: split
+import tokenspeed_kernel.numerics.embedding  # noqa: F401
 import tokenspeed_kernel.numerics.gemm  # noqa: F401
 import tokenspeed_kernel.numerics.moe  # noqa: F401
 import tokenspeed_kernel.numerics.quantize  # noqa: F401
@@ -100,6 +103,19 @@ def _verification_signature_and_reference(
     return (signatures[0], None) if signatures else (None, None)
 
 
+def _as_output_tuple(value: Any) -> tuple[torch.Tensor, ...]:
+    if isinstance(value, torch.Tensor):
+        return (value,)
+    if isinstance(value, Sequence) and all(
+        isinstance(item, torch.Tensor) for item in value
+    ):
+        return tuple(value)
+    raise TypeError(
+        "compare_outputs currently expects tensor outputs or a sequence of "
+        f"tensor outputs; got {type(value)!r}"
+    )
+
+
 def verify_kernel(
     kernel_name: str,
     *,
@@ -151,6 +167,7 @@ def verify_kernel(
     )
     test_shapes = shapes or get_standard_shapes(spec.family, spec.mode)
     tol_fn = _as_tolerance_fn(tolerance) or get_family_tolerance(spec.family)
+    output_extractor = get_output_extractor(spec.family, spec.mode)
 
     results: list[ComparisonResult] = []
     for shape in test_shapes:
@@ -159,22 +176,38 @@ def verify_kernel(
                 print(f"[SKIP] {kernel_name} shape={shape} incompatible with traits")
             continue
 
-        inputs = generator.generate(**shape)
-        expected = ref_kernel(**inputs)
-        actual = kernel(**inputs)
+        if output_extractor is None:
+            inputs = generator.generate(**shape)
+            expected = ref_kernel(**inputs)
+            actual = kernel(**inputs)
+        else:
+            reference_inputs = generator.generate(**shape)
+            inputs = generator.generate(**shape)
+            expected_result = ref_kernel(**reference_inputs)
+            actual_result = kernel(**inputs)
+            expected = output_extractor(reference_inputs, expected_result)
+            actual = output_extractor(inputs, actual_result)
 
-        if not isinstance(actual, torch.Tensor) or not isinstance(
-            expected, torch.Tensor
-        ):
-            raise TypeError(
-                "compare_outputs currently expects tensor outputs; "
-                f"got actual={type(actual)!r}, expected={type(expected)!r}"
+        actual_outputs = _as_output_tuple(actual)
+        expected_outputs = _as_output_tuple(expected)
+        if len(actual_outputs) != len(expected_outputs):
+            raise ValueError(
+                "Output count mismatch: "
+                f"actual={len(actual_outputs)} expected={len(expected_outputs)}"
             )
 
         tol = tol_fn(dtype, inputs=inputs, **shape)
-        result = compare_outputs(actual, expected, tolerance=tol)
-        if verbose:
-            print(format_comparison(result, f"{kernel_name} shape={shape}"))
-        results.append(result)
+        for output_index, (actual_tensor, expected_tensor) in enumerate(
+            zip(actual_outputs, expected_outputs, strict=True)
+        ):
+            result = compare_outputs(actual_tensor, expected_tensor, tolerance=tol)
+            if verbose:
+                print(
+                    format_comparison(
+                        result,
+                        f"{kernel_name} shape={shape} output={output_index}",
+                    )
+                )
+            results.append(result)
 
     return results
