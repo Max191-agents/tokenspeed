@@ -39,6 +39,9 @@ from tokenspeed_numerics_input_generators import (
     mla_reference,
 )
 
+_FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
+_MLA_DTYPES = frozenset({torch.float16, torch.bfloat16}) | _FP8_DTYPES
+
 
 def _mha_result(
     values: MHAReferenceValues,
@@ -453,7 +456,7 @@ def torch_mha_decode_with_kvcache(
     signatures=format_signatures(
         ("q", "k", "v"),
         "dense",
-        {torch.float16, torch.bfloat16},
+        _MLA_DTYPES,
     ),
     traits={},
     priority=Priority.REFERENCE,
@@ -508,7 +511,7 @@ def torch_mla_prefill(
     signatures=format_signatures(
         ("q", "kv_cache"),
         "dense",
-        {torch.float16, torch.bfloat16},
+        _MLA_DTYPES,
     ),
     traits={},
     priority=Priority.REFERENCE,

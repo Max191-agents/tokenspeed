@@ -103,6 +103,12 @@ from tokenspeed_numerics_input_generators import (
     packed_qkv_complex_rotary_reference,
 )
 
+_FP8_DTYPES = (
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2,
+)
+
 
 def _page_ids(inputs: MHAInputValues) -> list[int]:
     assert inputs.cache is not None
@@ -3369,6 +3375,40 @@ def test_mla_reference_prefill_supports_grouped_kv_heads() -> None:
     torch.testing.assert_close(ref.out[q_start:q_end], expected)
 
 
+@pytest.mark.parametrize("dtype", _FP8_DTYPES)
+def test_mla_prefill_generator_supports_fp8_reference(dtype: torch.dtype) -> None:
+    values = MLAInputs(
+        _mla_config(
+            batch_size=2,
+            total_cached_tokens=0,
+            total_new_q_tokens=6,
+            num_q_heads=4,
+            num_kv_heads=2,
+            qk_nope_head_dim=8,
+            qk_rope_head_dim=4,
+            kv_lora_rank=12,
+            v_head_dim=6,
+            q_dtype=dtype,
+            cache_layout="none",
+            metadata_kwargs={"new_q_length_mode": "fixed_per_request"},
+        )
+    ).generate(metadata_seed=17, value_seed=18, device="cpu")
+
+    ref = mla_reference(values, is_causal=True)
+
+    assert values.q is not None
+    assert values.k is not None
+    assert values.v is not None
+    assert values.q.dtype == dtype
+    assert values.k.dtype == dtype
+    assert values.v.dtype == dtype
+    assert ref.out.shape == (6, 4, 6)
+    assert ref.out.dtype == torch.bfloat16
+    assert ref.lse.shape == (6, 4)
+    assert torch.isfinite(ref.out).all()
+    assert torch.isfinite(ref.lse).all()
+
+
 def test_mla_paged_decode_generator_shapes() -> None:
     inputs = MLAInputs(
         _mla_config(
@@ -3431,6 +3471,45 @@ def test_mla_reference_paged_decode_shapes() -> None:
     assert values.q is not None
     assert ref.out.shape == (2, 1, 4, 12)
     assert ref.out.dtype == torch.float32
+    assert ref.lse.shape == (2, 1, 4)
+    assert torch.isfinite(ref.out).all()
+    assert torch.isfinite(ref.lse).all()
+
+
+@pytest.mark.parametrize("dtype", _FP8_DTYPES)
+def test_mla_paged_decode_generator_supports_fp8_reference(
+    dtype: torch.dtype,
+) -> None:
+    values = MLAInputs(
+        _mla_config(
+            batch_size=2,
+            total_cached_tokens=10,
+            total_new_q_tokens=2,
+            num_q_heads=4,
+            qk_nope_head_dim=8,
+            qk_rope_head_dim=4,
+            kv_lora_rank=12,
+            v_head_dim=6,
+            q_dtype=dtype,
+            cache_layout="paged",
+            page_size=4,
+            indexing="identity",
+            metadata_kwargs={
+                "max_seqlen_k": 6,
+                "cached_length_mode": "regular",
+                "new_q_length_mode": "fixed_per_request",
+            },
+        )
+    ).generate(metadata_seed=19, value_seed=20, device="cpu")
+
+    ref = mla_reference(values)
+
+    assert values.q is not None
+    assert values.cache is not None
+    assert values.q.dtype == dtype
+    assert values.cache.kv_cache.dtype == dtype
+    assert ref.out.shape == (2, 1, 4, 12)
+    assert ref.out.dtype == torch.bfloat16
     assert ref.lse.shape == (2, 1, 4)
     assert torch.isfinite(ref.out).all()
     assert torch.isfinite(ref.lse).all()

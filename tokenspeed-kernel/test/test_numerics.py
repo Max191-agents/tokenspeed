@@ -27,6 +27,7 @@ from tokenspeed_kernel.numerics.inputs import get_input_generator, get_standard_
 from tokenspeed_kernel.numerics.outputs import get_output_extractor
 from tokenspeed_kernel.numerics.tolerance import Tolerance
 from tokenspeed_kernel.numerics.verify import (
+    _compatible_reference_for_signature,
     _verification_signature_and_reference,
     verify_kernel,
 )
@@ -48,6 +49,11 @@ from tokenspeed_numerics_input_generators import (
 )
 
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype
+_mla_fp8_dtypes = (
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2,
+)
 
 
 class TestCompareOutputs:
@@ -810,6 +816,67 @@ def test_attention_mla_decode_generator_uses_package_inputs() -> None:
     assert out.shape == (2, 1, 4, 16)
 
 
+@pytest.mark.parametrize("dtype", _mla_fp8_dtypes)
+def test_attention_mla_fp8_generators_use_package_inputs(
+    dtype: torch.dtype,
+) -> None:
+    prefill_inputs = get_input_generator(
+        "attention",
+        "mla_prefill",
+        dtype=dtype,
+        traits={},
+        device="cpu",
+        seed=106,
+    ).generate(
+        batch_size=2,
+        total_new_q_tokens=6,
+        num_q_heads=4,
+        num_kv_heads=2,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=4,
+        kv_lora_rank=16,
+        v_head_dim=8,
+    )
+    decode_inputs = get_input_generator(
+        "attention",
+        "mla_decode_with_kvcache",
+        dtype=dtype,
+        traits={},
+        device="cpu",
+        seed=107,
+    ).generate(
+        batch_size=2,
+        total_cached_tokens=8,
+        total_new_q_tokens=2,
+        num_q_heads=4,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=4,
+        kv_lora_rank=16,
+        v_head_dim=8,
+        page_size=64,
+    )
+
+    assert prefill_inputs["q"].dtype == dtype
+    assert prefill_inputs["k"].dtype == dtype
+    assert prefill_inputs["v"].dtype == dtype
+    assert decode_inputs["q"].dtype == dtype
+    assert decode_inputs["kv_cache"].dtype == dtype
+
+    from tokenspeed_kernel.numerics.reference.attention import (
+        torch_mla_decode_with_kvcache,
+        torch_mla_prefill,
+    )
+
+    prefill_out = torch_mla_prefill(**prefill_inputs)
+    decode_out = torch_mla_decode_with_kvcache(**decode_inputs)
+    assert isinstance(prefill_out, torch.Tensor)
+    assert isinstance(decode_out, torch.Tensor)
+    assert prefill_out.shape == (6, 4, 8)
+    assert decode_out.shape == (2, 1, 4, 16)
+    assert prefill_out.dtype == torch.bfloat16
+    assert decode_out.dtype == torch.bfloat16
+
+
 def test_attention_mla_numerics_registration_matches_kernel_family() -> None:
     load_builtin_kernels()
     registry = KernelRegistry.get()
@@ -824,7 +891,12 @@ def test_attention_mla_numerics_registration_matches_kernel_family() -> None:
     ):
         specs = registry.get_for_operator("attention", mode)
         assert any(spec.name == reference_name for spec in specs)
-        assert any(spec.name == triton_name for spec in specs)
+        triton_spec = next(spec for spec in specs if spec.name == triton_name)
+        for signature in triton_spec.format_signatures:
+            assert (
+                _compatible_reference_for_signature(registry, triton_spec, signature)
+                is not None
+            )
         assert get_standard_shapes("attention", mode)
 
 
