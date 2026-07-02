@@ -82,6 +82,12 @@ be used to silently produce broken operation inputs. A valid generator call
 should either fail before returning or return values that satisfy the documented
 operation-level constraints for that generator.
 
+The target is just enough verification to make the generator safe to rely on:
+callers should not need to remember hidden shape, dtype, metadata, cache, or
+quantization rules after choosing the appropriate operation-family generator.
+Using the input generator library should be the point where malformed generated
+inputs are ruled out.
+
 This should be treated as a trusted boundary for tests and adapters. If a
 consumer uses the generator library, it should be able to assume that the
 returned inputs are internally coherent for the represented operation. The
