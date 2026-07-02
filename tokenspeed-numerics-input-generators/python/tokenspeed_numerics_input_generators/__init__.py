@@ -120,6 +120,7 @@ from tokenspeed_numerics_input_generators.attention import (
     PackedQKVComplexRotaryInputConfig,
     PackedQKVComplexRotaryInputs,
     PackedQKVComplexRotaryInputValues,
+    attention_generate,
     attention_merge_state_reference,
     deepseek_v4_build_dense_prefill_local_compressed_indices_reference,
     deepseek_v4_combine_dense_swa_indices_reference,
@@ -162,9 +163,12 @@ from tokenspeed_numerics_input_generators.attention_cache import (
     PageTableValues,
 )
 from tokenspeed_numerics_input_generators.attention_metadata import (
+    CacheLayout,
+    LengthMode,
     MHARequestMetadataInput,
     MHARequestMetadataInputConfig,
     MHARequestMetadataValues,
+    PageTableIndexing,
 )
 from tokenspeed_numerics_input_generators.communication import (
     AllGatherDualRMSNormInputConfig,
@@ -467,6 +471,7 @@ __all__ = [
     "ArgmaxPairInputValues",
     "ArgmaxPairInputs",
     "AttentionCacheInput",
+    "CacheLayout",
     "CustomDType",
     "DeepSeekV4PagedIndexInputConfig",
     "DeepSeekV4PagedIndexInputs",
@@ -569,6 +574,7 @@ __all__ = [
     "KVCacheTransferInputValues",
     "KVCacheTransferInputs",
     "KVCacheValues",
+    "LengthMode",
     "MHAInputConfig",
     "MHAInputValues",
     "MHAInputs",
@@ -649,6 +655,7 @@ __all__ = [
     "PageTableGatherInputs",
     "PageTableInputConfig",
     "PageTableValues",
+    "PageTableIndexing",
     "PackedQKVComplexRotaryInputConfig",
     "PackedQKVComplexRotaryInputs",
     "PackedQKVComplexRotaryInputValues",
@@ -708,6 +715,7 @@ __all__ = [
     "all_reduce_residual_rmsnorm_reference",
     "all_reduce_sum_reference",
     "argmax_pair_reference",
+    "attention_generate",
     "attention_merge_state_reference",
     "build_rope_cos_sin_cache",
     "canonicalize_moe_align_block_size",
