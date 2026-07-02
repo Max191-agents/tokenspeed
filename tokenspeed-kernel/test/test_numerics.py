@@ -174,6 +174,44 @@ def test_gemm_input_generator_requires_mxfp8_block_shape() -> None:
         generator.generate(M=4, N=256, K=128)
 
 
+def test_quantize_input_generator_uses_package_fp8_inputs() -> None:
+    first = get_input_generator(
+        "quantize",
+        "fp8_token_group_128",
+        dtype=torch.bfloat16,
+        traits={},
+        device="cpu",
+        seed=71,
+    ).generate(M=3, K=256)
+    second = get_input_generator(
+        "quantize",
+        "fp8_token_group_128",
+        dtype=torch.bfloat16,
+        traits={},
+        device="cpu",
+        seed=71,
+    ).generate(M=3, K=256)
+
+    assert set(first) == {"x"}
+    assert first["x"].shape == (3, 256)
+    assert first["x"].dtype == torch.bfloat16
+    assert torch.equal(first["x"], second["x"])
+
+
+def test_quantize_input_generator_rejects_unsupported_mode() -> None:
+    generator = get_input_generator(
+        "quantize",
+        "fp8_tensor",
+        dtype=torch.bfloat16,
+        traits={},
+        device="cpu",
+    )
+    generator.op_mode = "unsupported"
+
+    with pytest.raises(ValueError, match="unsupported quantize input mode"):
+        generator.generate(M=2, K=128)
+
+
 def test_moe_align_block_size_generator_uses_typed_tensor_input() -> None:
     first = get_input_generator(
         "moe",
