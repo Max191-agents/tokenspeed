@@ -418,6 +418,12 @@ from tokenspeed_numerics_input_generators.sampling import (
     top_k_top_p_sampling_reference,
     top_p_renorm_reference,
 )
+from tokenspeed_numerics_input_generators.transforms import (
+    HadamardTransformInputConfig,
+    HadamardTransformInputs,
+    HadamardTransformInputValues,
+    hadamard_transform_reference,
+)
 
 __all__ = [
     "AllGatherInputConfig",
@@ -548,6 +554,9 @@ __all__ = [
     "GatedActivationInputConfig",
     "GatedActivationInputValues",
     "GatedActivationInputs",
+    "HadamardTransformInputConfig",
+    "HadamardTransformInputValues",
+    "HadamardTransformInputs",
     "InputDType",
     "KVCacheInput",
     "KVCacheInputConfig",
@@ -741,6 +750,7 @@ __all__ = [
     "gated_activation_reference",
     "gemma_rmsnorm_reference",
     "gemm_scale_shape",
+    "hadamard_transform_reference",
     "lm_head_projection_reference",
     "kv_cache_store_reference",
     "kv_cache_transfer_reference",

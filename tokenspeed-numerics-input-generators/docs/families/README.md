@@ -31,3 +31,5 @@ on the config and values classes in code.
   quantization inputs.
 - [sampling](sampling/README.md): argmax, scalar gather, min-p, and top-k/top-p
   sampling inputs.
+- [transforms](transforms/README.md): standalone deterministic tensor
+  transforms such as Walsh-Hadamard.

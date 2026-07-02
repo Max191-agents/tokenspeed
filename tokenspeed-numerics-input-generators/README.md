@@ -255,6 +255,7 @@ input_generators/
   gemm/                     # GEMM-family generators and README
   attention/                # MHA/MLA/cache/metadata generators and README
   moe/                      # MoE-family generators and README
+  transforms/               # standalone deterministic tensor transforms
 ```
 
 The exact names and module boundaries can evolve, but the conceptual split
