@@ -21,7 +21,8 @@
 from __future__ import annotations
 
 import platform
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from typing import Literal
 
 import pytest
 import torch
@@ -31,13 +32,8 @@ from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
-    MLAKVPackKVLayout,
-    MLAKVPackQuantizeFP8InputConfig,
-    MLAKVPackQuantizeFP8Inputs,
-    MLAKVPackQuantizeFP8InputValues,
     MLAPrefillFP8InputConfig,
     MLAPrefillFP8Inputs,
-    mla_kv_pack_quantize_fp8_reference,
     mla_prefill_fp8_reference,
 )
 
@@ -52,6 +48,7 @@ H = 16
 QK_NOPE = 128
 QK_ROPE = 64
 V_HEAD = 128
+KVPackLayout = Literal["separate", "packed_slices"]
 
 # (is_causal, return_lse) variants exposed by tokenspeed_mla_prefill.
 PREFILL_BINARY_VARIANT_FLAGS = [
@@ -71,6 +68,43 @@ def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
+@dataclass
+class _MLAKVPackValues:
+    k_nope: torch.Tensor
+    k_pe: torch.Tensor
+    v: torch.Tensor
+    k_scale_inv: float
+    v_scale_inv: float
+    fp8_dtype: torch.dtype
+    kv_storage: torch.Tensor | None = None
+
+
+def _randn(
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    return torch.randn(
+        *shape,
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    ).to(dtype)
+
+
+def _mla_kv_pack_quantize_fp8_reference(
+    values: _MLAKVPackValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    k_pe_2d = values.k_pe.squeeze(1) if values.k_pe.ndim == 3 else values.k_pe
+    k_pe_heads = k_pe_2d.unsqueeze(1).expand(-1, values.k_nope.shape[1], -1)
+    k = torch.cat((values.k_nope, k_pe_heads), dim=-1)
+    k_fp8 = (k.float() * values.k_scale_inv).to(values.fp8_dtype)
+    v_fp8 = (values.v.float() * values.v_scale_inv).to(values.fp8_dtype)
+    return k_fp8.contiguous(), v_fp8.contiguous()
+
+
 def _make_mla_kv_pack_values(
     device: str,
     *,
@@ -79,30 +113,57 @@ def _make_mla_kv_pack_values(
     v_scale_inv: float = 1.0,
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
     k_pe_rank: int = 3,
-    kv_layout: MLAKVPackKVLayout = "separate",
+    kv_layout: KVPackLayout = "separate",
     seed: int = 0,
-) -> MLAKVPackQuantizeFP8InputValues:
-    return MLAKVPackQuantizeFP8Inputs(
-        MLAKVPackQuantizeFP8InputConfig(
-            num_tokens=S,
-            num_kv_heads=H,
-            qk_nope_head_dim=QK_NOPE,
-            qk_rope_head_dim=QK_ROPE,
-            v_head_dim=V_HEAD,
-            input_dtype=dtype,
-            k_scale_inv=k_scale_inv,
-            v_scale_inv=v_scale_inv,
-            fp8_dtype=fp8_dtype,
-            k_pe_rank=k_pe_rank,
-            kv_layout=kv_layout,
-        )
-    ).generate(seed=seed, device=device)
+) -> _MLAKVPackValues:
+    target_device = torch.device(device)
+    generator_device = "cuda" if target_device.type == "cuda" else "cpu"
+    generator = torch.Generator(device=generator_device).manual_seed(seed)
+    k_pe_shape = (S, QK_ROPE) if k_pe_rank == 2 else (S, 1, QK_ROPE)
+    k_pe = _randn(
+        k_pe_shape,
+        dtype=dtype,
+        device=target_device,
+        generator=generator,
+    ).contiguous()
+    kv_storage = None
+    if kv_layout == "packed_slices":
+        kv_storage = _randn(
+            (S, H, QK_NOPE + V_HEAD),
+            dtype=dtype,
+            device=target_device,
+            generator=generator,
+        ).contiguous()
+        k_nope = kv_storage[..., :QK_NOPE]
+        v = kv_storage[..., QK_NOPE:]
+    else:
+        k_nope = _randn(
+            (S, H, QK_NOPE),
+            dtype=dtype,
+            device=target_device,
+            generator=generator,
+        ).contiguous()
+        v = _randn(
+            (S, H, V_HEAD),
+            dtype=dtype,
+            device=target_device,
+            generator=generator,
+        ).contiguous()
+    return _MLAKVPackValues(
+        k_nope=k_nope,
+        k_pe=k_pe,
+        v=v,
+        k_scale_inv=k_scale_inv,
+        v_scale_inv=v_scale_inv,
+        fp8_dtype=fp8_dtype,
+        kv_storage=kv_storage,
+    )
 
 
 def _make_kv_slice_inputs(
     device: str,
     dtype: torch.dtype = torch.bfloat16,
-) -> MLAKVPackQuantizeFP8InputValues:
+) -> _MLAKVPackValues:
     """Mirror the deepseek_v3.py call site: k_nope and v are slice views of
     a packed kv tensor produced by kv_b_proj."""
     return _make_mla_kv_pack_values(
@@ -147,7 +208,7 @@ def _require_mla_binary_prefill():
 
 
 def _run_mla_kv_pack_quantize_fp8(
-    values: MLAKVPackQuantizeFP8InputValues,
+    values: _MLAKVPackValues,
     *,
     k_out: torch.Tensor | None = None,
     v_out: torch.Tensor | None = None,
@@ -313,7 +374,7 @@ def test_pure_cast_strided_inputs(device: str) -> None:
     assert not values.k_nope.is_contiguous()
     assert not values.v.is_contiguous()
 
-    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
+    k_ref, v_ref = _mla_kv_pack_quantize_fp8_reference(values)
     k_out, v_out = _run_mla_kv_pack_quantize_fp8(values)
     torch.cuda.synchronize()
 
@@ -332,7 +393,7 @@ def test_scaled_independent_k_v(device: str) -> None:
         seed=1,
     )
 
-    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
+    k_ref, v_ref = _mla_kv_pack_quantize_fp8_reference(values)
     k_out, v_out = _run_mla_kv_pack_quantize_fp8(values)
     torch.cuda.synchronize()
 
@@ -359,7 +420,7 @@ def test_contiguous_inputs(device: str) -> None:
     assert values.k_nope.is_contiguous()
     assert values.v.is_contiguous()
 
-    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
+    k_ref, v_ref = _mla_kv_pack_quantize_fp8_reference(values)
     k_out, v_out = _run_mla_kv_pack_quantize_fp8(values)
     torch.cuda.synchronize()
 
@@ -370,7 +431,7 @@ def test_contiguous_inputs(device: str) -> None:
 def test_fp16_input(device: str) -> None:
     values = _make_kv_slice_inputs(device, dtype=torch.float16)
 
-    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
+    k_ref, v_ref = _mla_kv_pack_quantize_fp8_reference(values)
     k_out, v_out = _run_mla_kv_pack_quantize_fp8(values)
     torch.cuda.synchronize()
 
@@ -384,7 +445,7 @@ def test_e5m2_output(device: str) -> None:
         fp8_dtype=torch.float8_e5m2,
         seed=4,
     )
-    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
+    k_ref, v_ref = _mla_kv_pack_quantize_fp8_reference(values)
     k_out, v_out = _run_mla_kv_pack_quantize_fp8(values)
     torch.cuda.synchronize()
 
@@ -411,7 +472,7 @@ def test_preallocated_outputs(device: str) -> None:
     assert k_ret.data_ptr() == k_out.data_ptr()
     assert v_ret.data_ptr() == v_out.data_ptr()
 
-    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
+    k_ref, v_ref = _mla_kv_pack_quantize_fp8_reference(values)
     assert _bitwise_equal(k_out, k_ref)
     assert _bitwise_equal(v_out, v_ref)
 

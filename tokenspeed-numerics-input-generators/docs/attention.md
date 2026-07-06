@@ -31,28 +31,6 @@ generated head counts require expansion. Paged-cache inputs gather compressed
 cache rows through the generated page table and compute absorbed MLA decode
 outputs over the latent KV channels.
 
-### MLA K/V Pack And FP8 Quantize
-
-`MLAKVPackQuantizeFP8Inputs` represents the utility operation that materializes
-MLA K/V tensors for FP8 cache storage. The operation takes non-RoPE key channels
-`k_nope`, RoPE key channels `k_pe`, and value channels `v`:
-
-```text
-k_pe_heads = broadcast(k_pe, across=kv_heads)
-k = concat(k_nope, k_pe_heads, dim=-1)
-k_fp8 = cast_fp8(k * k_scale_inv)
-v_fp8 = cast_fp8(v * v_scale_inv)
-```
-
-`k_nope` and `v` have shape `[num_tokens, num_kv_heads, dim]`. `k_pe` may be
-`[num_tokens, qk_rope_head_dim]` or `[num_tokens, 1, qk_rope_head_dim]`; both
-forms represent the same per-token RoPE key component shared by all KV heads.
-`k_nope` and `v` can be generated as separate contiguous tensors or as
-non-contiguous views into one packed `[tokens, kv_heads, qk_nope + v_dim]`
-projection tensor. Both layouts represent the same logical inputs; the packed
-layout exists so consumers can exercise production-style slice views while the
-reference continues to operate on the logical tensors.
-
 ### MLA FP8 Prefill
 
 `MLAPrefillFP8Inputs` represents varlen MLA prefill attention where
@@ -323,11 +301,10 @@ TokenSpeed has several attention registry entry points: MHA prefill, MHA
 extend/decode with KV cache, MLA prefill, MLA decode with KV cache, and
 attention merge-state. TokenSpeed also exposes GDN QKV split, packed QKV rotary,
 DSA sparse decode KV packing, DSA sparse slot conversion, deterministic DSA
-decode top-k selection, and MLA K/V pack+quantize helpers that map directly to
+decode top-k selection, and MLA FP8 prefill helpers that map directly to
 `GDNQKVSplitInputValues`, `PackedQKVComplexRotaryInputValues`,
 `DSASparseDecodeKVPackInputValues`, `DSATopKSlotInputValues`,
-`DSADecodeTopKInputValues`, `MLAKVPackQuantizeFP8InputValues`, and
-`MLAPrefillFP8InputValues`.
+`DSADecodeTopKInputValues`, and `MLAPrefillFP8InputValues`.
 
 Compressed sequence attention tests should start from
 `CompressedSequenceAttentionInputValues`. Its nested `sliding_window`,

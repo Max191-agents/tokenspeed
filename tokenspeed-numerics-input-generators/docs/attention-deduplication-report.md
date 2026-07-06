@@ -48,19 +48,6 @@ materialized prefill storage dtype/source dtype. If TokenSpeed wants a named
 convenience builder for a specific kernel/test shape, that helper should live
 in TokenSpeed tests/adapters, not in the standalone numerics package.
 
-### `MLAKVPackQuantizeFP8Inputs`
-
-This fuses two concepts:
-
-- MLA K/V assembly: broadcast `k_pe` across KV heads and concatenate it with
-  `k_nope`.
-- FP8 quantization of the assembled K and V tensors.
-
-Recommended direction: split this into reusable MLA K/V assembly inputs plus
-quantization-family utilities. The `packed_slices` option can remain an adapter
-or storage-layout mode, but the generator should not be named as a fused pack
-and quantize kernel.
-
 ### `GDNQKVSplitInputs` And `PackedQKVComplexRotaryInputs`
 
 Both generate a packed QKV projection tensor and then describe a split plus an
@@ -178,11 +165,9 @@ Recommended shared pieces:
 1. Add reusable packed-QKV and metadata/cache-row primitives.
 2. Convert `MLAPrefillFP8Inputs` into `MLAInputs` configuration. Any
    TokenSpeed convenience builder should live outside the numerics package.
-3. Split `MLAKVPackQuantizeFP8Inputs` into MLA K/V assembly plus quantization
-   composition.
-4. Continue refactoring DeepSeek V4 cache layouts and compression-window
+3. Continue refactoring DeepSeek V4 cache layouts and compression-window
    metadata into shared generators where that removes real implementation
    duplication.
-5. Move TokenSpeed-specific convenience builders and compatibility adapters out
+4. Move TokenSpeed-specific convenience builders and compatibility adapters out
    of the standalone numerics package once the kernel tests no longer import
    helper-specific DeepSeek generator names directly.

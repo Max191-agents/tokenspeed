@@ -69,8 +69,6 @@ from tokenspeed_numerics_input_generators import (
     MLAInputs,
     MLAKVCacheInput,
     MLAKVCacheInputConfig,
-    MLAKVPackQuantizeFP8InputConfig,
-    MLAKVPackQuantizeFP8Inputs,
     MLAPrefillFP8InputConfig,
     MLAPrefillFP8Inputs,
     PackedQKVComplexRotaryInputConfig,
@@ -103,7 +101,6 @@ from tokenspeed_numerics_input_generators import (
     gdn_chunk_prefill_reference,
     gdn_qkv_split_reference,
     mha_reference,
-    mla_kv_pack_quantize_fp8_reference,
     mla_prefill_fp8_reference,
     mla_reference,
     packed_qkv_complex_rotary_reference,
@@ -278,179 +275,6 @@ def test_attention_merge_state_rejects_invalid_config() -> None:
                 lse_scale_log2=0.0,
             )
         )
-
-
-def test_mla_kv_pack_quantize_fp8_inputs_generate_values_and_reference() -> None:
-    values = MLAKVPackQuantizeFP8Inputs(
-        MLAKVPackQuantizeFP8InputConfig(
-            num_tokens=5,
-            num_kv_heads=3,
-            qk_nope_head_dim=7,
-            qk_rope_head_dim=4,
-            v_head_dim=6,
-            input_dtype=torch.bfloat16,
-            k_scale_inv=0.5,
-            v_scale_inv=1.7,
-            fp8_dtype=torch.float8_e4m3fn,
-        )
-    ).generate(seed=7, device="cpu")
-
-    assert values.k_nope.shape == (5, 3, 7)
-    assert values.k_pe.shape == (5, 1, 4)
-    assert values.v.shape == (5, 3, 6)
-    assert values.k_nope.dtype == torch.bfloat16
-    assert values.k_pe.dtype == torch.bfloat16
-    assert values.v.dtype == torch.bfloat16
-
-    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
-    k_pe_heads = values.k_pe.squeeze(1).unsqueeze(1).expand(-1, 3, -1)
-    manual_k = torch.cat((values.k_nope, k_pe_heads), dim=-1)
-
-    assert k_ref.shape == (5, 3, 11)
-    assert v_ref.shape == (5, 3, 6)
-    assert k_ref.dtype == torch.float8_e4m3fn
-    assert v_ref.dtype == torch.float8_e4m3fn
-    assert torch.equal(
-        k_ref.view(torch.uint8),
-        (manual_k.float() * values.k_scale_inv)
-        .to(torch.float8_e4m3fn)
-        .view(torch.uint8),
-    )
-    assert torch.equal(
-        v_ref.view(torch.uint8),
-        (values.v.float() * values.v_scale_inv)
-        .to(torch.float8_e4m3fn)
-        .view(torch.uint8),
-    )
-
-
-def test_mla_kv_pack_quantize_fp8_inputs_generate_packed_kv_slices() -> None:
-    values = MLAKVPackQuantizeFP8Inputs(
-        MLAKVPackQuantizeFP8InputConfig(
-            num_tokens=5,
-            num_kv_heads=3,
-            qk_nope_head_dim=7,
-            qk_rope_head_dim=4,
-            v_head_dim=6,
-            input_dtype=torch.bfloat16,
-            kv_layout="packed_slices",
-        )
-    ).generate(seed=17, device="cpu")
-
-    assert values.kv_storage is not None
-    assert values.kv_storage.shape == (5, 3, 13)
-    assert values.k_nope.shape == (5, 3, 7)
-    assert values.v.shape == (5, 3, 6)
-    assert not values.k_nope.is_contiguous()
-    assert not values.v.is_contiguous()
-    assert values.k_nope.data_ptr() == values.kv_storage.data_ptr()
-    assert values.v.data_ptr() > values.kv_storage.data_ptr()
-    torch.testing.assert_close(values.k_nope, values.kv_storage[..., :7])
-    torch.testing.assert_close(values.v, values.kv_storage[..., 7:])
-
-    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
-    assert k_ref.shape == (5, 3, 11)
-    assert v_ref.shape == (5, 3, 6)
-
-
-def test_mla_kv_pack_quantize_fp8_supports_2d_k_pe_and_e5m2() -> None:
-    values = MLAKVPackQuantizeFP8Inputs(
-        MLAKVPackQuantizeFP8InputConfig(
-            num_tokens=4,
-            num_kv_heads=2,
-            qk_nope_head_dim=8,
-            qk_rope_head_dim=5,
-            v_head_dim=7,
-            input_dtype=torch.float16,
-            k_pe_rank=2,
-            fp8_dtype=torch.float8_e5m2,
-        )
-    ).generate(seed=8, device="cpu")
-
-    k_ref, v_ref = mla_kv_pack_quantize_fp8_reference(values)
-
-    assert values.k_pe.shape == (4, 5)
-    assert values.k_nope.dtype == torch.float16
-    assert values.v.dtype == torch.float16
-    assert k_ref.shape == (4, 2, 13)
-    assert v_ref.shape == (4, 2, 7)
-    assert k_ref.dtype == torch.float8_e5m2
-    assert v_ref.dtype == torch.float8_e5m2
-
-
-def test_mla_kv_pack_quantize_fp8_rejects_invalid_config() -> None:
-    with pytest.raises(ValueError, match="k_pe_rank"):
-        MLAKVPackQuantizeFP8Inputs(
-            MLAKVPackQuantizeFP8InputConfig(
-                num_tokens=4,
-                num_kv_heads=2,
-                qk_nope_head_dim=8,
-                qk_rope_head_dim=5,
-                v_head_dim=7,
-                input_dtype=torch.float16,
-                k_pe_rank=4,
-            )
-        )
-
-    with pytest.raises(ValueError, match="kv_layout"):
-        MLAKVPackQuantizeFP8Inputs(
-            MLAKVPackQuantizeFP8InputConfig(
-                num_tokens=4,
-                num_kv_heads=2,
-                qk_nope_head_dim=8,
-                qk_rope_head_dim=5,
-                v_head_dim=7,
-                input_dtype=torch.float16,
-                kv_layout="interleaved",  # type: ignore[arg-type]
-            )
-        )
-
-    with pytest.raises(ValueError, match="k_scale_inv"):
-        MLAKVPackQuantizeFP8Inputs(
-            MLAKVPackQuantizeFP8InputConfig(
-                num_tokens=4,
-                num_kv_heads=2,
-                qk_nope_head_dim=8,
-                qk_rope_head_dim=5,
-                v_head_dim=7,
-                input_dtype=torch.float16,
-                k_scale_inv=0.0,
-            )
-        )
-
-
-def test_mla_kv_pack_quantize_fp8_reference_rejects_bad_shapes() -> None:
-    values = MLAKVPackQuantizeFP8Inputs(
-        MLAKVPackQuantizeFP8InputConfig(
-            num_tokens=4,
-            num_kv_heads=2,
-            qk_nope_head_dim=8,
-            qk_rope_head_dim=5,
-            v_head_dim=7,
-            input_dtype=torch.float32,
-        )
-    ).generate(seed=9, device="cpu")
-    values.k_pe = values.k_pe.expand(-1, 2, -1)
-
-    with pytest.raises(ValueError, match="singleton head"):
-        mla_kv_pack_quantize_fp8_reference(values)
-
-
-def test_mla_kv_pack_quantize_fp8_reference_rejects_mixed_input_dtypes() -> None:
-    values = MLAKVPackQuantizeFP8Inputs(
-        MLAKVPackQuantizeFP8InputConfig(
-            num_tokens=4,
-            num_kv_heads=2,
-            qk_nope_head_dim=8,
-            qk_rope_head_dim=5,
-            v_head_dim=7,
-            input_dtype=torch.float32,
-        )
-    ).generate(seed=10, device="cpu")
-    values.v = values.v.to(torch.float16)
-
-    with pytest.raises(ValueError, match="same dtype"):
-        mla_kv_pack_quantize_fp8_reference(values)
 
 
 def test_mla_prefill_fp8_inputs_generate_values_and_reference() -> None:

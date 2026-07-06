@@ -54,7 +54,6 @@ from tokenspeed_kernel.ops.attention.flashinfer.dsa_topk import (
     deterministic_decode_topk,
     has_deterministic_decode_topk,
 )
-from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_combine_dense_swa_indices,
@@ -120,8 +119,6 @@ from tokenspeed_numerics_input_generators import (
     MHARequestMetadataInputConfig,
     MLAInputConfig,
     MLAInputs,
-    MLAKVPackQuantizeFP8InputConfig,
-    MLAKVPackQuantizeFP8Inputs,
     PackedQKVComplexRotaryInputConfig,
     PackedQKVComplexRotaryInputs,
     attention_merge_state_reference,
@@ -146,7 +143,6 @@ from tokenspeed_numerics_input_generators import (
     dsa_sparse_decode_kv_pack_reference,
     gdn_chunk_prefill_reference,
     gdn_qkv_split_reference,
-    mla_kv_pack_quantize_fp8_reference,
     packed_qkv_complex_rotary_reference,
 )
 
@@ -574,41 +570,6 @@ def test_mla_generator_runs_direct_flash_mla_paged_decode_kernel(device: str) ->
     assert lse.shape == (4, 16, 1)
     assert not torch.isnan(out.float()).any()
     assert not torch.isnan(lse.float()).any()
-
-
-def test_mla_kv_pack_quantize_fp8_generator_runs_tokenspeed_mla_kernel(
-    device: str,
-) -> None:
-    if not current_platform().is_nvidia:
-        pytest.skip("tokenspeed_mla K/V pack+quantize is NVIDIA-only")
-
-    values = MLAKVPackQuantizeFP8Inputs(
-        MLAKVPackQuantizeFP8InputConfig(
-            num_tokens=32,
-            num_kv_heads=4,
-            qk_nope_head_dim=32,
-            qk_rope_head_dim=16,
-            v_head_dim=24,
-            input_dtype=torch.bfloat16,
-            k_scale_inv=0.5,
-            v_scale_inv=1.7,
-            fp8_dtype=torch.float8_e4m3fn,
-        )
-    ).generate(seed=206, device=device)
-    expected_k, expected_v = mla_kv_pack_quantize_fp8_reference(values)
-
-    actual_k, actual_v = mla_kv_pack_quantize_fp8(
-        values.k_nope,
-        values.k_pe,
-        values.v,
-        k_scale_inv=values.k_scale_inv,
-        v_scale_inv=values.v_scale_inv,
-        fp8_dtype=values.fp8_dtype,
-    )
-    torch.cuda.synchronize()
-
-    assert torch.equal(actual_k.view(torch.uint8), expected_k.view(torch.uint8))
-    assert torch.equal(actual_v.view(torch.uint8), expected_v.view(torch.uint8))
 
 
 @pytest.mark.parametrize("fuse_l2norm", [False, True], ids=["split", "split-l2"])
