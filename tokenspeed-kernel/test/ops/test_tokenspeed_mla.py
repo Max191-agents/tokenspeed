@@ -32,9 +32,12 @@ from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
-    MLAPrefillFP8InputConfig,
-    MLAPrefillFP8Inputs,
-    mla_prefill_fp8_reference,
+    MHARequestMetadataInputConfig,
+    LengthMode,
+    MLAInputConfig,
+    MLAInputs,
+    MLAInputValues,
+    mla_reference,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -174,6 +177,46 @@ def _make_kv_slice_inputs(
     )
 
 
+def _make_fp8_mla_prefill_values(
+    *,
+    batch_size: int,
+    total_tokens: int,
+    num_heads: int,
+    length_mode: LengthMode,
+    seed: int,
+    metadata_seed: int,
+    device: str,
+    max_tokens_per_request: int | None = None,
+) -> MLAInputValues:
+    return MLAInputs(
+        MLAInputConfig(
+            batch_size=batch_size,
+            total_cached_tokens=0,
+            total_new_q_tokens=total_tokens,
+            num_q_heads=num_heads,
+            num_kv_heads=num_heads,
+            qk_nope_head_dim=QK_NOPE,
+            qk_rope_head_dim=QK_ROPE,
+            kv_lora_rank=QK_NOPE,
+            v_head_dim=V_HEAD,
+            q_dtype=torch.float8_e4m3fn,
+            k_dtype=torch.float8_e4m3fn,
+            v_dtype=torch.float8_e4m3fn,
+            cache_layout="none",
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=batch_size,
+                total_cached_tokens=0,
+                total_new_q_tokens=total_tokens,
+                total_new_kv_tokens=total_tokens,
+                new_q_length_mode=length_mode,
+                max_new_q_tokens_per_request=max_tokens_per_request,
+                tie_new_kv_to_query=True,
+                cache_layout="none",
+            ),
+        )
+    ).generate(seed=seed, metadata_seed=metadata_seed, device=device)
+
+
 def _host_arch() -> str:
     return {
         "amd64": "x86_64",
@@ -266,25 +309,26 @@ def test_kernel_tokenspeed_mla_prefill_binary_e2e(
     seq_lens_q, seq_lens_k, h_q, h_k = shape_case
     assert seq_lens_q == seq_lens_k
     assert h_q == h_k
-    values = MLAPrefillFP8Inputs(
-        MLAPrefillFP8InputConfig(
-            batch_size=len(seq_lens_q),
-            total_tokens=sum(seq_lens_q),
-            num_heads=h_q,
-            qk_head_dim=QK_NOPE + QK_ROPE,
-            v_head_dim=V_HEAD,
-            source_dtype=torch.bfloat16,
-            length_mode="ragged",
-            max_tokens_per_request=max(seq_lens_q),
-        )
-    ).generate(seed=3 + sum(seq_lens_q) + h_q, metadata_seed=4 + h_q, device=device)
-    expected = mla_prefill_fp8_reference(values, is_causal=is_causal)
+    values = _make_fp8_mla_prefill_values(
+        batch_size=len(seq_lens_q),
+        total_tokens=sum(seq_lens_q),
+        num_heads=h_q,
+        length_mode="ragged",
+        max_tokens_per_request=max(seq_lens_q),
+        seed=3 + sum(seq_lens_q) + h_q,
+        metadata_seed=4 + h_q,
+        device=device,
+    )
+    expected = mla_reference(values, is_causal=is_causal)
+    assert values.q is not None
+    assert values.k is not None
+    assert values.v is not None
 
     try:
         actual = kernel_mla.tokenspeed_mla_prefill(
-            values.query,
-            values.key,
-            values.value,
+            values.q,
+            values.k,
+            values.v,
             values.metadata.cache_seqlens,
             values.metadata.cu_seqlens_kv,
             values.metadata.resolved_max_seqlen_k,
@@ -326,24 +370,25 @@ def test_kernel_tokenspeed_mla_prefill_binary_uses_generator(
     monkeypatch.setattr(mla_prefill, "_PREFILL_BACKEND_ENV", "binary")
     mla_prefill._resolve_backend.cache_clear()
 
-    values = MLAPrefillFP8Inputs(
-        MLAPrefillFP8InputConfig(
-            batch_size=3,
-            total_tokens=192,
-            num_heads=8,
-            qk_head_dim=QK_NOPE + QK_ROPE,
-            v_head_dim=V_HEAD,
-            source_dtype=torch.bfloat16,
-            length_mode="fixed_per_request",
-        )
-    ).generate(seed=30, metadata_seed=31, device=device)
-    expected = mla_prefill_fp8_reference(values, is_causal=True)
+    values = _make_fp8_mla_prefill_values(
+        batch_size=3,
+        total_tokens=192,
+        num_heads=8,
+        length_mode="fixed_per_request",
+        seed=30,
+        metadata_seed=31,
+        device=device,
+    )
+    expected = mla_reference(values, is_causal=True)
+    assert values.q is not None
+    assert values.k is not None
+    assert values.v is not None
 
     try:
         actual, actual_lse = kernel_mla.tokenspeed_mla_prefill(
-            values.query,
-            values.key,
-            values.value,
+            values.q,
+            values.k,
+            values.v,
             values.metadata.cache_seqlens,
             values.metadata.cu_seqlens_kv,
             values.metadata.resolved_max_seqlen_k,

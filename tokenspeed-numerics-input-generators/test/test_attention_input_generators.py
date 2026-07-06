@@ -69,8 +69,6 @@ from tokenspeed_numerics_input_generators import (
     MLAInputs,
     MLAKVCacheInput,
     MLAKVCacheInputConfig,
-    MLAPrefillFP8InputConfig,
-    MLAPrefillFP8Inputs,
     PackedQKVComplexRotaryInputConfig,
     PackedQKVComplexRotaryInputs,
     PageTableInput,
@@ -101,7 +99,6 @@ from tokenspeed_numerics_input_generators import (
     gdn_chunk_prefill_reference,
     gdn_qkv_split_reference,
     mha_reference,
-    mla_prefill_fp8_reference,
     mla_reference,
     packed_qkv_complex_rotary_reference,
 )
@@ -275,109 +272,6 @@ def test_attention_merge_state_rejects_invalid_config() -> None:
                 lse_scale_log2=0.0,
             )
         )
-
-
-def test_mla_prefill_fp8_inputs_generate_values_and_reference() -> None:
-    values = MLAPrefillFP8Inputs(
-        MLAPrefillFP8InputConfig(
-            batch_size=3,
-            total_tokens=12,
-            num_heads=4,
-            qk_head_dim=8,
-            v_head_dim=6,
-            source_dtype=torch.bfloat16,
-            length_mode="regular",
-            fp8_dtype=torch.float8_e4m3fn,
-        )
-    ).generate(seed=21, metadata_seed=22, device="cpu")
-
-    assert values.query.shape == (12, 4, 8)
-    assert values.key.shape == (12, 4, 8)
-    assert values.value.shape == (12, 4, 6)
-    assert values.query.dtype == torch.float8_e4m3fn
-    assert values.key.dtype == torch.float8_e4m3fn
-    assert values.value.dtype == torch.float8_e4m3fn
-    assert values.metadata.cu_seqlens_q_cpu == values.metadata.cu_seqlens_kv_cpu
-    assert values.metadata.max_seqlen_q == 4
-    assert values.metadata.resolved_max_seqlen_k == 4
-
-    refs = mla_prefill_fp8_reference(values, is_causal=True)
-    assert refs.out.shape == (12, 4, 6)
-    assert refs.out.dtype == torch.bfloat16
-    assert refs.lse.shape == (12, 4)
-    assert refs.lse.dtype == torch.float32
-    assert torch.isfinite(refs.out.float()).all()
-    assert torch.isfinite(refs.lse).all()
-
-
-def test_mla_prefill_fp8_metadata_seed_controls_sequence_layout() -> None:
-    generator = MLAPrefillFP8Inputs(
-        MLAPrefillFP8InputConfig(
-            batch_size=4,
-            total_tokens=19,
-            num_heads=2,
-            qk_head_dim=6,
-            v_head_dim=5,
-            source_dtype=torch.float16,
-            length_mode="ragged",
-            max_tokens_per_request=8,
-        )
-    )
-
-    values1 = generator.generate(seed=31, metadata_seed=99, device="cpu")
-    values2 = generator.generate(seed=32, metadata_seed=99, device="cpu")
-
-    assert values1.metadata.cu_seqlens_q_cpu == values2.metadata.cu_seqlens_q_cpu
-    assert values1.metadata.cu_seqlens_kv_cpu == values2.metadata.cu_seqlens_kv_cpu
-    assert not torch.equal(
-        values1.query.view(torch.uint8),
-        values2.query.view(torch.uint8),
-    )
-
-
-def test_mla_prefill_fp8_rejects_invalid_config() -> None:
-    with pytest.raises(ValueError, match="source_dtype"):
-        MLAPrefillFP8Inputs(
-            MLAPrefillFP8InputConfig(
-                batch_size=1,
-                total_tokens=4,
-                num_heads=2,
-                qk_head_dim=8,
-                v_head_dim=6,
-                source_dtype=torch.int32,
-            )
-        )
-
-    with pytest.raises(ValueError, match="fp8_dtype"):
-        MLAPrefillFP8Inputs(
-            MLAPrefillFP8InputConfig(
-                batch_size=1,
-                total_tokens=4,
-                num_heads=2,
-                qk_head_dim=8,
-                v_head_dim=6,
-                source_dtype=torch.float32,
-                fp8_dtype=torch.bfloat16,
-            )
-        )
-
-
-def test_mla_prefill_fp8_reference_rejects_bad_shapes() -> None:
-    values = MLAPrefillFP8Inputs(
-        MLAPrefillFP8InputConfig(
-            batch_size=2,
-            total_tokens=6,
-            num_heads=2,
-            qk_head_dim=8,
-            v_head_dim=6,
-            source_dtype=torch.bfloat16,
-            length_mode="fixed_per_request",
-        )
-    ).generate(seed=41, device="cpu")
-    values.key = values.key[:, :1, :]
-
-    with pytest.raises(ValueError, match="matching head counts"):
-        mla_prefill_fp8_reference(values)
 
 
 def test_gdn_qkv_split_inputs_generate_plain_split_reference() -> None:

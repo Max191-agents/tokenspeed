@@ -25,8 +25,6 @@ compressed/cache-specific representations with different per-token shapes.
   this component.
 - `AttentionMergeStateInputs`: generates merge-state tensors for combining
   partial attention results.
-- `MLAPrefillFP8Inputs`: generates varlen FP8 Q/K/V tensors and tied prefill
-  request metadata for MLA prefill attention.
 - `GDNQKVSplitInputs`: generates packed QKV inputs for split operations.
 - `GDNChunkPrefillInputs`: generates Gated DeltaNet chunked-prefill tensors,
   log-space gates, recurrent state, and sequence metadata.

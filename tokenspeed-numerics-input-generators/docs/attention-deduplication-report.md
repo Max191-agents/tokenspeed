@@ -37,17 +37,6 @@ logic. The remaining candidates below are still useful as migration targets:
 they name fused TokenSpeed operations, but their constituent input concepts are
 now increasingly represented by narrower generators and helpers.
 
-### `MLAPrefillFP8Inputs`
-
-This is mostly `MLAInputs` in an uncached prefill configuration with materialized
-Q/K/V tensors stored in FP8 and tied Q/KV request lengths. The generator exists
-because a TokenSpeed kernel accepts that exact input bundle.
-
-Recommended direction: fold this into `MLAInputs` as configuration for
-materialized prefill storage dtype/source dtype. If TokenSpeed wants a named
-convenience builder for a specific kernel/test shape, that helper should live
-in TokenSpeed tests/adapters, not in the standalone numerics package.
-
 ### `GDNQKVSplitInputs` And `PackedQKVComplexRotaryInputs`
 
 Both generate a packed QKV projection tensor and then describe a split plus an
@@ -163,11 +152,9 @@ Recommended shared pieces:
 ## Suggested Cleanup Order
 
 1. Add reusable packed-QKV and metadata/cache-row primitives.
-2. Convert `MLAPrefillFP8Inputs` into `MLAInputs` configuration. Any
-   TokenSpeed convenience builder should live outside the numerics package.
-3. Continue refactoring DeepSeek V4 cache layouts and compression-window
+2. Continue refactoring DeepSeek V4 cache layouts and compression-window
    metadata into shared generators where that removes real implementation
    duplication.
-4. Move TokenSpeed-specific convenience builders and compatibility adapters out
+3. Move TokenSpeed-specific convenience builders and compatibility adapters out
    of the standalone numerics package once the kernel tests no longer import
    helper-specific DeepSeek generator names directly.

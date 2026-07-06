@@ -29,24 +29,8 @@ and optional new compressed KV inputs.
 inputs use explicit varlen Q/K/V attention, including grouped KV heads when the
 generated head counts require expansion. Paged-cache inputs gather compressed
 cache rows through the generated page table and compute absorbed MLA decode
-outputs over the latent KV channels.
-
-### MLA FP8 Prefill
-
-`MLAPrefillFP8Inputs` represents varlen MLA prefill attention where
-materialized query, key, and value tensors are already stored in FP8:
-
-```text
-scores = query @ key.T * softmax_scale
-probs = softmax(scores)
-out = probs @ value
-```
-
-The generator ties Q and K/V request lengths per sequence, which models true
-prefill and keeps causal masking valid by construction. Sequence metadata is
-generated with the same cumulative-offset machinery used by MHA/MLA request
-generators, while numerical values are generated in a regular floating source
-dtype and cast to the requested FP8 storage dtype.
+outputs over the latent KV channels. FP8 prefill is represented by configuring
+the generated Q, K, and V dtypes on `MLAInputs` directly.
 
 ### GDN Packed QKV Split
 
@@ -301,10 +285,10 @@ TokenSpeed has several attention registry entry points: MHA prefill, MHA
 extend/decode with KV cache, MLA prefill, MLA decode with KV cache, and
 attention merge-state. TokenSpeed also exposes GDN QKV split, packed QKV rotary,
 DSA sparse decode KV packing, DSA sparse slot conversion, deterministic DSA
-decode top-k selection, and MLA FP8 prefill helpers that map directly to
+decode top-k selection, and helpers that map directly to
 `GDNQKVSplitInputValues`, `PackedQKVComplexRotaryInputValues`,
 `DSASparseDecodeKVPackInputValues`, `DSATopKSlotInputValues`,
-`DSADecodeTopKInputValues`, and `MLAPrefillFP8InputValues`.
+and `DSADecodeTopKInputValues`.
 
 Compressed sequence attention tests should start from
 `CompressedSequenceAttentionInputValues`. Its nested `sliding_window`,
