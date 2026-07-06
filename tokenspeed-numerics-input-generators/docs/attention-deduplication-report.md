@@ -7,6 +7,15 @@ helpers represent real operations with their own input contracts. The main goal
 is to avoid creating new generators for renamed shapes or fused pipelines when
 composition would describe the inputs more clearly.
 
+## Configuration Helper Boundary
+
+The standalone numerics package should expose canonical generator configs,
+values, and reusable component generators. Named presets or builders that map
+TokenSpeed model/kernel terminology onto those configs should live in
+TokenSpeed tests or adapters if they are useful. In this report,
+"configuration" means capabilities on canonical configs, not new
+TokenSpeed-specific convenience constructors in the standalone package.
+
 ## Generators That Should Remain Canonical
 
 - `MHAInputs`: canonical generator for multi-head attention with configurable
@@ -29,9 +38,9 @@ Q/K/V tensors stored in FP8 and tied Q/KV request lengths. The generator exists
 because a TokenSpeed kernel accepts that exact input bundle.
 
 Recommended direction: fold this into `MLAInputs` as configuration for
-materialized prefill storage dtype/source dtype, or provide a small config
-builder for `MLAInputConfig`. Keep any TokenSpeed-specific argument conversion
-in tests/adapters.
+materialized prefill storage dtype/source dtype. If TokenSpeed wants a named
+convenience builder for a specific kernel/test shape, that helper should live
+in TokenSpeed tests/adapters, not in the standalone numerics package.
 
 ### `MLAKVPackQuantizeFP8Inputs`
 
@@ -67,10 +76,11 @@ generators/references where needed.
 - grouping/reshaping
 - MXFP4 or FP8 quantization
 
-Recommended direction: keep DeepSeek shape constants and config helpers where
-useful, but generate the component inputs through embedding, transforms, and
-quantization families. The fused references can be test/adaptor compositions
-instead of dedicated generator families.
+Recommended direction: keep DeepSeek-specific shape presets or config builders
+outside the standalone package, in TokenSpeed tests/adapters if needed. The
+numerics package should expose canonical component generators for embedding,
+transforms, and quantization; TokenSpeed code can assemble them for specific
+kernels.
 
 ### DeepSeek V4 Compression + Cache Insert Generators
 
@@ -145,8 +155,8 @@ Recommended shared pieces:
 ## Suggested Cleanup Order
 
 1. Add reusable packed-QKV and metadata/cache-row primitives.
-2. Convert `MLAPrefillFP8Inputs` into `MLAInputs` configuration or a config
-   helper.
+2. Convert `MLAPrefillFP8Inputs` into `MLAInputs` configuration. Any
+   TokenSpeed convenience builder should live outside the numerics package.
 3. Split `MLAKVPackQuantizeFP8Inputs` into MLA K/V assembly plus quantization
    composition.
 4. Refactor DeepSeek V4 cache layouts and compression-window metadata into
