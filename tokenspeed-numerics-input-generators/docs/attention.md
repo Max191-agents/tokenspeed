@@ -200,11 +200,12 @@ the already-masked `logits` tensor plus the output index buffer and `topk`.
 By default, generated rows include an equal-logit boundary case so references
 and kernels must use a deterministic smallest-index tie-break.
 
-### DeepSeek V4 Compressed Attention
+### Compressed Sequence Attention
 
-`DeepSeekV4CompressedAttentionInputs` is the canonical generator for DeepSeek V4
-attention input generation. It represents sliding-window attention plus
-optional compressed-history attention and optional CSA indexer inputs.
+`CompressedSequenceAttentionInputs` is the canonical generator for compressed
+sequence attention input generation. It represents sliding-window attention
+plus optional compressed-history attention and optional CSA indexer inputs. The
+current shape/layout support is DeepSeek V4-style.
 
 The sliding-window portion is always generated. It contains Q, attention sink,
 request metadata, absolute token positions, token-to-request indices, visible
@@ -284,14 +285,14 @@ values:
 - MLA FP8 prefill inputs require tied non-empty Q and K/V request lengths, FP8
   Q/K/V storage, matching head counts, matching Q/K head dimensions, and a
   positive softmax scale
-- DeepSeek V4 compressed-attention inputs require tied Q/KV request lengths,
-  the fixed DeepSeek V4 512-wide attention-head layout with a 64-channel RoPE
-  suffix, positive paged-cache dimensions, and page tables wide enough for the
-  generated visible KV positions
-- DeepSeek V4 compressed-history inputs require `compress_ratio` equal to 4
-  for CSA or 128 for HCA; CSA requires overlapping compressor state, and HCA
-  requires non-overlapping compressor state
-- DeepSeek V4 CSA indexer inputs require compressed-history inputs with
+- compressed sequence attention inputs require tied Q/KV request lengths, the
+  currently supported DeepSeek V4-style 512-wide attention-head layout with a
+  64-channel RoPE suffix, positive paged-cache dimensions, and page tables wide
+  enough for the generated visible KV positions
+- compressed-history inputs require `compress_ratio` equal to 4 for CSA or 128
+  for HCA; CSA requires overlapping compressor state, and HCA requires
+  non-overlapping compressor state
+- CSA indexer inputs require compressed-history inputs with
   `compress_ratio == 4`, valid MXFP4 indexer-cache layouts, and generated
   slot mappings that avoid out-of-bounds cache accesses
 - DeepSeek V4 inverse-RoPE FP8 quantization inputs require grouped head counts
@@ -328,12 +329,13 @@ decode top-k selection, and MLA K/V pack+quantize helpers that map directly to
 `DSADecodeTopKInputValues`, `MLAKVPackQuantizeFP8InputValues`, and
 `MLAPrefillFP8InputValues`.
 
-DeepSeek V4 compressed-attention tests should start from
-`DeepSeekV4CompressedAttentionInputValues`. Its nested `sliding_window`,
+Compressed sequence attention tests should start from
+`CompressedSequenceAttentionInputValues`. Its nested `sliding_window`,
 `compressed`, and `indexer` values contain the narrower bundles consumed by
 TokenSpeed's SWA, HCA, CSA, indexer, cache-insert, cache-gather, and sparse
-index helpers. The DeepSeek V4 inverse-RoPE FP8 quantization helper remains a
-separate utility and consumes `DeepSeekV4InvRoPEFP8QuantInputValues`.
+index helpers for DeepSeek V4-style kernels. The DeepSeek V4 inverse-RoPE FP8
+quantization helper remains a separate utility and consumes
+`DeepSeekV4InvRoPEFP8QuantInputValues`.
 
 Generator values are operation-level values. Tests or adapters are responsible
 for converting generated values into the exact keyword arguments expected by a

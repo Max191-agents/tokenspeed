@@ -87,14 +87,14 @@ __all__ = [
     "GDNChunkPrefillReferenceValues",
     "gdn_chunk_prefill_reference",
     "gdn_qkv_split_reference",
-    "DeepSeekV4CompressedAttentionInputConfig",
-    "DeepSeekV4CompressedAttentionInputs",
-    "DeepSeekV4CompressedAttentionInputValues",
-    "DeepSeekV4CompressedAttentionCompressedConfig",
-    "DeepSeekV4CompressedAttentionCompressedValues",
-    "DeepSeekV4CompressedAttentionIndexerConfig",
-    "DeepSeekV4CompressedAttentionIndexerValues",
-    "DeepSeekV4SlidingWindowAttentionValues",
+    "CompressedSequenceAttentionInputConfig",
+    "CompressedSequenceAttentionInputs",
+    "CompressedSequenceAttentionInputValues",
+    "CompressedSequenceAttentionHistoryConfig",
+    "CompressedSequenceAttentionHistoryValues",
+    "CompressedSequenceAttentionIndexerConfig",
+    "CompressedSequenceAttentionIndexerValues",
+    "CompressedSequenceAttentionSlidingWindowValues",
     "DeepSeekV4CompressorStateInputConfig",
     "DeepSeekV4CompressorStateInputs",
     "DeepSeekV4CompressorStateInputValues",
@@ -3225,8 +3225,8 @@ def dsa_full_context_topk_to_global_slots_reference(
 
 
 @dataclass
-class DeepSeekV4SlidingWindowAttentionValues:
-    """Generated values for the always-present DeepSeek V4 SWA portion."""
+class CompressedSequenceAttentionSlidingWindowValues:
+    """Generated values for the always-present sliding-window attention portion."""
 
     q: torch.Tensor
     attn_sink: torch.Tensor
@@ -3242,17 +3242,18 @@ class DeepSeekV4SlidingWindowAttentionValues:
 
 
 @dataclass
-class DeepSeekV4CompressedAttentionCompressedConfig:
+class CompressedSequenceAttentionHistoryConfig:
     """Configuration for optional compressed-history attention inputs.
 
-    ``compress_ratio=4`` models CSA and defaults to overlapping compressor
-    state. ``compress_ratio=128`` models HCA and defaults to non-overlapping
-    compressor state.
+    ``compress_ratio=4`` models CSA-style compressed sequence attention and
+    defaults to overlapping compressor state. ``compress_ratio=128`` models
+    HCA-style compressed history and defaults to non-overlapping compressor
+    state.
     """
 
     # Required: number of original token positions represented by each
-    # compressed-history row. DeepSeek V4 currently uses 4 for CSA or 128 for
-    # HCA.
+    # compressed-history row. The currently supported DeepSeek V4-style
+    # layouts use 4 for CSA or 128 for HCA.
     compress_ratio: int
 
     # Optional: number of compressed-prefix candidates to generate per token.
@@ -3290,7 +3291,7 @@ class DeepSeekV4CompressedAttentionCompressedConfig:
 
 
 @dataclass
-class DeepSeekV4CompressedAttentionIndexerConfig:
+class CompressedSequenceAttentionIndexerConfig:
     """Configuration for optional CSA indexer inputs."""
 
     # Optional: number of indexer heads used for indexer-Q/weight generation.
@@ -3319,7 +3320,7 @@ class DeepSeekV4CompressedAttentionIndexerConfig:
 
 
 @dataclass
-class DeepSeekV4CompressedAttentionCompressedValues:
+class CompressedSequenceAttentionHistoryValues:
     """Generated optional compressed-history values."""
 
     paged_index: DeepSeekV4PagedIndexValues
@@ -3330,7 +3331,7 @@ class DeepSeekV4CompressedAttentionCompressedValues:
 
 
 @dataclass
-class DeepSeekV4CompressedAttentionIndexerValues:
+class CompressedSequenceAttentionIndexerValues:
     """Generated optional CSA indexer values."""
 
     q_rope_hadamard_mxfp4: DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues
@@ -3340,8 +3341,8 @@ class DeepSeekV4CompressedAttentionIndexerValues:
 
 
 @dataclass
-class DeepSeekV4CompressedAttentionInputValues:
-    """Generated values for DeepSeek-style compressed attention.
+class CompressedSequenceAttentionInputValues:
+    """Generated values for compressed sequence attention.
 
     ``sliding_window`` is always present. ``compressed`` is present for CSA/HCA
     layers. ``indexer`` is present only for CSA-style sparse compressed
@@ -3349,19 +3350,20 @@ class DeepSeekV4CompressedAttentionInputValues:
     """
 
     kind: Literal["swa", "csa", "hca"]
-    sliding_window: DeepSeekV4SlidingWindowAttentionValues
-    compressed: DeepSeekV4CompressedAttentionCompressedValues | None
-    indexer: DeepSeekV4CompressedAttentionIndexerValues | None
+    sliding_window: CompressedSequenceAttentionSlidingWindowValues
+    compressed: CompressedSequenceAttentionHistoryValues | None
+    indexer: CompressedSequenceAttentionIndexerValues | None
 
 
 @dataclass
-class DeepSeekV4CompressedAttentionInputConfig:
-    """Initialization parameters for one DeepSeek-style compressed attention family.
+class CompressedSequenceAttentionInputConfig:
+    """Initialization parameters for compressed sequence attention.
 
     The represented operation is sliding-window attention plus optional
-    compressed-history attention and optional CSA indexer selection. This is the
-    canonical generator for DeepSeek V4 attention inputs; TokenSpeed helper
-    kernels should adapt its nested values to their narrower argument bundles.
+    compressed-history attention and optional CSA indexer selection. The current
+    implementation supports DeepSeek V4-style CSA/HCA layouts; TokenSpeed
+    helper kernels should adapt its nested values to their narrower argument
+    bundles.
     """
 
     # ------------------------------------------------------------------
@@ -3393,11 +3395,12 @@ class DeepSeekV4CompressedAttentionInputConfig:
     # Optional attention-shape and component configuration.
     # ------------------------------------------------------------------
 
-    # Optional: DeepSeek V4 attention head width. Helper references currently
-    # require the model's fixed 512-wide layout.
+    # Optional: attention head width. The current DeepSeek V4-style helper
+    # references require the model's fixed 512-wide layout.
     head_dim: int = _DEEPSEEK_V4_HEAD_DIM
 
-    # Optional: DeepSeek V4 RoPE width. Helper references currently require 64.
+    # Optional: RoPE width. The current DeepSeek V4-style helper references
+    # require 64.
     rope_dim: int = _DEEPSEEK_V4_ROPE_DIM
 
     # Optional: number of generated SWA cache pages. Defaults to the generated
@@ -3405,10 +3408,10 @@ class DeepSeekV4CompressedAttentionInputConfig:
     num_swa_cache_blocks: int | None = None
 
     # Optional: compressed-history component. ``None`` generates SWA-only.
-    compressed: DeepSeekV4CompressedAttentionCompressedConfig | None = None
+    compressed: CompressedSequenceAttentionHistoryConfig | None = None
 
     # Optional: CSA indexer component. Requires compressed.compress_ratio == 4.
-    indexer: DeepSeekV4CompressedAttentionIndexerConfig | None = None
+    indexer: CompressedSequenceAttentionIndexerConfig | None = None
 
     # Optional: metadata/page-table controls shared by generated components.
     indexing: PageTableIndexing = "random"
@@ -3420,15 +3423,15 @@ class DeepSeekV4CompressedAttentionInputConfig:
 
 
 @dataclass(init=False)
-class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
-    """Generator for DeepSeek-style compressed attention inputs."""
+class CompressedSequenceAttentionInputs(NumericsInputGenerator):
+    """Generator for compressed sequence attention inputs."""
 
-    config: DeepSeekV4CompressedAttentionInputConfig
+    config: CompressedSequenceAttentionInputConfig
     q_input: TensorInput | None
     metadata_input: MHARequestMetadataInput | None
     swa_page_table_input: PageTableInput | None
 
-    def __init__(self, config: DeepSeekV4CompressedAttentionInputConfig) -> None:
+    def __init__(self, config: CompressedSequenceAttentionInputConfig) -> None:
         self.config = config
         self.q_input = None
         self.metadata_input = None
@@ -3464,14 +3467,16 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
         metadata_seed: int | None = None,
         value_seed: int | None = None,
         device: DeviceLike = None,
-    ) -> DeepSeekV4CompressedAttentionInputValues:
+    ) -> CompressedSequenceAttentionInputValues:
         self.__post_init__()
         if (
             self.q_input is None
             or self.metadata_input is None
             or self.swa_page_table_input is None
         ):
-            raise ValueError("DeepSeek compressed-attention children must be initialized")
+            raise ValueError(
+                "compressed-sequence-attention children must be initialized"
+            )
         metadata_seed, value_seed = _resolve_attention_seeds(
             seed=seed,
             metadata_seed=metadata_seed,
@@ -3483,7 +3488,7 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
             device=target_device,
         )
         if metadata.new_q_lens_cpu != metadata.new_kv_lens_cpu:
-            raise ValueError("DeepSeek compressed attention requires tied Q/KV lengths")
+            raise ValueError("compressed sequence attention requires tied Q/KV lengths")
 
         self.q_input.shape = (
             self.config.total_new_q_tokens,
@@ -3523,7 +3528,7 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
             raise ValueError(
                 "num_swa_cache_blocks must cover generated SWA page-table pages"
             )
-        sliding = DeepSeekV4SlidingWindowAttentionValues(
+        sliding = CompressedSequenceAttentionSlidingWindowValues(
             q=q,
             attn_sink=torch.zeros(
                 (self.config.num_q_heads,),
@@ -3578,7 +3583,7 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
             kind = "csa"
         else:
             kind = "hca"
-        values = DeepSeekV4CompressedAttentionInputValues(
+        values = CompressedSequenceAttentionInputValues(
             kind=kind,
             sliding_window=sliding,
             compressed=compressed,
@@ -3611,11 +3616,13 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
         self.config.rope_dim = _check_positive("rope_dim", self.config.rope_dim)
         if self.config.head_dim != _DEEPSEEK_V4_HEAD_DIM:
             raise ValueError(
-                f"DeepSeek V4 compressed attention requires head_dim={_DEEPSEEK_V4_HEAD_DIM}"
+                "compressed sequence attention currently requires "
+                f"DeepSeek V4-style head_dim={_DEEPSEEK_V4_HEAD_DIM}"
             )
         if self.config.rope_dim != _DEEPSEEK_V4_ROPE_DIM:
             raise ValueError(
-                f"DeepSeek V4 compressed attention requires rope_dim={_DEEPSEEK_V4_ROPE_DIM}"
+                "compressed sequence attention currently requires "
+                f"DeepSeek V4-style rope_dim={_DEEPSEEK_V4_ROPE_DIM}"
             )
         if self.config.num_swa_cache_blocks is not None:
             self.config.num_swa_cache_blocks = _check_positive(
@@ -3633,7 +3640,9 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
             compressed.compress_ratio,
         )
         if compressed.compress_ratio not in (4, 128):
-            raise ValueError("DeepSeek V4 compressed attention supports ratios 4 or 128")
+            raise ValueError(
+                "compressed sequence attention currently supports ratios 4 or 128"
+            )
         compressed.topk = _check_positive("compressed.topk", compressed.topk)
         if compressed.overlap is None:
             compressed.overlap = compressed.compress_ratio == 4
@@ -3776,7 +3785,7 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
             ),
         ):
             _check_matches(
-                parent_name=f"DeepSeekV4CompressedAttentionInputConfig.{name}",
+                parent_name=f"CompressedSequenceAttentionInputConfig.{name}",
                 child_name=f"metadata_input.{name}",
                 parent_value=parent_value,
                 child_value=child_value,
@@ -3801,7 +3810,7 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
         if self.swa_page_table_input is None:
             raise ValueError("swa_page_table_input must be initialized")
         _check_matches(
-            parent_name="DeepSeekV4CompressedAttentionInputConfig.batch_size",
+            parent_name="CompressedSequenceAttentionInputConfig.batch_size",
             child_name="swa_page_table_input.batch_size",
             parent_value=self.config.batch_size,
             child_value=self.swa_page_table_input.config.batch_size,
@@ -3828,7 +3837,7 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
         metadata_seed: int,
         value_seed: int,
         device: torch.device,
-    ) -> DeepSeekV4CompressedAttentionCompressedValues | None:
+    ) -> CompressedSequenceAttentionHistoryValues | None:
         compressed = self.config.compressed
         if compressed is None:
             return None
@@ -3931,7 +3940,7 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 14),
             device=device,
         )
-        return DeepSeekV4CompressedAttentionCompressedValues(
+        return CompressedSequenceAttentionHistoryValues(
             paged_index=paged_index,
             sparse_prefill_index=sparse_prefill_index,
             compressor_state=compressor_state,
@@ -3945,7 +3954,7 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
         metadata_seed: int,
         value_seed: int,
         device: torch.device,
-    ) -> DeepSeekV4CompressedAttentionIndexerValues | None:
+    ) -> CompressedSequenceAttentionIndexerValues | None:
         compressed = self.config.compressed
         indexer = self.config.indexer
         if compressed is None or indexer is None:
@@ -4020,7 +4029,7 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 23),
             device=device,
         )
-        return DeepSeekV4CompressedAttentionIndexerValues(
+        return CompressedSequenceAttentionIndexerValues(
             q_rope_hadamard_mxfp4=q_rope,
             cache_insert=cache_insert,
             cache_write=cache_write,
@@ -4054,7 +4063,7 @@ class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
             device=parent.device,
         )
 
-    def _validate_values(self, values: DeepSeekV4CompressedAttentionInputValues) -> None:
+    def _validate_values(self, values: CompressedSequenceAttentionInputValues) -> None:
         sliding = values.sliding_window
         if sliding.q.shape != (
             self.config.total_new_q_tokens,

@@ -34,10 +34,11 @@ compressed/cache-specific representations with different per-token shapes.
   log-space gates, recurrent state, and sequence metadata.
 - `PackedQKVComplexRotaryInputs`: generates packed QKV and rotary metadata for
   complex rotary transforms.
-- `DeepSeekV4CompressedAttentionInputs`: generates DeepSeek V4 compressed
-  attention inputs. The sliding-window attention portion is always generated;
-  optional compressed-history and CSA indexer components add the nested values
-  needed by HCA/CSA cache, index, and gather helpers.
+- `CompressedSequenceAttentionInputs`: generates compressed sequence attention
+  inputs. The current layout is DeepSeek V4-style. The sliding-window attention
+  portion is always generated; optional compressed-history and CSA indexer
+  components add the nested values needed by HCA/CSA cache, index, and gather
+  helpers.
 - `DeepSeekV4InvRoPEFP8QuantInputs`: generates the separate DeepSeek V4
   inverse-RoPE output-projection FP8 quantization utility. This is not part of
   compressed attention input generation.

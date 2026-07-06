@@ -96,11 +96,12 @@ generate compressor-state cache contents, request/page metadata, compression
 window metadata, RMSNorm weights, RoPE cache, output cache bytes, and output
 slot mappings.
 
-Current direction: `DeepSeekV4CompressedAttentionInputs` is the canonical
-operation-level generator for DeepSeek V4 compressed attention. It always
-generates the sliding-window portion and optionally generates compressed-history
-and CSA indexer nested values. TokenSpeed helper tests can adapt those nested
-values to narrower kernel entry points.
+Current direction: `CompressedSequenceAttentionInputs` is the canonical
+operation-level generator for compressed sequence attention. It currently
+models DeepSeek V4-style layouts. It always generates the sliding-window
+portion and optionally generates compressed-history and CSA indexer nested
+values. TokenSpeed helper tests can adapt those nested values to narrower
+kernel entry points.
 
 Further cleanup should split the compatibility/helper bundles into reusable
 lower-level generators where that makes the implementation easier to follow:
@@ -134,16 +135,16 @@ write and gather are operation references over that storage.
 
 Current status: the repeated flat slot-mapping generation has been factored
 through `SlotMappingInput`, page/block-table generation can target larger
-physical page pools through `PageTableInput`, and DeepSeek V4 compressed
-attention now has one canonical high-level generator instead of a separate
-generator per CSA/HCA helper path.
+physical page pools through `PageTableInput`, and compressed sequence attention
+now has one canonical high-level generator instead of a separate generator per
+CSA/HCA helper path.
 
 ## Metadata Deduplication Candidates
 
 The following generators are metadata-heavy and share concepts:
 
 - `DSATopKSlotInputs`
-- DeepSeek V4 compressed-attention nested paged/sparse index values
+- compressed sequence attention nested paged/sparse index values
 
 They all generate request/token positions, sequence lengths, page tables or
 block tables, and local-to-global cache slot relationships. They should not

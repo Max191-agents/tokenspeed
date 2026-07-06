@@ -25,10 +25,10 @@ import torch
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
-    DeepSeekV4CompressedAttentionCompressedConfig,
-    DeepSeekV4CompressedAttentionIndexerConfig,
-    DeepSeekV4CompressedAttentionInputConfig,
-    DeepSeekV4CompressedAttentionInputs,
+    CompressedSequenceAttentionHistoryConfig,
+    CompressedSequenceAttentionIndexerConfig,
+    CompressedSequenceAttentionInputConfig,
+    CompressedSequenceAttentionInputs,
     DeepSeekV4CompressorStateInputConfig,
     DeepSeekV4CompressorStateInputs,
     DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig,
@@ -1213,9 +1213,9 @@ def test_dsa_topk_slot_inputs_reject_invalid_configs_and_values() -> None:
         dsa_local_topk_to_global_slots_reference(values)
 
 
-def test_deepseek_v4_compressed_attention_generates_swa_only_values() -> None:
-    values = DeepSeekV4CompressedAttentionInputs(
-        DeepSeekV4CompressedAttentionInputConfig(
+def test_compressed_sequence_attention_generates_swa_only_values() -> None:
+    values = CompressedSequenceAttentionInputs(
+        CompressedSequenceAttentionInputConfig(
             batch_size=2,
             total_cached_tokens=8,
             total_new_q_tokens=4,
@@ -1244,9 +1244,9 @@ def test_deepseek_v4_compressed_attention_generates_swa_only_values() -> None:
     assert values.sliding_window.page_table.shape[0] == 2
 
 
-def test_deepseek_v4_compressed_attention_generates_hca_values() -> None:
-    values = DeepSeekV4CompressedAttentionInputs(
-        DeepSeekV4CompressedAttentionInputConfig(
+def test_compressed_sequence_attention_generates_hca_values() -> None:
+    values = CompressedSequenceAttentionInputs(
+        CompressedSequenceAttentionInputConfig(
             batch_size=2,
             total_cached_tokens=16,
             total_new_q_tokens=4,
@@ -1254,7 +1254,7 @@ def test_deepseek_v4_compressed_attention_generates_hca_values() -> None:
             num_q_heads=2,
             page_size=4,
             window_size=5,
-            compressed=DeepSeekV4CompressedAttentionCompressedConfig(
+            compressed=CompressedSequenceAttentionHistoryConfig(
                 compress_ratio=128,
                 topk=3,
                 num_state_cache_blocks=2,
@@ -1301,9 +1301,9 @@ def test_deepseek_v4_compressed_attention_generates_hca_values() -> None:
     deepseek_v4_dequantize_and_gather_k_cache_reference(values.compressed.k_cache_gather)
 
 
-def test_deepseek_v4_compressed_attention_generates_csa_indexer_values() -> None:
-    values = DeepSeekV4CompressedAttentionInputs(
-        DeepSeekV4CompressedAttentionInputConfig(
+def test_compressed_sequence_attention_generates_csa_indexer_values() -> None:
+    values = CompressedSequenceAttentionInputs(
+        CompressedSequenceAttentionInputConfig(
             batch_size=2,
             total_cached_tokens=16,
             total_new_q_tokens=4,
@@ -1311,7 +1311,7 @@ def test_deepseek_v4_compressed_attention_generates_csa_indexer_values() -> None
             num_q_heads=2,
             page_size=4,
             window_size=5,
-            compressed=DeepSeekV4CompressedAttentionCompressedConfig(
+            compressed=CompressedSequenceAttentionHistoryConfig(
                 compress_ratio=4,
                 topk=3,
                 num_state_cache_blocks=2,
@@ -1319,7 +1319,7 @@ def test_deepseek_v4_compressed_attention_generates_csa_indexer_values() -> None
                 num_kv_cache_blocks=2,
                 kv_cache_block_size=4,
             ),
-            indexer=DeepSeekV4CompressedAttentionIndexerConfig(
+            indexer=CompressedSequenceAttentionIndexerConfig(
                 num_heads=2,
                 num_state_cache_blocks=2,
                 compressor_block_size=4,
@@ -1364,10 +1364,10 @@ def test_deepseek_v4_compressed_attention_generates_csa_indexer_values() -> None
     deepseek_v4_indexer_mxfp4_cache_gather_reference(values.indexer.cache_gather)
 
 
-def test_deepseek_v4_compressed_attention_rejects_invalid_component_mix() -> None:
+def test_compressed_sequence_attention_rejects_invalid_component_mix() -> None:
     with pytest.raises(ValueError, match="indexer requires compressed"):
-        DeepSeekV4CompressedAttentionInputs(
-            DeepSeekV4CompressedAttentionInputConfig(
+        CompressedSequenceAttentionInputs(
+            CompressedSequenceAttentionInputConfig(
                 batch_size=1,
                 total_cached_tokens=1,
                 total_new_q_tokens=1,
@@ -1375,13 +1375,13 @@ def test_deepseek_v4_compressed_attention_rejects_invalid_component_mix() -> Non
                 num_q_heads=1,
                 page_size=1,
                 window_size=1,
-                indexer=DeepSeekV4CompressedAttentionIndexerConfig(),
+                indexer=CompressedSequenceAttentionIndexerConfig(),
             )
         )
 
     with pytest.raises(ValueError, match="only valid for CSA"):
-        DeepSeekV4CompressedAttentionInputs(
-            DeepSeekV4CompressedAttentionInputConfig(
+        CompressedSequenceAttentionInputs(
+            CompressedSequenceAttentionInputConfig(
                 batch_size=1,
                 total_cached_tokens=1,
                 total_new_q_tokens=1,
@@ -1389,10 +1389,10 @@ def test_deepseek_v4_compressed_attention_rejects_invalid_component_mix() -> Non
                 num_q_heads=1,
                 page_size=1,
                 window_size=1,
-                compressed=DeepSeekV4CompressedAttentionCompressedConfig(
+                compressed=CompressedSequenceAttentionHistoryConfig(
                     compress_ratio=128,
                 ),
-                indexer=DeepSeekV4CompressedAttentionIndexerConfig(),
+                indexer=CompressedSequenceAttentionIndexerConfig(),
             )
         )
 
