@@ -542,6 +542,15 @@ Metadata-oriented values such as request lengths and page mappings are generated
 from metadata seeds. Numerical tensors are generated from value seeds so tests
 can reuse the same request/cache layout across different value draws.
 
+`MHARequestMetadataInput`, `PageTableInput`, and `SlotMappingInput` are the
+shared metadata primitives for attention-style generators. Use them for request
+lengths/cumulative offsets, page or block tables, and row-to-cache-slot
+mappings before adding operation-specific metadata generation. Many
+TokenSpeed-facing names are aliases for these concepts: `block_table` is a
+page table when it maps request-local pages to physical cache pages, and
+`slot_mapping`, `kv_slot_mapping`, and `compressor_slot_mapping` are flat slot
+mappings with different consumers.
+
 ## TokenSpeed API Mapping
 
 TokenSpeed has several attention registry entry points: MHA prefill, MHA

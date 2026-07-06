@@ -73,6 +73,8 @@ from tokenspeed_numerics_input_generators import (
     PackedQKVComplexRotaryInputs,
     PageTableInput,
     PageTableInputConfig,
+    SlotMappingInput,
+    SlotMappingInputConfig,
     attention_merge_state_reference,
     deepseek_v4_build_dense_prefill_local_compressed_indices_reference,
     deepseek_v4_combine_dense_swa_indices_reference,
@@ -2656,6 +2658,57 @@ def test_page_table_input_generates_identity_and_random_indexing() -> None:
     assert identity.page_ids() == expected_pages
     assert sorted(random.page_ids()) == expected_pages
     assert random.page_ids() != expected_pages
+
+
+def test_page_table_input_can_index_larger_physical_page_pool() -> None:
+    values = PageTableInput(
+        PageTableInputConfig(
+            batch_size=2,
+            max_pages_per_request=3,
+            indexing="random",
+            num_physical_pages=11,
+        )
+    ).generate(seed=4, device="cpu")
+
+    assert values.page_table.shape == (2, 3)
+    assert values.num_pages == 11
+    assert len(set(values.page_ids())) == 6
+    assert min(values.page_ids()) >= 0
+    assert max(values.page_ids()) < 11
+
+
+def test_slot_mapping_input_generates_unique_nullable_slots() -> None:
+    values = SlotMappingInput(
+        SlotMappingInputConfig(
+            num_rows=8,
+            total_slots=16,
+            negative_count=3,
+        )
+    ).generate(seed=5, device="cpu")
+
+    slots = values.slot_mapping.cpu()
+    mapped = slots[slots >= 0]
+    assert values.slot_mapping.dtype == torch.int64
+    assert int((slots < 0).sum().item()) == 3
+    assert mapped.numel() == 5
+    assert torch.unique(mapped).numel() == mapped.numel()
+    assert int(mapped.max().item()) < 16
+
+
+def test_slot_mapping_input_can_allow_duplicate_gather_slots() -> None:
+    values = SlotMappingInput(
+        SlotMappingInputConfig(
+            num_rows=6,
+            total_slots=2,
+            unique=False,
+            dtype=torch.int32,
+        )
+    ).generate(seed=6, device="cpu")
+
+    assert values.slot_mapping.dtype == torch.int32
+    assert values.slot_mapping.shape == (6,)
+    assert int(values.slot_mapping.min().item()) >= 0
+    assert int(values.slot_mapping.max().item()) < 2
 
 
 def test_kv_cache_input_generates_dense_cache() -> None:

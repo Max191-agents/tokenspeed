@@ -45,6 +45,8 @@ from tokenspeed_numerics_input_generators.attention_metadata import (
     MHARequestMetadataInputConfig,
     MHARequestMetadataValues,
     PageTableIndexing,
+    SlotMappingInput,
+    SlotMappingInputConfig,
 )
 from tokenspeed_numerics_input_generators.core import (
     DeviceLike,
@@ -319,6 +321,171 @@ def _require_tensor(values: torch.Tensor | None, name: str) -> torch.Tensor:
     return values
 
 
+def _generate_slot_mapping_tensor(
+    *,
+    num_rows: int,
+    total_slots: int,
+    negative_count: int,
+    seed: int,
+    device: torch.device,
+    unique: bool = True,
+    dtype: torch.dtype = torch.int64,
+) -> torch.Tensor:
+    """Generate row-to-flat-cache-slot metadata."""
+
+    return SlotMappingInput(
+        SlotMappingInputConfig(
+            num_rows=num_rows,
+            total_slots=total_slots,
+            negative_count=negative_count,
+            unique=unique,
+            dtype=dtype,
+        )
+    ).generate(seed=seed, device=device).slot_mapping
+
+
+def _generate_valid_mask(
+    *,
+    num_rows: int,
+    false_count: int,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate a boolean row-validity mask with exactly ``false_count`` false rows."""
+
+    false_count = _check_nonnegative("false_count", false_count)
+    if false_count > num_rows:
+        raise ValueError("false_count must be <= num_rows")
+    valid = torch.ones((num_rows,), dtype=torch.bool)
+    if false_count:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        order = torch.randperm(num_rows, generator=rng)
+        valid[order[:false_count]] = False
+    return valid.to(device)
+
+
+def _generate_random_positions(
+    *,
+    num_tokens: int,
+    max_position: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate per-token absolute positions inside a RoPE cache range."""
+
+    if dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"position dtype must be int32 or int64, got {dtype}")
+    rng = torch.Generator(device="cpu").manual_seed(seed)
+    positions = torch.randint(
+        0,
+        max_position,
+        (num_tokens,),
+        dtype=dtype,
+        generator=rng,
+    )
+    return positions.to(device)
+
+
+def _generate_token_to_request_indices(
+    *,
+    num_tokens: int,
+    batch_size: int,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate per-token request ids."""
+
+    rng = torch.Generator(device="cpu").manual_seed(seed)
+    reqs = torch.randint(
+        0,
+        batch_size,
+        (num_tokens,),
+        dtype=torch.int64,
+        generator=rng,
+    )
+    return reqs.to(device)
+
+
+def _compression_boundary_positions(
+    *,
+    max_seq_len: int,
+    compress_ratio: int,
+) -> torch.Tensor:
+    return torch.arange(
+        compress_ratio - 1,
+        max_seq_len,
+        compress_ratio,
+        dtype=torch.int64,
+    )
+
+
+def _compression_non_boundary_positions(
+    *,
+    max_seq_len: int,
+    compress_ratio: int,
+) -> torch.Tensor:
+    positions = torch.arange(max_seq_len, dtype=torch.int64)
+    return positions[(positions + 1) % compress_ratio != 0]
+
+
+def _generate_compression_positions(
+    *,
+    num_tokens: int,
+    max_seq_len: int,
+    compress_ratio: int,
+    non_boundary_token_count: int,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate positions with a configured mix of compression-boundary rows."""
+
+    rng = torch.Generator(device="cpu").manual_seed(seed)
+    positions = torch.empty((num_tokens,), dtype=torch.int64)
+    boundary_count = num_tokens - non_boundary_token_count
+    if boundary_count:
+        boundary = _compression_boundary_positions(
+            max_seq_len=max_seq_len,
+            compress_ratio=compress_ratio,
+        )
+        choices = torch.randint(0, boundary.numel(), (boundary_count,), generator=rng)
+        positions[:boundary_count] = boundary[choices]
+    if non_boundary_token_count:
+        non_boundary = _compression_non_boundary_positions(
+            max_seq_len=max_seq_len,
+            compress_ratio=compress_ratio,
+        )
+        choices = torch.randint(
+            0,
+            non_boundary.numel(),
+            (non_boundary_token_count,),
+            generator=rng,
+        )
+        positions[boundary_count:] = non_boundary[choices]
+    if num_tokens:
+        order = torch.randperm(num_tokens, generator=rng)
+        positions = positions[order]
+    return positions.to(device)
+
+
+def _generate_random_uint8_tensor(
+    *,
+    shape: tuple[int, ...],
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate arbitrary byte storage for cache rows."""
+
+    return torch.randint(
+        0,
+        256,
+        shape,
+        dtype=torch.uint8,
+        device=device,
+        generator=_rng_for_device(device, seed),
+    )
+
+
 def _generate_optional_tensor(
     *,
     tensor_input: TensorInput | None,
@@ -334,6 +501,27 @@ def _generate_optional_tensor(
         raise ValueError("tensor_input requires a shape")
     tensor_input.shape = shape
     return tensor_input.generate(seed=seed, device=device).values
+
+
+def _generate_packed_rows(
+    *,
+    tensor_input: TensorInput | None,
+    shape: tuple[int, int],
+    dtype: torch.dtype,
+    seed: int,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    """Generate a packed projection tensor with one row per token."""
+
+    if tensor_input is None:
+        raise ValueError(f"{name}_input must be initialized")
+    tensor_input.shape = shape
+    tensor_input.dtype = dtype
+    return _require_tensor(
+        tensor_input.generate(seed=seed, device=device).values,
+        name,
+    ).contiguous()
 
 
 def attention_generate(
@@ -1296,17 +1484,17 @@ class GDNQKVSplitInputs(NumericsInputGenerator):
         device: DeviceLike = None,
     ) -> GDNQKVSplitInputValues:
         self.__post_init__()
-        if self.mixed_qkv_input is None:
-            raise ValueError("mixed_qkv_input must be initialized")
         target_device = _resolve_device(self.config.device, device)
-        self.mixed_qkv_input.shape = (self.config.num_tokens, self._qkv_dim())
-        self.mixed_qkv_input.dtype = self.config.dtype
-        mixed_qkv = _require_tensor(
-            self.mixed_qkv_input.generate(seed=seed, device=target_device).values,
-            "mixed_qkv",
+        mixed_qkv = _generate_packed_rows(
+            tensor_input=self.mixed_qkv_input,
+            shape=(self.config.num_tokens, self._qkv_dim()),
+            dtype=self.config.dtype,
+            seed=seed,
+            device=target_device,
+            name="mixed_qkv",
         )
         return GDNQKVSplitInputValues(
-            mixed_qkv=mixed_qkv.contiguous(),
+            mixed_qkv=mixed_qkv,
             num_q_heads=self.config.num_q_heads,
             num_k_heads=self.config.num_k_heads,
             num_v_heads=self.config.num_v_heads,
@@ -2078,23 +2266,21 @@ class PackedQKVComplexRotaryInputs(NumericsInputGenerator):
         device: DeviceLike = None,
     ) -> PackedQKVComplexRotaryInputValues:
         self.__post_init__()
-        if self.qkv_input is None:
-            raise ValueError("qkv_input must be initialized")
         target_device = _resolve_device(self.config.device, device)
-        self.qkv_input.shape = (self.config.num_tokens, self._packed_dim())
-        self.qkv_input.dtype = self.config.dtype
-        qkv = _require_tensor(
-            self.qkv_input.generate(
-                seed=_child_seed(seed, 1), device=target_device
-            ).values,
-            "qkv",
+        qkv = _generate_packed_rows(
+            tensor_input=self.qkv_input,
+            shape=(self.config.num_tokens, self._packed_dim()),
+            dtype=self.config.dtype,
+            seed=_child_seed(seed, 1),
+            device=target_device,
+            name="qkv",
         )
         freqs_cis = self._generate_freqs_cis(
             seed=_child_seed(seed, 2),
             device=target_device,
         )
         return PackedQKVComplexRotaryInputValues(
-            qkv=qkv.contiguous(),
+            qkv=qkv,
             freqs_cis=freqs_cis.contiguous(),
             num_heads=self.config.num_heads,
             head_dim=self.config.head_dim,
@@ -3288,21 +3474,13 @@ class DeepSeekV4CompressorStateInputs(NumericsInputGenerator):
     def _generate_slot_mapping(
         self, *, seed: int, device: torch.device
     ) -> torch.Tensor:
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        slot_mapping = torch.full(
-            (self.config.num_tokens,),
-            -1,
-            dtype=torch.int64,
+        return _generate_slot_mapping_tensor(
+            num_rows=self.config.num_tokens,
+            total_slots=self.config.num_cache_blocks * self.config.block_size,
+            negative_count=self.config.invalid_token_count,
+            seed=seed,
+            device=device,
         )
-        if self.config.num_tokens == 0:
-            return slot_mapping.to(device)
-        order = torch.randperm(self.config.num_tokens, generator=rng)
-        valid_count = self.config.num_tokens - self.config.invalid_token_count
-        if valid_count:
-            total_slots = self.config.num_cache_blocks * self.config.block_size
-            slots = torch.randperm(total_slots, generator=rng)[:valid_count]
-            slot_mapping[order[:valid_count]] = slots.to(torch.int64)
-        return slot_mapping.to(device)
 
 
 def _validate_deepseek_v4_compressor_state_values(
@@ -3642,15 +3820,13 @@ class DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(NumericsInputGenerator):
         return (self.config.num_tokens, self.config.num_heads)
 
     def _generate_positions(self, *, seed: int, device: torch.device) -> torch.Tensor:
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        positions = torch.randint(
-            0,
-            self.config.max_position,
-            (self.config.num_tokens,),
+        return _generate_random_positions(
+            num_tokens=self.config.num_tokens,
+            max_position=self.config.max_position,
             dtype=self.config.position_dtype,
-            generator=rng,
+            seed=seed,
+            device=device,
         )
-        return positions.to(device)
 
 
 def _validate_deepseek_v4_indexer_q_rope_hadamard_mxfp4_values(
@@ -4038,15 +4214,13 @@ class DeepSeekV4InvRoPEFP8QuantInputs(NumericsInputGenerator):
         return (self.config.num_tokens, self._num_heads(), self.config.head_dim)
 
     def _generate_positions(self, *, seed: int, device: torch.device) -> torch.Tensor:
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        positions = torch.randint(
-            0,
-            self.config.max_position,
-            (self.config.num_tokens,),
+        return _generate_random_positions(
+            num_tokens=self.config.num_tokens,
+            max_position=self.config.max_position,
             dtype=self.config.position_dtype,
-            generator=rng,
+            seed=seed,
+            device=device,
         )
-        return positions.to(device)
 
 
 def _validate_deepseek_v4_inv_rope_fp8_quant_values(
@@ -4518,53 +4692,36 @@ class DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(NumericsInputGenerator):
         return math.ceil(self.config.max_seq_len / self.config.compressor_block_size)
 
     def _boundary_positions(self) -> torch.Tensor:
-        return torch.arange(
-            self.config.compress_ratio - 1,
-            self.config.max_seq_len,
-            self.config.compress_ratio,
-            dtype=torch.int64,
+        return _compression_boundary_positions(
+            max_seq_len=self.config.max_seq_len,
+            compress_ratio=self.config.compress_ratio,
         )
 
     def _non_boundary_positions(self) -> torch.Tensor:
-        positions = torch.arange(self.config.max_seq_len, dtype=torch.int64)
-        return positions[(positions + 1) % self.config.compress_ratio != 0]
+        return _compression_non_boundary_positions(
+            max_seq_len=self.config.max_seq_len,
+            compress_ratio=self.config.compress_ratio,
+        )
 
     def _generate_token_to_req_indices(
         self, *, seed: int, device: torch.device
     ) -> torch.Tensor:
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        reqs = torch.randint(
-            0,
-            self.config.batch_size,
-            (self.config.num_tokens,),
-            dtype=torch.int64,
-            generator=rng,
+        return _generate_token_to_request_indices(
+            num_tokens=self.config.num_tokens,
+            batch_size=self.config.batch_size,
+            seed=seed,
+            device=device,
         )
-        return reqs.to(device)
 
     def _generate_positions(self, *, seed: int, device: torch.device) -> torch.Tensor:
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        positions = torch.empty((self.config.num_tokens,), dtype=torch.int64)
-        boundary_count = self.config.num_tokens - self.config.non_boundary_token_count
-        if boundary_count:
-            boundary = self._boundary_positions()
-            choices = torch.randint(
-                0, boundary.numel(), (boundary_count,), generator=rng
-            )
-            positions[:boundary_count] = boundary[choices]
-        if self.config.non_boundary_token_count:
-            non_boundary = self._non_boundary_positions()
-            choices = torch.randint(
-                0,
-                non_boundary.numel(),
-                (self.config.non_boundary_token_count,),
-                generator=rng,
-            )
-            positions[boundary_count:] = non_boundary[choices]
-        if self.config.num_tokens:
-            order = torch.randperm(self.config.num_tokens, generator=rng)
-            positions = positions[order]
-        return positions.to(device)
+        return _generate_compression_positions(
+            num_tokens=self.config.num_tokens,
+            max_seq_len=self.config.max_seq_len,
+            compress_ratio=self.config.compress_ratio,
+            non_boundary_token_count=self.config.non_boundary_token_count,
+            seed=seed,
+            device=device,
+        )
 
     def _generate_slot_mapping(
         self,
@@ -4574,14 +4731,13 @@ class DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(NumericsInputGenerator):
         negative_count: int,
         device: torch.device,
     ) -> torch.Tensor:
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        mapping = torch.full((self.config.num_tokens,), -1, dtype=torch.int64)
-        non_negative_count = self.config.num_tokens - negative_count
-        if non_negative_count:
-            order = torch.randperm(self.config.num_tokens, generator=rng)
-            slots = torch.randperm(total_slots, generator=rng)[:non_negative_count]
-            mapping[order[:non_negative_count]] = slots.to(torch.int64)
-        return mapping.to(device)
+        return _generate_slot_mapping_tensor(
+            num_rows=self.config.num_tokens,
+            total_slots=total_slots,
+            negative_count=negative_count,
+            seed=seed,
+            device=device,
+        )
 
     def _generate_block_table(self, *, seed: int, device: torch.device) -> torch.Tensor:
         rng = torch.Generator(device="cpu").manual_seed(seed)
@@ -4595,11 +4751,8 @@ class DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(NumericsInputGenerator):
         return table.to(device)
 
     def _generate_kv_cache(self, *, seed: int, device: torch.device) -> torch.Tensor:
-        generator = _rng_for_device(device, seed)
-        return torch.randint(
-            0,
-            256,
-            (
+        return _generate_random_uint8_tensor(
+            shape=(
                 self.config.num_kv_cache_blocks,
                 self.config.kv_cache_block_size
                 * (
@@ -4607,9 +4760,8 @@ class DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(NumericsInputGenerator):
                     + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
                 ),
             ),
-            dtype=torch.uint8,
+            seed=seed,
             device=device,
-            generator=generator,
         )
 
 
@@ -5210,53 +5362,36 @@ class DeepSeekV4SparseCompressCacheInsertInputs(NumericsInputGenerator):
         return math.ceil(self.config.max_seq_len / self.config.compressor_block_size)
 
     def _boundary_positions(self) -> torch.Tensor:
-        return torch.arange(
-            self.config.compress_ratio - 1,
-            self.config.max_seq_len,
-            self.config.compress_ratio,
-            dtype=torch.int64,
+        return _compression_boundary_positions(
+            max_seq_len=self.config.max_seq_len,
+            compress_ratio=self.config.compress_ratio,
         )
 
     def _non_boundary_positions(self) -> torch.Tensor:
-        positions = torch.arange(self.config.max_seq_len, dtype=torch.int64)
-        return positions[(positions + 1) % self.config.compress_ratio != 0]
+        return _compression_non_boundary_positions(
+            max_seq_len=self.config.max_seq_len,
+            compress_ratio=self.config.compress_ratio,
+        )
 
     def _generate_token_to_req_indices(
         self, *, seed: int, device: torch.device
     ) -> torch.Tensor:
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        reqs = torch.randint(
-            0,
-            self.config.batch_size,
-            (self.config.num_tokens,),
-            dtype=torch.int64,
-            generator=rng,
+        return _generate_token_to_request_indices(
+            num_tokens=self.config.num_tokens,
+            batch_size=self.config.batch_size,
+            seed=seed,
+            device=device,
         )
-        return reqs.to(device)
 
     def _generate_positions(self, *, seed: int, device: torch.device) -> torch.Tensor:
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        positions = torch.empty((self.config.num_tokens,), dtype=torch.int64)
-        boundary_count = self.config.num_tokens - self.config.non_boundary_token_count
-        if boundary_count:
-            boundary = self._boundary_positions()
-            choices = torch.randint(
-                0, boundary.numel(), (boundary_count,), generator=rng
-            )
-            positions[:boundary_count] = boundary[choices]
-        if self.config.non_boundary_token_count:
-            non_boundary = self._non_boundary_positions()
-            choices = torch.randint(
-                0,
-                non_boundary.numel(),
-                (self.config.non_boundary_token_count,),
-                generator=rng,
-            )
-            positions[boundary_count:] = non_boundary[choices]
-        if self.config.num_tokens:
-            order = torch.randperm(self.config.num_tokens, generator=rng)
-            positions = positions[order]
-        return positions.to(device)
+        return _generate_compression_positions(
+            num_tokens=self.config.num_tokens,
+            max_seq_len=self.config.max_seq_len,
+            compress_ratio=self.config.compress_ratio,
+            non_boundary_token_count=self.config.non_boundary_token_count,
+            seed=seed,
+            device=device,
+        )
 
     def _generate_slot_mapping(
         self,
@@ -5266,14 +5401,13 @@ class DeepSeekV4SparseCompressCacheInsertInputs(NumericsInputGenerator):
         negative_count: int,
         device: torch.device,
     ) -> torch.Tensor:
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        mapping = torch.full((self.config.num_tokens,), -1, dtype=torch.int64)
-        non_negative_count = self.config.num_tokens - negative_count
-        if non_negative_count:
-            order = torch.randperm(self.config.num_tokens, generator=rng)
-            slots = torch.randperm(total_slots, generator=rng)[:non_negative_count]
-            mapping[order[:non_negative_count]] = slots.to(torch.int64)
-        return mapping.to(device)
+        return _generate_slot_mapping_tensor(
+            num_rows=self.config.num_tokens,
+            total_slots=total_slots,
+            negative_count=negative_count,
+            seed=seed,
+            device=device,
+        )
 
     def _generate_block_table(self, *, seed: int, device: torch.device) -> torch.Tensor:
         rng = torch.Generator(device="cpu").manual_seed(seed)
@@ -5287,18 +5421,14 @@ class DeepSeekV4SparseCompressCacheInsertInputs(NumericsInputGenerator):
         return table.to(device)
 
     def _generate_kv_cache(self, *, seed: int, device: torch.device) -> torch.Tensor:
-        generator = _rng_for_device(device, seed)
-        return torch.randint(
-            0,
-            256,
-            (
+        return _generate_random_uint8_tensor(
+            shape=(
                 self.config.num_kv_cache_blocks,
                 self.config.kv_cache_block_size
                 * (_DEEPSEEK_V4_SWA_TOKEN_STRIDE + _DEEPSEEK_V4_SWA_SCALE_DIM),
             ),
-            dtype=torch.uint8,
+            seed=seed,
             device=device,
-            generator=generator,
         )
 
 
@@ -5797,41 +5927,30 @@ class DeepSeekV4IndexerMXFP4CacheWriteInputs(NumericsInputGenerator):
         )
 
     def _generate_cache(self, *, seed: int, device: torch.device) -> torch.Tensor:
-        rng_device = "cuda" if device.type == "cuda" else "cpu"
-        generator = torch.Generator(device=rng_device).manual_seed(seed)
-        return torch.randint(
-            0,
-            256,
-            (self.config.num_cache_blocks, self._cache_row_bytes()),
-            dtype=torch.uint8,
+        return _generate_random_uint8_tensor(
+            shape=(self.config.num_cache_blocks, self._cache_row_bytes()),
+            seed=seed,
             device=device,
-            generator=generator,
         )
 
     def _generate_slot_mapping(
         self, *, seed: int, device: torch.device
     ) -> torch.Tensor:
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        slots = torch.full((self.config.num_rows,), -1, dtype=torch.int64)
-        if self.config.num_rows == 0:
-            return slots.to(device)
-        order = torch.randperm(self.config.num_rows, generator=rng)
-        non_negative_count = self.config.num_rows - self.config.negative_slot_count
-        if non_negative_count:
-            total_slots = self.config.num_cache_blocks * self.config.block_size
-            slots[order[:non_negative_count]] = torch.randperm(
-                total_slots,
-                generator=rng,
-            )[:non_negative_count].to(torch.int64)
-        return slots.to(device)
+        return _generate_slot_mapping_tensor(
+            num_rows=self.config.num_rows,
+            total_slots=self.config.num_cache_blocks * self.config.block_size,
+            negative_count=self.config.negative_slot_count,
+            seed=seed,
+            device=device,
+        )
 
     def _generate_valid(self, *, seed: int, device: torch.device) -> torch.Tensor:
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        valid = torch.ones((self.config.num_rows,), dtype=torch.bool)
-        if self.config.masked_row_count:
-            order = torch.randperm(self.config.num_rows, generator=rng)
-            valid[order[: self.config.masked_row_count]] = False
-        return valid.to(device)
+        return _generate_valid_mask(
+            num_rows=self.config.num_rows,
+            false_count=self.config.masked_row_count,
+            seed=seed,
+            device=device,
+        )
 
 
 def _deepseek_v4_mxfp4_nibble_reference(x: torch.Tensor) -> torch.Tensor:
@@ -6127,15 +6246,10 @@ class DeepSeekV4IndexerMXFP4CacheGatherInputs(NumericsInputGenerator):
         )
 
     def _generate_cache(self, *, seed: int, device: torch.device) -> torch.Tensor:
-        rng_device = "cuda" if device.type == "cuda" else "cpu"
-        generator = torch.Generator(device=rng_device).manual_seed(seed)
-        return torch.randint(
-            0,
-            256,
-            (self.config.num_cache_blocks, self._cache_row_bytes()),
-            dtype=torch.uint8,
+        return _generate_random_uint8_tensor(
+            shape=(self.config.num_cache_blocks, self._cache_row_bytes()),
+            seed=seed,
             device=device,
-            generator=generator,
         )
 
     def _generate_output(
@@ -6145,35 +6259,23 @@ class DeepSeekV4IndexerMXFP4CacheGatherInputs(NumericsInputGenerator):
         shape: tuple[int, int],
         device: torch.device,
     ) -> torch.Tensor:
-        rng_device = "cuda" if device.type == "cuda" else "cpu"
-        generator = torch.Generator(device=rng_device).manual_seed(seed)
-        return torch.randint(
-            0,
-            256,
-            shape,
-            dtype=torch.uint8,
+        return _generate_random_uint8_tensor(
+            shape=shape,
+            seed=seed,
             device=device,
-            generator=generator,
         )
 
     def _generate_slot_mapping(
         self, *, seed: int, device: torch.device
     ) -> torch.Tensor:
-        rng = torch.Generator(device="cpu").manual_seed(seed)
-        slots = torch.full((self.config.num_rows,), -1, dtype=torch.int64)
-        non_negative_count = self.config.num_rows - self.config.negative_slot_count
-        if non_negative_count:
-            total_slots = self.config.num_cache_blocks * self.config.block_size
-            slots[:non_negative_count] = torch.randint(
-                0,
-                total_slots,
-                (non_negative_count,),
-                dtype=torch.int64,
-                generator=rng,
-            )
-            order = torch.randperm(self.config.num_rows, generator=rng)
-            slots = slots[order]
-        return slots.to(device)
+        return _generate_slot_mapping_tensor(
+            num_rows=self.config.num_rows,
+            total_slots=self.config.num_cache_blocks * self.config.block_size,
+            negative_count=self.config.negative_slot_count,
+            unique=False,
+            seed=seed,
+            device=device,
+        )
 
 
 def _validate_deepseek_v4_indexer_mxfp4_cache_gather_values(
@@ -6379,7 +6481,7 @@ class DeepSeekV4KCacheGatherInputs(NumericsInputGenerator):
             generator=metadata_generator,
         )
         block_table = self._generate_block_table(
-            generator=metadata_generator,
+            seed=_child_seed(metadata_seed, 2),
             device=target_device,
         )
         base_offsets = None
@@ -6503,20 +6605,21 @@ class DeepSeekV4KCacheGatherInputs(NumericsInputGenerator):
     def _generate_block_table(
         self,
         *,
-        generator: torch.Generator,
+        seed: int,
         device: torch.device,
     ) -> torch.Tensor:
         width = self._max_blocks_per_seq()
         if self.config.batch_size == 0:
             return torch.empty((0, width), dtype=torch.int32, device=device)
         assert self.config.num_cache_blocks is not None
-        page_ids = torch.randperm(
-            self.config.num_cache_blocks,
-            dtype=torch.int64,
-            device=device,
-            generator=generator,
-        )[: self._required_page_table_entries()]
-        return page_ids.reshape(self.config.batch_size, width).to(torch.int32)
+        return PageTableInput(
+            PageTableInputConfig(
+                batch_size=self.config.batch_size,
+                max_pages_per_request=width,
+                indexing="random",
+                num_physical_pages=self.config.num_cache_blocks,
+            )
+        ).generate(seed=seed, device=device).page_table
 
     def _generate_out(
         self,

@@ -31,6 +31,12 @@ TokenSpeed-specific convenience constructors in the standalone package.
 
 ## Strong Deduplication Candidates
 
+Current shared primitives already cover request metadata, page/block tables,
+flat slot mappings, packed-row tensor generation, and common byte-cache helper
+logic. The remaining candidates below are still useful as migration targets:
+they name fused TokenSpeed operations, but their constituent input concepts are
+now increasingly represented by narrower generators and helpers.
+
 ### `MLAPrefillFP8Inputs`
 
 This is mostly `MLAInputs` in an uncached prefill configuration with materialized
@@ -94,9 +100,11 @@ Recommended direction: split these into reusable lower-level generators:
 
 - compressor-state cache rows
 - compression-window metadata
-- page/block-table metadata
+- page/block-table metadata, using `PageTableInput` where the table semantics
+  are a physical page lookup
 - RMSNorm parameters
 - RoPE metadata
+- flat compressor and KV slot mappings, using `SlotMappingInput`
 - indexer MXFP4 cache rows
 - sparse K-cache byte rows
 
@@ -116,6 +124,10 @@ Recommended direction: move byte-cache layout generation into cache-oriented
 generators, then have write/gather tests compose cache rows with slot mappings.
 This follows the same pattern as GEMM: the storage format is reusable, while
 write and gather are operation references over that storage.
+
+Current status: the repeated flat slot-mapping generation has been factored
+through `SlotMappingInput`, and page/block-table generation can target larger
+physical page pools through `PageTableInput`.
 
 ## Metadata Deduplication Candidates
 

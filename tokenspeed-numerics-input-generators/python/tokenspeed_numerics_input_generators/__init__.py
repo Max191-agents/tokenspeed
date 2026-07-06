@@ -171,6 +171,9 @@ from tokenspeed_numerics_input_generators.attention_metadata import (
     MHARequestMetadataInputConfig,
     MHARequestMetadataValues,
     PageTableIndexing,
+    SlotMappingInput,
+    SlotMappingInputConfig,
+    SlotMappingValues,
 )
 from tokenspeed_numerics_input_generators.communication import (
     AllGatherDualRMSNormInputConfig,
@@ -585,6 +588,9 @@ __all__ = [
     "MHARequestMetadataInput",
     "MHARequestMetadataValues",
     "MHAReferenceValues",
+    "SlotMappingInput",
+    "SlotMappingInputConfig",
+    "SlotMappingValues",
     "MinPRenormInputConfig",
     "MinPRenormInputValues",
     "MinPRenormInputs",

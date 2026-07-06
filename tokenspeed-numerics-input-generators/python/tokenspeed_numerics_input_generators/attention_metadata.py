@@ -39,6 +39,9 @@ __all__ = [
     "MHARequestMetadataInput",
     "MHARequestMetadataValues",
     "PageTableIndexing",
+    "SlotMappingInput",
+    "SlotMappingInputConfig",
+    "SlotMappingValues",
 ]
 
 CacheLayout = Literal["none", "dense", "paged"]
@@ -229,6 +232,114 @@ class MHARequestMetadataValues:
     cache_seqlens: torch.Tensor
     max_seqlen_q: int
     resolved_max_seqlen_k: int
+
+
+@dataclass
+class SlotMappingValues:
+    """Generated flat slot mapping metadata.
+
+    ``slot_mapping[i]`` gives the flat cache slot used by row ``i``. Negative
+    entries represent rows that should not read or write a cache slot.
+    """
+
+    slot_mapping: torch.Tensor
+
+
+@dataclass
+class SlotMappingInputConfig:
+    """Initialization parameters for ``SlotMappingInput``."""
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of generated row mappings.
+    num_rows: int
+
+    # Required: number of addressable non-negative flat cache slots.
+    total_slots: int
+
+    # ------------------------------------------------------------------
+    # Optional mapping configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: number of rows generated with slot id -1.
+    negative_count: int = 0
+
+    # Optional: require non-negative slot ids to be unique.
+    unique: bool = True
+
+    # Optional: integer dtype for the generated tensor.
+    dtype: torch.dtype = torch.int64
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class SlotMappingInput(NumericsInputGenerator):
+    """Generator for flat cache slot mappings.
+
+    This is the common metadata behind names such as ``slot_mapping``,
+    ``kv_slot_mapping``, ``compressor_slot_mapping``, and cache gather
+    mappings. It intentionally produces only the mapping tensor; request/page
+    metadata is represented by separate generators.
+    """
+
+    config: SlotMappingInputConfig
+
+    def __init__(self, config: SlotMappingInputConfig) -> None:
+        self.config = config
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_rows = _check_nonnegative("num_rows", self.config.num_rows)
+        self.config.total_slots = _check_nonnegative(
+            "total_slots", self.config.total_slots
+        )
+        self.config.negative_count = _check_nonnegative(
+            "negative_count", self.config.negative_count
+        )
+        if self.config.negative_count > self.config.num_rows:
+            raise ValueError("negative_count must be <= num_rows")
+        if self.config.dtype not in (torch.int32, torch.int64):
+            raise TypeError(
+                "SlotMappingInput dtype must be torch.int32 or torch.int64, "
+                f"got {self.config.dtype}"
+            )
+        non_negative_count = self.config.num_rows - self.config.negative_count
+        if non_negative_count and self.config.total_slots <= 0:
+            raise ValueError("total_slots must be positive when any row is mapped")
+        if self.config.unique and non_negative_count > self.config.total_slots:
+            raise ValueError(
+                "unique slot mapping requires non-negative rows to fit in "
+                f"total_slots; got {non_negative_count} > {self.config.total_slots}"
+            )
+
+    def generate(self, *, seed: int, device: DeviceLike = None) -> SlotMappingValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        slots = torch.full((self.config.num_rows,), -1, dtype=torch.int64)
+        non_negative_count = self.config.num_rows - self.config.negative_count
+        if non_negative_count:
+            row_order = torch.randperm(self.config.num_rows, generator=rng)
+            if self.config.unique:
+                values = torch.randperm(self.config.total_slots, generator=rng)[
+                    :non_negative_count
+                ]
+            else:
+                values = torch.randint(
+                    0,
+                    self.config.total_slots,
+                    (non_negative_count,),
+                    dtype=torch.int64,
+                    generator=rng,
+                )
+            slots[row_order[:non_negative_count]] = values.to(torch.int64)
+        return SlotMappingValues(
+            slot_mapping=slots.to(device=target_device, dtype=self.config.dtype)
+        )
 
 
 @dataclass

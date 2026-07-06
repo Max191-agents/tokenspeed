@@ -8,6 +8,15 @@ compressed/cache-specific representations with different per-token shapes.
 
 ## Generators
 
+- `MHARequestMetadataInput`: generates request token lengths, cumulative
+  offsets, visible KV lengths, and cache sequence lengths shared by MHA, MLA,
+  and sparse-index metadata generators.
+- `PageTableInput`: generates page/block table metadata. It can model a table
+  that covers exactly its entries or indexes into a larger physical page pool.
+- `SlotMappingInput`: generates flat row-to-cache-slot mappings with optional
+  negative rows for skipped reads or writes.
+- `KVCacheInput` and `MLAKVCacheInput`: generate dense or paged cache storage
+  for MHA and compressed MLA cache layouts.
 - `MHAInputs`: generates Q, optional new K/V, request metadata, and optional
   dense or paged KV cache state for MHA.
 - `MLAInputs`: generates MLA query/cache inputs using the same metadata/cache
@@ -54,8 +63,10 @@ so different numerical draws can share the same request layout, page mapping,
 or sparse-index structure.
 
 Cache/page generation enforces valid page tables, request lengths, and cache
-slot relationships. Kernel-specific names such as `block_tables` or flattened
-registry arguments belong in adapters outside the generator.
+slot relationships. Different kernel names such as `page_table`, `block_table`,
+`slot_mapping`, `kv_slot_mapping`, or `compressor_slot_mapping` should map back
+to these shared metadata concepts when their semantics match. Kernel-specific
+flattened registry arguments belong in adapters outside the generator.
 
 See `../../attention-deduplication-report.md` for the current cleanup plan for
 over-specific and fused attention generators.

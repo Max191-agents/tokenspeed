@@ -119,6 +119,10 @@ class PageTableInputConfig:
     # non-contiguous cache allocation; identity models row-major page ids.
     indexing: PageTableIndexing = "random"
 
+    # Optional: number of physical pages available for table entries. Defaults
+    # to exactly batch_size * max_pages_per_request.
+    num_physical_pages: int | None = None
+
     # Optional: default generation device.
     device: DeviceLike = None
 
@@ -149,6 +153,11 @@ class PageTableInput(NumericsInputGenerator):
             self.config.max_pages_per_request,
         )
         self.config.indexing = _check_page_table_indexing(self.config.indexing)
+        if self.config.num_physical_pages is not None:
+            self.config.num_physical_pages = _check_positive(
+                "num_physical_pages",
+                self.config.num_physical_pages,
+            )
 
     def generate(self, *, seed: int, device: DeviceLike = None) -> PageTableValues:
         target_device = _resolve_device(self.config.device, device)
@@ -158,11 +167,25 @@ class PageTableInput(NumericsInputGenerator):
             self.config.max_pages_per_request,
         )
         self.config.indexing = _check_page_table_indexing(self.config.indexing)
-        num_pages = self.config.batch_size * self.config.max_pages_per_request
+        required_entries = self.config.batch_size * self.config.max_pages_per_request
+        num_pages = (
+            required_entries
+            if self.config.num_physical_pages is None
+            else self.config.num_physical_pages
+        )
+        if num_pages < required_entries:
+            raise ValueError(
+                "num_physical_pages must cover the generated page-table entries; "
+                f"got {num_pages} < {required_entries}"
+            )
         if self.config.indexing == "random":
-            page_table_cpu = self._make_random_page_table(seed, num_pages)
+            page_table_cpu = self._make_random_page_table(
+                seed,
+                num_pages,
+                required_entries,
+            )
         else:
-            page_table_cpu = self._make_identity_page_table(num_pages)
+            page_table_cpu = self._make_identity_page_table(required_entries)
 
         return PageTableValues(
             page_table=torch.tensor(
@@ -174,13 +197,20 @@ class PageTableInput(NumericsInputGenerator):
             num_pages=num_pages,
         )
 
-    def _make_identity_page_table(self, num_pages: int) -> list[list[int]]:
-        physical_pages = list(range(num_pages))
+    def _make_identity_page_table(self, required_entries: int) -> list[list[int]]:
+        physical_pages = list(range(required_entries))
         return self._assign_physical_pages(physical_pages)
 
-    def _make_random_page_table(self, seed: int, num_pages: int) -> list[list[int]]:
+    def _make_random_page_table(
+        self,
+        seed: int,
+        num_pages: int,
+        required_entries: int,
+    ) -> list[list[int]]:
         generator = torch.Generator(device="cpu").manual_seed(seed)
-        physical_pages = torch.randperm(num_pages, generator=generator).tolist()
+        physical_pages = torch.randperm(num_pages, generator=generator)[
+            :required_entries
+        ].tolist()
         return self._assign_physical_pages([int(page) for page in physical_pages])
 
     def _assign_physical_pages(self, physical_pages: list[int]) -> list[list[int]]:
