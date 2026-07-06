@@ -245,10 +245,6 @@ from tokenspeed_numerics_input_generators.gemm import (
     GemmInputValues,
     gemm_reference,
     gemm_scale_shape,
-    mxfp4_gemm_input_config,
-    mxfp8_gemm_input_config,
-    mxint4_gemm_input_config,
-    nvfp4_gemm_input_config,
 )
 from tokenspeed_numerics_input_generators.kvcache import (
     FP8KVCacheWriteInputConfig,
@@ -762,10 +758,6 @@ __all__ = [
     "moe_reference",
     "moe_softplus_sqrt_topk_routing_reference",
     "moe_softmax_topk_routing_reference",
-    "mxfp4_gemm_input_config",
-    "mxfp8_gemm_input_config",
-    "mxint4_gemm_input_config",
-    "nvfp4_gemm_input_config",
     "mxfp4_quantization_reference",
     "mxfp4_scale_shape",
     "mxfp8_quantization_reference",

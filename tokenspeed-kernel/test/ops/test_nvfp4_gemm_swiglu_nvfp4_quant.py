@@ -26,14 +26,16 @@ from dataclasses import dataclass
 import pytest
 import torch
 from tokenspeed_numerics_input_generators import (
+    CustomDType,
     FusedSwiGLUNVFP4QuantInputValues,
+    GemmInputConfig,
     GemmInputValues,
     GemmInputs,
     TensorInput,
     fused_swiglu_nvfp4_quant_reference,
     gemm_reference,
+    gemm_scale_shape,
     nvfp4_dequantization_reference,
-    nvfp4_gemm_input_config,
 )
 
 
@@ -86,11 +88,29 @@ def _generate_nvfp4_gemm_swiglu_values(
     device: str,
 ) -> _NVFP4GemmSwiGLUValues:
     gemm = GemmInputs(
-        nvfp4_gemm_input_config(
+        GemmInputConfig(
             M=m,
             N=2 * intermediate_size,
             K=k,
+            a_dtype=CustomDType.NVFP4,
+            b_dtype=CustomDType.NVFP4,
             c_dtype=torch.bfloat16,
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=m,
+                N=2 * intermediate_size,
+                K=k,
+                block_shape=(16,),
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=m,
+                N=2 * intermediate_size,
+                K=k,
+                block_shape=(16,),
+            ),
         )
     ).generate(seed=seed, device=device)
     assert gemm.A is not None

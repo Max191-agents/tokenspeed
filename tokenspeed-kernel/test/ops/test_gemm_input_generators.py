@@ -27,11 +27,11 @@ import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
+    CustomDType,
     GemmInputConfig,
     GemmInputs,
     gemm_reference,
-    mxfp4_gemm_input_config,
-    mxfp8_gemm_input_config,
+    gemm_scale_shape,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -89,11 +89,29 @@ def test_dense_gemm_generator_runs_reference_kernel(device: str, require) -> Non
 def test_mxfp4_gemm_generator_runs_triton_kernel(device: str, require) -> None:
     require("gemm", "mm", "triton", torch.uint8, "a")
     values = GemmInputs(
-        mxfp4_gemm_input_config(
+        GemmInputConfig(
             M=5,
             N=33,
             K=64,
+            a_dtype=CustomDType.MXFP4,
+            b_dtype=CustomDType.MXFP4,
             c_dtype=torch.float32,
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=5,
+                N=33,
+                K=64,
+                block_shape=(32,),
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=5,
+                N=33,
+                K=64,
+                block_shape=(32,),
+            ),
         )
     ).generate(seed=31, device=device)
     assert values.A is not None
@@ -292,12 +310,31 @@ def test_mxfp8_blockscale_gemm_generator_runs_triton_kernel(
     block_size = [128, 128]
     M, N, K = 8, 256, 256
     values = GemmInputs(
-        mxfp8_gemm_input_config(
+        GemmInputConfig(
             M=M,
             N=N,
             K=K,
+            a_dtype=torch.float8_e4m3fn,
+            b_dtype=torch.float8_e4m3fn,
             c_dtype=torch.float16,
-            block_shape=tuple(block_size),
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=M,
+                N=N,
+                K=K,
+                block_shape=tuple(block_size),
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=M,
+                N=N,
+                K=K,
+                block_shape=tuple(block_size),
+            ),
+            a_scale_dtype=torch.float32,
+            b_scale_dtype=torch.float32,
         )
     ).generate(seed=41, device=device)
     assert values.A is not None
@@ -337,12 +374,31 @@ def test_mxfp8_gemm_generator_runs_deep_gemm_kernel(device: str) -> None:
 
     block_size = [128, 128]
     values = GemmInputs(
-        mxfp8_gemm_input_config(
+        GemmInputConfig(
             M=128,
             N=128,
             K=256,
+            a_dtype=torch.float8_e4m3fn,
+            b_dtype=torch.float8_e4m3fn,
             c_dtype=torch.bfloat16,
-            block_shape=tuple(block_size),
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=128,
+                N=128,
+                K=256,
+                block_shape=tuple(block_size),
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=128,
+                N=128,
+                K=256,
+                block_shape=tuple(block_size),
+            ),
+            a_scale_dtype=torch.float32,
+            b_scale_dtype=torch.float32,
         )
     ).generate(seed=53, device=device)
     assert values.A is not None

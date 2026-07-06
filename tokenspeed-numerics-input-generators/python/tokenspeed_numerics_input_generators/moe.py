@@ -41,8 +41,7 @@ from tokenspeed_numerics_input_generators.gemm import (
     GemmInputValues,
     _check_gemm_layout,
     _logical_operand,
-    mxfp4_gemm_input_config,
-    mxint4_gemm_input_config,
+    gemm_scale_shape,
 )
 
 __all__ = [
@@ -1920,27 +1919,45 @@ class MoeInputs(NumericsInputGenerator):
             )
 
         if self.config.weight_format == "mxfp4":
-            return mxfp4_gemm_input_config(
+            return GemmInputConfig(
                 M=self.config.num_tokens,
                 N=N,
                 K=K,
                 a_dtype=None,
                 b_dtype=self.config.weight_dtype,
-                scale_dtype=self.config.weight_scale_dtype,
                 c_dtype=c_dtype,
                 batch_shape=(self.config.num_experts,),
+                b_scale_shape=gemm_scale_shape(
+                    "block",
+                    "b",
+                    M=self.config.num_tokens,
+                    N=N,
+                    K=K,
+                    batch_shape=(self.config.num_experts,),
+                    block_shape=(32,),
+                ),
+                b_scale_dtype=self.config.weight_scale_dtype,
             )
 
         if self.config.weight_format == "mxint4":
-            return mxint4_gemm_input_config(
+            return GemmInputConfig(
                 M=self.config.num_tokens,
                 N=N,
                 K=K,
                 a_dtype=None,
                 b_dtype=self.config.weight_dtype,
-                scale_dtype=self.config.weight_scale_dtype,
                 c_dtype=c_dtype,
                 batch_shape=(self.config.num_experts,),
+                b_scale_shape=gemm_scale_shape(
+                    "block",
+                    "b",
+                    M=self.config.num_tokens,
+                    N=N,
+                    K=K,
+                    batch_shape=(self.config.num_experts,),
+                    block_shape=(32,),
+                ),
+                b_scale_dtype=self.config.weight_scale_dtype,
             )
 
         return GemmInputConfig(

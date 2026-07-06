@@ -64,11 +64,7 @@ from tokenspeed_numerics_input_generators import (
     moe_reference,
     moe_softmax_topk_routing_reference,
     moe_softplus_sqrt_topk_routing_reference,
-    mxfp4_gemm_input_config,
-    mxfp8_gemm_input_config,
-    mxint4_gemm_input_config,
     nvfp4_dequantization_reference,
-    nvfp4_gemm_input_config,
 )
 
 _fp8_dtype = torch.float8_e4m3fn
@@ -452,12 +448,16 @@ def test_gemm_inputs_reject_custom_mxfp4_without_scales() -> None:
 def test_gemm_inputs_reject_mxfp4_non_kernel_layouts() -> None:
     with pytest.raises(ValueError, match="a_layout='MK'"):
         GemmInputs(
-            mxfp4_gemm_input_config(
+            GemmInputConfig(
                 M=4,
                 N=8,
                 K=64,
+                a_dtype=CustomDType.MXFP4,
+                b_dtype=CustomDType.MXFP4,
                 c_dtype=torch.float32,
                 a_layout="KM",
+                a_scale_shape=(4, 2),
+                b_scale_shape=(8, 2),
             )
         )
 
@@ -546,11 +546,29 @@ def test_gemm_inputs_accept_scaled_config_objects() -> None:
 
 def test_gemm_inputs_support_mxfp4_ue8m0_scales() -> None:
     inputs = GemmInputs(
-        mxfp4_gemm_input_config(
+        GemmInputConfig(
             M=4,
             N=8,
             K=64,
+            a_dtype=CustomDType.MXFP4,
+            b_dtype=CustomDType.MXFP4,
             c_dtype=torch.float32,
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=4,
+                N=8,
+                K=64,
+                block_shape=(32,),
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=4,
+                N=8,
+                K=64,
+                block_shape=(32,),
+            ),
         )
     ).generate(seed=19, device="cpu")
 
@@ -572,11 +590,29 @@ def test_gemm_inputs_support_mxfp4_ue8m0_scales() -> None:
 
 def test_gemm_reference_dequantizes_mxfp4_inputs() -> None:
     values = GemmInputs(
-        mxfp4_gemm_input_config(
+        GemmInputConfig(
             M=4,
             N=8,
             K=64,
+            a_dtype=CustomDType.MXFP4,
+            b_dtype=CustomDType.MXFP4,
             c_dtype=torch.float32,
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=4,
+                N=8,
+                K=64,
+                block_shape=(32,),
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=4,
+                N=8,
+                K=64,
+                block_shape=(32,),
+            ),
         )
     ).generate(seed=21, device="cpu")
 
@@ -589,11 +625,29 @@ def test_gemm_reference_dequantizes_mxfp4_inputs() -> None:
 
 def test_gemm_inputs_support_nvfp4_fp8_scales() -> None:
     inputs = GemmInputs(
-        nvfp4_gemm_input_config(
+        GemmInputConfig(
             M=4,
             N=8,
             K=64,
+            a_dtype=CustomDType.NVFP4,
+            b_dtype=CustomDType.NVFP4,
             c_dtype=torch.float32,
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=4,
+                N=8,
+                K=64,
+                block_shape=(16,),
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=4,
+                N=8,
+                K=64,
+                block_shape=(16,),
+            ),
         )
     ).generate(seed=96, device="cpu")
 
@@ -622,14 +676,31 @@ def test_gemm_inputs_support_nvfp4_storage_and_scale_dtypes(
     scale_dtype: torch.dtype,
 ) -> None:
     inputs = GemmInputs(
-        nvfp4_gemm_input_config(
+        GemmInputConfig(
             M=4,
             N=8,
             K=64,
-            c_dtype=torch.float32,
             a_dtype=storage_dtype,  # type: ignore[arg-type]
             b_dtype=storage_dtype,  # type: ignore[arg-type]
-            scale_dtype=scale_dtype,
+            c_dtype=torch.float32,
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=4,
+                N=8,
+                K=64,
+                block_shape=(16,),
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=4,
+                N=8,
+                K=64,
+                block_shape=(16,),
+            ),
+            a_scale_dtype=scale_dtype,
+            b_scale_dtype=scale_dtype,
         )
     ).generate(seed=98, device="cpu")
 
@@ -652,11 +723,29 @@ def test_gemm_inputs_support_nvfp4_storage_and_scale_dtypes(
 
 def test_gemm_reference_dequantizes_nvfp4_inputs() -> None:
     values = GemmInputs(
-        nvfp4_gemm_input_config(
+        GemmInputConfig(
             M=4,
             N=8,
             K=64,
+            a_dtype=CustomDType.NVFP4,
+            b_dtype=CustomDType.NVFP4,
             c_dtype=torch.float32,
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=4,
+                N=8,
+                K=64,
+                block_shape=(16,),
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=4,
+                N=8,
+                K=64,
+                block_shape=(16,),
+            ),
         )
     ).generate(seed=97, device="cpu")
 
@@ -667,29 +756,76 @@ def test_gemm_reference_dequantizes_nvfp4_inputs() -> None:
     assert torch.isfinite(ref).all()
 
 
-def test_nvfp4_gemm_input_config_rejects_invalid_config() -> None:
-    with pytest.raises(ValueError, match="divisible by block_size"):
-        nvfp4_gemm_input_config(M=4, N=8, K=68, c_dtype=torch.float32)
+def test_gemm_inputs_reject_invalid_nvfp4_config() -> None:
+    with pytest.raises(ValueError, match="prefix-compatible"):
+        GemmInputs(
+            GemmInputConfig(
+                M=4,
+                N=8,
+                K=68,
+                a_dtype=CustomDType.NVFP4,
+                b_dtype=CustomDType.NVFP4,
+                c_dtype=torch.float32,
+                a_scale_shape=gemm_scale_shape(
+                    "block",
+                    "a",
+                    M=4,
+                    N=8,
+                    K=68,
+                    block_shape=(16,),
+                ),
+                b_scale_shape=gemm_scale_shape(
+                    "block",
+                    "b",
+                    M=4,
+                    N=8,
+                    K=68,
+                    block_shape=(16,),
+                ),
+            )
+        ).generate(seed=99, device="cpu")
 
     with pytest.raises(ValueError, match="a_layout='MK'"):
         GemmInputs(
-            nvfp4_gemm_input_config(
+            GemmInputConfig(
                 M=4,
                 N=8,
                 K=64,
+                a_dtype=CustomDType.NVFP4,
+                b_dtype=CustomDType.NVFP4,
                 c_dtype=torch.float32,
                 a_layout="KM",
+                a_scale_shape=(4, 4),
+                b_scale_shape=(8, 4),
             )
         )
 
 
 def test_gemm_inputs_support_mxint4_bf16_scales() -> None:
     inputs = GemmInputs(
-        mxint4_gemm_input_config(
+        GemmInputConfig(
             M=4,
             N=8,
             K=64,
+            a_dtype=CustomDType.MXINT4,
+            b_dtype=CustomDType.MXINT4,
             c_dtype=torch.float32,
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=4,
+                N=8,
+                K=64,
+                block_shape=(32,),
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=4,
+                N=8,
+                K=64,
+                block_shape=(32,),
+            ),
         )
     ).generate(seed=94, device="cpu")
 
@@ -724,12 +860,16 @@ def test_gemm_reference_dequantizes_mxint4_inputs() -> None:
 def test_gemm_inputs_reject_mxint4_non_kernel_layouts() -> None:
     with pytest.raises(ValueError, match="a_layout='MK'"):
         GemmInputs(
-            mxint4_gemm_input_config(
+            GemmInputConfig(
                 M=4,
                 N=8,
                 K=64,
+                a_dtype=CustomDType.MXINT4,
+                b_dtype=CustomDType.MXINT4,
                 c_dtype=torch.float32,
                 a_layout="KM",
+                a_scale_shape=(4, 2),
+                b_scale_shape=(8, 2),
             )
         )
 
@@ -795,12 +935,31 @@ def test_gemm_reference_applies_channel_scales_to_transposed_layouts() -> None:
 def test_gemm_reference_applies_2d_block_scales() -> None:
     block_shape = (128, 128)
     values = GemmInputs(
-        mxfp8_gemm_input_config(
+        GemmInputConfig(
             M=4,
             N=256,
             K=256,
+            a_dtype=torch.float8_e4m3fn,
+            b_dtype=torch.float8_e4m3fn,
             c_dtype=torch.float32,
-            block_shape=block_shape,
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=4,
+                N=256,
+                K=256,
+                block_shape=block_shape,
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=4,
+                N=256,
+                K=256,
+                block_shape=block_shape,
+            ),
+            a_scale_dtype=torch.float32,
+            b_scale_dtype=torch.float32,
         )
     ).generate(seed=93, device="cpu")
     assert values.A is not None
@@ -820,33 +979,6 @@ def test_gemm_reference_applies_2d_block_scales() -> None:
     )
 
     torch.testing.assert_close(gemm_reference(values), expected)
-
-
-def test_mxfp8_gemm_input_config_rejects_irregular_block_grid() -> None:
-    with pytest.raises(ValueError, match="K to be divisible"):
-        mxfp8_gemm_input_config(
-            M=4,
-            N=256,
-            K=192,
-            c_dtype=torch.float32,
-        )
-
-    with pytest.raises(ValueError, match="N to be divisible"):
-        mxfp8_gemm_input_config(
-            M=4,
-            N=192,
-            K=256,
-            c_dtype=torch.float32,
-        )
-
-    with pytest.raises(ValueError, match="a_layout='MK'"):
-        mxfp8_gemm_input_config(
-            M=4,
-            N=256,
-            K=256,
-            c_dtype=torch.float32,
-            a_layout="KM",
-        )
 
 
 def test_gemm_inputs_cover_router_projection_shape() -> None:
@@ -901,11 +1033,29 @@ def test_gemm_inputs_cover_lm_head_projection_shape() -> None:
 
 def test_composes_nvfp4_gemm_with_swiglu_quant_reference() -> None:
     values = GemmInputs(
-        nvfp4_gemm_input_config(
+        GemmInputConfig(
             M=3,
             N=64,
             K=64,
+            a_dtype=CustomDType.NVFP4,
+            b_dtype=CustomDType.NVFP4,
             c_dtype=torch.bfloat16,
+            a_scale_shape=gemm_scale_shape(
+                "block",
+                "a",
+                M=3,
+                N=64,
+                K=64,
+                block_shape=(16,),
+            ),
+            b_scale_shape=gemm_scale_shape(
+                "block",
+                "b",
+                M=3,
+                N=64,
+                K=64,
+                block_shape=(16,),
+            ),
         )
     ).generate(seed=23, device="cpu")
     assert values.A is not None

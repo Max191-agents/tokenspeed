@@ -77,11 +77,10 @@ local scales, and MXINT4 storage with BF16 group scales, are represented through
 the shared custom dtype enum so format-specific constraints stay centralized.
 
 `gemm_scale_shape` provides common scale-shape calculations for tensor,
-channel, and block granularities. Helper functions such as
-`mxfp4_gemm_input_config`, `nvfp4_gemm_input_config`,
-`mxint4_gemm_input_config`, and `mxfp8_gemm_input_config` build valid
-`GemmInputConfig` objects for common scaled or packed formats. They are
-configuration helpers, not separate generator families.
+channel, and block granularities. Quantized or scaled GEMMs are configured by
+constructing `GemmInputConfig` directly with the appropriate custom dtype,
+scale shape, and scale dtype. The tensor generator owns format-specific dtype
+defaults, such as UE8M0 scales for MXFP4 and BF16 group scales for MXINT4.
 
 Some backend entry points consume a physical layout different from the
 operation-level default. For example, a backend may expect `B` as `[K, N]` while

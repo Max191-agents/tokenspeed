@@ -9,10 +9,10 @@ operand layouts, optional batch prefixes, and optional scale sidecars.
 - `GemmInputs`: generates dense, scaled, FP8, MXFP4, NVFP4, MXINT4, or skipped
   operands for GEMM-style tests.
 
-Helper functions such as `gemm_scale_shape`, `mxfp8_gemm_input_config`,
-`mxfp4_gemm_input_config`, `nvfp4_gemm_input_config`, and
-`mxint4_gemm_input_config` build valid scale shapes and custom operand configs
-from logical GEMM dimensions.
+`gemm_scale_shape` can be used to compute common tensor, channel, and block
+scale shapes from logical GEMM dimensions. Quantized and scaled GEMMs should
+still use the same `GemmInputConfig` surface directly, with custom dtypes and
+scale sidecars configured on the relevant operands.
 
 Layer-level projections such as router projection and LM-head projection should
 map their domain names onto `M`, `N`, and `K` instead of using separate GEMM
