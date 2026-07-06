@@ -41,7 +41,7 @@ compressed/cache-specific representations with different per-token shapes.
   helpers.
 - `DeepSeekV4InvRoPEFP8QuantInputs`: generates the separate DeepSeek V4
   inverse-RoPE output-projection FP8 quantization utility. This is not part of
-  compressed attention input generation.
+  compressed sequence attention input generation.
 - `DSASparseDecodeKVPackInputs`, `DSATopKSlotInputs`,
   and `DSADecodeTopKInputs`: generate DeepSeek-style sparse decode indexing,
   deterministic top-k selection, and cache metadata.

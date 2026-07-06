@@ -116,7 +116,7 @@ lower-level generators where that makes the implementation easier to follow:
 - indexer MXFP4 cache rows
 - sparse K-cache byte rows
 
-The fused DeepSeek tests can then compose those pieces and call a fused
+TokenSpeed helper tests can then compose those pieces and call a fused
 reference. That preserves coverage without making a fused kernel name the input
 generation abstraction.
 

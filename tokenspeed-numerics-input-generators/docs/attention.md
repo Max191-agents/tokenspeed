@@ -223,8 +223,8 @@ values, and indexer cache write/gather values.
 
 The nested values intentionally expose the narrower helper-operation bundles
 that TokenSpeed tests and references already consume, but callers should start
-from the single compressed-attention generator instead of constructing one
-generator per helper kernel.
+from the single compressed sequence attention generator instead of constructing
+one generator per helper kernel.
 
 DeepSeek V4 inverse-RoPE FP8 quantization remains a separate generator because
 it is an output-projection preparation utility, not part of compressed

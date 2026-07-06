@@ -235,27 +235,35 @@ documentation belongs in the config and values classes. The README should give a
 reader enough context to choose the right generator and know where to look next.
 
 The library should be organized around those family boundaries, with shared core
-components and utilities factored out when they are genuinely reusable:
+components and utilities factored out when they are genuinely reusable. The
+current package keeps a flat Python module surface for compatibility and a
+separate family-doc navigation tree:
 
 ```text
-input_generators/
-  README.md                 # overall philosophy and navigation
-  core/                     # dtype, tensor, scaled tensor, base interfaces
-  utils/                    # shared helpers used by multiple families
-  gemm/                     # GEMM-family generators and README
-  attention/                # MHA/MLA/cache/metadata generators and README
-  moe/                      # MoE-family generators and README
-  transforms/               # standalone deterministic tensor transforms
+tokenspeed_numerics_input_generators/
+  core.py                   # dtype, tensor, base interfaces
+  gemm.py                   # GEMM-family generators
+  attention.py              # MHA/MLA/attention utility generators
+  attention_cache.py        # reusable cache/page-table generators
+  attention_metadata.py     # request metadata and slot mappings
+  moe.py                    # MoE-family generators
+  transforms.py             # standalone deterministic tensor transforms
+
+docs/families/
+  README.md                 # operation-family navigation
+  core/README.md
+  gemm/README.md
+  attention/README.md
+  moe/README.md
+  transforms/README.md
 ```
 
 The exact names and module boundaries can evolve, but the conceptual split
 should remain: core primitives, optional shared utilities, and documented
 operation-family generators.
 
-The current family documentation lives under
-[`docs/families`](docs/families/README.md). The implementation modules still use
-a flat Python import surface for compatibility, while the docs provide the
-family navigation structure expected by this design.
+The implementation modules use the flat Python import surface above, while the
+docs provide the family navigation structure expected by this design.
 
 ## Growth Model
 
