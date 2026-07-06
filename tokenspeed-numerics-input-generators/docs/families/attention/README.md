@@ -34,26 +34,16 @@ compressed/cache-specific representations with different per-token shapes.
   log-space gates, recurrent state, and sequence metadata.
 - `PackedQKVComplexRotaryInputs`: generates packed QKV and rotary metadata for
   complex rotary transforms.
-- `DeepSeekV4CompressorStateInputs`: generates DeepSeek V4 compressor-state
-  cache write inputs.
-- `DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs`: generates DeepSeek V4 indexer
-  Q RoPE/Hadamard/MXFP4 transform inputs.
-- `DeepSeekV4InvRoPEFP8QuantInputs`: generates DeepSeek V4 inverse-RoPE
-  output-projection FP8 quantization inputs.
-- `DeepSeekV4CSAIndexerMXFP4CacheInsertInputs`: generates DeepSeek V4 CSA
-  indexer compression plus MXFP4 cache-insert inputs.
-- `DeepSeekV4SparseCompressCacheInsertInputs`: generates DeepSeek V4 sparse
-  K-cache compression plus FP8/BF16 cache-insert inputs.
-- `DeepSeekV4IndexerMXFP4CacheWriteInputs`: generates DeepSeek V4 indexer
-  K-cache MXFP4 write inputs.
-- `DeepSeekV4IndexerMXFP4CacheGatherInputs`: generates DeepSeek V4 indexer
-  K-cache MXFP4 gather inputs.
-- `DeepSeekV4KCacheGatherInputs`: generates DeepSeek V4 sparse-window
-  K-cache gather/dequantization inputs.
+- `DeepSeekV4CompressedAttentionInputs`: generates DeepSeek V4 compressed
+  attention inputs. The sliding-window attention portion is always generated;
+  optional compressed-history and CSA indexer components add the nested values
+  needed by HCA/CSA cache, index, and gather helpers.
+- `DeepSeekV4InvRoPEFP8QuantInputs`: generates the separate DeepSeek V4
+  inverse-RoPE output-projection FP8 quantization utility. This is not part of
+  compressed attention input generation.
 - `DSASparseDecodeKVPackInputs`, `DSATopKSlotInputs`,
-  `DSADecodeTopKInputs`, `DeepSeekV4PagedIndexInputs`, and
-  `DeepSeekV4SparsePrefillIndexInputs`: generate DeepSeek-style sparse
-  decode/prefill indexing, deterministic top-k selection, and cache metadata.
+  and `DSADecodeTopKInputs`: generate DeepSeek-style sparse decode indexing,
+  deterministic top-k selection, and cache metadata.
 
 ## Generated Values
 

@@ -87,6 +87,14 @@ __all__ = [
     "GDNChunkPrefillReferenceValues",
     "gdn_chunk_prefill_reference",
     "gdn_qkv_split_reference",
+    "DeepSeekV4CompressedAttentionInputConfig",
+    "DeepSeekV4CompressedAttentionInputs",
+    "DeepSeekV4CompressedAttentionInputValues",
+    "DeepSeekV4CompressedAttentionCompressedConfig",
+    "DeepSeekV4CompressedAttentionCompressedValues",
+    "DeepSeekV4CompressedAttentionIndexerConfig",
+    "DeepSeekV4CompressedAttentionIndexerValues",
+    "DeepSeekV4SlidingWindowAttentionValues",
     "DeepSeekV4CompressorStateInputConfig",
     "DeepSeekV4CompressorStateInputs",
     "DeepSeekV4CompressorStateInputValues",
@@ -3214,6 +3222,867 @@ def dsa_full_context_topk_to_global_slots_reference(
             page = int(block_table_cpu[token_idx, block_idx].item())
             global_slots[token_idx, offset] = page * values.block_size + block_offset
     return global_slots, lens
+
+
+@dataclass
+class DeepSeekV4SlidingWindowAttentionValues:
+    """Generated values for the always-present DeepSeek V4 SWA portion."""
+
+    q: torch.Tensor
+    attn_sink: torch.Tensor
+    metadata: MHARequestMetadataValues
+    positions: torch.Tensor
+    token_to_req_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    page_table: torch.Tensor
+    page_table_values: PageTableValues
+    cache_2d: torch.Tensor
+    block_size: int
+    window_size: int
+
+
+@dataclass
+class DeepSeekV4CompressedAttentionCompressedConfig:
+    """Configuration for optional compressed-history attention inputs.
+
+    ``compress_ratio=4`` models CSA and defaults to overlapping compressor
+    state. ``compress_ratio=128`` models HCA and defaults to non-overlapping
+    compressor state.
+    """
+
+    # Required: number of original token positions represented by each
+    # compressed-history row. DeepSeek V4 currently uses 4 for CSA or 128 for
+    # HCA.
+    compress_ratio: int
+
+    # Optional: number of compressed-prefix candidates to generate per token.
+    topk: int = 4
+
+    # Optional: whether compressor state is the overlapping CSA layout. Defaults
+    # from compress_ratio when omitted.
+    overlap: bool | None = None
+
+    # Optional: generated compressor/cache storage sizes.
+    num_state_cache_blocks: int = 4
+    compressor_block_size: int | None = None
+    num_kv_cache_blocks: int = 4
+    kv_cache_block_size: int | None = None
+
+    # Optional: generate non-boundary rows for cache-insert skip coverage.
+    non_boundary_token_count: int = 0
+
+    # Optional: generate negative slot mappings for skipped rows.
+    negative_compressor_slot_count: int = 0
+    negative_kv_slot_count: int = 0
+
+    # Optional: generated block-table/base-offset and validity metadata.
+    include_block_table_base_offsets: bool = False
+    include_valid_token_mask: bool = False
+    invalid_token_probability: float = 0.25
+
+    # Optional: generated top-k ordering policy for sparse prefill.
+    topk_indexing: PageTableIndexing = "random"
+
+    # Optional: value-generation controls for cache-insert helper inputs.
+    rms_norm_eps: float = 1.0e-5
+    rope_base: float = 10000.0
+    value_scale: float = 1.0
+
+
+@dataclass
+class DeepSeekV4CompressedAttentionIndexerConfig:
+    """Configuration for optional CSA indexer inputs."""
+
+    # Optional: number of indexer heads used for indexer-Q/weight generation.
+    num_heads: int = 2
+
+    # Optional: softmax/head scales used by the indexer query packing helper.
+    softmax_scale: float = 1.0
+    head_scale: float = 1.0
+
+    # Optional: generated indexer cache sizes.
+    num_state_cache_blocks: int = 4
+    compressor_block_size: int | None = None
+    num_kv_cache_blocks: int = 4
+    kv_cache_block_size: int | None = None
+    num_cache_blocks: int = 4
+    block_size: int | None = None
+
+    # Optional: generated invalid/masked rows for cache write/gather helpers.
+    negative_slot_count: int = 0
+    masked_row_count: int = 0
+
+    # Optional: value-generation controls for the indexer cache-insert helper.
+    rms_norm_eps: float = 1.0e-5
+    rope_base: float = 10000.0
+    value_scale: float = 1.0
+
+
+@dataclass
+class DeepSeekV4CompressedAttentionCompressedValues:
+    """Generated optional compressed-history values."""
+
+    paged_index: DeepSeekV4PagedIndexValues
+    sparse_prefill_index: DeepSeekV4SparsePrefillIndexValues
+    compressor_state: DeepSeekV4CompressorStateInputValues
+    cache_insert: DeepSeekV4SparseCompressCacheInsertInputValues
+    k_cache_gather: DeepSeekV4KCacheGatherInputValues
+
+
+@dataclass
+class DeepSeekV4CompressedAttentionIndexerValues:
+    """Generated optional CSA indexer values."""
+
+    q_rope_hadamard_mxfp4: DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues
+    cache_insert: DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues
+    cache_write: DeepSeekV4IndexerMXFP4CacheWriteInputValues
+    cache_gather: DeepSeekV4IndexerMXFP4CacheGatherInputValues
+
+
+@dataclass
+class DeepSeekV4CompressedAttentionInputValues:
+    """Generated values for DeepSeek-style compressed attention.
+
+    ``sliding_window`` is always present. ``compressed`` is present for CSA/HCA
+    layers. ``indexer`` is present only for CSA-style sparse compressed
+    attention.
+    """
+
+    kind: Literal["swa", "csa", "hca"]
+    sliding_window: DeepSeekV4SlidingWindowAttentionValues
+    compressed: DeepSeekV4CompressedAttentionCompressedValues | None
+    indexer: DeepSeekV4CompressedAttentionIndexerValues | None
+
+
+@dataclass
+class DeepSeekV4CompressedAttentionInputConfig:
+    """Initialization parameters for one DeepSeek-style compressed attention family.
+
+    The represented operation is sliding-window attention plus optional
+    compressed-history attention and optional CSA indexer selection. This is the
+    canonical generator for DeepSeek V4 attention inputs; TokenSpeed helper
+    kernels should adapt its nested values to their narrower argument bundles.
+    """
+
+    # ------------------------------------------------------------------
+    # Required configuration fields.
+    # ------------------------------------------------------------------
+
+    # Required: number of request sequences represented by generated metadata.
+    batch_size: int
+
+    # Required: total already-resident KV tokens across all requests.
+    total_cached_tokens: int
+
+    # Required: total new query/KV tokens across all requests.
+    total_new_q_tokens: int
+
+    # Required: generated floating dtype for Q and state/cache helper values.
+    dtype: torch.dtype
+
+    # Required: number of local Q heads in generated attention queries.
+    num_q_heads: int
+
+    # Required: page size used for generated paged caches.
+    page_size: int
+
+    # Required: number of recent tokens included in the sliding-window portion.
+    window_size: int
+
+    # ------------------------------------------------------------------
+    # Optional attention-shape and component configuration.
+    # ------------------------------------------------------------------
+
+    # Optional: DeepSeek V4 attention head width. Helper references currently
+    # require the model's fixed 512-wide layout.
+    head_dim: int = _DEEPSEEK_V4_HEAD_DIM
+
+    # Optional: DeepSeek V4 RoPE width. Helper references currently require 64.
+    rope_dim: int = _DEEPSEEK_V4_ROPE_DIM
+
+    # Optional: number of generated SWA cache pages. Defaults to the generated
+    # page-table page count.
+    num_swa_cache_blocks: int | None = None
+
+    # Optional: compressed-history component. ``None`` generates SWA-only.
+    compressed: DeepSeekV4CompressedAttentionCompressedConfig | None = None
+
+    # Optional: CSA indexer component. Requires compressed.compress_ratio == 4.
+    indexer: DeepSeekV4CompressedAttentionIndexerConfig | None = None
+
+    # Optional: metadata/page-table controls shared by generated components.
+    indexing: PageTableIndexing = "random"
+    metadata_input: MHARequestMetadataInputConfig | None = None
+    swa_page_table_input: PageTableInputConfig | None = None
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class DeepSeekV4CompressedAttentionInputs(NumericsInputGenerator):
+    """Generator for DeepSeek-style compressed attention inputs."""
+
+    config: DeepSeekV4CompressedAttentionInputConfig
+    q_input: TensorInput | None
+    metadata_input: MHARequestMetadataInput | None
+    swa_page_table_input: PageTableInput | None
+
+    def __init__(self, config: DeepSeekV4CompressedAttentionInputConfig) -> None:
+        self.config = config
+        self.q_input = None
+        self.metadata_input = None
+        self.swa_page_table_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.q_input = self.q_input or TensorInput(
+            (
+                self.config.total_new_q_tokens,
+                self.config.num_q_heads,
+                self.config.head_dim,
+            ),
+            self.config.dtype,
+            device=self.config.device,
+        )
+        self.metadata_input = self.metadata_input or MHARequestMetadataInput(
+            self.config.metadata_input or self._make_metadata_config()
+        )
+        self._verify_metadata_config_matches_parent()
+        self.config.metadata_input = self.metadata_input.config
+        self.swa_page_table_input = self.swa_page_table_input or PageTableInput(
+            self.config.swa_page_table_input or self._make_swa_page_table_config()
+        )
+        self._verify_swa_page_table_config_matches_parent()
+        self.config.swa_page_table_input = self.swa_page_table_input.config
+
+    def generate(
+        self,
+        *,
+        seed: int | None = None,
+        metadata_seed: int | None = None,
+        value_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> DeepSeekV4CompressedAttentionInputValues:
+        self.__post_init__()
+        if (
+            self.q_input is None
+            or self.metadata_input is None
+            or self.swa_page_table_input is None
+        ):
+            raise ValueError("DeepSeek compressed-attention children must be initialized")
+        metadata_seed, value_seed = _resolve_attention_seeds(
+            seed=seed,
+            metadata_seed=metadata_seed,
+            value_seed=value_seed,
+        )
+        target_device = _resolve_device(self.config.device, device)
+        metadata = self.metadata_input.generate(
+            seed=_child_seed(metadata_seed, 1),
+            device=target_device,
+        )
+        if metadata.new_q_lens_cpu != metadata.new_kv_lens_cpu:
+            raise ValueError("DeepSeek compressed attention requires tied Q/KV lengths")
+
+        self.q_input.shape = (
+            self.config.total_new_q_tokens,
+            self.config.num_q_heads,
+            self.config.head_dim,
+        )
+        self.q_input.dtype = self.config.dtype
+        q = _require_tensor(
+            self.q_input.generate(
+                seed=_child_seed(value_seed, 1),
+                device=target_device,
+            ).values,
+            "q",
+        )
+
+        positions_cpu, token_to_req_cpu = self._positions_from_metadata(metadata)
+        required_pages = max(
+            1,
+            math.ceil(max(metadata.visible_kv_lens_cpu) / self.config.page_size),
+        )
+        self.swa_page_table_input.config.batch_size = self.config.batch_size
+        self.swa_page_table_input.config.max_pages_per_request = max(
+            self.swa_page_table_input.config.max_pages_per_request,
+            required_pages,
+        )
+        self.swa_page_table_input.config.indexing = self.config.indexing
+        page_table = self.swa_page_table_input.generate(
+            seed=_child_seed(metadata_seed, 2),
+            device=target_device,
+        )
+        num_swa_cache_blocks = (
+            page_table.num_pages
+            if self.config.num_swa_cache_blocks is None
+            else self.config.num_swa_cache_blocks
+        )
+        if num_swa_cache_blocks < page_table.num_pages:
+            raise ValueError(
+                "num_swa_cache_blocks must cover generated SWA page-table pages"
+            )
+        sliding = DeepSeekV4SlidingWindowAttentionValues(
+            q=q,
+            attn_sink=torch.zeros(
+                (self.config.num_q_heads,),
+                dtype=torch.float32,
+                device=target_device,
+            ),
+            metadata=metadata,
+            positions=torch.tensor(
+                positions_cpu,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            token_to_req_indices=torch.tensor(
+                token_to_req_cpu,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            seq_lens=torch.tensor(
+                metadata.visible_kv_lens_cpu,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            page_table=page_table.page_table,
+            page_table_values=page_table,
+            cache_2d=_generate_random_uint8_tensor(
+                shape=(
+                    num_swa_cache_blocks,
+                    self.config.page_size
+                    * (_DEEPSEEK_V4_SWA_TOKEN_STRIDE + _DEEPSEEK_V4_SWA_SCALE_DIM),
+                ),
+                seed=_child_seed(value_seed, 2),
+                device=target_device,
+            ),
+            block_size=self.config.page_size,
+            window_size=self.config.window_size,
+        )
+
+        compressed = self._generate_compressed_values(
+            metadata_seed=metadata_seed,
+            value_seed=value_seed,
+            device=target_device,
+        )
+        indexer = self._generate_indexer_values(
+            metadata_seed=metadata_seed,
+            value_seed=value_seed,
+            device=target_device,
+        )
+        kind: Literal["swa", "csa", "hca"]
+        if self.config.compressed is None:
+            kind = "swa"
+        elif self.config.compressed.compress_ratio == 4:
+            kind = "csa"
+        else:
+            kind = "hca"
+        values = DeepSeekV4CompressedAttentionInputValues(
+            kind=kind,
+            sliding_window=sliding,
+            compressed=compressed,
+            indexer=indexer,
+        )
+        self._validate_values(values)
+        return values
+
+    def _normalize_config(self) -> None:
+        self.config.batch_size = _check_positive("batch_size", self.config.batch_size)
+        self.config.total_cached_tokens = _check_nonnegative(
+            "total_cached_tokens",
+            self.config.total_cached_tokens,
+        )
+        self.config.total_new_q_tokens = _check_positive(
+            "total_new_q_tokens",
+            self.config.total_new_q_tokens,
+        )
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        self.config.num_q_heads = _check_positive(
+            "num_q_heads",
+            self.config.num_q_heads,
+        )
+        self.config.page_size = _check_positive("page_size", self.config.page_size)
+        self.config.window_size = _check_positive(
+            "window_size",
+            self.config.window_size,
+        )
+        self.config.head_dim = _check_positive("head_dim", self.config.head_dim)
+        self.config.rope_dim = _check_positive("rope_dim", self.config.rope_dim)
+        if self.config.head_dim != _DEEPSEEK_V4_HEAD_DIM:
+            raise ValueError(
+                f"DeepSeek V4 compressed attention requires head_dim={_DEEPSEEK_V4_HEAD_DIM}"
+            )
+        if self.config.rope_dim != _DEEPSEEK_V4_ROPE_DIM:
+            raise ValueError(
+                f"DeepSeek V4 compressed attention requires rope_dim={_DEEPSEEK_V4_ROPE_DIM}"
+            )
+        if self.config.num_swa_cache_blocks is not None:
+            self.config.num_swa_cache_blocks = _check_positive(
+                "num_swa_cache_blocks",
+                self.config.num_swa_cache_blocks,
+            )
+        self.config.indexing = _check_page_table_indexing(self.config.indexing)
+        if self.config.compressed is None:
+            if self.config.indexer is not None:
+                raise ValueError("indexer requires compressed attention")
+            return
+        compressed = self.config.compressed
+        compressed.compress_ratio = _check_positive(
+            "compressed.compress_ratio",
+            compressed.compress_ratio,
+        )
+        if compressed.compress_ratio not in (4, 128):
+            raise ValueError("DeepSeek V4 compressed attention supports ratios 4 or 128")
+        compressed.topk = _check_positive("compressed.topk", compressed.topk)
+        if compressed.overlap is None:
+            compressed.overlap = compressed.compress_ratio == 4
+        if compressed.compress_ratio == 4 and not compressed.overlap:
+            raise ValueError("CSA compressed attention requires overlap=True")
+        if compressed.compress_ratio == 128 and compressed.overlap:
+            raise ValueError("HCA compressed attention requires overlap=False")
+        compressed.num_state_cache_blocks = _check_positive(
+            "compressed.num_state_cache_blocks",
+            compressed.num_state_cache_blocks,
+        )
+        compressed.compressor_block_size = _check_positive(
+            "compressed.compressor_block_size",
+            compressed.compressor_block_size
+            if compressed.compressor_block_size is not None
+            else (4 if compressed.compress_ratio == 4 else 8),
+        )
+        compressed.num_kv_cache_blocks = _check_positive(
+            "compressed.num_kv_cache_blocks",
+            compressed.num_kv_cache_blocks,
+        )
+        compressed.kv_cache_block_size = _check_positive(
+            "compressed.kv_cache_block_size",
+            compressed.kv_cache_block_size
+            if compressed.kv_cache_block_size is not None
+            else self.config.page_size,
+        )
+        compressed.non_boundary_token_count = _check_nonnegative(
+            "compressed.non_boundary_token_count",
+            compressed.non_boundary_token_count,
+        )
+        compressed.negative_compressor_slot_count = _check_nonnegative(
+            "compressed.negative_compressor_slot_count",
+            compressed.negative_compressor_slot_count,
+        )
+        compressed.negative_kv_slot_count = _check_nonnegative(
+            "compressed.negative_kv_slot_count",
+            compressed.negative_kv_slot_count,
+        )
+        if compressed.non_boundary_token_count > self.config.total_new_q_tokens:
+            raise ValueError("compressed.non_boundary_token_count must be <= total_new_q_tokens")
+        if compressed.negative_compressor_slot_count > self.config.total_new_q_tokens:
+            raise ValueError(
+                "compressed.negative_compressor_slot_count must be <= total_new_q_tokens"
+            )
+        if compressed.negative_kv_slot_count > self.config.total_new_q_tokens:
+            raise ValueError("compressed.negative_kv_slot_count must be <= total_new_q_tokens")
+        compressed.topk_indexing = _check_page_table_indexing(compressed.topk_indexing)
+        compressed.invalid_token_probability = float(compressed.invalid_token_probability)
+        if not 0.0 <= compressed.invalid_token_probability < 1.0:
+            raise ValueError("compressed.invalid_token_probability must be in [0, 1)")
+        compressed.rms_norm_eps = float(compressed.rms_norm_eps)
+        if compressed.rms_norm_eps <= 0.0 or not math.isfinite(compressed.rms_norm_eps):
+            raise ValueError("compressed.rms_norm_eps must be finite and positive")
+        compressed.rope_base = float(compressed.rope_base)
+        if compressed.rope_base <= 0.0 or not math.isfinite(compressed.rope_base):
+            raise ValueError("compressed.rope_base must be finite and positive")
+        compressed.value_scale = float(compressed.value_scale)
+        if compressed.value_scale < 0.0 or not math.isfinite(compressed.value_scale):
+            raise ValueError("compressed.value_scale must be finite and non-negative")
+        if self.config.indexer is None:
+            return
+        if compressed.compress_ratio != 4:
+            raise ValueError("indexer inputs are only valid for CSA compress_ratio=4")
+        indexer = self.config.indexer
+        indexer.num_heads = _check_positive("indexer.num_heads", indexer.num_heads)
+        indexer.num_state_cache_blocks = _check_positive(
+            "indexer.num_state_cache_blocks",
+            indexer.num_state_cache_blocks,
+        )
+        indexer.compressor_block_size = _check_positive(
+            "indexer.compressor_block_size",
+            indexer.compressor_block_size
+            if indexer.compressor_block_size is not None
+            else compressed.compressor_block_size,
+        )
+        indexer.num_kv_cache_blocks = _check_positive(
+            "indexer.num_kv_cache_blocks",
+            indexer.num_kv_cache_blocks,
+        )
+        indexer.kv_cache_block_size = _check_positive(
+            "indexer.kv_cache_block_size",
+            indexer.kv_cache_block_size
+            if indexer.kv_cache_block_size is not None
+            else compressed.kv_cache_block_size,
+        )
+        indexer.num_cache_blocks = _check_positive(
+            "indexer.num_cache_blocks",
+            indexer.num_cache_blocks,
+        )
+        indexer.block_size = _check_positive(
+            "indexer.block_size",
+            indexer.block_size if indexer.block_size is not None else self.config.page_size,
+        )
+        indexer.negative_slot_count = _check_nonnegative(
+            "indexer.negative_slot_count",
+            indexer.negative_slot_count,
+        )
+        indexer.masked_row_count = _check_nonnegative(
+            "indexer.masked_row_count",
+            indexer.masked_row_count,
+        )
+        for name, value in (
+            ("indexer.negative_slot_count", indexer.negative_slot_count),
+            ("indexer.masked_row_count", indexer.masked_row_count),
+        ):
+            if value > self.config.total_new_q_tokens:
+                raise ValueError(f"{name} must be <= total_new_q_tokens")
+        indexer.rms_norm_eps = float(indexer.rms_norm_eps)
+        if indexer.rms_norm_eps <= 0.0 or not math.isfinite(indexer.rms_norm_eps):
+            raise ValueError("indexer.rms_norm_eps must be finite and positive")
+        indexer.rope_base = float(indexer.rope_base)
+        if indexer.rope_base <= 0.0 or not math.isfinite(indexer.rope_base):
+            raise ValueError("indexer.rope_base must be finite and positive")
+        indexer.value_scale = float(indexer.value_scale)
+        if indexer.value_scale < 0.0 or not math.isfinite(indexer.value_scale):
+            raise ValueError("indexer.value_scale must be finite and non-negative")
+
+    def _make_metadata_config(self) -> MHARequestMetadataInputConfig:
+        return MHARequestMetadataInputConfig(
+            batch_size=self.config.batch_size,
+            total_cached_tokens=self.config.total_cached_tokens,
+            total_new_q_tokens=self.config.total_new_q_tokens,
+            cache_layout="paged",
+        )
+
+    def _verify_metadata_config_matches_parent(self) -> None:
+        config = _metadata_config(self.metadata_input)
+        for name, parent_value, child_value in (
+            ("batch_size", self.config.batch_size, config.batch_size),
+            (
+                "total_cached_tokens",
+                self.config.total_cached_tokens,
+                config.total_cached_tokens,
+            ),
+            (
+                "total_new_q_tokens",
+                self.config.total_new_q_tokens,
+                config.total_new_q_tokens,
+            ),
+        ):
+            _check_matches(
+                parent_name=f"DeepSeekV4CompressedAttentionInputConfig.{name}",
+                child_name=f"metadata_input.{name}",
+                parent_value=parent_value,
+                child_value=child_value,
+            )
+        if config.total_new_kv_tokens != self.config.total_new_q_tokens:
+            raise ValueError("metadata_input.total_new_kv_tokens must match total_new_q_tokens")
+        if not config.tie_new_kv_to_query:
+            raise ValueError("metadata_input.tie_new_kv_to_query must be true")
+
+    def _make_swa_page_table_config(self) -> PageTableInputConfig:
+        max_tokens = (
+            self.config.total_cached_tokens + self.config.total_new_q_tokens
+        )
+        return PageTableInputConfig(
+            batch_size=self.config.batch_size,
+            max_pages_per_request=max(1, math.ceil(max_tokens / self.config.page_size)),
+            indexing=self.config.indexing,
+            device=self.config.device,
+        )
+
+    def _verify_swa_page_table_config_matches_parent(self) -> None:
+        if self.swa_page_table_input is None:
+            raise ValueError("swa_page_table_input must be initialized")
+        _check_matches(
+            parent_name="DeepSeekV4CompressedAttentionInputConfig.batch_size",
+            child_name="swa_page_table_input.batch_size",
+            parent_value=self.config.batch_size,
+            child_value=self.swa_page_table_input.config.batch_size,
+        )
+
+    def _positions_from_metadata(
+        self,
+        metadata: MHARequestMetadataValues,
+    ) -> tuple[list[int], list[int]]:
+        positions: list[int] = []
+        token_to_req: list[int] = []
+        for req, (query_len, seq_len) in enumerate(
+            zip(metadata.new_q_lens_cpu, metadata.visible_kv_lens_cpu, strict=True)
+        ):
+            start_pos = seq_len - query_len
+            for offset in range(query_len):
+                positions.append(start_pos + offset)
+                token_to_req.append(req)
+        return positions, token_to_req
+
+    def _generate_compressed_values(
+        self,
+        *,
+        metadata_seed: int,
+        value_seed: int,
+        device: torch.device,
+    ) -> DeepSeekV4CompressedAttentionCompressedValues | None:
+        compressed = self.config.compressed
+        if compressed is None:
+            return None
+        metadata_config = self._shared_metadata_config(cache_layout="paged")
+        dense_metadata_config = self._shared_metadata_config(cache_layout="dense")
+        paged_index = DeepSeekV4PagedIndexInputs(
+            DeepSeekV4PagedIndexInputConfig(
+                batch_size=self.config.batch_size,
+                total_cached_tokens=self.config.total_cached_tokens,
+                total_new_q_tokens=self.config.total_new_q_tokens,
+                block_size=self.config.page_size,
+                compress_ratio=compressed.compress_ratio,
+                window_size=self.config.window_size,
+                topk=compressed.topk,
+                indexing=self.config.indexing,
+                include_block_table_base_offsets=compressed.include_block_table_base_offsets,
+                include_valid_token_mask=compressed.include_valid_token_mask,
+                invalid_token_probability=compressed.invalid_token_probability,
+                metadata_input=metadata_config,
+                page_table_input=self.config.swa_page_table_input,
+                device=self.config.device,
+            )
+        ).generate(seed=metadata_seed, device=device)
+        sparse_prefill_index = DeepSeekV4SparsePrefillIndexInputs(
+            DeepSeekV4SparsePrefillIndexInputConfig(
+                batch_size=self.config.batch_size,
+                total_cached_tokens=self.config.total_cached_tokens,
+                total_new_q_tokens=self.config.total_new_q_tokens,
+                topk=compressed.topk,
+                window_size=self.config.window_size,
+                compress_ratio=compressed.compress_ratio,
+                topk_indexing=compressed.topk_indexing,
+                metadata_input=dense_metadata_config,
+                device=self.config.device,
+            )
+        ).generate(seed=metadata_seed, device=device)
+        max_seq_len = max(
+            compressed.compress_ratio,
+            self.config.total_cached_tokens + self.config.total_new_q_tokens,
+        )
+        compressor_state = DeepSeekV4CompressorStateInputs(
+            DeepSeekV4CompressorStateInputConfig(
+                num_tokens=self.config.total_new_q_tokens,
+                state_width=_DEEPSEEK_V4_HEAD_DIM * (2 if compressed.overlap else 1),
+                num_cache_blocks=compressed.num_state_cache_blocks,
+                block_size=compressed.compressor_block_size,
+                compress_ratio=compressed.compress_ratio,
+                dtype=self.config.dtype,
+                invalid_token_count=compressed.negative_compressor_slot_count,
+                device=self.config.device,
+            )
+        ).generate(
+            metadata_seed=_child_seed(metadata_seed, 12),
+            value_seed=_child_seed(value_seed, 12),
+            device=device,
+        )
+        cache_insert = DeepSeekV4SparseCompressCacheInsertInputs(
+            DeepSeekV4SparseCompressCacheInsertInputConfig(
+                num_tokens=self.config.total_new_q_tokens,
+                batch_size=self.config.batch_size,
+                max_seq_len=max_seq_len,
+                num_state_cache_blocks=compressed.num_state_cache_blocks,
+                compressor_block_size=compressed.compressor_block_size,
+                num_kv_cache_blocks=compressed.num_kv_cache_blocks,
+                kv_cache_block_size=compressed.kv_cache_block_size,
+                compress_ratio=compressed.compress_ratio,
+                overlap=bool(compressed.overlap),
+                dtype=self.config.dtype,
+                non_boundary_token_count=compressed.non_boundary_token_count,
+                negative_compressor_slot_count=compressed.negative_compressor_slot_count,
+                negative_kv_slot_count=compressed.negative_kv_slot_count,
+                include_block_table_base_offsets=compressed.include_block_table_base_offsets,
+                rms_norm_eps=compressed.rms_norm_eps,
+                rope_base=compressed.rope_base,
+                value_scale=compressed.value_scale,
+                device=self.config.device,
+            )
+        ).generate(
+            metadata_seed=_child_seed(metadata_seed, 13),
+            value_seed=_child_seed(value_seed, 13),
+            device=device,
+        )
+        k_cache_gather = DeepSeekV4KCacheGatherInputs(
+            DeepSeekV4KCacheGatherInputConfig(
+                batch_size=self.config.batch_size,
+                max_seq_len=max_seq_len,
+                block_size=self.config.page_size,
+                max_gather_len=min(max_seq_len, self.config.window_size),
+                offset=0,
+                num_cache_blocks=max(
+                    compressed.num_kv_cache_blocks,
+                    self.config.batch_size * max(1, math.ceil(max_seq_len / self.config.page_size)),
+                ),
+                include_gather_lens=True,
+                include_block_table_base_offsets=compressed.include_block_table_base_offsets,
+                device=self.config.device,
+            )
+        ).generate(
+            metadata_seed=_child_seed(metadata_seed, 14),
+            value_seed=_child_seed(value_seed, 14),
+            device=device,
+        )
+        return DeepSeekV4CompressedAttentionCompressedValues(
+            paged_index=paged_index,
+            sparse_prefill_index=sparse_prefill_index,
+            compressor_state=compressor_state,
+            cache_insert=cache_insert,
+            k_cache_gather=k_cache_gather,
+        )
+
+    def _generate_indexer_values(
+        self,
+        *,
+        metadata_seed: int,
+        value_seed: int,
+        device: torch.device,
+    ) -> DeepSeekV4CompressedAttentionIndexerValues | None:
+        compressed = self.config.compressed
+        indexer = self.config.indexer
+        if compressed is None or indexer is None:
+            return None
+        max_seq_len = max(1, self.config.total_cached_tokens + self.config.total_new_q_tokens)
+        q_rope = DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+            DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
+                num_tokens=self.config.total_new_q_tokens,
+                num_heads=indexer.num_heads,
+                dtype=self.config.dtype,
+                max_position=max_seq_len,
+                softmax_scale=indexer.softmax_scale,
+                head_scale=indexer.head_scale,
+                rope_base=indexer.rope_base,
+                device=self.config.device,
+            )
+        ).generate(
+            metadata_seed=_child_seed(metadata_seed, 20),
+            value_seed=_child_seed(value_seed, 20),
+            device=device,
+        )
+        cache_insert = DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+            DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
+                num_tokens=self.config.total_new_q_tokens,
+                batch_size=self.config.batch_size,
+                max_seq_len=max_seq_len,
+                num_state_cache_blocks=indexer.num_state_cache_blocks,
+                compressor_block_size=indexer.compressor_block_size,
+                num_kv_cache_blocks=indexer.num_kv_cache_blocks,
+                kv_cache_block_size=indexer.kv_cache_block_size,
+                dtype=self.config.dtype,
+                non_boundary_token_count=compressed.non_boundary_token_count,
+                negative_compressor_slot_count=compressed.negative_compressor_slot_count,
+                negative_kv_slot_count=compressed.negative_kv_slot_count,
+                include_block_table_base_offsets=compressed.include_block_table_base_offsets,
+                compress_ratio=compressed.compress_ratio,
+                rms_norm_eps=indexer.rms_norm_eps,
+                rope_base=indexer.rope_base,
+                value_scale=indexer.value_scale,
+                device=self.config.device,
+            )
+        ).generate(
+            metadata_seed=_child_seed(metadata_seed, 21),
+            value_seed=_child_seed(value_seed, 21),
+            device=device,
+        )
+        cache_write = DeepSeekV4IndexerMXFP4CacheWriteInputs(
+            DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
+                num_rows=self.config.total_new_q_tokens,
+                num_cache_blocks=indexer.num_cache_blocks,
+                block_size=indexer.block_size,
+                dtype=self.config.dtype,
+                negative_slot_count=indexer.negative_slot_count,
+                masked_row_count=indexer.masked_row_count,
+                device=self.config.device,
+            )
+        ).generate(
+            metadata_seed=_child_seed(metadata_seed, 22),
+            value_seed=_child_seed(value_seed, 22),
+            device=device,
+        )
+        cache_gather = DeepSeekV4IndexerMXFP4CacheGatherInputs(
+            DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
+                num_rows=self.config.total_new_q_tokens,
+                num_cache_blocks=indexer.num_cache_blocks,
+                block_size=indexer.block_size,
+                negative_slot_count=indexer.negative_slot_count,
+                device=self.config.device,
+            )
+        ).generate(
+            metadata_seed=_child_seed(metadata_seed, 23),
+            value_seed=_child_seed(value_seed, 23),
+            device=device,
+        )
+        return DeepSeekV4CompressedAttentionIndexerValues(
+            q_rope_hadamard_mxfp4=q_rope,
+            cache_insert=cache_insert,
+            cache_write=cache_write,
+            cache_gather=cache_gather,
+        )
+
+    def _shared_metadata_config(self, *, cache_layout: CacheLayout) -> MHARequestMetadataInputConfig:
+        parent = self.config.metadata_input
+        if parent is None:
+            return MHARequestMetadataInputConfig(
+                batch_size=self.config.batch_size,
+                total_cached_tokens=self.config.total_cached_tokens,
+                total_new_q_tokens=self.config.total_new_q_tokens,
+                cache_layout=cache_layout,
+            )
+        return MHARequestMetadataInputConfig(
+            batch_size=parent.batch_size,
+            total_cached_tokens=parent.total_cached_tokens,
+            total_new_q_tokens=parent.total_new_q_tokens,
+            total_new_kv_tokens=parent.total_new_kv_tokens,
+            cache_layout=cache_layout,
+            cached_length_mode=parent.cached_length_mode,
+            new_q_length_mode=parent.new_q_length_mode,
+            new_kv_length_mode=parent.new_kv_length_mode,
+            max_cached_tokens_per_request=parent.max_cached_tokens_per_request,
+            max_new_q_tokens_per_request=parent.max_new_q_tokens_per_request,
+            max_new_kv_tokens_per_request=parent.max_new_kv_tokens_per_request,
+            tie_new_kv_to_query=parent.tie_new_kv_to_query,
+            allow_untied_non_cached_kv=parent.allow_untied_non_cached_kv,
+            max_seqlen_k=parent.max_seqlen_k,
+            device=parent.device,
+        )
+
+    def _validate_values(self, values: DeepSeekV4CompressedAttentionInputValues) -> None:
+        sliding = values.sliding_window
+        if sliding.q.shape != (
+            self.config.total_new_q_tokens,
+            self.config.num_q_heads,
+            self.config.head_dim,
+        ):
+            raise ValueError("sliding_window.q shape does not match config")
+        if sliding.positions.shape != (self.config.total_new_q_tokens,):
+            raise ValueError("sliding_window.positions must have one row per query")
+        if sliding.token_to_req_indices.shape != (self.config.total_new_q_tokens,):
+            raise ValueError("sliding_window.token_to_req_indices must have one row per query")
+        if sliding.seq_lens.shape != (self.config.batch_size,):
+            raise ValueError("sliding_window.seq_lens must have one row per request")
+        if sliding.page_table.shape[0] != self.config.batch_size:
+            raise ValueError("sliding_window.page_table must have one row per request")
+        if sliding.cache_2d.dtype != torch.uint8:
+            raise TypeError("sliding_window.cache_2d must be uint8")
+        if self.config.compressed is None:
+            if values.compressed is not None or values.indexer is not None:
+                raise ValueError("SWA-only values must not include compressed/indexer data")
+            return
+        if values.compressed is None:
+            raise ValueError("compressed config must generate compressed values")
+        if self.config.indexer is None:
+            if values.indexer is not None:
+                raise ValueError("indexer values require indexer config")
+        elif values.indexer is None:
+            raise ValueError("indexer config must generate indexer values")
 
 
 @dataclass

@@ -200,256 +200,34 @@ the already-masked `logits` tensor plus the output index buffer and `topk`.
 By default, generated rows include an equal-logit boundary case so references
 and kernels must use a deterministic smallest-index tie-break.
 
-### DeepSeek V4 Compressor State Save
+### DeepSeek V4 Compressed Attention
 
-`DeepSeekV4CompressorStateInputs` represents the write that saves intermediate
-compressor state into a paged DeepSeek V4 state cache. Each valid token row has
-a physical `slot_mapping` entry. The slot selects a cache page and row:
+`DeepSeekV4CompressedAttentionInputs` is the canonical generator for DeepSeek V4
+attention input generation. It represents sliding-window attention plus
+optional compressed-history attention and optional CSA indexer inputs.
 
-```text
-page = slot // block_size
-row = slot % block_size
-state_cache[page, row, 0:state_width] = kv[token]
-state_cache[page, row, state_width:] = score[token] + ape[position % compress_ratio]
-```
+The sliding-window portion is always generated. It contains Q, attention sink,
+request metadata, absolute token positions, token-to-request indices, visible
+sequence lengths, a page table, and a paged byte cache.
 
-Rows with `slot_mapping == -1` are skipped and leave the generated cache
-unchanged. The generator ensures non-negative slots are unique and in range, so
-generated writes do not race with each other and always address valid cache
-rows.
+The optional `compressed` config adds compressed-history inputs. A
+`compress_ratio` of `128` represents HCA-style compressed history, while a
+`compress_ratio` of `4` represents CSA-style compressed history. The generated
+compressed values include paged/sparse index metadata, compressor-state cache
+values, sparse K-cache insert values, and sparse K-cache gather values.
 
-For the C4 overlap path (`compress_ratio == 4` with an even state width), the
-kernel treats the APE tensor as a flat overlapping layout: the first half of the
-APE vector comes from row `position % 4`, and the second half comes from the
-corresponding row in the second half of the flattened APE buffer. The reference
-models this layout explicitly so tests can validate both standard and overlap
-state-cache writes.
+The optional `indexer` config is valid only for CSA. It adds the generated
+indexer-Q RoPE/Hadamard/MXFP4 transform values, CSA indexer cache-insert
+values, and indexer cache write/gather values.
 
-### DeepSeek V4 Indexer Q RoPE/Hadamard/MXFP4
+The nested values intentionally expose the narrower helper-operation bundles
+that TokenSpeed tests and references already consume, but callers should start
+from the single compressed-attention generator instead of constructing one
+generator per helper kernel.
 
-`DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs` represents the query-side indexer
-transform used by DeepSeek V4 sparse attention metadata. Each generated input
-row is a 128-channel per-head indexer Q vector. The operation leaves the first
-64 channels as NoPE channels, applies interleaved RoPE to the final 64
-channels using `positions` and a generated `[cos | sin]` cache, rounds the
-rotated row to BF16, then projects it with a normalized Walsh-Hadamard sign
-matrix:
-
-```text
-rotated = bf16(nope || rope(index_q, position))
-hadamard = bf16(rotated @ H / sqrt(128))
-```
-
-The 128 projected channels are quantized in four 32-channel blocks. Each block
-packs two E2M1 MXFP4 nibbles per byte and emits one UE8M0 scale byte. The
-operation also scales a `[num_tokens, num_heads]` weight tensor by
-`softmax_scale * head_scale`. Generated positions are always in range for the
-generated RoPE cache, and the indexer width is fixed to the DeepSeek V4
-operation width rather than exposed as a free-form kernel constant.
-
-### DeepSeek V4 Inverse-RoPE FP8 Quantization
-
-`DeepSeekV4InvRoPEFP8QuantInputs` represents the output-projection input
-preparation used after DeepSeek V4 attention. Each generated attention output
-row has shape `[num_tokens, n_groups * heads_per_group, head_dim]`. The
-operation applies inverse interleaved RoPE to the rotary suffix of every head:
-
-```text
-even' = even * cos + odd * sin
-odd'  = odd * cos - even * sin
-```
-
-The heads are then regrouped as `[num_tokens, n_groups,
-heads_per_group * head_dim]` and each contiguous `quant_group_size` block is
-quantized to FP8 E4M3. The block scale is rounded up to a power of two:
-
-```text
-scale = 2 ** ceil(log2(max(abs(block)) / fp8_max))
-fp8 = clamp(block / scale, -fp8_max, fp8_max).to(fp8_e4m3)
-```
-
-When `tma_aligned_scales` is true, each head's four UE8M0 scale bytes are
-packed into one int32 value for the grouped DeepGEMM path. Otherwise, scales are
-returned as one float32 value per quantization block. The generator verifies the
-DeepSeek V4 shape relationship that the rotary suffix fits in the final
-quantization group, and generated positions are always in range for the RoPE
-cache.
-
-### DeepSeek V4 CSA Indexer MXFP4 Cache Insert
-
-`DeepSeekV4CSAIndexerMXFP4CacheInsertInputs` represents the compressed sparse
-attention indexer-cache insert path. For each candidate token row, the
-operation writes only when the compressor slot and output KV slot are
-non-negative and `(position + 1) % 4 == 0`. The compression window spans eight
-token positions:
-
-```text
-window = [position - 7, ..., position]
-```
-
-For the older four window positions, the operation reads the first 128-channel
-indexer slice from the paged state cache. For the newer four positions, it
-reads the second 128-channel indexer slice. Matching score rows from the second
-half of the state cache are softmaxed across the window independently for each
-channel, then used to produce a weighted state vector:
-
-```text
-weights[:, channel] = softmax(score_window[:, channel])
-compressed[channel] = sum(kv_window[:, channel] * weights[:, channel])
-normed = rms_norm(compressed, rms_norm_weight, rms_norm_eps)
-```
-
-The normalized vector then follows the indexer transform: RoPE on the final
-64 channels at the compressed position, BF16 rounding, normalized
-Walsh-Hadamard projection, another BF16 rounding step, and MXFP4 quantization
-into four 32-channel blocks. The result is written into the paged MXFP4 indexer
-cache layout used by the standalone indexer cache write/gather generators.
-
-### DeepSeek V4 Sparse-Compress K-Cache Insert
-
-`DeepSeekV4SparseCompressCacheInsertInputs` represents the compressed sparse
-attention K-cache insert path. The operation compresses a window of state-cache
-rows into one 512-channel K row, applies RMSNorm, stores the 448-channel NoPE
-prefix as block-scaled FP8 E4M3 bytes, and stores the 64-channel RoPE suffix as
-BF16 bytes after applying RoPE at the compressed position.
-
-Rows write only when the compressor slot and output KV slot are non-negative
-and `(position + 1) % compress_ratio == 0`. The compression window length is
-`compress_ratio` for the non-overlap path and `2 * compress_ratio` for the
-overlap path:
-
-```text
-window = [position - window_len + 1, ..., position]
-```
-
-For non-overlap compression, every valid window position reads the first
-512-channel state slice. For overlap compression, the older half of the window
-reads the first 512-channel slice and the newer half reads the second
-512-channel slice. Matching score rows from the second half of the state cache
-are softmaxed across the window independently for each channel:
-
-```text
-weights[:, channel] = softmax(score_window[:, channel])
-compressed[channel] = sum(kv_window[:, channel] * weights[:, channel])
-normed = rms_norm(compressed, rms_norm_weight, rms_norm_eps)
-```
-
-The generated output cache uses the same sparse-window byte layout consumed by
-the K-cache gather generator:
-
-```text
-token_base = page * page_stride + row * 576
-scale_base = page * page_stride + block_size * 576 + row * 8
-```
-
-The first 448 token bytes hold NoPE FP8 values with seven UE8M0 scale bytes.
-The final scale byte is reserved and generated as zero. The final 128 token
-bytes hold the 64 BF16 RoPE channels.
-
-### DeepSeek V4 Indexer MXFP4 Cache Write
-
-`DeepSeekV4IndexerMXFP4CacheWriteInputs` represents writing 128-channel indexer
-K rows into a paged MXFP4 byte cache. Each cache page stores all packed value
-bytes for its rows first, followed by one scale byte per 32-channel MXFP4 block:
-
-```text
-value_base = page * page_stride + row * 64
-scale_base = page * page_stride + block_size * 64 + row * 4
-```
-
-For each writable input row, the operation splits the 128 channels into four
-32-channel blocks. Every pair of channels is packed into one E2M1 MXFP4 byte,
-and every block gets one encoded exponent scale byte. A row is writable only
-when `valid[row]` is true and `slot_mapping[row] >= 0`; otherwise the cache
-contents for that row remain unchanged. The generator gives writable rows
-unique in-range slots so generated inputs cannot describe write races or
-out-of-bounds cache accesses.
-
-### DeepSeek V4 Indexer MXFP4 Cache Gather
-
-`DeepSeekV4IndexerMXFP4CacheGatherInputs` represents reading 128-channel indexer
-K rows from the same paged MXFP4 byte-cache layout used by the write generator.
-For each requested row, `slot_mapping` selects the physical page and row within
-that page. The operation copies 64 packed value bytes and 4 scale bytes into
-dense output workspaces:
-
-```text
-value_base = page * page_stride + row * 64
-scale_base = page * page_stride + block_size * 64 + row * 4
-```
-
-Rows with `slot_mapping < 0` gather zeros. Non-negative slots are generated
-within the physical cache range, and generated cache/output byte workspaces use
-layouts compatible with this packed cache representation.
-
-### DeepSeek V4 K-Cache Gather And Dequantize
-
-`DeepSeekV4KCacheGatherInputs` represents reading sparse-window K rows from a
-paged DeepSeek V4 cache into a dense BF16 workspace. Each physical cache page
-stores all token payload bytes first, followed by one scale-byte row per token:
-
-```text
-token_base = page * page_stride + row * 576
-scale_base = page * page_stride + block_size * 576 + row * 8
-```
-
-The first 448 token payload bytes are FP8 E4M3 NoPE values, with one UE8M0
-scale byte per contiguous 64-channel group. The final 128 payload bytes are the
-64 BF16 RoPE channels. For each request, `seq_lens` and optional `gather_lens`
-select a suffix of visible K tokens. `block_table` maps each logical cache page
-to a physical page, and generated metadata keeps all gathered positions within
-the table.
-
-### DeepSeek V4 Sparse-Prefill Indices
-
-`DeepSeekV4SparsePrefillIndexInputs` represents the metadata/index construction
-used by DeepSeek V4 sparse prefill attention. The operation does not generate
-attention values. It builds integer candidate lists into a per-request KV
-workspace:
-
-```text
-workspace[request] =
-  compressed_prefix_slots[0:compressed_base] +
-  gathered_sliding_window_slots[compressed_base:workspace_width]
-```
-
-For each generated query token, `positions` gives the absolute token position in
-the request and `token_to_req_indices` maps the packed token row back to the
-request. The generated `topk_indices` select sparse compressed-prefix slots for
-the top-k path. Dense-compressed references instead enumerate compressed prefix
-slots from zero up to the per-token compressed length. Both paths append local
-sliding-window attention slots derived from `window_size`, `gather_lens`, and
-the request sequence lengths.
-
-The generator keeps request lengths, compressed-prefix capacity, gathered SWA
-capacity, and workspace width consistent so the generated indices are valid
-operation-level inputs for the local-compressed, top-k+SWA, and
-dense-compressed+SWA index builders.
-
-### DeepSeek V4 Paged Indices
-
-`DeepSeekV4PagedIndexInputs` represents paged-cache metadata used by DeepSeek V4
-decode and indexer helpers. The generated object describes packed query tokens,
-their absolute request positions, a request id for each packed token row, and a
-per-request block table:
-
-```text
-logical_token_position -> logical_block = position // block_size
-logical_block -> physical_block = block_table[request, logical_block]
-slot_id = physical_block * block_size + position % block_size
-```
-
-The same generated values support several related metadata operations:
-
-- mapping request-local top-k indices to global paged-cache slot ids
-- building per-token decode sliding-window slot lists and row lengths
-- building compressed KV slot mappings for newly materialized compressed tokens
-- building decode-indexer block tables and compressed context lengths
-
-The generator owns the shape relationships between request metadata, token
-positions, page-table width, optional valid-token masks, optional block-table
-base offsets, and the compressed/paged indexing parameters. These are metadata
-operations, so no attention value tensors are generated.
+DeepSeek V4 inverse-RoPE FP8 quantization remains a separate generator because
+it is an output-projection preparation utility, not part of compressed
+attention input generation.
 
 ### Merge State
 
@@ -506,33 +284,20 @@ values:
 - MLA FP8 prefill inputs require tied non-empty Q and K/V request lengths, FP8
   Q/K/V storage, matching head counts, matching Q/K head dimensions, and a
   positive softmax scale
-- DeepSeek V4 sparse-prefill index inputs require tied Q/KV request lengths, a
-  compressed-prefix ratio greater than one, valid top-k compressed-prefix slots,
-  and a workspace width that covers compressed-prefix plus gathered SWA slots
-- DeepSeek V4 paged-index inputs require tied Q/KV request lengths, a block
-  table wide enough for generated visible KV positions, positive block/window
-  sizes, a compressed-prefix ratio greater than one, and valid token-to-request
-  metadata
-- DeepSeek V4 K-cache gather inputs require a paged byte-cache layout with
-  FP8 NoPE bytes, BF16 RoPE bytes, UE8M0 scale bytes, valid gather lengths, and
-  block-table entries covering every gathered token position
-- DeepSeek V4 indexer-Q RoPE/Hadamard/MXFP4 inputs require 128-channel indexer
-  Q rows, a 64-channel RoPE cache, per-token positions within that cache, and
-  per-head weights matching the token/head dimensions
+- DeepSeek V4 compressed-attention inputs require tied Q/KV request lengths,
+  the fixed DeepSeek V4 512-wide attention-head layout with a 64-channel RoPE
+  suffix, positive paged-cache dimensions, and page tables wide enough for the
+  generated visible KV positions
+- DeepSeek V4 compressed-history inputs require `compress_ratio` equal to 4
+  for CSA or 128 for HCA; CSA requires overlapping compressor state, and HCA
+  requires non-overlapping compressor state
+- DeepSeek V4 CSA indexer inputs require compressed-history inputs with
+  `compress_ratio == 4`, valid MXFP4 indexer-cache layouts, and generated
+  slot mappings that avoid out-of-bounds cache accesses
 - DeepSeek V4 inverse-RoPE FP8 quantization inputs require grouped head counts
   matching the attention-output head dimension, an even rotary suffix, a head
   dimension divisible by the quantization group size, and a rotary suffix that
   fits in the final quantization group
-- DeepSeek V4 CSA indexer MXFP4 cache-insert inputs require state-cache pages
-  with two 128-channel indexer slices plus matching score slices, block tables
-  that cover generated positions, unique writable output slots, valid request
-  ids, and MXFP4 cache rows large enough for 64 packed value bytes plus 4 scale
-  bytes per row
-- DeepSeek V4 sparse-compress K-cache insert inputs require state-cache pages
-  with one or two 512-channel K slices plus matching score slices, block tables
-  that cover generated positions, unique writable output slots, valid request
-  ids, a generated RoPE cache covering compressed positions, and K-cache rows
-  large enough for 448 FP8 NoPE bytes, 128 BF16 RoPE bytes, and 8 scale bytes
 - merge-state outputs must have shape `[total_q, num_heads, head_dim]`
 - merge-state LSE tensors must have shape `[total_q, num_heads]` and use fp32
   generated values
@@ -557,23 +322,19 @@ TokenSpeed has several attention registry entry points: MHA prefill, MHA
 extend/decode with KV cache, MLA prefill, MLA decode with KV cache, and
 attention merge-state. TokenSpeed also exposes GDN QKV split, packed QKV rotary,
 DSA sparse decode KV packing, DSA sparse slot conversion, deterministic DSA
-decode top-k selection, and MLA K/V
-pack+quantize helpers that map directly to `GDNQKVSplitInputValues`,
-`PackedQKVComplexRotaryInputValues`, `DSASparseDecodeKVPackInputValues`,
-`DSATopKSlotInputValues`, `DSADecodeTopKInputValues`,
-`MLAKVPackQuantizeFP8InputValues`, and `MLAPrefillFP8InputValues`, plus
-DeepSeek V4 sparse-prefill index helpers that accept the tensors and scalar
-workspace parameters generated by
-`DeepSeekV4SparsePrefillIndexInputs`. DeepSeek V4
-paged-cache index helpers similarly consume `DeepSeekV4PagedIndexInputs`
-through small adapters. The DeepSeek V4 K-cache gather/dequantize helper
-consumes `DeepSeekV4KCacheGatherInputs` directly, and the DeepSeek V4
-indexer-Q RoPE/Hadamard/MXFP4 helper consumes
-`DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues` directly. The DeepSeek V4
-inverse-RoPE FP8 quantization helper consumes
-`DeepSeekV4InvRoPEFP8QuantInputValues` directly. The DeepSeek V4 CSA indexer
-MXFP4 cache-insert helper consumes
-`DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues` directly. The generator
-values are operation-level values. Tests or adapters are responsible for
-converting generated values into the exact keyword arguments expected by a
+decode top-k selection, and MLA K/V pack+quantize helpers that map directly to
+`GDNQKVSplitInputValues`, `PackedQKVComplexRotaryInputValues`,
+`DSASparseDecodeKVPackInputValues`, `DSATopKSlotInputValues`,
+`DSADecodeTopKInputValues`, `MLAKVPackQuantizeFP8InputValues`, and
+`MLAPrefillFP8InputValues`.
+
+DeepSeek V4 compressed-attention tests should start from
+`DeepSeekV4CompressedAttentionInputValues`. Its nested `sliding_window`,
+`compressed`, and `indexer` values contain the narrower bundles consumed by
+TokenSpeed's SWA, HCA, CSA, indexer, cache-insert, cache-gather, and sparse
+index helpers. The DeepSeek V4 inverse-RoPE FP8 quantization helper remains a
+separate utility and consumes `DeepSeekV4InvRoPEFP8QuantInputValues`.
+
+Generator values are operation-level values. Tests or adapters are responsible
+for converting generated values into the exact keyword arguments expected by a
 selected TokenSpeed backend.

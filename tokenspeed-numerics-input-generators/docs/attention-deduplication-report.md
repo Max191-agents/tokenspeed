@@ -96,7 +96,14 @@ generate compressor-state cache contents, request/page metadata, compression
 window metadata, RMSNorm weights, RoPE cache, output cache bytes, and output
 slot mappings.
 
-Recommended direction: split these into reusable lower-level generators:
+Current direction: `DeepSeekV4CompressedAttentionInputs` is the canonical
+operation-level generator for DeepSeek V4 compressed attention. It always
+generates the sliding-window portion and optionally generates compressed-history
+and CSA indexer nested values. TokenSpeed helper tests can adapt those nested
+values to narrower kernel entry points.
+
+Further cleanup should split the compatibility/helper bundles into reusable
+lower-level generators where that makes the implementation easier to follow:
 
 - compressor-state cache rows
 - compression-window metadata
@@ -126,16 +133,17 @@ This follows the same pattern as GEMM: the storage format is reusable, while
 write and gather are operation references over that storage.
 
 Current status: the repeated flat slot-mapping generation has been factored
-through `SlotMappingInput`, and page/block-table generation can target larger
-physical page pools through `PageTableInput`.
+through `SlotMappingInput`, page/block-table generation can target larger
+physical page pools through `PageTableInput`, and DeepSeek V4 compressed
+attention now has one canonical high-level generator instead of a separate
+generator per CSA/HCA helper path.
 
 ## Metadata Deduplication Candidates
 
 The following generators are metadata-heavy and share concepts:
 
 - `DSATopKSlotInputs`
-- `DeepSeekV4PagedIndexInputs`
-- `DeepSeekV4SparsePrefillIndexInputs`
+- DeepSeek V4 compressed-attention nested paged/sparse index values
 
 They all generate request/token positions, sequence lengths, page tables or
 block tables, and local-to-global cache slot relationships. They should not
@@ -171,8 +179,9 @@ Recommended shared pieces:
    TokenSpeed convenience builder should live outside the numerics package.
 3. Split `MLAKVPackQuantizeFP8Inputs` into MLA K/V assembly plus quantization
    composition.
-4. Refactor DeepSeek V4 cache layouts and compression-window metadata into
-   shared generators.
-5. Rework the fused DeepSeek generator tests to compose lower-level generators,
-   then remove the fused generator classes whose names mirror TokenSpeed kernel
-   entry points.
+4. Continue refactoring DeepSeek V4 cache layouts and compression-window
+   metadata into shared generators where that removes real implementation
+   duplication.
+5. Move TokenSpeed-specific convenience builders and compatibility adapters out
+   of the standalone numerics package once the kernel tests no longer import
+   helper-specific DeepSeek generator names directly.

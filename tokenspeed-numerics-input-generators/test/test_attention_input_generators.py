@@ -25,6 +25,10 @@ import torch
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
     AttentionMergeStateInputs,
+    DeepSeekV4CompressedAttentionCompressedConfig,
+    DeepSeekV4CompressedAttentionIndexerConfig,
+    DeepSeekV4CompressedAttentionInputConfig,
+    DeepSeekV4CompressedAttentionInputs,
     DeepSeekV4CompressorStateInputConfig,
     DeepSeekV4CompressorStateInputs,
     DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig,
@@ -1207,6 +1211,190 @@ def test_dsa_topk_slot_inputs_reject_invalid_configs_and_values() -> None:
     values.seq_lens = values.seq_lens[:-1]
     with pytest.raises(ValueError, match="seq_lens"):
         dsa_local_topk_to_global_slots_reference(values)
+
+
+def test_deepseek_v4_compressed_attention_generates_swa_only_values() -> None:
+    values = DeepSeekV4CompressedAttentionInputs(
+        DeepSeekV4CompressedAttentionInputConfig(
+            batch_size=2,
+            total_cached_tokens=8,
+            total_new_q_tokens=4,
+            dtype=torch.bfloat16,
+            num_q_heads=3,
+            page_size=4,
+            window_size=5,
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=2,
+                total_cached_tokens=8,
+                total_new_q_tokens=4,
+                cache_layout="paged",
+                cached_length_mode="regular",
+                new_q_length_mode="fixed_per_request",
+            ),
+        )
+    ).generate(seed=911, device="cpu")
+
+    assert values.kind == "swa"
+    assert values.compressed is None
+    assert values.indexer is None
+    assert values.sliding_window.q.shape == (4, 3, 512)
+    assert values.sliding_window.positions.shape == (4,)
+    assert values.sliding_window.token_to_req_indices.tolist() == [0, 0, 1, 1]
+    assert values.sliding_window.cache_2d.dtype == torch.uint8
+    assert values.sliding_window.page_table.shape[0] == 2
+
+
+def test_deepseek_v4_compressed_attention_generates_hca_values() -> None:
+    values = DeepSeekV4CompressedAttentionInputs(
+        DeepSeekV4CompressedAttentionInputConfig(
+            batch_size=2,
+            total_cached_tokens=16,
+            total_new_q_tokens=4,
+            dtype=torch.float32,
+            num_q_heads=2,
+            page_size=4,
+            window_size=5,
+            compressed=DeepSeekV4CompressedAttentionCompressedConfig(
+                compress_ratio=128,
+                topk=3,
+                num_state_cache_blocks=2,
+                compressor_block_size=8,
+                num_kv_cache_blocks=2,
+                kv_cache_block_size=4,
+            ),
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=2,
+                total_cached_tokens=16,
+                total_new_q_tokens=4,
+                cache_layout="paged",
+                cached_length_mode="regular",
+                new_q_length_mode="fixed_per_request",
+            ),
+        )
+    ).generate(seed=912, device="cpu")
+
+    assert values.kind == "hca"
+    assert values.indexer is None
+    assert values.compressed is not None
+    assert values.compressed.cache_insert.compress_ratio == 128
+    assert values.compressed.cache_insert.overlap is False
+    assert values.compressed.compressor_state.compress_ratio == 128
+    assert values.compressed.paged_index.compress_ratio == 128
+    assert (
+        values.compressed.paged_index.metadata.new_q_lens_cpu
+        == values.sliding_window.metadata.new_q_lens_cpu
+    )
+    assert (
+        values.compressed.sparse_prefill_index.metadata.visible_kv_lens_cpu
+        == values.sliding_window.metadata.visible_kv_lens_cpu
+    )
+    assert torch.equal(values.compressed.paged_index.block_table, values.sliding_window.page_table)
+
+    deepseek_v4_sparse_compress_cache_insert_reference(values.compressed.cache_insert)
+    deepseek_v4_save_compressor_state_reference(values.compressed.compressor_state)
+    deepseek_v4_compute_global_topk_indices_and_lens_reference(
+        values.compressed.paged_index
+    )
+    deepseek_v4_combine_dense_swa_indices_reference(
+        values.compressed.sparse_prefill_index
+    )
+    deepseek_v4_dequantize_and_gather_k_cache_reference(values.compressed.k_cache_gather)
+
+
+def test_deepseek_v4_compressed_attention_generates_csa_indexer_values() -> None:
+    values = DeepSeekV4CompressedAttentionInputs(
+        DeepSeekV4CompressedAttentionInputConfig(
+            batch_size=2,
+            total_cached_tokens=16,
+            total_new_q_tokens=4,
+            dtype=torch.float32,
+            num_q_heads=2,
+            page_size=4,
+            window_size=5,
+            compressed=DeepSeekV4CompressedAttentionCompressedConfig(
+                compress_ratio=4,
+                topk=3,
+                num_state_cache_blocks=2,
+                compressor_block_size=4,
+                num_kv_cache_blocks=2,
+                kv_cache_block_size=4,
+            ),
+            indexer=DeepSeekV4CompressedAttentionIndexerConfig(
+                num_heads=2,
+                num_state_cache_blocks=2,
+                compressor_block_size=4,
+                num_kv_cache_blocks=2,
+                kv_cache_block_size=4,
+                num_cache_blocks=2,
+                block_size=4,
+            ),
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=2,
+                total_cached_tokens=16,
+                total_new_q_tokens=4,
+                cache_layout="paged",
+                cached_length_mode="regular",
+                new_q_length_mode="fixed_per_request",
+            ),
+        )
+    ).generate(metadata_seed=913, value_seed=914, device="cpu")
+
+    assert values.kind == "csa"
+    assert values.compressed is not None
+    assert values.indexer is not None
+    assert values.compressed.cache_insert.compress_ratio == 4
+    assert values.compressed.cache_insert.overlap is True
+    assert values.indexer.cache_insert.compress_ratio == 4
+    assert values.indexer.q_rope_hadamard_mxfp4.index_q.shape == (4, 2, 128)
+    assert (
+        values.compressed.paged_index.metadata.new_q_lens_cpu
+        == values.sliding_window.metadata.new_q_lens_cpu
+    )
+    assert (
+        values.compressed.sparse_prefill_index.token_to_req_indices.tolist()
+        == values.sliding_window.token_to_req_indices.tolist()
+    )
+
+    deepseek_v4_sparse_compress_cache_insert_reference(values.compressed.cache_insert)
+    deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(values.indexer.cache_insert)
+    deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(
+        values.indexer.q_rope_hadamard_mxfp4
+    )
+    deepseek_v4_indexer_mxfp4_cache_write_reference(values.indexer.cache_write)
+    deepseek_v4_indexer_mxfp4_cache_gather_reference(values.indexer.cache_gather)
+
+
+def test_deepseek_v4_compressed_attention_rejects_invalid_component_mix() -> None:
+    with pytest.raises(ValueError, match="indexer requires compressed"):
+        DeepSeekV4CompressedAttentionInputs(
+            DeepSeekV4CompressedAttentionInputConfig(
+                batch_size=1,
+                total_cached_tokens=1,
+                total_new_q_tokens=1,
+                dtype=torch.float32,
+                num_q_heads=1,
+                page_size=1,
+                window_size=1,
+                indexer=DeepSeekV4CompressedAttentionIndexerConfig(),
+            )
+        )
+
+    with pytest.raises(ValueError, match="only valid for CSA"):
+        DeepSeekV4CompressedAttentionInputs(
+            DeepSeekV4CompressedAttentionInputConfig(
+                batch_size=1,
+                total_cached_tokens=1,
+                total_new_q_tokens=1,
+                dtype=torch.float32,
+                num_q_heads=1,
+                page_size=1,
+                window_size=1,
+                compressed=DeepSeekV4CompressedAttentionCompressedConfig(
+                    compress_ratio=128,
+                ),
+                indexer=DeepSeekV4CompressedAttentionIndexerConfig(),
+            )
+        )
 
 
 def test_deepseek_v4_compressor_state_inputs_generate_values_and_reference() -> None:
