@@ -56,3 +56,6 @@ or sparse-index structure.
 Cache/page generation enforces valid page tables, request lengths, and cache
 slot relationships. Kernel-specific names such as `block_tables` or flattened
 registry arguments belong in adapters outside the generator.
+
+See `../../attention-deduplication-report.md` for the current cleanup plan for
+over-specific and fused attention generators.

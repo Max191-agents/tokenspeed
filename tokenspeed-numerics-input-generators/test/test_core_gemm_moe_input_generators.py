@@ -20,16 +20,16 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 from tokenspeed_numerics_input_generators import (
     CustomDType,
+    FusedSwiGLUNVFP4QuantInputValues,
     GemmInputConfig,
     GemmInputs,
     GemmInputValues,
-    LMHeadProjectionInputConfig,
-    LMHeadProjectionInputs,
-    LMHeadProjectionInputValues,
     MoeAlignBlockSizeInputConfig,
     MoeAlignBlockSizeInputs,
     MoeAlignBlockSizeInputValues,
@@ -51,16 +51,11 @@ from tokenspeed_numerics_input_generators import (
     MoESoftplusSqrtTopKRoutingInputConfig,
     MoESoftplusSqrtTopKRoutingInputs,
     MoESoftplusSqrtTopKRoutingInputValues,
-    NVFP4GemmSwiGLUNVFP4QuantInputConfig,
-    NVFP4GemmSwiGLUNVFP4QuantInputs,
-    RouterProjectionInputConfig,
-    RouterProjectionInputs,
-    RouterProjectionInputValues,
     TensorInput,
     canonicalize_moe_align_block_size,
+    fused_swiglu_nvfp4_quant_reference,
     gemm_reference,
     gemm_scale_shape,
-    lm_head_projection_reference,
     moe_align_block_size_buffer_dims,
     moe_align_block_size_reference,
     moe_biased_grouped_topk_reference,
@@ -74,8 +69,6 @@ from tokenspeed_numerics_input_generators import (
     mxint4_gemm_input_config,
     nvfp4_dequantization_reference,
     nvfp4_gemm_input_config,
-    nvfp4_gemm_swiglu_nvfp4_quant_reference,
-    router_projection_reference,
 )
 
 _fp8_dtype = torch.float8_e4m3fn
@@ -856,197 +849,86 @@ def test_mxfp8_gemm_input_config_rejects_irregular_block_grid() -> None:
         )
 
 
-def test_router_projection_inputs_generate_useful_logits() -> None:
-    values = RouterProjectionInputs(
-        RouterProjectionInputConfig(
-            num_tokens=5,
-            hidden_dim=64,
-            num_experts=7,
-            hidden_dtype=torch.bfloat16,
-            router_weight_dtype=torch.float32,
+def test_gemm_inputs_cover_router_projection_shape() -> None:
+    values = GemmInputs(
+        GemmInputConfig(
+            M=5,
+            N=7,
+            K=64,
+            a_dtype=torch.bfloat16,
+            b_dtype=torch.float32,
+            c_dtype=torch.float32,
         )
     ).generate(seed=95, device="cpu")
+    assert values.A is not None
+    assert values.B is not None
+    values.B = (values.B.float() / math.sqrt(64)).contiguous()
 
-    assert values.hidden_states.shape == (5, 64)
-    assert values.router_weights.shape == (7, 64)
-    assert values.hidden_states.dtype == torch.bfloat16
-    assert values.router_weights.dtype == torch.float32
+    logits = gemm_reference(values, out_dtype=torch.float32)
 
-    logits = router_projection_reference(values)
-
+    assert values.A.shape == (5, 64)
+    assert values.B.shape == (7, 64)
     assert logits.shape == (5, 7)
     assert logits.dtype == torch.float32
     assert torch.isfinite(logits).all()
     assert logits.float().std() > 0.0
-    assert logits.float().abs().max() < 10.0
 
 
-def test_router_projection_reference_matches_matmul() -> None:
-    values = RouterProjectionInputValues(
-        hidden_states=torch.tensor(
-            [[1.0, 2.0, -1.0], [0.5, -0.25, 2.0]],
-            dtype=torch.float32,
-        ),
-        router_weights=torch.tensor(
-            [[0.5, 1.0, 2.0], [1.5, -1.0, 0.25]],
-            dtype=torch.float32,
-        ),
-    )
-
-    logits = router_projection_reference(values)
-
-    torch.testing.assert_close(logits, values.hidden_states @ values.router_weights.T)
-
-
-def test_router_projection_inputs_reject_invalid_configs() -> None:
-    with pytest.raises(ValueError, match="num_tokens"):
-        RouterProjectionInputs(
-            RouterProjectionInputConfig(
-                num_tokens=0,
-                hidden_dim=64,
-                num_experts=7,
-            )
-        )
-    with pytest.raises(ValueError, match="hidden_dtype"):
-        RouterProjectionInputs(
-            RouterProjectionInputConfig(
-                num_tokens=5,
-                hidden_dim=64,
-                num_experts=7,
-                hidden_dtype=torch.int32,  # type: ignore[arg-type]
-            )
-        )
-    with pytest.raises(ValueError, match="router_weight_scale"):
-        RouterProjectionInputs(
-            RouterProjectionInputConfig(
-                num_tokens=5,
-                hidden_dim=64,
-                num_experts=7,
-                router_weight_scale=0.0,
-            )
-        )
-
-
-def test_router_projection_reference_rejects_invalid_values() -> None:
-    values = RouterProjectionInputValues(
-        hidden_states=torch.randn(2, 4),
-        router_weights=torch.randn(3, 5),
-    )
-
-    with pytest.raises(ValueError, match="hidden dimensions"):
-        router_projection_reference(values)
-
-
-def test_lm_head_projection_inputs_generate_useful_logits() -> None:
-    values = LMHeadProjectionInputs(
-        LMHeadProjectionInputConfig(
-            num_tokens=4,
-            hidden_dim=64,
-            vocab_size=11,
-            hidden_dtype=torch.bfloat16,
-            weight_dtype=torch.bfloat16,
+def test_gemm_inputs_cover_lm_head_projection_shape() -> None:
+    values = GemmInputs(
+        GemmInputConfig(
+            M=4,
+            N=11,
+            K=64,
+            a_dtype=torch.bfloat16,
+            b_dtype=torch.bfloat16,
+            c_dtype=torch.bfloat16,
         )
     ).generate(seed=96, device="cpu")
+    assert values.A is not None
+    assert values.B is not None
+    values.B = (values.B.float() / math.sqrt(64)).to(torch.bfloat16).contiguous()
 
-    assert values.hidden_states.shape == (4, 64)
-    assert values.weight.shape == (11, 64)
-    assert values.hidden_states.dtype == torch.bfloat16
-    assert values.weight.dtype == torch.bfloat16
+    logits = gemm_reference(values)
 
-    logits = lm_head_projection_reference(values)
-
+    assert values.A.shape == (4, 64)
+    assert values.B.shape == (11, 64)
     assert logits.shape == (4, 11)
     assert logits.dtype == torch.bfloat16
     assert torch.isfinite(logits.float()).all()
     assert logits.float().std() > 0.0
-    assert logits.float().abs().max() < 10.0
 
 
-def test_lm_head_projection_reference_matches_matmul() -> None:
-    values = LMHeadProjectionInputValues(
-        hidden_states=torch.tensor(
-            [[1.0, 2.0, -1.0], [0.5, -0.25, 2.0]],
-            dtype=torch.float32,
-        ),
-        weight=torch.tensor(
-            [[0.5, 1.0, 2.0], [1.5, -1.0, 0.25]],
-            dtype=torch.float32,
-        ),
-    )
-
-    logits = lm_head_projection_reference(values, out_dtype=torch.float32)
-
-    torch.testing.assert_close(logits, values.hidden_states @ values.weight.T)
-
-
-def test_lm_head_projection_inputs_reject_invalid_configs() -> None:
-    with pytest.raises(ValueError, match="vocab_size"):
-        LMHeadProjectionInputs(
-            LMHeadProjectionInputConfig(
-                num_tokens=4,
-                hidden_dim=64,
-                vocab_size=0,
-            )
-        )
-    with pytest.raises(ValueError, match="weight_dtype"):
-        LMHeadProjectionInputs(
-            LMHeadProjectionInputConfig(
-                num_tokens=4,
-                hidden_dim=64,
-                vocab_size=11,
-                weight_dtype=torch.int32,  # type: ignore[arg-type]
-            )
-        )
-    with pytest.raises(ValueError, match="weight_scale"):
-        LMHeadProjectionInputs(
-            LMHeadProjectionInputConfig(
-                num_tokens=4,
-                hidden_dim=64,
-                vocab_size=11,
-                weight_scale=0.0,
-            )
-        )
-
-
-def test_lm_head_projection_reference_rejects_invalid_values() -> None:
-    values = LMHeadProjectionInputValues(
-        hidden_states=torch.randn(2, 4),
-        weight=torch.randn(3, 5),
-    )
-
-    with pytest.raises(ValueError, match="hidden dimensions"):
-        lm_head_projection_reference(values)
-
-
-def test_nvfp4_gemm_swiglu_inputs_generate_values_and_reference() -> None:
-    values = NVFP4GemmSwiGLUNVFP4QuantInputs(
-        NVFP4GemmSwiGLUNVFP4QuantInputConfig(
+def test_composes_nvfp4_gemm_with_swiglu_quant_reference() -> None:
+    values = GemmInputs(
+        nvfp4_gemm_input_config(
             M=3,
+            N=64,
             K=64,
-            intermediate_size=32,
-            dtype=torch.bfloat16,
+            c_dtype=torch.bfloat16,
         )
     ).generate(seed=23, device="cpu")
+    assert values.A is not None
+    assert values.B is not None
+    assert values.A_scales is not None
+    assert values.B_scales is not None
+    output_global_scale = torch.tensor([0.01], dtype=torch.float32)
+    output_global_scale_inv = 1.0 / output_global_scale
 
-    assert values.x.shape == (3, 64)
-    assert values.w1.shape == (64, 64)
-    assert values.x_fp4.shape == (3, 32)
-    assert values.w1_fp4.shape == (64, 32)
-    assert values.x_scale.shape == (3, 4)
-    assert values.w1_scale.shape == (64, 4)
-    assert values.fc1_alpha.shape == (1,)
-    torch.testing.assert_close(
-        values.fc1_alpha,
-        values.x_global_scale * values.w1_global_scale,
+    gate_up = gemm_reference(
+        values,
+        alpha=torch.tensor([1.0e-3], dtype=torch.float32),
+        out_dtype=torch.bfloat16,
     )
-    assert values.output_global_scale.shape == (1,)
-    torch.testing.assert_close(
-        values.output_global_scale * values.output_global_scale_inv,
-        torch.ones_like(values.output_global_scale),
+    packed, scales = fused_swiglu_nvfp4_quant_reference(
+        FusedSwiGLUNVFP4QuantInputValues(
+            gate_up=gate_up,
+            global_scale=output_global_scale_inv,
+            scale_size=16,
+        )
     )
 
-    packed, scales = nvfp4_gemm_swiglu_nvfp4_quant_reference(values)
-
+    assert gate_up.shape == (3, 64)
     assert packed.shape == (3, 16)
     assert scales.shape == (3, 2)
     assert packed.dtype == torch.uint8
@@ -1054,58 +936,10 @@ def test_nvfp4_gemm_swiglu_inputs_generate_values_and_reference() -> None:
     dequant = nvfp4_dequantization_reference(
         packed,
         scales,
-        scale=values.output_global_scale,
+        scale=output_global_scale,
     )
     assert dequant.shape == (3, 32)
     assert torch.isfinite(dequant).all()
-
-
-def test_nvfp4_gemm_swiglu_reference_rejects_bad_shapes() -> None:
-    values = NVFP4GemmSwiGLUNVFP4QuantInputs(
-        NVFP4GemmSwiGLUNVFP4QuantInputConfig(
-            M=3,
-            K=64,
-            intermediate_size=32,
-            dtype=torch.bfloat16,
-        )
-    ).generate(seed=24, device="cpu")
-    values.w1_fp4 = values.w1_fp4[:-1]
-
-    with pytest.raises(ValueError, match="even gate/up"):
-        nvfp4_gemm_swiglu_nvfp4_quant_reference(values)
-
-
-def test_nvfp4_gemm_swiglu_inputs_verify_dimensions() -> None:
-    with pytest.raises(ValueError, match="K must be divisible"):
-        NVFP4GemmSwiGLUNVFP4QuantInputs(
-            NVFP4GemmSwiGLUNVFP4QuantInputConfig(
-                M=3,
-                K=65,
-                intermediate_size=32,
-                dtype=torch.bfloat16,
-            )
-        )
-
-    with pytest.raises(ValueError, match="intermediate_size must be divisible"):
-        NVFP4GemmSwiGLUNVFP4QuantInputs(
-            NVFP4GemmSwiGLUNVFP4QuantInputConfig(
-                M=3,
-                K=64,
-                intermediate_size=31,
-                dtype=torch.bfloat16,
-            )
-        )
-
-    with pytest.raises(ValueError, match="output_global_scale must be positive"):
-        NVFP4GemmSwiGLUNVFP4QuantInputs(
-            NVFP4GemmSwiGLUNVFP4QuantInputConfig(
-                M=3,
-                K=64,
-                intermediate_size=32,
-                dtype=torch.bfloat16,
-                output_global_scale=0.0,
-            )
-        )
 
 
 def test_moe_inputs_compose_dense_weight_gemms() -> None:

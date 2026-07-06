@@ -21,15 +21,19 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import pytest
 import torch
 from tokenspeed_numerics_input_generators import (
-    NVFP4GemmSwiGLUNVFP4QuantInputConfig,
-    NVFP4GemmSwiGLUNVFP4QuantInputs,
+    FusedSwiGLUNVFP4QuantInputValues,
+    GemmInputValues,
+    GemmInputs,
     TensorInput,
+    fused_swiglu_nvfp4_quant_reference,
+    gemm_reference,
     nvfp4_dequantization_reference,
-    nvfp4_gemm_swiglu_nvfp4_quant_reference,
+    nvfp4_gemm_input_config,
 )
 
 
@@ -42,6 +46,87 @@ def _scale_inv_for(tensor: torch.Tensor) -> torch.Tensor:
         min=1e-8
     )
     return (1.0 / scale).view(1)
+
+
+@dataclass
+class _NVFP4GemmSwiGLUValues:
+    gemm: GemmInputValues
+    fc1_alpha: torch.Tensor
+    output_global_scale: torch.Tensor
+    output_global_scale_inv: torch.Tensor
+    scale_size: int
+
+    @property
+    def x_fp4(self) -> torch.Tensor:
+        assert self.gemm.A is not None
+        return self.gemm.A
+
+    @property
+    def x_scale(self) -> torch.Tensor:
+        assert self.gemm.A_scales is not None
+        return self.gemm.A_scales
+
+    @property
+    def w1_fp4(self) -> torch.Tensor:
+        assert self.gemm.B is not None
+        return self.gemm.B
+
+    @property
+    def w1_scale(self) -> torch.Tensor:
+        assert self.gemm.B_scales is not None
+        return self.gemm.B_scales
+
+
+def _generate_nvfp4_gemm_swiglu_values(
+    *,
+    m: int,
+    k: int,
+    intermediate_size: int,
+    seed: int,
+    device: str,
+) -> _NVFP4GemmSwiGLUValues:
+    gemm = GemmInputs(
+        nvfp4_gemm_input_config(
+            M=m,
+            N=2 * intermediate_size,
+            K=k,
+            c_dtype=torch.bfloat16,
+        )
+    ).generate(seed=seed, device=device)
+    assert gemm.A is not None
+    assert gemm.B is not None
+    assert gemm.A_scales is not None
+    assert gemm.B_scales is not None
+    fc1_alpha = torch.tensor([1.0e-3], dtype=torch.float32, device=gemm.A.device)
+    output_global_scale = torch.tensor(
+        [0.01],
+        dtype=torch.float32,
+        device=gemm.A.device,
+    )
+    return _NVFP4GemmSwiGLUValues(
+        gemm=gemm,
+        fc1_alpha=fc1_alpha,
+        output_global_scale=output_global_scale,
+        output_global_scale_inv=1.0 / output_global_scale,
+        scale_size=16,
+    )
+
+
+def _nvfp4_gemm_swiglu_reference(
+    values: _NVFP4GemmSwiGLUValues,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    gate_up = gemm_reference(
+        values.gemm,
+        alpha=values.fc1_alpha,
+        out_dtype=torch.bfloat16,
+    )
+    return fused_swiglu_nvfp4_quant_reference(
+        FusedSwiGLUNVFP4QuantInputValues(
+            gate_up=gate_up,
+            global_scale=values.output_global_scale_inv,
+            scale_size=values.scale_size,
+        )
+    )
 
 
 def _unswizzle_blockscale_2d(
@@ -173,15 +258,14 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_generator_reference() -> None:
         swizzle_blockscale_2d,
     )
 
-    values = NVFP4GemmSwiGLUNVFP4QuantInputs(
-        NVFP4GemmSwiGLUNVFP4QuantInputConfig(
-            M=8,
-            K=256,
-            intermediate_size=128,
-            dtype=torch.bfloat16,
-        )
-    ).generate(seed=141, device="cuda")
-    expected_fp4, expected_scales = nvfp4_gemm_swiglu_nvfp4_quant_reference(values)
+    values = _generate_nvfp4_gemm_swiglu_values(
+        m=8,
+        k=256,
+        intermediate_size=128,
+        seed=141,
+        device="cuda",
+    )
+    expected_fp4, expected_scales = _nvfp4_gemm_swiglu_reference(values)
 
     gate_fp4, linear_fp4 = values.w1_fp4.chunk(2, dim=0)
     gate_scale, linear_scale = values.w1_scale.chunk(2, dim=0)
@@ -262,14 +346,13 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
 
     load_builtin_kernels()
 
-    values = NVFP4GemmSwiGLUNVFP4QuantInputs(
-        NVFP4GemmSwiGLUNVFP4QuantInputConfig(
-            M=m,
-            K=k,
-            intermediate_size=i,
-            dtype=torch.bfloat16,
-        )
-    ).generate(seed=1000 + m + i, device="cuda")
+    values = _generate_nvfp4_gemm_swiglu_values(
+        m=m,
+        k=k,
+        intermediate_size=i,
+        seed=1000 + m + i,
+        device="cuda",
+    )
     w2_values = TensorInput((k, i), torch.bfloat16).generate(
         seed=2000 + m + i,
         device="cuda",

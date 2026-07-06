@@ -21,7 +21,7 @@ on the config and values classes in code.
 - [core](core/README.md): shared base interfaces, tensor generation, and custom
   dtype semantics.
 - [embedding](embedding/README.md): rotary embedding inputs and references.
-- [gemm](gemm/README.md): dense, scaled, quantized, and fused GEMM-like inputs.
+- [gemm](gemm/README.md): dense, scaled, and quantized GEMM inputs.
 - [kvcache](kvcache/README.md): cache stores, page-table gathers, and cache-row
   transfers.
 - [layernorm](layernorm/README.md): RMSNorm, QK RMSNorm, fused RoPE/gate, and
