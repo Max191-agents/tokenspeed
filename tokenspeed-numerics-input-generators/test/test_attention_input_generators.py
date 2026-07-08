@@ -54,15 +54,6 @@ from tokenspeed_numerics_input_generators import (
     SlotMappingInput,
     SlotMappingInputConfig,
     attention_merge_state_reference,
-    deepseek_v4_combine_dense_swa_indices_reference,
-    deepseek_v4_compute_global_topk_indices_and_lens_reference,
-    deepseek_v4_csa_indexer_mxfp4_cache_insert_reference,
-    deepseek_v4_dequantize_and_gather_k_cache_reference,
-    deepseek_v4_indexer_mxfp4_cache_gather_reference,
-    deepseek_v4_indexer_mxfp4_cache_write_reference,
-    deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference,
-    deepseek_v4_save_compressor_state_reference,
-    deepseek_v4_sparse_compress_cache_insert_reference,
     dsa_decode_topk_reference,
     dsa_full_context_topk_to_global_slots_reference,
     dsa_local_topk_to_global_slots_reference,
@@ -73,6 +64,17 @@ from tokenspeed_numerics_input_generators import (
     mha_reference,
     mla_reference,
     packed_qkv_complex_rotary_reference,
+)
+from tokenspeed_numerics_input_generators.attention.csa import (
+    csa_combine_dense_swa_indices_reference,
+    csa_compute_global_topk_indices_and_lens_reference,
+    csa_dequantize_and_gather_k_cache_reference,
+    csa_indexer_mxfp4_cache_gather_reference,
+    csa_indexer_mxfp4_cache_insert_reference,
+    csa_indexer_mxfp4_cache_write_reference,
+    csa_indexer_q_rope_hadamard_mxfp4_reference,
+    csa_save_compressor_state_reference,
+    csa_sparse_compress_cache_insert_reference,
 )
 
 _FP8_DTYPES = (
@@ -1125,15 +1127,15 @@ def test_compressed_sequence_attention_generates_hca_values() -> None:
     )
     assert torch.equal(values.compressed.paged_index.block_table, values.sliding_window.page_table)
 
-    deepseek_v4_sparse_compress_cache_insert_reference(values.compressed.cache_insert)
-    deepseek_v4_save_compressor_state_reference(values.compressed.compressor_state)
-    deepseek_v4_compute_global_topk_indices_and_lens_reference(
+    csa_sparse_compress_cache_insert_reference(values.compressed.cache_insert)
+    csa_save_compressor_state_reference(values.compressed.compressor_state)
+    csa_compute_global_topk_indices_and_lens_reference(
         values.compressed.paged_index
     )
-    deepseek_v4_combine_dense_swa_indices_reference(
+    csa_combine_dense_swa_indices_reference(
         values.compressed.sparse_prefill_index
     )
-    deepseek_v4_dequantize_and_gather_k_cache_reference(values.compressed.k_cache_gather)
+    csa_dequantize_and_gather_k_cache_reference(values.compressed.k_cache_gather)
 
 
 def test_compressed_sequence_attention_generates_csa_indexer_values() -> None:
@@ -1190,13 +1192,13 @@ def test_compressed_sequence_attention_generates_csa_indexer_values() -> None:
         == values.sliding_window.token_to_req_indices.tolist()
     )
 
-    deepseek_v4_sparse_compress_cache_insert_reference(values.compressed.cache_insert)
-    deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(values.indexer.cache_insert)
-    deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(
+    csa_sparse_compress_cache_insert_reference(values.compressed.cache_insert)
+    csa_indexer_mxfp4_cache_insert_reference(values.indexer.cache_insert)
+    csa_indexer_q_rope_hadamard_mxfp4_reference(
         values.indexer.q_rope_hadamard_mxfp4
     )
-    deepseek_v4_indexer_mxfp4_cache_write_reference(values.indexer.cache_write)
-    deepseek_v4_indexer_mxfp4_cache_gather_reference(values.indexer.cache_gather)
+    csa_indexer_mxfp4_cache_write_reference(values.indexer.cache_write)
+    csa_indexer_mxfp4_cache_gather_reference(values.indexer.cache_gather)
 
 
 def test_compressed_sequence_attention_rejects_invalid_component_mix() -> None:

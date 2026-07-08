@@ -34,19 +34,19 @@ from ._core import (
     PageTableInputConfig,
     PageTableValues,
     TensorInput,
-    _DEEPSEEK_V4_FP8_MAX,
-    _DEEPSEEK_V4_FP8_QUANT_BLOCK,
-    _DEEPSEEK_V4_HEAD_DIM,
-    _DEEPSEEK_V4_INDEXER_DIM,
-    _DEEPSEEK_V4_INDEXER_MXFP4_BLOCK_SIZE,
-    _DEEPSEEK_V4_INDEXER_MXFP4_HALF_BLOCK,
-    _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES,
-    _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES,
-    _DEEPSEEK_V4_NOPE_DIM,
-    _DEEPSEEK_V4_ROPE_DIM,
-    _DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
-    _DEEPSEEK_V4_SWA_SCALE_DIM,
-    _DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+    _CSA_FP8_MAX,
+    _CSA_FP8_QUANT_BLOCK,
+    _CSA_HEAD_DIM,
+    _CSA_INDEXER_DIM,
+    _CSA_INDEXER_MXFP4_BLOCK_SIZE,
+    _CSA_INDEXER_MXFP4_HALF_BLOCK,
+    _CSA_INDEXER_MXFP4_SCALE_BYTES,
+    _CSA_INDEXER_MXFP4_VALUE_BYTES,
+    _CSA_NOPE_DIM,
+    _CSA_ROPE_DIM,
+    _CSA_SPARSE_PREFILL_TOPK_ALIGNMENT,
+    _CSA_SWA_SCALE_DIM,
+    _CSA_SWA_TOKEN_STRIDE,
     _align_up,
     _check_float_dtype,
     _check_matches,
@@ -102,8 +102,8 @@ class CompressedSequenceAttentionHistoryConfig:
     """
 
     # Required: number of original token positions represented by each
-    # compressed-history row. The currently supported DeepSeek V4-style
-    # layouts use 4 for CSA or 128 for HCA.
+    # compressed-history row. The currently supported layouts use 4 for CSA or
+    # 128 for HCA.
     compress_ratio: int
 
     # Optional: number of compressed-prefix candidates to generate per token.
@@ -173,21 +173,21 @@ class CompressedSequenceAttentionIndexerConfig:
 class CompressedSequenceAttentionHistoryValues:
     """Generated optional compressed-history values."""
 
-    paged_index: DeepSeekV4PagedIndexValues
-    sparse_prefill_index: DeepSeekV4SparsePrefillIndexValues
-    compressor_state: DeepSeekV4CompressorStateInputValues
-    cache_insert: DeepSeekV4SparseCompressCacheInsertInputValues
-    k_cache_gather: DeepSeekV4KCacheGatherInputValues
+    paged_index: CSAPagedIndexValues
+    sparse_prefill_index: CSASparsePrefillIndexValues
+    compressor_state: CSACompressorStateValues
+    cache_insert: CSASparseCompressCacheInsertValues
+    k_cache_gather: CSAKCacheGatherValues
 
 
 @dataclass
 class CompressedSequenceAttentionIndexerValues:
     """Generated optional CSA indexer values."""
 
-    q_rope_hadamard_mxfp4: DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues
-    cache_insert: DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues
-    cache_write: DeepSeekV4IndexerMXFP4CacheWriteInputValues
-    cache_gather: DeepSeekV4IndexerMXFP4CacheGatherInputValues
+    q_rope_hadamard_mxfp4: CSAIndexerQRoPEHadamardMXFP4Values
+    cache_insert: CSAIndexerMXFP4CacheInsertValues
+    cache_write: CSAIndexerMXFP4CacheWriteValues
+    cache_gather: CSAIndexerMXFP4CacheGatherValues
 
 
 @dataclass
@@ -211,9 +211,8 @@ class CompressedSequenceAttentionInputConfig:
 
     The represented operation is sliding-window attention plus optional
     compressed-history attention and optional CSA indexer selection. The current
-    implementation supports DeepSeek V4-style CSA/HCA layouts; TokenSpeed
-    helper kernels should adapt its nested values to their narrower argument
-    bundles.
+    implementation supports CSA/HCA layouts; TokenSpeed helper kernels should
+    adapt its nested values to their narrower argument bundles.
     """
 
     # ------------------------------------------------------------------
@@ -245,13 +244,12 @@ class CompressedSequenceAttentionInputConfig:
     # Optional attention-shape and component configuration.
     # ------------------------------------------------------------------
 
-    # Optional: attention head width. The current DeepSeek V4-style helper
-    # references require the model's fixed 512-wide layout.
-    head_dim: int = _DEEPSEEK_V4_HEAD_DIM
+    # Optional: attention head width. The current CSA/HCA references require
+    # the model's fixed 512-wide layout.
+    head_dim: int = _CSA_HEAD_DIM
 
-    # Optional: RoPE width. The current DeepSeek V4-style helper references
-    # require 64.
-    rope_dim: int = _DEEPSEEK_V4_ROPE_DIM
+    # Optional: RoPE width. The current CSA/HCA references require 64.
+    rope_dim: int = _CSA_ROPE_DIM
 
     # Optional: number of generated SWA cache pages. Defaults to the generated
     # page-table page count.
@@ -405,7 +403,7 @@ class CSAInputs(NumericsInputGenerator):
                 shape=(
                     num_swa_cache_blocks,
                     self.config.page_size
-                    * (_DEEPSEEK_V4_SWA_TOKEN_STRIDE + _DEEPSEEK_V4_SWA_SCALE_DIM),
+                    * (_CSA_SWA_TOKEN_STRIDE + _CSA_SWA_SCALE_DIM),
                 ),
                 seed=_child_seed(value_seed, 2),
                 device=target_device,
@@ -462,15 +460,15 @@ class CSAInputs(NumericsInputGenerator):
         )
         self.config.head_dim = _check_positive("head_dim", self.config.head_dim)
         self.config.rope_dim = _check_positive("rope_dim", self.config.rope_dim)
-        if self.config.head_dim != _DEEPSEEK_V4_HEAD_DIM:
+        if self.config.head_dim != _CSA_HEAD_DIM:
             raise ValueError(
                 "compressed sequence attention currently requires "
-                f"DeepSeek V4-style head_dim={_DEEPSEEK_V4_HEAD_DIM}"
+                f"current CSA/HCA head_dim={_CSA_HEAD_DIM}"
             )
-        if self.config.rope_dim != _DEEPSEEK_V4_ROPE_DIM:
+        if self.config.rope_dim != _CSA_ROPE_DIM:
             raise ValueError(
                 "compressed sequence attention currently requires "
-                f"DeepSeek V4-style rope_dim={_DEEPSEEK_V4_ROPE_DIM}"
+                f"current CSA/HCA rope_dim={_CSA_ROPE_DIM}"
             )
         if self.config.num_swa_cache_blocks is not None:
             self.config.num_swa_cache_blocks = _check_positive(
@@ -691,8 +689,8 @@ class CSAInputs(NumericsInputGenerator):
             return None
         metadata_config = self._shared_metadata_config(cache_layout="paged")
         dense_metadata_config = self._shared_metadata_config(cache_layout="dense")
-        paged_index = _DeepSeekV4PagedIndexBuilder(
-            DeepSeekV4PagedIndexInputConfig(
+        paged_index = _CSAPagedIndexBuilder(
+            _CSAPagedIndexConfig(
                 batch_size=self.config.batch_size,
                 total_cached_tokens=self.config.total_cached_tokens,
                 total_new_q_tokens=self.config.total_new_q_tokens,
@@ -709,8 +707,8 @@ class CSAInputs(NumericsInputGenerator):
                 device=self.config.device,
             )
         ).generate(seed=metadata_seed, device=device)
-        sparse_prefill_index = _DeepSeekV4SparsePrefillIndexBuilder(
-            DeepSeekV4SparsePrefillIndexInputConfig(
+        sparse_prefill_index = _CSASparsePrefillIndexBuilder(
+            _CSASparsePrefillIndexConfig(
                 batch_size=self.config.batch_size,
                 total_cached_tokens=self.config.total_cached_tokens,
                 total_new_q_tokens=self.config.total_new_q_tokens,
@@ -726,10 +724,10 @@ class CSAInputs(NumericsInputGenerator):
             compressed.compress_ratio,
             self.config.total_cached_tokens + self.config.total_new_q_tokens,
         )
-        compressor_state = _DeepSeekV4CompressorStateBuilder(
-            DeepSeekV4CompressorStateInputConfig(
+        compressor_state = _CSACompressorStateBuilder(
+            _CSACompressorStateConfig(
                 num_tokens=self.config.total_new_q_tokens,
-                state_width=_DEEPSEEK_V4_HEAD_DIM * (2 if compressed.overlap else 1),
+                state_width=_CSA_HEAD_DIM * (2 if compressed.overlap else 1),
                 num_cache_blocks=compressed.num_state_cache_blocks,
                 block_size=compressed.compressor_block_size,
                 compress_ratio=compressed.compress_ratio,
@@ -742,8 +740,8 @@ class CSAInputs(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 12),
             device=device,
         )
-        cache_insert = _DeepSeekV4SparseCompressCacheInsertBuilder(
-            DeepSeekV4SparseCompressCacheInsertInputConfig(
+        cache_insert = _CSASparseCompressCacheInsertBuilder(
+            _CSASparseCompressCacheInsertConfig(
                 num_tokens=self.config.total_new_q_tokens,
                 batch_size=self.config.batch_size,
                 max_seq_len=max_seq_len,
@@ -768,8 +766,8 @@ class CSAInputs(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 13),
             device=device,
         )
-        k_cache_gather = _DeepSeekV4KCacheGatherBuilder(
-            DeepSeekV4KCacheGatherInputConfig(
+        k_cache_gather = _CSAKCacheGatherBuilder(
+            _CSAKCacheGatherConfig(
                 batch_size=self.config.batch_size,
                 max_seq_len=max_seq_len,
                 block_size=self.config.page_size,
@@ -808,8 +806,8 @@ class CSAInputs(NumericsInputGenerator):
         if compressed is None or indexer is None:
             return None
         max_seq_len = max(1, self.config.total_cached_tokens + self.config.total_new_q_tokens)
-        q_rope = _DeepSeekV4IndexerQRoPEHadamardMXFP4Builder(
-            DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
+        q_rope = _CSAIndexerQRoPEHadamardMXFP4Builder(
+            _CSAIndexerQRoPEHadamardMXFP4Config(
                 num_tokens=self.config.total_new_q_tokens,
                 num_heads=indexer.num_heads,
                 dtype=self.config.dtype,
@@ -824,8 +822,8 @@ class CSAInputs(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 20),
             device=device,
         )
-        cache_insert = _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder(
-            DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
+        cache_insert = _CSAIndexerMXFP4CacheInsertBuilder(
+            _CSAIndexerMXFP4CacheInsertConfig(
                 num_tokens=self.config.total_new_q_tokens,
                 batch_size=self.config.batch_size,
                 max_seq_len=max_seq_len,
@@ -849,8 +847,8 @@ class CSAInputs(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 21),
             device=device,
         )
-        cache_write = _DeepSeekV4IndexerMXFP4CacheWriteBuilder(
-            DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
+        cache_write = _CSAIndexerMXFP4CacheWriteBuilder(
+            _CSAIndexerMXFP4CacheWriteConfig(
                 num_rows=self.config.total_new_q_tokens,
                 num_cache_blocks=indexer.num_cache_blocks,
                 block_size=indexer.block_size,
@@ -864,8 +862,8 @@ class CSAInputs(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 22),
             device=device,
         )
-        cache_gather = _DeepSeekV4IndexerMXFP4CacheGatherBuilder(
-            DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
+        cache_gather = _CSAIndexerMXFP4CacheGatherBuilder(
+            _CSAIndexerMXFP4CacheGatherConfig(
                 num_rows=self.config.total_new_q_tokens,
                 num_cache_blocks=indexer.num_cache_blocks,
                 block_size=indexer.block_size,
@@ -943,8 +941,8 @@ class CSAInputs(NumericsInputGenerator):
 
 
 @dataclass
-class DeepSeekV4CompressorStateInputValues:
-    """Generated values for saving DeepSeek V4 compressor state rows."""
+class CSACompressorStateValues:
+    """Generated values for saving CSA compressor state rows."""
 
     kv: torch.Tensor
     score: torch.Tensor
@@ -957,8 +955,8 @@ class DeepSeekV4CompressorStateInputValues:
 
 
 @dataclass
-class DeepSeekV4CompressorStateInputConfig:
-    """Initialization parameters for DeepSeek V4 compressor-state writes.
+class _CSACompressorStateConfig:
+    """Initialization parameters for CSA compressor-state writes.
 
     The represented operation writes one generated token row into a paged
     compressor-state cache. The first half of the cache row stores the K/V
@@ -1010,16 +1008,16 @@ class DeepSeekV4CompressorStateInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4CompressorStateBuilder:
-    """Generator for DeepSeek V4 compressor-state save inputs."""
+class _CSACompressorStateBuilder:
+    """Generator for CSA compressor-state save inputs."""
 
-    config: DeepSeekV4CompressorStateInputConfig
+    config: _CSACompressorStateConfig
     kv_input: TensorInput | None
     score_input: TensorInput | None
     ape_input: TensorInput | None
     state_cache_input: TensorInput | None
 
-    def __init__(self, config: DeepSeekV4CompressorStateInputConfig) -> None:
+    def __init__(self, config: _CSACompressorStateConfig) -> None:
         self.config = config
         self.kv_input = None
         self.score_input = None
@@ -1057,7 +1055,7 @@ class _DeepSeekV4CompressorStateBuilder:
         metadata_seed: int | None = None,
         value_seed: int | None = None,
         device: DeviceLike = None,
-    ) -> DeepSeekV4CompressorStateInputValues:
+    ) -> CSACompressorStateValues:
         self.__post_init__()
         if (
             self.kv_input is None
@@ -1066,7 +1064,7 @@ class _DeepSeekV4CompressorStateBuilder:
             or self.state_cache_input is None
         ):
             raise ValueError(
-                "_DeepSeekV4CompressorStateBuilder child generators must be initialized"
+                "_CSACompressorStateBuilder child generators must be initialized"
             )
         metadata_seed, value_seed = _resolve_attention_seeds(
             seed=seed,
@@ -1111,7 +1109,7 @@ class _DeepSeekV4CompressorStateBuilder:
             ).values,
             "state_cache",
         )
-        values = DeepSeekV4CompressorStateInputValues(
+        values = CSACompressorStateValues(
             kv=kv.contiguous(),
             score=(score.float() * self.config.score_scale)
             .to(score.dtype)
@@ -1126,7 +1124,7 @@ class _DeepSeekV4CompressorStateBuilder:
             block_size=self.config.block_size,
             compress_ratio=self.config.compress_ratio,
         )
-        _validate_deepseek_v4_compressor_state_values(values)
+        _validate_csa_compressor_state_values(values)
         return values
 
     def _normalize_config(self) -> None:
@@ -1209,8 +1207,8 @@ class _DeepSeekV4CompressorStateBuilder:
         )
 
 
-def _validate_deepseek_v4_compressor_state_values(
-    values: DeepSeekV4CompressorStateInputValues,
+def _validate_csa_compressor_state_values(
+    values: CSACompressorStateValues,
 ) -> None:
     if values.kv.shape != values.score.shape:
         raise ValueError(
@@ -1284,7 +1282,7 @@ def _validate_deepseek_v4_compressor_state_values(
         raise ValueError("valid slot_mapping entries must be unique")
 
 
-def _deepseek_v4_compressor_state_ape_row(
+def _csa_compressor_state_ape_row(
     *,
     ape: torch.Tensor,
     ape_row: int,
@@ -1301,12 +1299,12 @@ def _deepseek_v4_compressor_state_ape_row(
     return ape[ape_row]
 
 
-def deepseek_v4_save_compressor_state_reference(
-    values: DeepSeekV4CompressorStateInputValues,
+def csa_save_compressor_state_reference(
+    values: CSACompressorStateValues,
 ) -> torch.Tensor:
-    """Return state cache after applying DeepSeek V4 compressor-state writes."""
+    """Return state cache after applying CSA compressor-state writes."""
 
-    _validate_deepseek_v4_compressor_state_values(values)
+    _validate_csa_compressor_state_values(values)
     out = values.state_cache.clone()
     state_width = values.kv.shape[1]
     slots = values.slot_mapping.to(torch.int64)
@@ -1318,7 +1316,7 @@ def deepseek_v4_save_compressor_state_reference(
         block_idx = slot // values.block_size
         pos_in_block = slot % values.block_size
         ape_row = int(positions[token_idx].item()) % values.compress_ratio
-        ape = _deepseek_v4_compressor_state_ape_row(
+        ape = _csa_compressor_state_ape_row(
             ape=values.ape.float(),
             ape_row=ape_row,
             state_width=state_width,
@@ -1332,8 +1330,8 @@ def deepseek_v4_save_compressor_state_reference(
 
 
 @dataclass
-class DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues:
-    """Generated values for DeepSeek V4 indexer-Q RoPE/Hadamard/MXFP4."""
+class CSAIndexerQRoPEHadamardMXFP4Values:
+    """Generated values for CSA indexer-Q RoPE/Hadamard/MXFP4."""
 
     index_q: torch.Tensor
     positions: torch.Tensor
@@ -1344,8 +1342,8 @@ class DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues:
 
 
 @dataclass
-class DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig:
-    """Initialization parameters for DeepSeek V4 indexer-Q transforms.
+class _CSAIndexerQRoPEHadamardMXFP4Config:
+    """Initialization parameters for CSA indexer-Q transforms.
 
     The represented operation transforms 128-channel per-head indexer Q rows:
     RoPE is applied to the final 64 channels, the rotated row is projected by a
@@ -1400,16 +1398,16 @@ class DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4IndexerQRoPEHadamardMXFP4Builder:
-    """Generator for DeepSeek V4 indexer-Q RoPE/Hadamard/MXFP4 inputs."""
+class _CSAIndexerQRoPEHadamardMXFP4Builder:
+    """Generator for CSA indexer-Q RoPE/Hadamard/MXFP4 inputs."""
 
-    config: DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig
+    config: _CSAIndexerQRoPEHadamardMXFP4Config
     index_q_input: TensorInput | None
     weights_input: TensorInput | None
 
     def __init__(
         self,
-        config: DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig,
+        config: _CSAIndexerQRoPEHadamardMXFP4Config,
     ) -> None:
         self.config = config
         self.index_q_input = None
@@ -1436,7 +1434,7 @@ class _DeepSeekV4IndexerQRoPEHadamardMXFP4Builder:
         metadata_seed: int | None = None,
         value_seed: int | None = None,
         device: DeviceLike = None,
-    ) -> DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues:
+    ) -> CSAIndexerQRoPEHadamardMXFP4Values:
         self.__post_init__()
         if self.index_q_input is None:
             raise ValueError("index_q_input must be initialized")
@@ -1467,7 +1465,7 @@ class _DeepSeekV4IndexerQRoPEHadamardMXFP4Builder:
             ).values,
             "weights",
         )
-        values = DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues(
+        values = CSAIndexerQRoPEHadamardMXFP4Values(
             index_q=(index_q.float() * self.config.value_scale)
             .to(index_q.dtype)
             .contiguous(),
@@ -1476,7 +1474,7 @@ class _DeepSeekV4IndexerQRoPEHadamardMXFP4Builder:
                 device=target_device,
             ),
             cos_sin_cache=build_rope_cos_sin_cache(
-                rotary_dim=_DEEPSEEK_V4_ROPE_DIM,
+                rotary_dim=_CSA_ROPE_DIM,
                 max_position=self.config.max_position,
                 base=self.config.rope_base,
                 device=target_device,
@@ -1487,7 +1485,7 @@ class _DeepSeekV4IndexerQRoPEHadamardMXFP4Builder:
             softmax_scale=self.config.softmax_scale,
             head_scale=self.config.head_scale,
         )
-        _validate_deepseek_v4_indexer_q_rope_hadamard_mxfp4_values(values)
+        _validate_csa_indexer_q_rope_hadamard_mxfp4_values(values)
         return values
 
     def _normalize_config(self) -> None:
@@ -1539,7 +1537,7 @@ class _DeepSeekV4IndexerQRoPEHadamardMXFP4Builder:
         return (
             self.config.num_tokens,
             self.config.num_heads,
-            _DEEPSEEK_V4_INDEXER_DIM,
+            _CSA_INDEXER_DIM,
         )
 
     def _weights_shape(self) -> tuple[int, int]:
@@ -1555,14 +1553,14 @@ class _DeepSeekV4IndexerQRoPEHadamardMXFP4Builder:
         )
 
 
-def _validate_deepseek_v4_indexer_q_rope_hadamard_mxfp4_values(
-    values: DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues,
+def _validate_csa_indexer_q_rope_hadamard_mxfp4_values(
+    values: CSAIndexerQRoPEHadamardMXFP4Values,
 ) -> None:
     if values.index_q.ndim != 3:
         raise ValueError(f"index_q must be rank-3, got {values.index_q.ndim}")
-    if values.index_q.shape[-1] != _DEEPSEEK_V4_INDEXER_DIM:
+    if values.index_q.shape[-1] != _CSA_INDEXER_DIM:
         raise ValueError(
-            f"index_q width must be {_DEEPSEEK_V4_INDEXER_DIM}, "
+            f"index_q width must be {_CSA_INDEXER_DIM}, "
             f"got {values.index_q.shape[-1]}"
         )
     if not values.index_q.is_floating_point():
@@ -1575,9 +1573,9 @@ def _validate_deepseek_v4_indexer_q_rope_hadamard_mxfp4_values(
         raise ValueError("positions length must match index_q token dimension")
     if values.cos_sin_cache.ndim != 2:
         raise ValueError("cos_sin_cache must be rank-2")
-    if values.cos_sin_cache.shape[1] != _DEEPSEEK_V4_ROPE_DIM:
+    if values.cos_sin_cache.shape[1] != _CSA_ROPE_DIM:
         raise ValueError(
-            f"cos_sin_cache width must be {_DEEPSEEK_V4_ROPE_DIM}, "
+            f"cos_sin_cache width must be {_CSA_ROPE_DIM}, "
             f"got {values.cos_sin_cache.shape[1]}"
         )
     if values.weights.shape != values.index_q.shape[:2]:
@@ -1609,28 +1607,28 @@ def _validate_deepseek_v4_indexer_q_rope_hadamard_mxfp4_values(
         raise ValueError(f"head_scale must be finite, got {values.head_scale}")
 
 
-def _deepseek_v4_apply_indexer_q_rope(
-    values: DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues,
+def _csa_apply_indexer_q_rope(
+    values: CSAIndexerQRoPEHadamardMXFP4Values,
 ) -> torch.Tensor:
     q = values.index_q.float()
     positions = values.positions.to(torch.int64)
     positions = positions[:, None].expand(q.shape[0], q.shape[1]).reshape(-1)
-    rotated = _deepseek_v4_apply_indexer_rope_rows(
-        q.reshape(-1, _DEEPSEEK_V4_INDEXER_DIM),
+    rotated = _csa_apply_indexer_rope_rows(
+        q.reshape(-1, _CSA_INDEXER_DIM),
         positions,
         values.cos_sin_cache,
     )
     return rotated.reshape_as(q)
 
 
-def _deepseek_v4_apply_indexer_rope_rows(
+def _csa_apply_indexer_rope_rows(
     rows: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
 ) -> torch.Tensor:
     rows = rows.float()
-    nope_dim = _DEEPSEEK_V4_INDEXER_DIM - _DEEPSEEK_V4_ROPE_DIM
-    half_rope = _DEEPSEEK_V4_ROPE_DIM // 2
+    nope_dim = _CSA_INDEXER_DIM - _CSA_ROPE_DIM
+    half_rope = _CSA_ROPE_DIM // 2
     rope = rows[..., nope_dim:]
     rope_even = rope[..., 0::2]
     rope_odd = rope[..., 1::2]
@@ -1644,9 +1642,9 @@ def _deepseek_v4_apply_indexer_rope_rows(
     return rotated.to(torch.bfloat16).to(torch.float32)
 
 
-def _deepseek_v4_indexer_hadamard_signs(device: torch.device) -> torch.Tensor:
+def _csa_indexer_hadamard_signs(device: torch.device) -> torch.Tensor:
     indices = torch.arange(
-        _DEEPSEEK_V4_INDEXER_DIM,
+        _CSA_INDEXER_DIM,
         dtype=torch.int32,
         device=device,
     )
@@ -1662,29 +1660,29 @@ def _deepseek_v4_indexer_hadamard_signs(device: torch.device) -> torch.Tensor:
     )
 
 
-def _deepseek_v4_indexer_q_hadamard(
+def _csa_indexer_q_hadamard(
     rotated: torch.Tensor,
 ) -> torch.Tensor:
-    signs = _deepseek_v4_indexer_hadamard_signs(rotated.device)
-    flat = rotated.reshape(-1, _DEEPSEEK_V4_INDEXER_DIM)
+    signs = _csa_indexer_hadamard_signs(rotated.device)
+    flat = rotated.reshape(-1, _CSA_INDEXER_DIM)
     projected = flat @ signs
-    projected = projected * (_DEEPSEEK_V4_INDEXER_DIM**-0.5)
+    projected = projected * (_CSA_INDEXER_DIM**-0.5)
     projected = projected.reshape_as(rotated)
     return projected.to(torch.bfloat16).to(torch.float32)
 
 
-def deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(
-    values: DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues,
+def csa_indexer_q_rope_hadamard_mxfp4_reference(
+    values: CSAIndexerQRoPEHadamardMXFP4Values,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Return packed MXFP4 indexer Q and scaled weights for DeepSeek V4."""
+    """Return packed MXFP4 indexer Q and scaled weights for CSA."""
 
-    _validate_deepseek_v4_indexer_q_rope_hadamard_mxfp4_values(values)
+    _validate_csa_indexer_q_rope_hadamard_mxfp4_values(values)
     num_tokens, num_heads, _ = values.index_q.shape
     q_packed = torch.empty(
         (
             num_tokens,
             num_heads,
-            _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES,
+            _CSA_INDEXER_MXFP4_VALUE_BYTES,
         ),
         dtype=torch.uint8,
         device=values.index_q.device,
@@ -1693,7 +1691,7 @@ def deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(
         (
             num_tokens,
             num_heads,
-            _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES,
+            _CSA_INDEXER_MXFP4_SCALE_BYTES,
         ),
         dtype=torch.uint8,
         device=values.index_q.device,
@@ -1707,12 +1705,12 @@ def deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(
             q_scale_bytes.view(torch.int32).squeeze(-1).contiguous(),
         ), weights_out
 
-    rotated = _deepseek_v4_apply_indexer_q_rope(values)
-    hadamard = _deepseek_v4_indexer_q_hadamard(rotated)
-    packed_rows = q_packed.reshape(-1, _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES)
-    scale_rows = q_scale_bytes.reshape(-1, _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES)
-    for row_idx, row in enumerate(hadamard.reshape(-1, _DEEPSEEK_V4_INDEXER_DIM)):
-        packed, scales = _deepseek_v4_indexer_mxfp4_row_reference(row)
+    rotated = _csa_apply_indexer_q_rope(values)
+    hadamard = _csa_indexer_q_hadamard(rotated)
+    packed_rows = q_packed.reshape(-1, _CSA_INDEXER_MXFP4_VALUE_BYTES)
+    scale_rows = q_scale_bytes.reshape(-1, _CSA_INDEXER_MXFP4_SCALE_BYTES)
+    for row_idx, row in enumerate(hadamard.reshape(-1, _CSA_INDEXER_DIM)):
+        packed, scales = _csa_indexer_mxfp4_row_reference(row)
         packed_rows[row_idx] = packed
         scale_rows[row_idx] = scales
     return (
@@ -1722,8 +1720,8 @@ def deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(
 
 
 @dataclass
-class DeepSeekV4InvRoPEFP8QuantInputValues:
-    """Generated values for DeepSeek V4 inverse-RoPE FP8 quantization."""
+class CSAInvRoPEFP8QuantValues:
+    """Generated values for CSA inverse-RoPE FP8 quantization."""
 
     o: torch.Tensor
     positions: torch.Tensor
@@ -1737,7 +1735,7 @@ class DeepSeekV4InvRoPEFP8QuantInputValues:
 
 
 @dataclass
-class DeepSeekV4InvRoPEFP8QuantInputConfig:
+class _CSAInvRoPEFP8QuantConfig:
     """Initialization parameters for inverse-RoPE FP8 output quantization.
 
     The represented operation starts from attention output rows shaped as
@@ -1766,17 +1764,17 @@ class DeepSeekV4InvRoPEFP8QuantInputConfig:
     # Optional shape and quantization configuration.
     # ------------------------------------------------------------------
 
-    # Optional: attention output width per head. DeepSeek V4 uses 512.
-    head_dim: int = _DEEPSEEK_V4_HEAD_DIM
+    # Optional: attention output width per head. CSA uses 512.
+    head_dim: int = _CSA_HEAD_DIM
 
-    # Optional: non-rotary prefix width per head. DeepSeek V4 uses 448.
-    nope_dim: int = _DEEPSEEK_V4_NOPE_DIM
+    # Optional: non-rotary prefix width per head. CSA uses 448.
+    nope_dim: int = _CSA_NOPE_DIM
 
-    # Optional: rotary suffix width per head. DeepSeek V4 uses 64.
-    rope_dim: int = _DEEPSEEK_V4_ROPE_DIM
+    # Optional: rotary suffix width per head. CSA uses 64.
+    rope_dim: int = _CSA_ROPE_DIM
 
     # Optional: number of contiguous values sharing one FP8 scale.
-    quant_group_size: int = _DEEPSEEK_V4_FP8_QUANT_BLOCK * 2
+    quant_group_size: int = _CSA_FP8_QUANT_BLOCK * 2
 
     # Optional: when true, pack each head's four UE8M0 scale bytes into int32
     # values laid out for the DeepGEMM TMA-aligned path.
@@ -1804,13 +1802,13 @@ class DeepSeekV4InvRoPEFP8QuantInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4InvRoPEFP8QuantBuilder:
-    """Generator for DeepSeek V4 inverse-RoPE FP8 output quantization inputs."""
+class _CSAInvRoPEFP8QuantBuilder:
+    """Generator for CSA inverse-RoPE FP8 output quantization inputs."""
 
-    config: DeepSeekV4InvRoPEFP8QuantInputConfig
+    config: _CSAInvRoPEFP8QuantConfig
     o_input: TensorInput | None
 
-    def __init__(self, config: DeepSeekV4InvRoPEFP8QuantInputConfig) -> None:
+    def __init__(self, config: _CSAInvRoPEFP8QuantConfig) -> None:
         self.config = config
         self.o_input = None
         self.__post_init__()
@@ -1830,7 +1828,7 @@ class _DeepSeekV4InvRoPEFP8QuantBuilder:
         metadata_seed: int | None = None,
         value_seed: int | None = None,
         device: DeviceLike = None,
-    ) -> DeepSeekV4InvRoPEFP8QuantInputValues:
+    ) -> CSAInvRoPEFP8QuantValues:
         self.__post_init__()
         if self.o_input is None:
             raise ValueError("o_input must be initialized")
@@ -1849,7 +1847,7 @@ class _DeepSeekV4InvRoPEFP8QuantBuilder:
             ).values,
             "o",
         )
-        values = DeepSeekV4InvRoPEFP8QuantInputValues(
+        values = CSAInvRoPEFP8QuantValues(
             o=(o.float() * self.config.value_scale).to(o.dtype).contiguous(),
             positions=self._generate_positions(
                 seed=_child_seed(metadata_seed, 1),
@@ -1868,7 +1866,7 @@ class _DeepSeekV4InvRoPEFP8QuantBuilder:
             quant_group_size=self.config.quant_group_size,
             tma_aligned_scales=self.config.tma_aligned_scales,
         )
-        _validate_deepseek_v4_inv_rope_fp8_quant_values(values)
+        _validate_csa_inv_rope_fp8_quant_values(values)
         return values
 
     def _normalize_config(self) -> None:
@@ -1949,8 +1947,8 @@ class _DeepSeekV4InvRoPEFP8QuantBuilder:
         )
 
 
-def _validate_deepseek_v4_inv_rope_fp8_quant_values(
-    values: DeepSeekV4InvRoPEFP8QuantInputValues,
+def _validate_csa_inv_rope_fp8_quant_values(
+    values: CSAInvRoPEFP8QuantValues,
 ) -> None:
     if values.o.ndim != 3:
         raise ValueError(f"o must be rank-3, got {values.o.ndim}")
@@ -2012,8 +2010,8 @@ def _validate_deepseek_v4_inv_rope_fp8_quant_values(
             )
 
 
-def _deepseek_v4_apply_inverse_rope(
-    values: DeepSeekV4InvRoPEFP8QuantInputValues,
+def _csa_apply_inverse_rope(
+    values: CSAInvRoPEFP8QuantValues,
 ) -> torch.Tensor:
     out = values.o.float().clone()
     half_rope = values.rope_dim // 2
@@ -2028,7 +2026,7 @@ def _deepseek_v4_apply_inverse_rope(
     return out
 
 
-def _deepseek_v4_grouped_fp8_quant(
+def _csa_grouped_fp8_quant(
     x: torch.Tensor,
     *,
     n_groups: int,
@@ -2055,7 +2053,7 @@ def _deepseek_v4_grouped_fp8_quant(
     return quantized.contiguous(), scales.contiguous()
 
 
-def _deepseek_v4_pack_tma_aligned_scale_int32(
+def _csa_pack_tma_aligned_scale_int32(
     scales: torch.Tensor,
     *,
     heads_per_group: int,
@@ -2073,14 +2071,14 @@ def _deepseek_v4_pack_tma_aligned_scale_int32(
     return torch.sum(scale_bytes << shifts, dim=-1).to(torch.int32).contiguous()
 
 
-def deepseek_v4_inv_rope_fp8_quant_reference(
-    values: DeepSeekV4InvRoPEFP8QuantInputValues,
+def csa_inv_rope_fp8_quant_reference(
+    values: CSAInvRoPEFP8QuantValues,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return grouped FP8 output rows and scales after inverse RoPE."""
 
-    _validate_deepseek_v4_inv_rope_fp8_quant_values(values)
-    inv_rope = _deepseek_v4_apply_inverse_rope(values)
-    fp8, scales = _deepseek_v4_grouped_fp8_quant(
+    _validate_csa_inv_rope_fp8_quant_values(values)
+    inv_rope = _csa_apply_inverse_rope(values)
+    fp8, scales = _csa_grouped_fp8_quant(
         inv_rope,
         n_groups=values.n_groups,
         heads_per_group=values.heads_per_group,
@@ -2088,7 +2086,7 @@ def deepseek_v4_inv_rope_fp8_quant_reference(
     )
     if not values.tma_aligned_scales:
         return fp8, scales
-    return fp8, _deepseek_v4_pack_tma_aligned_scale_int32(
+    return fp8, _csa_pack_tma_aligned_scale_int32(
         scales,
         heads_per_group=values.heads_per_group,
         chunks_per_head=values.o.shape[-1] // values.quant_group_size,
@@ -2096,8 +2094,8 @@ def deepseek_v4_inv_rope_fp8_quant_reference(
 
 
 @dataclass
-class DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues:
-    """Generated values for DeepSeek V4 CSA indexer MXFP4 cache inserts."""
+class CSAIndexerMXFP4CacheInsertValues:
+    """Generated values for CSA indexer MXFP4 cache inserts."""
 
     state_cache: torch.Tensor
     token_to_req_indices: torch.Tensor
@@ -2116,8 +2114,8 @@ class DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues:
 
 
 @dataclass
-class DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig:
-    """Initialization parameters for DeepSeek V4 CSA indexer cache inserts.
+class _CSAIndexerMXFP4CacheInsertConfig:
+    """Initialization parameters for CSA indexer cache inserts.
 
     The represented operation compresses an overlapping CSA state window,
     normalizes it, applies indexer RoPE/Hadamard, quantizes to MXFP4, and writes
@@ -2168,7 +2166,7 @@ class DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig:
     # Optional: include zero block-table base offsets in generated values.
     include_block_table_base_offsets: bool = False
 
-    # Optional: CSA indexer compression ratio. DeepSeek V4 CSA indexer uses 4.
+    # Optional: CSA indexer compression ratio. CSA indexer uses 4.
     compress_ratio: int = 4
 
     # Optional: RMSNorm epsilon.
@@ -2185,16 +2183,16 @@ class DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder:
-    """Generator for DeepSeek V4 CSA indexer MXFP4 cache-insert inputs."""
+class _CSAIndexerMXFP4CacheInsertBuilder:
+    """Generator for CSA indexer MXFP4 cache-insert inputs."""
 
-    config: DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig
+    config: _CSAIndexerMXFP4CacheInsertConfig
     state_cache_input: TensorInput | None
     rms_norm_weight_input: TensorInput | None
 
     def __init__(
         self,
-        config: DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig,
+        config: _CSAIndexerMXFP4CacheInsertConfig,
     ) -> None:
         self.config = config
         self.state_cache_input = None
@@ -2209,7 +2207,7 @@ class _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder:
             device=self.config.device,
         )
         self.rms_norm_weight_input = self.rms_norm_weight_input or TensorInput(
-            (_DEEPSEEK_V4_INDEXER_DIM,),
+            (_CSA_INDEXER_DIM,),
             self.config.dtype,
             device=self.config.device,
         )
@@ -2221,7 +2219,7 @@ class _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder:
         metadata_seed: int | None = None,
         value_seed: int | None = None,
         device: DeviceLike = None,
-    ) -> DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues:
+    ) -> CSAIndexerMXFP4CacheInsertValues:
         self.__post_init__()
         if self.state_cache_input is None or self.rms_norm_weight_input is None:
             raise ValueError("CSA indexer child generators must be initialized")
@@ -2233,7 +2231,7 @@ class _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder:
         target_device = _resolve_device(self.config.device, device)
         self.state_cache_input.shape = self._state_cache_shape()
         self.state_cache_input.dtype = self.config.dtype
-        self.rms_norm_weight_input.shape = (_DEEPSEEK_V4_INDEXER_DIM,)
+        self.rms_norm_weight_input.shape = (_CSA_INDEXER_DIM,)
         self.rms_norm_weight_input.dtype = self.config.dtype
         state_cache = _require_tensor(
             self.state_cache_input.generate(
@@ -2249,7 +2247,7 @@ class _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder:
             ).values,
             "rms_norm_weight",
         )
-        values = DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues(
+        values = CSAIndexerMXFP4CacheInsertValues(
             state_cache=(state_cache.float() * self.config.value_scale)
             .to(state_cache.dtype)
             .contiguous(),
@@ -2275,7 +2273,7 @@ class _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder:
             rms_norm_weight=rms_norm_weight.contiguous(),
             rms_norm_eps=self.config.rms_norm_eps,
             cos_sin_cache=build_rope_cos_sin_cache(
-                rotary_dim=_DEEPSEEK_V4_ROPE_DIM,
+                rotary_dim=_CSA_ROPE_DIM,
                 max_position=self.config.max_seq_len,
                 base=self.config.rope_base,
                 device=target_device,
@@ -2302,7 +2300,7 @@ class _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder:
                 else None
             ),
         )
-        _validate_deepseek_v4_csa_indexer_mxfp4_cache_insert_values(values)
+        _validate_csa_csa_indexer_mxfp4_cache_insert_values(values)
         return values
 
     def _normalize_config(self) -> None:
@@ -2338,7 +2336,7 @@ class _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder:
         )
         if self.config.compress_ratio != 4:
             raise ValueError(
-                f"DeepSeek V4 CSA indexer uses compress_ratio=4, got {self.config.compress_ratio}"
+                f"CSA indexer uses compress_ratio=4, got {self.config.compress_ratio}"
             )
         self.config.non_boundary_token_count = _check_nonnegative(
             "non_boundary_token_count",
@@ -2399,7 +2397,7 @@ class _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder:
             )
 
     def _state_width(self) -> int:
-        return _DEEPSEEK_V4_INDEXER_DIM * 2
+        return _CSA_INDEXER_DIM * 2
 
     def _state_cache_shape(self) -> tuple[int, int, int]:
         return (
@@ -2482,8 +2480,8 @@ class _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder:
                 self.config.num_kv_cache_blocks,
                 self.config.kv_cache_block_size
                 * (
-                    _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
-                    + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+                    _CSA_INDEXER_MXFP4_VALUE_BYTES
+                    + _CSA_INDEXER_MXFP4_SCALE_BYTES
                 ),
             ),
             seed=seed,
@@ -2491,8 +2489,8 @@ class _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder:
         )
 
 
-def _validate_deepseek_v4_csa_indexer_mxfp4_cache_insert_values(
-    values: DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues,
+def _validate_csa_csa_indexer_mxfp4_cache_insert_values(
+    values: CSAIndexerMXFP4CacheInsertValues,
 ) -> None:
     if values.state_cache.ndim != 3:
         raise ValueError("state_cache must be rank-3")
@@ -2501,12 +2499,12 @@ def _validate_deepseek_v4_csa_indexer_mxfp4_cache_insert_values(
             f"state_cache must be floating point, got {values.state_cache.dtype}"
         )
     state_width = values.state_cache.shape[-1] // 2
-    if values.state_cache.shape[-1] != _DEEPSEEK_V4_INDEXER_DIM * 4:
+    if values.state_cache.shape[-1] != _CSA_INDEXER_DIM * 4:
         raise ValueError(
             "CSA indexer state_cache last dimension must be "
-            f"{_DEEPSEEK_V4_INDEXER_DIM * 4}, got {values.state_cache.shape[-1]}"
+            f"{_CSA_INDEXER_DIM * 4}, got {values.state_cache.shape[-1]}"
         )
-    if state_width != _DEEPSEEK_V4_INDEXER_DIM * 2:
+    if state_width != _CSA_INDEXER_DIM * 2:
         raise ValueError("state_cache state width must be two indexer rows")
     compressor_block_size = _check_positive(
         "compressor_block_size",
@@ -2525,7 +2523,7 @@ def _validate_deepseek_v4_csa_indexer_mxfp4_cache_insert_values(
         values.kv_cache_block_size,
     )
     min_row_bytes = kv_cache_block_size * (
-        _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+        _CSA_INDEXER_MXFP4_VALUE_BYTES + _CSA_INDEXER_MXFP4_SCALE_BYTES
     )
     if values.kv_cache_2d.shape[1] < min_row_bytes:
         raise ValueError(
@@ -2573,9 +2571,9 @@ def _validate_deepseek_v4_csa_indexer_mxfp4_cache_insert_values(
             raise ValueError(
                 "block_table_base_offsets must share the state_cache device"
             )
-    if values.rms_norm_weight.shape != (_DEEPSEEK_V4_INDEXER_DIM,):
+    if values.rms_norm_weight.shape != (_CSA_INDEXER_DIM,):
         raise ValueError(
-            f"rms_norm_weight must have shape {(_DEEPSEEK_V4_INDEXER_DIM,)}, "
+            f"rms_norm_weight must have shape {(_CSA_INDEXER_DIM,)}, "
             f"got {tuple(values.rms_norm_weight.shape)}"
         )
     if not values.rms_norm_weight.is_floating_point():
@@ -2584,9 +2582,9 @@ def _validate_deepseek_v4_csa_indexer_mxfp4_cache_insert_values(
         raise ValueError("rms_norm_weight must share the state_cache device")
     if values.rms_norm_eps <= 0.0 or not math.isfinite(values.rms_norm_eps):
         raise ValueError("rms_norm_eps must be finite and positive")
-    if values.cos_sin_cache.shape[-1] != _DEEPSEEK_V4_ROPE_DIM:
+    if values.cos_sin_cache.shape[-1] != _CSA_ROPE_DIM:
         raise ValueError(
-            f"cos_sin_cache width must be {_DEEPSEEK_V4_ROPE_DIM}, "
+            f"cos_sin_cache width must be {_CSA_ROPE_DIM}, "
             f"got {values.cos_sin_cache.shape[-1]}"
         )
     if values.cos_sin_cache.device != values.state_cache.device:
@@ -2629,8 +2627,8 @@ def _validate_deepseek_v4_csa_indexer_mxfp4_cache_insert_values(
                 raise ValueError("writable kv_slot_mapping entries must be unique")
 
 
-def _deepseek_v4_csa_indexer_compress_rows(
-    values: DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues,
+def _csa_csa_indexer_compress_rows(
+    values: CSAIndexerMXFP4CacheInsertValues,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_actual = min(
         values.compressor_slot_mapping.numel(),
@@ -2640,7 +2638,7 @@ def _deepseek_v4_csa_indexer_compress_rows(
     if num_actual == 0:
         return (
             torch.empty(
-                (0, _DEEPSEEK_V4_INDEXER_DIM),
+                (0, _CSA_INDEXER_DIM),
                 dtype=torch.float32,
                 device=values.state_cache.device,
             ),
@@ -2686,13 +2684,13 @@ def _deepseek_v4_csa_indexer_compress_rows(
     state_width = values.state_cache.shape[-1] // 2
     head_offsets = torch.where(
         offsets >= values.compress_ratio,
-        torch.full_like(offsets, _DEEPSEEK_V4_INDEXER_DIM),
+        torch.full_like(offsets, _CSA_INDEXER_DIM),
         torch.zeros_like(offsets),
     )
     dim_indices = (
         head_offsets[:, None]
         + torch.arange(
-            _DEEPSEEK_V4_INDEXER_DIM,
+            _CSA_INDEXER_DIM,
             dtype=torch.int64,
             device=values.state_cache.device,
         )[None, :]
@@ -2710,20 +2708,20 @@ def _deepseek_v4_csa_indexer_compress_rows(
     kv_rows = torch.where(valid_window_f, kv_rows, torch.zeros_like(kv_rows))
     compressed = torch.sum(kv_rows * weights, dim=1)
     variance = compressed.square().sum(dim=-1, keepdim=True) / float(
-        _DEEPSEEK_V4_INDEXER_DIM
+        _CSA_INDEXER_DIM
     )
     normed = compressed * torch.rsqrt(variance + values.rms_norm_eps)
     return normed * values.rms_norm_weight.float(), valid_token
 
 
-def deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(
-    values: DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues,
+def csa_indexer_mxfp4_cache_insert_reference(
+    values: CSAIndexerMXFP4CacheInsertValues,
 ) -> torch.Tensor:
-    """Return cache bytes after applying DeepSeek V4 CSA indexer MXFP4 inserts."""
+    """Return cache bytes after applying CSA indexer MXFP4 inserts."""
 
-    _validate_deepseek_v4_csa_indexer_mxfp4_cache_insert_values(values)
+    _validate_csa_csa_indexer_mxfp4_cache_insert_values(values)
     out = values.kv_cache_2d.clone()
-    normed, valid = _deepseek_v4_csa_indexer_compress_rows(values)
+    normed, valid = _csa_csa_indexer_compress_rows(values)
     if normed.numel() == 0:
         return out.contiguous()
 
@@ -2735,12 +2733,12 @@ def deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(
         )
         * values.compress_ratio
     )
-    rotated = _deepseek_v4_apply_indexer_rope_rows(
+    rotated = _csa_apply_indexer_rope_rows(
         normed,
         compressed_positions,
         values.cos_sin_cache,
     )
-    hadamard = _deepseek_v4_indexer_q_hadamard(rotated)
+    hadamard = _csa_indexer_q_hadamard(rotated)
     flat = out.reshape(-1)
     slots = values.kv_slot_mapping[: normed.shape[0]].to(torch.int64)
     for row_idx, row in enumerate(hadamard):
@@ -2750,21 +2748,21 @@ def deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(
         page = slot // values.kv_cache_block_size
         pos = slot % values.kv_cache_block_size
         page_base = page * out.stride(0)
-        value_base = page_base + pos * _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
+        value_base = page_base + pos * _CSA_INDEXER_MXFP4_VALUE_BYTES
         scale_base = (
             page_base
-            + values.kv_cache_block_size * _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
-            + pos * _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+            + values.kv_cache_block_size * _CSA_INDEXER_MXFP4_VALUE_BYTES
+            + pos * _CSA_INDEXER_MXFP4_SCALE_BYTES
         )
-        packed, scales = _deepseek_v4_indexer_mxfp4_row_reference(row)
-        flat[value_base : value_base + _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES] = packed
-        flat[scale_base : scale_base + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES] = scales
+        packed, scales = _csa_indexer_mxfp4_row_reference(row)
+        flat[value_base : value_base + _CSA_INDEXER_MXFP4_VALUE_BYTES] = packed
+        flat[scale_base : scale_base + _CSA_INDEXER_MXFP4_SCALE_BYTES] = scales
     return out.contiguous()
 
 
 @dataclass
-class DeepSeekV4SparseCompressCacheInsertInputValues:
-    """Generated values for DeepSeek V4 sparse-compress K-cache inserts."""
+class CSASparseCompressCacheInsertValues:
+    """Generated values for CSA sparse-compress K-cache inserts."""
 
     state_cache: torch.Tensor
     token_to_req_indices: torch.Tensor
@@ -2784,8 +2782,8 @@ class DeepSeekV4SparseCompressCacheInsertInputValues:
 
 
 @dataclass
-class DeepSeekV4SparseCompressCacheInsertInputConfig:
-    """Initialization parameters for DeepSeek V4 sparse-compress cache inserts.
+class _CSASparseCompressCacheInsertConfig:
+    """Initialization parameters for CSA sparse-compress cache inserts.
 
     The represented operation compresses state-cache windows into one 512-wide
     K row, normalizes the row, stores the NoPE prefix as block-scaled FP8, and
@@ -2856,16 +2854,16 @@ class DeepSeekV4SparseCompressCacheInsertInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4SparseCompressCacheInsertBuilder:
-    """Generator for DeepSeek V4 sparse-compress K-cache insert inputs."""
+class _CSASparseCompressCacheInsertBuilder:
+    """Generator for CSA sparse-compress K-cache insert inputs."""
 
-    config: DeepSeekV4SparseCompressCacheInsertInputConfig
+    config: _CSASparseCompressCacheInsertConfig
     state_cache_input: TensorInput | None
     rms_norm_weight_input: TensorInput | None
 
     def __init__(
         self,
-        config: DeepSeekV4SparseCompressCacheInsertInputConfig,
+        config: _CSASparseCompressCacheInsertConfig,
     ) -> None:
         self.config = config
         self.state_cache_input = None
@@ -2880,7 +2878,7 @@ class _DeepSeekV4SparseCompressCacheInsertBuilder:
             device=self.config.device,
         )
         self.rms_norm_weight_input = self.rms_norm_weight_input or TensorInput(
-            (_DEEPSEEK_V4_HEAD_DIM,),
+            (_CSA_HEAD_DIM,),
             self.config.dtype,
             device=self.config.device,
         )
@@ -2892,7 +2890,7 @@ class _DeepSeekV4SparseCompressCacheInsertBuilder:
         metadata_seed: int | None = None,
         value_seed: int | None = None,
         device: DeviceLike = None,
-    ) -> DeepSeekV4SparseCompressCacheInsertInputValues:
+    ) -> CSASparseCompressCacheInsertValues:
         self.__post_init__()
         if self.state_cache_input is None or self.rms_norm_weight_input is None:
             raise ValueError("sparse-compress child generators must be initialized")
@@ -2904,7 +2902,7 @@ class _DeepSeekV4SparseCompressCacheInsertBuilder:
         target_device = _resolve_device(self.config.device, device)
         self.state_cache_input.shape = self._state_cache_shape()
         self.state_cache_input.dtype = self.config.dtype
-        self.rms_norm_weight_input.shape = (_DEEPSEEK_V4_HEAD_DIM,)
+        self.rms_norm_weight_input.shape = (_CSA_HEAD_DIM,)
         self.rms_norm_weight_input.dtype = self.config.dtype
         state_cache = _require_tensor(
             self.state_cache_input.generate(
@@ -2920,7 +2918,7 @@ class _DeepSeekV4SparseCompressCacheInsertBuilder:
             ).values,
             "rms_norm_weight",
         )
-        values = DeepSeekV4SparseCompressCacheInsertInputValues(
+        values = CSASparseCompressCacheInsertValues(
             state_cache=(state_cache.float() * self.config.value_scale)
             .to(state_cache.dtype)
             .contiguous(),
@@ -2946,7 +2944,7 @@ class _DeepSeekV4SparseCompressCacheInsertBuilder:
             rms_norm_weight=rms_norm_weight.contiguous(),
             rms_norm_eps=self.config.rms_norm_eps,
             cos_sin_cache=build_rope_cos_sin_cache(
-                rotary_dim=_DEEPSEEK_V4_ROPE_DIM,
+                rotary_dim=_CSA_ROPE_DIM,
                 max_position=self.config.max_seq_len,
                 base=self.config.rope_base,
                 device=target_device,
@@ -2974,7 +2972,7 @@ class _DeepSeekV4SparseCompressCacheInsertBuilder:
                 else None
             ),
         )
-        _validate_deepseek_v4_sparse_compress_cache_insert_values(values)
+        _validate_csa_sparse_compress_cache_insert_values(values)
         return values
 
     def _normalize_config(self) -> None:
@@ -3069,7 +3067,7 @@ class _DeepSeekV4SparseCompressCacheInsertBuilder:
             )
 
     def _state_width(self) -> int:
-        return _DEEPSEEK_V4_HEAD_DIM * (2 if self.config.overlap else 1)
+        return _CSA_HEAD_DIM * (2 if self.config.overlap else 1)
 
     def _state_cache_shape(self) -> tuple[int, int, int]:
         return (
@@ -3151,15 +3149,15 @@ class _DeepSeekV4SparseCompressCacheInsertBuilder:
             shape=(
                 self.config.num_kv_cache_blocks,
                 self.config.kv_cache_block_size
-                * (_DEEPSEEK_V4_SWA_TOKEN_STRIDE + _DEEPSEEK_V4_SWA_SCALE_DIM),
+                * (_CSA_SWA_TOKEN_STRIDE + _CSA_SWA_SCALE_DIM),
             ),
             seed=seed,
             device=device,
         )
 
 
-def _validate_deepseek_v4_sparse_compress_cache_insert_values(
-    values: DeepSeekV4SparseCompressCacheInsertInputValues,
+def _validate_csa_sparse_compress_cache_insert_values(
+    values: CSASparseCompressCacheInsertValues,
 ) -> None:
     if values.state_cache.ndim != 3:
         raise ValueError("state_cache must be rank-3")
@@ -3167,7 +3165,7 @@ def _validate_deepseek_v4_sparse_compress_cache_insert_values(
         raise TypeError(
             f"state_cache must be floating point, got {values.state_cache.dtype}"
         )
-    expected_state_width = _DEEPSEEK_V4_HEAD_DIM * (2 if values.overlap else 1)
+    expected_state_width = _CSA_HEAD_DIM * (2 if values.overlap else 1)
     if values.state_cache.shape[-1] != expected_state_width * 2:
         raise ValueError(
             "state_cache last dimension must be "
@@ -3191,7 +3189,7 @@ def _validate_deepseek_v4_sparse_compress_cache_insert_values(
         values.kv_cache_block_size,
     )
     min_row_bytes = kv_cache_block_size * (
-        _DEEPSEEK_V4_SWA_TOKEN_STRIDE + _DEEPSEEK_V4_SWA_SCALE_DIM
+        _CSA_SWA_TOKEN_STRIDE + _CSA_SWA_SCALE_DIM
     )
     if values.kv_cache_2d.shape[1] < min_row_bytes:
         raise ValueError(
@@ -3239,9 +3237,9 @@ def _validate_deepseek_v4_sparse_compress_cache_insert_values(
             raise ValueError(
                 "block_table_base_offsets must share the state_cache device"
             )
-    if values.rms_norm_weight.shape != (_DEEPSEEK_V4_HEAD_DIM,):
+    if values.rms_norm_weight.shape != (_CSA_HEAD_DIM,):
         raise ValueError(
-            f"rms_norm_weight must have shape {(_DEEPSEEK_V4_HEAD_DIM,)}, "
+            f"rms_norm_weight must have shape {(_CSA_HEAD_DIM,)}, "
             f"got {tuple(values.rms_norm_weight.shape)}"
         )
     if not values.rms_norm_weight.is_floating_point():
@@ -3250,9 +3248,9 @@ def _validate_deepseek_v4_sparse_compress_cache_insert_values(
         raise ValueError("rms_norm_weight must share the state_cache device")
     if values.rms_norm_eps <= 0.0 or not math.isfinite(values.rms_norm_eps):
         raise ValueError("rms_norm_eps must be finite and positive")
-    if values.cos_sin_cache.shape[-1] != _DEEPSEEK_V4_ROPE_DIM:
+    if values.cos_sin_cache.shape[-1] != _CSA_ROPE_DIM:
         raise ValueError(
-            f"cos_sin_cache width must be {_DEEPSEEK_V4_ROPE_DIM}, "
+            f"cos_sin_cache width must be {_CSA_ROPE_DIM}, "
             f"got {values.cos_sin_cache.shape[-1]}"
         )
     if values.cos_sin_cache.device != values.state_cache.device:
@@ -3295,8 +3293,8 @@ def _validate_deepseek_v4_sparse_compress_cache_insert_values(
                 raise ValueError("writable kv_slot_mapping entries must be unique")
 
 
-def _deepseek_v4_sparse_compress_rows(
-    values: DeepSeekV4SparseCompressCacheInsertInputValues,
+def _csa_sparse_compress_rows(
+    values: CSASparseCompressCacheInsertValues,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_actual = min(
         values.compressor_slot_mapping.numel(),
@@ -3306,7 +3304,7 @@ def _deepseek_v4_sparse_compress_rows(
     if num_actual == 0:
         return (
             torch.empty(
-                (0, _DEEPSEEK_V4_HEAD_DIM),
+                (0, _CSA_HEAD_DIM),
                 dtype=torch.float32,
                 device=values.state_cache.device,
             ),
@@ -3353,7 +3351,7 @@ def _deepseek_v4_sparse_compress_rows(
     head_offsets = (
         torch.where(
             offsets >= values.compress_ratio,
-            torch.full_like(offsets, _DEEPSEEK_V4_HEAD_DIM),
+            torch.full_like(offsets, _CSA_HEAD_DIM),
             torch.zeros_like(offsets),
         )
         if values.overlap
@@ -3362,7 +3360,7 @@ def _deepseek_v4_sparse_compress_rows(
     dim_indices = (
         head_offsets[:, None]
         + torch.arange(
-            _DEEPSEEK_V4_HEAD_DIM,
+            _CSA_HEAD_DIM,
             dtype=torch.int64,
             device=values.state_cache.device,
         )[None, :]
@@ -3380,22 +3378,22 @@ def _deepseek_v4_sparse_compress_rows(
     kv_rows = torch.where(valid_window_f, kv_rows, torch.zeros_like(kv_rows))
     compressed = torch.sum(kv_rows * weights, dim=1)
     variance = compressed.square().sum(dim=-1, keepdim=True) / float(
-        _DEEPSEEK_V4_HEAD_DIM
+        _CSA_HEAD_DIM
     )
     normed = compressed * torch.rsqrt(variance + values.rms_norm_eps)
     return normed * values.rms_norm_weight.float(), valid_token
 
 
-def _deepseek_v4_apply_k_rope_rows(
+def _csa_apply_k_rope_rows(
     rows: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
 ) -> torch.Tensor:
     rows = rows.float().clone()
-    rope = rows[..., _DEEPSEEK_V4_NOPE_DIM:]
+    rope = rows[..., _CSA_NOPE_DIM:]
     even = rope[..., 0::2].clone()
     odd = rope[..., 1::2].clone()
-    half_rope = _DEEPSEEK_V4_ROPE_DIM // 2
+    half_rope = _CSA_ROPE_DIM // 2
     cos_sin = cos_sin_cache[positions.to(torch.int64)]
     cos = cos_sin[..., :half_rope].float()
     sin = cos_sin[..., half_rope:].float()
@@ -3404,7 +3402,7 @@ def _deepseek_v4_apply_k_rope_rows(
     return rows
 
 
-def _deepseek_v4_sparse_cache_row_bytes(
+def _csa_sparse_cache_row_bytes(
     normed: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
@@ -3412,42 +3410,42 @@ def _deepseek_v4_sparse_cache_row_bytes(
     quant_input = normed.to(torch.bfloat16).to(torch.float32)
     quant_blocks = quant_input.reshape(
         quant_input.shape[0],
-        _DEEPSEEK_V4_HEAD_DIM // _DEEPSEEK_V4_FP8_QUANT_BLOCK,
-        _DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        _CSA_HEAD_DIM // _CSA_FP8_QUANT_BLOCK,
+        _CSA_FP8_QUANT_BLOCK,
     )
     absmax = quant_blocks.abs().amax(dim=-1).clamp_min(1.0e-4)
-    exponent = torch.ceil(torch.log2(absmax / _DEEPSEEK_V4_FP8_MAX))
+    exponent = torch.ceil(torch.log2(absmax / _CSA_FP8_MAX))
     scaled = torch.clamp(
         quant_blocks * torch.exp2(-exponent).unsqueeze(-1),
-        -_DEEPSEEK_V4_FP8_MAX,
-        _DEEPSEEK_V4_FP8_MAX,
+        -_CSA_FP8_MAX,
+        _CSA_FP8_MAX,
     )
     value_bytes = (
         scaled.to(torch.float8_e4m3fn)
         .view(torch.uint8)
         .reshape(
             quant_input.shape[0],
-            _DEEPSEEK_V4_HEAD_DIM,
+            _CSA_HEAD_DIM,
         )
     )
     scale_bytes = torch.clamp(exponent + 127.0, 0.0, 255.0).to(torch.uint8)
     scale_bytes[..., -1] = 0
-    rotated = _deepseek_v4_apply_k_rope_rows(normed, positions, cos_sin_cache).to(
+    rotated = _csa_apply_k_rope_rows(normed, positions, cos_sin_cache).to(
         torch.bfloat16
     )
-    rope_bytes = rotated[..., _DEEPSEEK_V4_NOPE_DIM:].contiguous().view(torch.uint8)
-    rope_bytes = rope_bytes.reshape(normed.shape[0], _DEEPSEEK_V4_ROPE_DIM * 2)
-    return value_bytes[..., :_DEEPSEEK_V4_NOPE_DIM], scale_bytes, rope_bytes
+    rope_bytes = rotated[..., _CSA_NOPE_DIM:].contiguous().view(torch.uint8)
+    rope_bytes = rope_bytes.reshape(normed.shape[0], _CSA_ROPE_DIM * 2)
+    return value_bytes[..., :_CSA_NOPE_DIM], scale_bytes, rope_bytes
 
 
-def deepseek_v4_sparse_compress_cache_insert_reference(
-    values: DeepSeekV4SparseCompressCacheInsertInputValues,
+def csa_sparse_compress_cache_insert_reference(
+    values: CSASparseCompressCacheInsertValues,
 ) -> torch.Tensor:
-    """Return cache bytes after applying DeepSeek V4 sparse-compress inserts."""
+    """Return cache bytes after applying CSA sparse-compress inserts."""
 
-    _validate_deepseek_v4_sparse_compress_cache_insert_values(values)
+    _validate_csa_sparse_compress_cache_insert_values(values)
     out = values.kv_cache_2d.clone()
-    normed, valid = _deepseek_v4_sparse_compress_rows(values)
+    normed, valid = _csa_sparse_compress_rows(values)
     if normed.numel() == 0:
         return out.contiguous()
     compressed_positions = (
@@ -3458,7 +3456,7 @@ def deepseek_v4_sparse_compress_cache_insert_reference(
         )
         * values.compress_ratio
     )
-    value_bytes, scale_bytes, rope_bytes = _deepseek_v4_sparse_cache_row_bytes(
+    value_bytes, scale_bytes, rope_bytes = _csa_sparse_cache_row_bytes(
         normed,
         compressed_positions,
         values.cos_sin_cache,
@@ -3472,24 +3470,24 @@ def deepseek_v4_sparse_compress_cache_insert_reference(
         page = slot // values.kv_cache_block_size
         pos = slot % values.kv_cache_block_size
         page_base = page * out.stride(0)
-        token_base = page_base + pos * _DEEPSEEK_V4_SWA_TOKEN_STRIDE
+        token_base = page_base + pos * _CSA_SWA_TOKEN_STRIDE
         scale_base = (
             page_base
-            + values.kv_cache_block_size * _DEEPSEEK_V4_SWA_TOKEN_STRIDE
-            + pos * _DEEPSEEK_V4_SWA_SCALE_DIM
+            + values.kv_cache_block_size * _CSA_SWA_TOKEN_STRIDE
+            + pos * _CSA_SWA_SCALE_DIM
         )
-        flat[token_base : token_base + _DEEPSEEK_V4_NOPE_DIM] = value_bytes[row_idx]
-        rope_base = token_base + _DEEPSEEK_V4_NOPE_DIM
-        flat[rope_base : rope_base + _DEEPSEEK_V4_ROPE_DIM * 2] = rope_bytes[row_idx]
-        flat[scale_base : scale_base + _DEEPSEEK_V4_SWA_SCALE_DIM] = scale_bytes[
+        flat[token_base : token_base + _CSA_NOPE_DIM] = value_bytes[row_idx]
+        rope_base = token_base + _CSA_NOPE_DIM
+        flat[rope_base : rope_base + _CSA_ROPE_DIM * 2] = rope_bytes[row_idx]
+        flat[scale_base : scale_base + _CSA_SWA_SCALE_DIM] = scale_bytes[
             row_idx
         ]
     return out.contiguous()
 
 
 @dataclass
-class DeepSeekV4IndexerMXFP4CacheWriteInputValues:
-    """Generated values for writing DeepSeek V4 indexer K rows to MXFP4 cache."""
+class CSAIndexerMXFP4CacheWriteValues:
+    """Generated values for writing CSA indexer K rows to MXFP4 cache."""
 
     index_k: torch.Tensor
     cache_2d: torch.Tensor
@@ -3499,8 +3497,8 @@ class DeepSeekV4IndexerMXFP4CacheWriteInputValues:
 
 
 @dataclass
-class DeepSeekV4IndexerMXFP4CacheWriteInputConfig:
-    """Initialization parameters for DeepSeek V4 indexer MXFP4 cache writes.
+class _CSAIndexerMXFP4CacheWriteConfig:
+    """Initialization parameters for CSA indexer MXFP4 cache writes.
 
     The represented operation quantizes 128-channel indexer K rows into MXFP4
     storage and writes them into a paged byte cache. Cache rows are selected by
@@ -3544,13 +3542,13 @@ class DeepSeekV4IndexerMXFP4CacheWriteInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4IndexerMXFP4CacheWriteBuilder:
-    """Generator for DeepSeek V4 indexer MXFP4 cache-write inputs."""
+class _CSAIndexerMXFP4CacheWriteBuilder:
+    """Generator for CSA indexer MXFP4 cache-write inputs."""
 
-    config: DeepSeekV4IndexerMXFP4CacheWriteInputConfig
+    config: _CSAIndexerMXFP4CacheWriteConfig
     index_k_input: TensorInput | None
 
-    def __init__(self, config: DeepSeekV4IndexerMXFP4CacheWriteInputConfig) -> None:
+    def __init__(self, config: _CSAIndexerMXFP4CacheWriteConfig) -> None:
         self.config = config
         self.index_k_input = None
         self.__post_init__()
@@ -3570,7 +3568,7 @@ class _DeepSeekV4IndexerMXFP4CacheWriteBuilder:
         metadata_seed: int | None = None,
         value_seed: int | None = None,
         device: DeviceLike = None,
-    ) -> DeepSeekV4IndexerMXFP4CacheWriteInputValues:
+    ) -> CSAIndexerMXFP4CacheWriteValues:
         self.__post_init__()
         if self.index_k_input is None:
             raise ValueError("index_k_input must be initialized")
@@ -3589,7 +3587,7 @@ class _DeepSeekV4IndexerMXFP4CacheWriteBuilder:
             ).values,
             "index_k",
         )
-        values = DeepSeekV4IndexerMXFP4CacheWriteInputValues(
+        values = CSAIndexerMXFP4CacheWriteValues(
             index_k=(index_k.float() * self.config.value_scale)
             .to(index_k.dtype)
             .contiguous(),
@@ -3607,7 +3605,7 @@ class _DeepSeekV4IndexerMXFP4CacheWriteBuilder:
             ),
             block_size=self.config.block_size,
         )
-        _validate_deepseek_v4_indexer_mxfp4_cache_write_values(values)
+        _validate_csa_indexer_mxfp4_cache_write_values(values)
         return values
 
     def _normalize_config(self) -> None:
@@ -3644,12 +3642,12 @@ class _DeepSeekV4IndexerMXFP4CacheWriteBuilder:
             )
 
     def _index_k_shape(self) -> tuple[int, int]:
-        return (self.config.num_rows, _DEEPSEEK_V4_INDEXER_DIM)
+        return (self.config.num_rows, _CSA_INDEXER_DIM)
 
     def _cache_row_bytes(self) -> int:
         return self.config.block_size * (
-            _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
-            + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+            _CSA_INDEXER_MXFP4_VALUE_BYTES
+            + _CSA_INDEXER_MXFP4_SCALE_BYTES
         )
 
     def _generate_cache(self, *, seed: int, device: torch.device) -> torch.Tensor:
@@ -3679,7 +3677,7 @@ class _DeepSeekV4IndexerMXFP4CacheWriteBuilder:
         )
 
 
-def _deepseek_v4_mxfp4_nibble_reference(x: torch.Tensor) -> torch.Tensor:
+def _csa_mxfp4_nibble_reference(x: torch.Tensor) -> torch.Tensor:
     abs_x = torch.minimum(x.abs(), torch.tensor(6.0, device=x.device))
     code = torch.where(
         abs_x <= 0.25,
@@ -3714,23 +3712,23 @@ def _deepseek_v4_mxfp4_nibble_reference(x: torch.Tensor) -> torch.Tensor:
     return code | (sign << 3)
 
 
-def _deepseek_v4_indexer_mxfp4_row_reference(
+def _csa_indexer_mxfp4_row_reference(
     row: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     row = row.float()
     packed = torch.empty(
-        (_DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES,),
+        (_CSA_INDEXER_MXFP4_VALUE_BYTES,),
         dtype=torch.uint8,
         device=row.device,
     )
     scales = torch.empty(
-        (_DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES,),
+        (_CSA_INDEXER_MXFP4_SCALE_BYTES,),
         dtype=torch.uint8,
         device=row.device,
     )
-    for block_idx in range(_DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES):
-        block_base = block_idx * _DEEPSEEK_V4_INDEXER_MXFP4_BLOCK_SIZE
-        block = row[block_base : block_base + _DEEPSEEK_V4_INDEXER_MXFP4_BLOCK_SIZE]
+    for block_idx in range(_CSA_INDEXER_MXFP4_SCALE_BYTES):
+        block_base = block_idx * _CSA_INDEXER_MXFP4_BLOCK_SIZE
+        block = row[block_base : block_base + _CSA_INDEXER_MXFP4_BLOCK_SIZE]
         lo = block[0::2]
         hi = block[1::2]
         amax = torch.maximum(
@@ -3739,24 +3737,24 @@ def _deepseek_v4_indexer_mxfp4_row_reference(
         )
         exponent = torch.ceil(torch.log2(amax / 6.0)).clamp(-127.0, 127.0)
         inv_scale = torch.exp2(-exponent)
-        lo_nibbles = _deepseek_v4_mxfp4_nibble_reference(lo * inv_scale)
-        hi_nibbles = _deepseek_v4_mxfp4_nibble_reference(hi * inv_scale)
-        start = block_idx * _DEEPSEEK_V4_INDEXER_MXFP4_HALF_BLOCK
-        packed[start : start + _DEEPSEEK_V4_INDEXER_MXFP4_HALF_BLOCK] = lo_nibbles | (
+        lo_nibbles = _csa_mxfp4_nibble_reference(lo * inv_scale)
+        hi_nibbles = _csa_mxfp4_nibble_reference(hi * inv_scale)
+        start = block_idx * _CSA_INDEXER_MXFP4_HALF_BLOCK
+        packed[start : start + _CSA_INDEXER_MXFP4_HALF_BLOCK] = lo_nibbles | (
             hi_nibbles << 4
         )
         scales[block_idx] = int(exponent.item()) + 127
     return packed, scales
 
 
-def _validate_deepseek_v4_indexer_mxfp4_cache_write_values(
-    values: DeepSeekV4IndexerMXFP4CacheWriteInputValues,
+def _validate_csa_indexer_mxfp4_cache_write_values(
+    values: CSAIndexerMXFP4CacheWriteValues,
 ) -> None:
     if values.index_k.ndim != 2:
         raise ValueError(f"index_k must be rank-2, got {values.index_k.ndim}")
-    if values.index_k.shape[1] != _DEEPSEEK_V4_INDEXER_DIM:
+    if values.index_k.shape[1] != _CSA_INDEXER_DIM:
         raise ValueError(
-            f"index_k width must be {_DEEPSEEK_V4_INDEXER_DIM}, "
+            f"index_k width must be {_CSA_INDEXER_DIM}, "
             f"got {values.index_k.shape[1]}"
         )
     if values.cache_2d.dtype != torch.uint8:
@@ -3765,7 +3763,7 @@ def _validate_deepseek_v4_indexer_mxfp4_cache_write_values(
         raise ValueError(f"cache_2d must be rank-2, got {values.cache_2d.ndim}")
     block_size = _check_positive("block_size", values.block_size)
     min_row_bytes = block_size * (
-        _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+        _CSA_INDEXER_MXFP4_VALUE_BYTES + _CSA_INDEXER_MXFP4_SCALE_BYTES
     )
     if values.cache_2d.shape[1] < min_row_bytes:
         raise ValueError(
@@ -3815,12 +3813,12 @@ def _validate_deepseek_v4_indexer_mxfp4_cache_write_values(
         raise ValueError("writable slot_mapping entries must be unique")
 
 
-def deepseek_v4_indexer_mxfp4_cache_write_reference(
-    values: DeepSeekV4IndexerMXFP4CacheWriteInputValues,
+def csa_indexer_mxfp4_cache_write_reference(
+    values: CSAIndexerMXFP4CacheWriteValues,
 ) -> torch.Tensor:
-    """Return cache bytes after applying DeepSeek V4 indexer MXFP4 writes."""
+    """Return cache bytes after applying CSA indexer MXFP4 writes."""
 
-    _validate_deepseek_v4_indexer_mxfp4_cache_write_values(values)
+    _validate_csa_indexer_mxfp4_cache_write_values(values)
     out = values.cache_2d.clone()
     num_rows = min(
         values.index_k.shape[0],
@@ -3837,24 +3835,24 @@ def deepseek_v4_indexer_mxfp4_cache_write_reference(
         page = slot // values.block_size
         pos = slot % values.block_size
         page_base = page * out.stride(0)
-        value_base = page_base + pos * _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
+        value_base = page_base + pos * _CSA_INDEXER_MXFP4_VALUE_BYTES
         scale_base = (
             page_base
-            + values.block_size * _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
-            + pos * _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+            + values.block_size * _CSA_INDEXER_MXFP4_VALUE_BYTES
+            + pos * _CSA_INDEXER_MXFP4_SCALE_BYTES
         )
-        packed, scales = _deepseek_v4_indexer_mxfp4_row_reference(
+        packed, scales = _csa_indexer_mxfp4_row_reference(
             values.index_k[row_idx]
         )
         flat = out.reshape(-1)
-        flat[value_base : value_base + _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES] = packed
-        flat[scale_base : scale_base + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES] = scales
+        flat[value_base : value_base + _CSA_INDEXER_MXFP4_VALUE_BYTES] = packed
+        flat[scale_base : scale_base + _CSA_INDEXER_MXFP4_SCALE_BYTES] = scales
     return out.contiguous()
 
 
 @dataclass
-class DeepSeekV4IndexerMXFP4CacheGatherInputValues:
-    """Generated values for gathering DeepSeek V4 indexer MXFP4 cache rows."""
+class CSAIndexerMXFP4CacheGatherValues:
+    """Generated values for gathering CSA indexer MXFP4 cache rows."""
 
     cache_2d: torch.Tensor
     slot_mapping: torch.Tensor
@@ -3864,8 +3862,8 @@ class DeepSeekV4IndexerMXFP4CacheGatherInputValues:
 
 
 @dataclass
-class DeepSeekV4IndexerMXFP4CacheGatherInputConfig:
-    """Initialization parameters for DeepSeek V4 indexer MXFP4 cache gathers.
+class _CSAIndexerMXFP4CacheGatherConfig:
+    """Initialization parameters for CSA indexer MXFP4 cache gathers.
 
     The represented operation reads packed MXFP4 value bytes and UE8M0 scale
     bytes from a paged cache into dense workspaces. Negative slot ids produce
@@ -3897,12 +3895,12 @@ class DeepSeekV4IndexerMXFP4CacheGatherInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4IndexerMXFP4CacheGatherBuilder:
-    """Generator for DeepSeek V4 indexer MXFP4 cache-gather inputs."""
+class _CSAIndexerMXFP4CacheGatherBuilder:
+    """Generator for CSA indexer MXFP4 cache-gather inputs."""
 
-    config: DeepSeekV4IndexerMXFP4CacheGatherInputConfig
+    config: _CSAIndexerMXFP4CacheGatherConfig
 
-    def __init__(self, config: DeepSeekV4IndexerMXFP4CacheGatherInputConfig) -> None:
+    def __init__(self, config: _CSAIndexerMXFP4CacheGatherConfig) -> None:
         self.config = config
         self.__post_init__()
 
@@ -3916,7 +3914,7 @@ class _DeepSeekV4IndexerMXFP4CacheGatherBuilder:
         metadata_seed: int | None = None,
         value_seed: int | None = None,
         device: DeviceLike = None,
-    ) -> DeepSeekV4IndexerMXFP4CacheGatherInputValues:
+    ) -> CSAIndexerMXFP4CacheGatherValues:
         self.__post_init__()
         metadata_seed, value_seed = _resolve_attention_seeds(
             seed=seed,
@@ -3924,7 +3922,7 @@ class _DeepSeekV4IndexerMXFP4CacheGatherBuilder:
             value_seed=value_seed,
         )
         target_device = _resolve_device(self.config.device, device)
-        values = DeepSeekV4IndexerMXFP4CacheGatherInputValues(
+        values = CSAIndexerMXFP4CacheGatherValues(
             cache_2d=self._generate_cache(
                 seed=_child_seed(value_seed, 1),
                 device=target_device,
@@ -3935,17 +3933,17 @@ class _DeepSeekV4IndexerMXFP4CacheGatherBuilder:
             ),
             values_out=self._generate_output(
                 seed=_child_seed(value_seed, 2),
-                shape=(self.config.num_rows, _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES),
+                shape=(self.config.num_rows, _CSA_INDEXER_MXFP4_VALUE_BYTES),
                 device=target_device,
             ),
             scales_out=self._generate_output(
                 seed=_child_seed(value_seed, 3),
-                shape=(self.config.num_rows, _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES),
+                shape=(self.config.num_rows, _CSA_INDEXER_MXFP4_SCALE_BYTES),
                 device=target_device,
             ),
             block_size=self.config.block_size,
         )
-        _validate_deepseek_v4_indexer_mxfp4_cache_gather_values(values)
+        _validate_csa_indexer_mxfp4_cache_gather_values(values)
         return values
 
     def _normalize_config(self) -> None:
@@ -3967,8 +3965,8 @@ class _DeepSeekV4IndexerMXFP4CacheGatherBuilder:
 
     def _cache_row_bytes(self) -> int:
         return self.config.block_size * (
-            _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
-            + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+            _CSA_INDEXER_MXFP4_VALUE_BYTES
+            + _CSA_INDEXER_MXFP4_SCALE_BYTES
         )
 
     def _generate_cache(self, *, seed: int, device: torch.device) -> torch.Tensor:
@@ -4004,8 +4002,8 @@ class _DeepSeekV4IndexerMXFP4CacheGatherBuilder:
         )
 
 
-def _validate_deepseek_v4_indexer_mxfp4_cache_gather_values(
-    values: DeepSeekV4IndexerMXFP4CacheGatherInputValues,
+def _validate_csa_indexer_mxfp4_cache_gather_values(
+    values: CSAIndexerMXFP4CacheGatherValues,
 ) -> None:
     if values.cache_2d.dtype != torch.uint8:
         raise TypeError(f"cache_2d must be uint8, got {values.cache_2d.dtype}")
@@ -4021,7 +4019,7 @@ def _validate_deepseek_v4_indexer_mxfp4_cache_gather_values(
         raise ValueError("values_out and scales_out must be rank-2")
     block_size = _check_positive("block_size", values.block_size)
     min_row_bytes = block_size * (
-        _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+        _CSA_INDEXER_MXFP4_VALUE_BYTES + _CSA_INDEXER_MXFP4_SCALE_BYTES
     )
     if values.cache_2d.shape[1] < min_row_bytes:
         raise ValueError(
@@ -4035,9 +4033,9 @@ def _validate_deepseek_v4_indexer_mxfp4_cache_gather_values(
         raise ValueError(
             "gather output workspaces must have at least slot_mapping rows"
         )
-    if values.values_out.shape[1] < _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES:
+    if values.values_out.shape[1] < _CSA_INDEXER_MXFP4_VALUE_BYTES:
         raise ValueError("values_out has insufficient value bytes")
-    if values.scales_out.shape[1] < _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES:
+    if values.scales_out.shape[1] < _CSA_INDEXER_MXFP4_SCALE_BYTES:
         raise ValueError("scales_out has insufficient scale bytes")
     if values.values_out.stride(1) != 1 or values.scales_out.stride(1) != 1:
         raise ValueError(
@@ -4068,44 +4066,44 @@ def _validate_deepseek_v4_indexer_mxfp4_cache_gather_values(
         )
 
 
-def deepseek_v4_indexer_mxfp4_cache_gather_reference(
-    values: DeepSeekV4IndexerMXFP4CacheGatherInputValues,
+def csa_indexer_mxfp4_cache_gather_reference(
+    values: CSAIndexerMXFP4CacheGatherValues,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return dense value and scale byte workspaces gathered from MXFP4 cache."""
 
-    _validate_deepseek_v4_indexer_mxfp4_cache_gather_values(values)
+    _validate_csa_indexer_mxfp4_cache_gather_values(values)
     values_out = values.values_out.clone()
     scales_out = values.scales_out.clone()
     flat_cache = values.cache_2d.reshape(-1)
     slots = values.slot_mapping.to(torch.int64)
     for row_idx, slot_value in enumerate(slots.tolist()):
         if slot_value < 0:
-            values_out[row_idx, :_DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES].zero_()
-            scales_out[row_idx, :_DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES].zero_()
+            values_out[row_idx, :_CSA_INDEXER_MXFP4_VALUE_BYTES].zero_()
+            scales_out[row_idx, :_CSA_INDEXER_MXFP4_SCALE_BYTES].zero_()
             continue
         page = slot_value // values.block_size
         pos = slot_value % values.block_size
         page_base = page * values.cache_2d.stride(0)
-        value_base = page_base + pos * _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
+        value_base = page_base + pos * _CSA_INDEXER_MXFP4_VALUE_BYTES
         scale_base = (
             page_base
-            + values.block_size * _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES
-            + pos * _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES
+            + values.block_size * _CSA_INDEXER_MXFP4_VALUE_BYTES
+            + pos * _CSA_INDEXER_MXFP4_SCALE_BYTES
         )
         values_out[
             row_idx,
-            :_DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES,
-        ] = flat_cache[value_base : value_base + _DEEPSEEK_V4_INDEXER_MXFP4_VALUE_BYTES]
+            :_CSA_INDEXER_MXFP4_VALUE_BYTES,
+        ] = flat_cache[value_base : value_base + _CSA_INDEXER_MXFP4_VALUE_BYTES]
         scales_out[
             row_idx,
-            :_DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES,
-        ] = flat_cache[scale_base : scale_base + _DEEPSEEK_V4_INDEXER_MXFP4_SCALE_BYTES]
+            :_CSA_INDEXER_MXFP4_SCALE_BYTES,
+        ] = flat_cache[scale_base : scale_base + _CSA_INDEXER_MXFP4_SCALE_BYTES]
     return values_out.contiguous(), scales_out.contiguous()
 
 
 @dataclass
-class DeepSeekV4KCacheGatherInputValues:
-    """Generated values for DeepSeek V4 sparse K-cache gather/dequantization."""
+class CSAKCacheGatherValues:
+    """Generated values for CSA sparse K-cache gather/dequantization."""
 
     out: torch.Tensor
     cache_2d: torch.Tensor
@@ -4118,8 +4116,8 @@ class DeepSeekV4KCacheGatherInputValues:
 
 
 @dataclass
-class DeepSeekV4KCacheGatherInputConfig:
-    """Initialization parameters for DeepSeek V4 K-cache gather/dequantization.
+class _CSAKCacheGatherConfig:
+    """Initialization parameters for CSA K-cache gather/dequantization.
 
     The represented operation reads paged sparse-window attention K-cache rows.
     Each cache page stores per-token FP8 NoPE bytes, BF16 RoPE bytes, and UE8M0
@@ -4168,12 +4166,12 @@ class DeepSeekV4KCacheGatherInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4KCacheGatherBuilder:
-    """Generator for DeepSeek V4 paged K-cache gather/dequantization inputs."""
+class _CSAKCacheGatherBuilder:
+    """Generator for CSA paged K-cache gather/dequantization inputs."""
 
-    config: DeepSeekV4KCacheGatherInputConfig
+    config: _CSAKCacheGatherConfig
 
-    def __init__(self, config: DeepSeekV4KCacheGatherInputConfig) -> None:
+    def __init__(self, config: _CSAKCacheGatherConfig) -> None:
         self.config = config
         self.__post_init__()
 
@@ -4187,7 +4185,7 @@ class _DeepSeekV4KCacheGatherBuilder:
         metadata_seed: int | None = None,
         value_seed: int | None = None,
         device: DeviceLike = None,
-    ) -> DeepSeekV4KCacheGatherInputValues:
+    ) -> CSAKCacheGatherValues:
         self.__post_init__()
         metadata_seed, value_seed = _resolve_attention_seeds(
             seed=seed,
@@ -4218,7 +4216,7 @@ class _DeepSeekV4KCacheGatherBuilder:
                 device=target_device,
             )
         out_rows = self.config.offset + self._out_gather_width()
-        values = DeepSeekV4KCacheGatherInputValues(
+        values = CSAKCacheGatherValues(
             out=self._generate_out(
                 seed=_child_seed(value_seed, 1),
                 out_rows=out_rows,
@@ -4237,7 +4235,7 @@ class _DeepSeekV4KCacheGatherBuilder:
                 None if base_offsets is None else base_offsets.contiguous()
             ),
         )
-        _validate_deepseek_v4_k_cache_gather_values(values)
+        _validate_csa_k_cache_gather_values(values)
         return values
 
     def _normalize_config(self) -> None:
@@ -4279,7 +4277,7 @@ class _DeepSeekV4KCacheGatherBuilder:
 
     def _cache_row_bytes(self) -> int:
         return self.config.block_size * (
-            _DEEPSEEK_V4_SWA_TOKEN_STRIDE + _DEEPSEEK_V4_SWA_SCALE_DIM
+            _CSA_SWA_TOKEN_STRIDE + _CSA_SWA_SCALE_DIM
         )
 
     def _out_gather_width(self) -> int:
@@ -4356,7 +4354,7 @@ class _DeepSeekV4KCacheGatherBuilder:
     ) -> torch.Tensor:
         generator = _rng_for_device(device, seed)
         out = torch.randn(
-            (self.config.batch_size, out_rows, _DEEPSEEK_V4_HEAD_DIM),
+            (self.config.batch_size, out_rows, _CSA_HEAD_DIM),
             dtype=torch.float32,
             device=device,
             generator=generator,
@@ -4371,24 +4369,24 @@ class _DeepSeekV4KCacheGatherBuilder:
             dtype=torch.uint8,
             device=device,
         )
-        token_area = cache[:, : self.config.block_size * _DEEPSEEK_V4_SWA_TOKEN_STRIDE]
+        token_area = cache[:, : self.config.block_size * _CSA_SWA_TOKEN_STRIDE]
         token_area = token_area.reshape(
             self.config.num_cache_blocks,
             self.config.block_size,
-            _DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+            _CSA_SWA_TOKEN_STRIDE,
         )
-        scale_area = cache[:, self.config.block_size * _DEEPSEEK_V4_SWA_TOKEN_STRIDE :]
+        scale_area = cache[:, self.config.block_size * _CSA_SWA_TOKEN_STRIDE :]
         scale_area = scale_area.reshape(
             self.config.num_cache_blocks,
             self.config.block_size,
-            _DEEPSEEK_V4_SWA_SCALE_DIM,
+            _CSA_SWA_SCALE_DIM,
         )
         nope_fp8 = (
             torch.randn(
                 (
                     self.config.num_cache_blocks,
                     self.config.block_size,
-                    _DEEPSEEK_V4_NOPE_DIM,
+                    _CSA_NOPE_DIM,
                 ),
                 dtype=torch.float32,
                 device=device,
@@ -4403,7 +4401,7 @@ class _DeepSeekV4KCacheGatherBuilder:
                 (
                     self.config.num_cache_blocks,
                     self.config.block_size,
-                    _DEEPSEEK_V4_ROPE_DIM,
+                    _CSA_ROPE_DIM,
                 ),
                 dtype=torch.float32,
                 device=device,
@@ -4418,24 +4416,24 @@ class _DeepSeekV4KCacheGatherBuilder:
             (
                 self.config.num_cache_blocks,
                 self.config.block_size,
-                _DEEPSEEK_V4_SWA_SCALE_DIM,
+                _CSA_SWA_SCALE_DIM,
             ),
             dtype=torch.uint8,
             device=device,
             generator=generator,
         )
         scale_bytes[..., -1] = 127
-        token_area[..., :_DEEPSEEK_V4_NOPE_DIM] = nope_fp8
+        token_area[..., :_CSA_NOPE_DIM] = nope_fp8
         token_area[
             ...,
-            _DEEPSEEK_V4_NOPE_DIM:_DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+            _CSA_NOPE_DIM:_CSA_SWA_TOKEN_STRIDE,
         ] = rope_bf16
         scale_area.copy_(scale_bytes)
         return cache.contiguous()
 
 
-def _validate_deepseek_v4_k_cache_gather_values(
-    values: DeepSeekV4KCacheGatherInputValues,
+def _validate_csa_k_cache_gather_values(
+    values: CSAKCacheGatherValues,
 ) -> None:
     if values.out.dtype != torch.bfloat16:
         raise TypeError(f"out must be bfloat16, got {values.out.dtype}")
@@ -4443,9 +4441,9 @@ def _validate_deepseek_v4_k_cache_gather_values(
         raise TypeError(f"cache_2d must be uint8, got {values.cache_2d.dtype}")
     if values.out.ndim != 3:
         raise ValueError(f"out must be rank-3, got {values.out.ndim}")
-    if values.out.shape[-1] != _DEEPSEEK_V4_HEAD_DIM:
+    if values.out.shape[-1] != _CSA_HEAD_DIM:
         raise ValueError(
-            f"out hidden width must be {_DEEPSEEK_V4_HEAD_DIM}, "
+            f"out hidden width must be {_CSA_HEAD_DIM}, "
             f"got {values.out.shape[-1]}"
         )
     if values.out.stride(-1) != 1:
@@ -4454,7 +4452,7 @@ def _validate_deepseek_v4_k_cache_gather_values(
         raise ValueError(f"cache_2d must be rank-2, got {values.cache_2d.ndim}")
     block_size = _check_positive("block_size", values.block_size)
     row_bytes = block_size * (
-        _DEEPSEEK_V4_SWA_TOKEN_STRIDE + _DEEPSEEK_V4_SWA_SCALE_DIM
+        _CSA_SWA_TOKEN_STRIDE + _CSA_SWA_SCALE_DIM
     )
     if values.cache_2d.shape[1] < row_bytes:
         raise ValueError(
@@ -4545,12 +4543,12 @@ def _validate_deepseek_v4_k_cache_gather_values(
                 raise ValueError("block_table is too narrow for generated positions")
 
 
-def deepseek_v4_dequantize_and_gather_k_cache_reference(
-    values: DeepSeekV4KCacheGatherInputValues,
+def csa_dequantize_and_gather_k_cache_reference(
+    values: CSAKCacheGatherValues,
 ) -> torch.Tensor:
-    """Return BF16 K rows gathered/dequantized from DeepSeek V4 paged cache."""
+    """Return BF16 K rows gathered/dequantized from CSA paged cache."""
 
-    _validate_deepseek_v4_k_cache_gather_values(values)
+    _validate_csa_k_cache_gather_values(values)
     out = values.out.clone()
     block_size = values.block_size
     seq_lens = values.seq_lens.to(torch.int64)
@@ -4562,7 +4560,7 @@ def deepseek_v4_dequantize_and_gather_k_cache_reference(
         if values.block_table_base_offsets is None
         else values.block_table_base_offsets.to(torch.int64)
     )
-    n_quant_blocks = _DEEPSEEK_V4_NOPE_DIM // _DEEPSEEK_V4_FP8_QUANT_BLOCK
+    n_quant_blocks = _CSA_NOPE_DIM // _CSA_FP8_QUANT_BLOCK
     for batch_idx in range(seq_lens.numel()):
         seq_len = int(seq_lens[batch_idx].item())
         gather_len = int(gather_lens[batch_idx].item())
@@ -4575,33 +4573,33 @@ def deepseek_v4_dequantize_and_gather_k_cache_reference(
             physical = int(values.block_table[batch_idx, table_idx].item())
             pos_in_block = pos % block_size
             cache_row = values.cache_2d[physical]
-            token_base = pos_in_block * _DEEPSEEK_V4_SWA_TOKEN_STRIDE
+            token_base = pos_in_block * _CSA_SWA_TOKEN_STRIDE
             scale_base = (
-                block_size * _DEEPSEEK_V4_SWA_TOKEN_STRIDE
-                + pos_in_block * _DEEPSEEK_V4_SWA_SCALE_DIM
+                block_size * _CSA_SWA_TOKEN_STRIDE
+                + pos_in_block * _CSA_SWA_SCALE_DIM
             )
             for qblock in range(n_quant_blocks):
-                qstart = token_base + qblock * _DEEPSEEK_V4_FP8_QUANT_BLOCK
-                qend = qstart + _DEEPSEEK_V4_FP8_QUANT_BLOCK
+                qstart = token_base + qblock * _CSA_FP8_QUANT_BLOCK
+                qend = qstart + _CSA_FP8_QUANT_BLOCK
                 x_fp8 = cache_row[qstart:qend].view(torch.float8_e4m3fn).float()
                 scale_exp = int(cache_row[scale_base + qblock].item()) - 127
                 scale = math.pow(2.0, scale_exp)
                 out_row[
                     qblock
-                    * _DEEPSEEK_V4_FP8_QUANT_BLOCK : (qblock + 1)
-                    * _DEEPSEEK_V4_FP8_QUANT_BLOCK
+                    * _CSA_FP8_QUANT_BLOCK : (qblock + 1)
+                    * _CSA_FP8_QUANT_BLOCK
                 ] = (x_fp8 * scale).to(torch.bfloat16)
-            rope_start = token_base + _DEEPSEEK_V4_NOPE_DIM
-            rope_end = rope_start + _DEEPSEEK_V4_ROPE_DIM * 2
-            out_row[_DEEPSEEK_V4_NOPE_DIM:] = cache_row[rope_start:rope_end].view(
+            rope_start = token_base + _CSA_NOPE_DIM
+            rope_end = rope_start + _CSA_ROPE_DIM * 2
+            out_row[_CSA_NOPE_DIM:] = cache_row[rope_start:rope_end].view(
                 torch.bfloat16
             )
     return out.contiguous()
 
 
 @dataclass
-class DeepSeekV4PagedIndexValues:
-    """Generated values for DeepSeek V4 paged index metadata operations."""
+class CSAPagedIndexValues:
+    """Generated values for CSA paged index metadata operations."""
 
     metadata: MHARequestMetadataValues
     positions: torch.Tensor
@@ -4621,12 +4619,12 @@ class DeepSeekV4PagedIndexValues:
 
 
 @dataclass
-class DeepSeekV4PagedIndexInputConfig:
-    """Initialization parameters for DeepSeek V4 paged index metadata.
+class _CSAPagedIndexConfig:
+    """Initialization parameters for CSA paged index metadata.
 
     The represented operation family maps request-local token or compressed
     token positions through a paged KV cache block table. The generated values
-    are shared by DeepSeek V4 helpers that build global top-k slot ids, decode
+    are shared by CSA helpers that build global top-k slot ids, decode
     sliding-window slot ids, compressed KV slot mappings, and decode-indexer
     block-table/context metadata.
     """
@@ -4692,14 +4690,14 @@ class DeepSeekV4PagedIndexInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4PagedIndexBuilder:
-    """Generator for DeepSeek V4 paged index metadata inputs."""
+class _CSAPagedIndexBuilder:
+    """Generator for CSA paged index metadata inputs."""
 
-    config: DeepSeekV4PagedIndexInputConfig
+    config: _CSAPagedIndexConfig
     metadata_input: MHARequestMetadataInput | None
     page_table_input: PageTableInput | None
 
-    def __init__(self, config: DeepSeekV4PagedIndexInputConfig) -> None:
+    def __init__(self, config: _CSAPagedIndexConfig) -> None:
         self.config = config
         self.metadata_input = None
         self.page_table_input = None
@@ -4723,7 +4721,7 @@ class _DeepSeekV4PagedIndexBuilder:
         *,
         seed: int,
         device: DeviceLike = None,
-    ) -> DeepSeekV4PagedIndexValues:
+    ) -> CSAPagedIndexValues:
         self.__post_init__()
         if self.metadata_input is None or self.page_table_input is None:
             raise ValueError("metadata/page-table child generators must be initialized")
@@ -4733,7 +4731,7 @@ class _DeepSeekV4PagedIndexBuilder:
             device=target_device,
         )
         if metadata.new_q_lens_cpu != metadata.new_kv_lens_cpu:
-            raise ValueError("DeepSeek V4 paged indices require tied Q/KV lengths")
+            raise ValueError("CSA paged indices require tied Q/KV lengths")
 
         max_visible = max(metadata.visible_kv_lens_cpu)
         required_pages = max(1, math.ceil(max_visible / self.config.block_size))
@@ -4779,7 +4777,7 @@ class _DeepSeekV4PagedIndexBuilder:
             device=target_device,
         )
 
-        return DeepSeekV4PagedIndexValues(
+        return CSAPagedIndexValues(
             metadata=metadata,
             positions=torch.tensor(
                 positions_cpu,
@@ -4866,14 +4864,14 @@ class _DeepSeekV4PagedIndexBuilder:
         metadata_config = self.metadata_input.config
         for name in ("batch_size", "total_cached_tokens", "total_new_q_tokens"):
             _check_matches(
-                parent_name=f"DeepSeekV4PagedIndexInputConfig.{name}",
+                parent_name=f"_CSAPagedIndexConfig.{name}",
                 child_name=f"metadata_input.{name}",
                 parent_value=getattr(self.config, name),
                 child_value=getattr(metadata_config, name),
             )
         if metadata_config.total_new_kv_tokens is not None:
             _check_matches(
-                parent_name="DeepSeekV4PagedIndexInputConfig.total_new_q_tokens",
+                parent_name="_CSAPagedIndexConfig.total_new_q_tokens",
                 child_name="metadata_input.total_new_kv_tokens",
                 parent_value=self.config.total_new_q_tokens,
                 child_value=metadata_config.total_new_kv_tokens,
@@ -4887,7 +4885,7 @@ class _DeepSeekV4PagedIndexBuilder:
         if self.page_table_input is None:
             raise ValueError("page_table_input must be initialized")
         _check_matches(
-            parent_name="DeepSeekV4PagedIndexInputConfig.batch_size",
+            parent_name="_CSAPagedIndexConfig.batch_size",
             child_name="page_table_input.batch_size",
             parent_value=self.config.batch_size,
             child_value=self.page_table_input.config.batch_size,
@@ -4958,8 +4956,8 @@ class _DeepSeekV4PagedIndexBuilder:
         return torch.tensor(offsets, dtype=torch.int32, device=device)
 
 
-def _validate_deepseek_v4_paged_index_values(
-    values: DeepSeekV4PagedIndexValues,
+def _validate_csa_paged_index_values(
+    values: CSAPagedIndexValues,
 ) -> None:
     if values.positions.dtype != torch.int32:
         raise TypeError(f"positions must be int32, got {values.positions.dtype}")
@@ -5011,12 +5009,12 @@ def _validate_deepseek_v4_paged_index_values(
         raise ValueError("max_blocks must be positive")
 
 
-def deepseek_v4_compute_global_topk_indices_and_lens_reference(
-    values: DeepSeekV4PagedIndexValues,
+def csa_compute_global_topk_indices_and_lens_reference(
+    values: CSAPagedIndexValues,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return global KV slot ids for request-local top-k indices."""
 
-    _validate_deepseek_v4_paged_index_values(values)
+    _validate_csa_paged_index_values(values)
     device = values.local_topk_indices.device
     topk = values.local_topk_indices
     num_tokens = int(topk.shape[0])
@@ -5052,12 +5050,12 @@ def deepseek_v4_compute_global_topk_indices_and_lens_reference(
     return out, lens
 
 
-def deepseek_v4_decode_swa_indices_and_lens_reference(
-    values: DeepSeekV4PagedIndexValues,
+def csa_decode_swa_indices_and_lens_reference(
+    values: CSAPagedIndexValues,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return decode sliding-window KV slot ids and row lengths."""
 
-    _validate_deepseek_v4_paged_index_values(values)
+    _validate_csa_paged_index_values(values)
     device = values.positions.device
     num_tokens = int(values.positions.numel())
     out = torch.full(
@@ -5107,12 +5105,12 @@ def deepseek_v4_decode_swa_indices_and_lens_reference(
     return out, lens
 
 
-def deepseek_v4_compressed_slot_mapping_reference(
-    values: DeepSeekV4PagedIndexValues,
+def csa_compressed_slot_mapping_reference(
+    values: CSAPagedIndexValues,
 ) -> torch.Tensor:
     """Return compressed KV slot ids for newly materialized compressed tokens."""
 
-    _validate_deepseek_v4_paged_index_values(values)
+    _validate_csa_paged_index_values(values)
     device = values.positions.device
     num_tokens = int(values.positions.numel())
     out = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
@@ -5142,12 +5140,12 @@ def deepseek_v4_compressed_slot_mapping_reference(
     return out
 
 
-def deepseek_v4_indexer_decode_metadata_reference(
-    values: DeepSeekV4PagedIndexValues,
+def csa_indexer_decode_metadata_reference(
+    values: CSAPagedIndexValues,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return decode-indexer context lengths and block tables."""
 
-    _validate_deepseek_v4_paged_index_values(values)
+    _validate_csa_paged_index_values(values)
     device = values.positions.device
     num_tokens = int(values.positions.numel())
     out_context_lens = torch.zeros(num_tokens, dtype=torch.int32, device=device)
@@ -5190,8 +5188,8 @@ def deepseek_v4_indexer_decode_metadata_reference(
 
 
 @dataclass
-class DeepSeekV4SparsePrefillIndexValues:
-    """Generated values for DeepSeek V4 sparse-prefill index construction.
+class CSASparsePrefillIndexValues:
+    """Generated values for CSA sparse-prefill index construction.
 
     The tensors describe one packed batch of new query tokens. For each query
     token, the operation can build candidate KV workspace indices from a
@@ -5214,8 +5212,8 @@ class DeepSeekV4SparsePrefillIndexValues:
 
 
 @dataclass
-class DeepSeekV4SparsePrefillIndexInputConfig:
-    """Initialization parameters for DeepSeek V4 sparse-prefill indices.
+class _CSASparsePrefillIndexConfig:
+    """Initialization parameters for CSA sparse-prefill indices.
 
     The represented operation builds integer candidate lists for sparse
     prefill attention. Each request has a per-request workspace. The compressed
@@ -5243,7 +5241,7 @@ class DeepSeekV4SparsePrefillIndexInputConfig:
     window_size: int
 
     # Required: number of original sequence positions represented by one
-    # compressed prefix position. DeepSeek V4 sparse prefill uses a compressed
+    # compressed prefix position. CSA sparse prefill uses a compressed
     # prefix plus an uncompressed sliding-window span, so this must be > 1.
     compress_ratio: int
 
@@ -5273,13 +5271,13 @@ class DeepSeekV4SparsePrefillIndexInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4SparsePrefillIndexBuilder:
-    """Generator for DeepSeek V4 sparse-prefill index-construction inputs."""
+class _CSASparsePrefillIndexBuilder:
+    """Generator for CSA sparse-prefill index-construction inputs."""
 
-    config: DeepSeekV4SparsePrefillIndexInputConfig
+    config: _CSASparsePrefillIndexConfig
     metadata_input: MHARequestMetadataInput | None
 
-    def __init__(self, config: DeepSeekV4SparsePrefillIndexInputConfig) -> None:
+    def __init__(self, config: _CSASparsePrefillIndexConfig) -> None:
         self.config = config
         self.metadata_input = None
         self.__post_init__()
@@ -5297,7 +5295,7 @@ class _DeepSeekV4SparsePrefillIndexBuilder:
         *,
         seed: int,
         device: DeviceLike = None,
-    ) -> DeepSeekV4SparsePrefillIndexValues:
+    ) -> CSASparsePrefillIndexValues:
         self.__post_init__()
         if self.metadata_input is None:
             raise ValueError("metadata_input must be initialized")
@@ -5307,7 +5305,7 @@ class _DeepSeekV4SparsePrefillIndexBuilder:
             device=target_device,
         )
         if metadata.new_q_lens_cpu != metadata.new_kv_lens_cpu:
-            raise ValueError("DeepSeek V4 sparse prefill requires tied Q/KV lengths")
+            raise ValueError("CSA sparse prefill requires tied Q/KV lengths")
 
         positions_cpu: list[int] = []
         token_to_req_cpu: list[int] = []
@@ -5362,7 +5360,7 @@ class _DeepSeekV4SparsePrefillIndexBuilder:
             compressed_base=compressed_base,
         )
 
-        return DeepSeekV4SparsePrefillIndexValues(
+        return CSASparsePrefillIndexValues(
             metadata=metadata,
             topk_indices=topk_indices_cpu.to(target_device),
             positions=torch.tensor(
@@ -5448,7 +5446,7 @@ class _DeepSeekV4SparsePrefillIndexBuilder:
         metadata_config = self.metadata_input.config
         for name in ("batch_size", "total_cached_tokens", "total_new_q_tokens"):
             _check_matches(
-                parent_name=f"DeepSeekV4SparsePrefillIndexInputConfig.{name}",
+                parent_name=f"_CSASparsePrefillIndexConfig.{name}",
                 child_name=f"metadata_input.{name}",
                 parent_value=getattr(self.config, name),
                 child_value=getattr(metadata_config, name),
@@ -5456,7 +5454,7 @@ class _DeepSeekV4SparsePrefillIndexBuilder:
         if metadata_config.total_new_kv_tokens is not None:
             _check_matches(
                 parent_name=(
-                    "DeepSeekV4SparsePrefillIndexInputConfig.total_new_q_tokens"
+                    "_CSASparsePrefillIndexConfig.total_new_q_tokens"
                 ),
                 child_name="metadata_input.total_new_kv_tokens",
                 parent_value=self.config.total_new_q_tokens,
@@ -5495,8 +5493,8 @@ class _DeepSeekV4SparsePrefillIndexBuilder:
         return topk_indices
 
 
-def _validate_deepseek_v4_sparse_prefill_values(
-    values: DeepSeekV4SparsePrefillIndexValues,
+def _validate_csa_sparse_prefill_values(
+    values: CSASparsePrefillIndexValues,
 ) -> None:
     if values.topk_indices.dtype != torch.int32:
         raise TypeError(f"topk_indices must be int32, got {values.topk_indices.dtype}")
@@ -5545,14 +5543,14 @@ def _validate_deepseek_v4_sparse_prefill_values(
         raise ValueError("workspace_width does not cover generated workspace indices")
 
 
-def deepseek_v4_build_dense_prefill_local_compressed_indices_reference(
-    values: DeepSeekV4SparsePrefillIndexValues,
+def csa_build_dense_prefill_local_compressed_indices_reference(
+    values: CSASparsePrefillIndexValues,
     *,
     width: int | None = None,
 ) -> torch.Tensor:
     """Return per-token local compressed-prefix indices for dense prefill."""
 
-    _validate_deepseek_v4_sparse_prefill_values(values)
+    _validate_csa_sparse_prefill_values(values)
     width = (
         values.compressed_base if width is None else _check_nonnegative("width", width)
     )
@@ -5568,17 +5566,17 @@ def deepseek_v4_build_dense_prefill_local_compressed_indices_reference(
     return torch.where(valid, local, torch.full_like(local, -1)).to(torch.int32)
 
 
-def deepseek_v4_combine_topk_swa_indices_reference(
-    values: DeepSeekV4SparsePrefillIndexValues,
+def csa_combine_topk_swa_indices_reference(
+    values: CSASparsePrefillIndexValues,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return sparse-prefill candidate indices from top-k prefix plus SWA."""
 
-    _validate_deepseek_v4_sparse_prefill_values(values)
+    _validate_csa_sparse_prefill_values(values)
     device = values.topk_indices.device
     num_tokens = int(values.topk_indices.shape[0])
     combined_topk = _align_up(
         values.topk + values.window_size,
-        _DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
+        _CSA_SPARSE_PREFILL_TOPK_ALIGNMENT,
     )
     combined_indices = torch.full(
         (num_tokens, combined_topk),
@@ -5625,17 +5623,17 @@ def deepseek_v4_combine_topk_swa_indices_reference(
     return combined_indices, combined_lens
 
 
-def deepseek_v4_combine_dense_swa_indices_reference(
-    values: DeepSeekV4SparsePrefillIndexValues,
+def csa_combine_dense_swa_indices_reference(
+    values: CSASparsePrefillIndexValues,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return sparse-prefill candidate indices from dense prefix plus SWA."""
 
-    _validate_deepseek_v4_sparse_prefill_values(values)
+    _validate_csa_sparse_prefill_values(values)
     device = values.positions.device
     num_tokens = int(values.positions.numel())
     combined_topk = _align_up(
         max(values.compressed_base + values.window_size, 1),
-        _DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
+        _CSA_SPARSE_PREFILL_TOPK_ALIGNMENT,
     )
     combined_indices = torch.full(
         (num_tokens, combined_topk),
