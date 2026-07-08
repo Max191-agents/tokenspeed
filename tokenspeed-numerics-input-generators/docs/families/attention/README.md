@@ -9,7 +9,7 @@ Attention input generation is organized around five operation families:
 - `CSAInputs`: compressed sequence attention. This includes sliding-window
   attention and optional compressed-history/indexer inputs for DeepSeek
   V4-style CSA/HCA paths.
-- `DSAInputs`: DeepSeek sparse attention helper inputs, including sparse
+- `DSAInputs`: dynamic sparse attention helper inputs, including sparse
   decode KV packing, sparse slot mapping, and deterministic decode top-k
   selection.
 - `GDNInputs`: Gated DeltaNet inputs, including packed QKV split and chunked

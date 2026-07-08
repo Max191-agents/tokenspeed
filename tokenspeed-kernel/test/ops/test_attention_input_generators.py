@@ -699,7 +699,7 @@ def test_dsa_sparse_decode_kv_pack_generator_runs_tokenspeed_triton(
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip(
-            "CUDA/ROCm GPU is required for DeepSeek sparse attention pack Triton test"
+            "CUDA/ROCm GPU is required for dynamic sparse attention pack Triton test"
         )
 
     values = DSAInputs(
@@ -748,7 +748,7 @@ def test_dsa_topk_slot_generator_runs_tokenspeed_triton(
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip(
-            "CUDA/ROCm GPU is required for DeepSeek sparse attention top-k slot test"
+            "CUDA/ROCm GPU is required for dynamic sparse attention top-k slot test"
         )
 
     values = DSAInputs(
@@ -791,7 +791,7 @@ def test_dsa_topk_slot_generator_runs_tokenspeed_triton(
 def test_dsa_decode_topk_generator_runs_flashinfer_kernel(device: str) -> None:
     if not torch.cuda.is_available() or not has_deterministic_decode_topk():
         pytest.skip(
-            "FlashInfer deterministic DeepSeek sparse attention top-k requires CUDA "
+            "FlashInfer deterministic dynamic sparse attention top-k requires CUDA "
             "and flashinfer"
         )
 

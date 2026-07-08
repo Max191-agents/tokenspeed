@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Deterministic DeepSeek sparse attention decode indexer top-k via flashinfer.
+"""Deterministic dynamic sparse attention decode indexer top-k via flashinfer.
 
 The trtllm ``indexer_topk_decode`` kernel breaks ties (equal logits competing for
 the last selected slot) non-deterministically: repeated runs select *different*
