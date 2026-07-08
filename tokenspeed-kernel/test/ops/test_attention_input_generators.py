@@ -81,46 +81,36 @@ from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
 )
 from tokenspeed_kernel.ops.attention.triton.qkv_rotary import packed_qkv_complex_rotary
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_numerics_input_generators.attention import (
+    _AttentionMergeStateGenerator,
+    _PackedQKVComplexRotaryGenerator,
+)
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
-    AttentionMergeStateInputs,
     DeepSeekV4CompressorStateInputConfig,
-    DeepSeekV4CompressorStateInputs,
+    CSAInputs,
     DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig,
-    DeepSeekV4CSAIndexerMXFP4CacheInsertInputs,
     DeepSeekV4IndexerMXFP4CacheGatherInputConfig,
-    DeepSeekV4IndexerMXFP4CacheGatherInputs,
     DeepSeekV4IndexerMXFP4CacheWriteInputConfig,
-    DeepSeekV4IndexerMXFP4CacheWriteInputs,
     DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig,
-    DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs,
     DeepSeekV4InvRoPEFP8QuantInputConfig,
-    DeepSeekV4InvRoPEFP8QuantInputs,
     DeepSeekV4KCacheGatherInputConfig,
-    DeepSeekV4KCacheGatherInputs,
     DeepSeekV4PagedIndexInputConfig,
-    DeepSeekV4PagedIndexInputs,
     DeepSeekV4SparseCompressCacheInsertInputConfig,
-    DeepSeekV4SparseCompressCacheInsertInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
-    DeepSeekV4SparsePrefillIndexInputs,
     DSADecodeTopKInputConfig,
-    DSADecodeTopKInputs,
+    DSAInputs,
     DSASparseDecodeKVPackInputConfig,
-    DSASparseDecodeKVPackInputs,
     DSATopKSlotInputConfig,
-    DSATopKSlotInputs,
     GDNChunkPrefillInputConfig,
-    GDNChunkPrefillInputs,
+    GDNInputs,
     GDNQKVSplitInputConfig,
-    GDNQKVSplitInputs,
     MHAInputConfig,
     MHAInputs,
     MHARequestMetadataInputConfig,
     MLAInputConfig,
     MLAInputs,
     PackedQKVComplexRotaryInputConfig,
-    PackedQKVComplexRotaryInputs,
     attention_merge_state_reference,
     deepseek_v4_build_dense_prefill_local_compressed_indices_reference,
     deepseek_v4_combine_dense_swa_indices_reference,
@@ -261,7 +251,7 @@ def test_attention_merge_state_generator_runs_triton_kernel(
     solution = "triton"
     require("attention", "attn_merge_state", solution, dtype, "out_a")
 
-    values = AttentionMergeStateInputs(
+    values = _AttentionMergeStateGenerator(
         AttentionMergeStateInputConfig(
             total_q=31,
             num_heads=8,
@@ -580,7 +570,7 @@ def test_gdn_qkv_split_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for GDN QKV split Triton test")
 
-    values = GDNQKVSplitInputs(
+    values = GDNInputs(
         GDNQKVSplitInputConfig(
             num_tokens=13,
             num_q_heads=4,
@@ -622,7 +612,7 @@ def test_gdn_chunk_prefill_generator_runs_tokenspeed_flashinfer(device: str) -> 
     if not torch.cuda.is_available():
         pytest.skip("CUDA GPU is required for FlashInfer GDN chunk-prefill test")
 
-    values = GDNChunkPrefillInputs(
+    values = GDNInputs(
         GDNChunkPrefillInputConfig(
             batch_size=2,
             total_tokens=32,
@@ -669,7 +659,7 @@ def test_packed_qkv_complex_rotary_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for packed QKV rotary Triton test")
 
-    values = PackedQKVComplexRotaryInputs(
+    values = _PackedQKVComplexRotaryGenerator(
         PackedQKVComplexRotaryInputConfig(
             num_tokens=17,
             num_heads=4,
@@ -710,7 +700,7 @@ def test_dsa_sparse_decode_kv_pack_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for DSA sparse decode pack Triton test")
 
-    values = DSASparseDecodeKVPackInputs(
+    values = DSAInputs(
         DSASparseDecodeKVPackInputConfig(
             num_tokens=7,
             num_slots=11,
@@ -757,7 +747,7 @@ def test_dsa_topk_slot_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for DSA top-k slot Triton test")
 
-    values = DSATopKSlotInputs(
+    values = DSAInputs(
         DSATopKSlotInputConfig(
             num_tokens=7,
             topk=6,
@@ -798,7 +788,7 @@ def test_dsa_decode_topk_generator_runs_flashinfer_kernel(device: str) -> None:
     if not torch.cuda.is_available() or not has_deterministic_decode_topk():
         pytest.skip("FlashInfer deterministic DSA top-k requires CUDA and flashinfer")
 
-    values = DSADecodeTopKInputs(
+    values = DSAInputs(
         DSADecodeTopKInputConfig(
             num_rows=5,
             vocab_size=32,
@@ -817,7 +807,7 @@ def test_dsa_decode_topk_generator_runs_flashinfer_kernel(device: str) -> None:
 
 
 def test_deepseek_v4_global_topk_generator_runs_tokenspeed_cpu() -> None:
-    values = DeepSeekV4PagedIndexInputs(
+    values = CSAInputs(
         DeepSeekV4PagedIndexInputConfig(
             batch_size=3,
             total_cached_tokens=18,
@@ -860,7 +850,7 @@ def test_deepseek_v4_compressor_state_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton compressor-state test")
 
-    values = DeepSeekV4CompressorStateInputs(
+    values = CSAInputs(
         DeepSeekV4CompressorStateInputConfig(
             num_tokens=6,
             state_width=16,
@@ -895,7 +885,7 @@ def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_generator_runs_tokenspeed_tri
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton indexer-Q MXFP4 test")
 
-    values = DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+    values = CSAInputs(
         DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
             num_tokens=4,
             num_heads=3,
@@ -934,7 +924,7 @@ def test_deepseek_v4_inv_rope_fp8_quant_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton inverse-RoPE FP8 test")
 
-    values = DeepSeekV4InvRoPEFP8QuantInputs(
+    values = CSAInputs(
         DeepSeekV4InvRoPEFP8QuantInputConfig(
             num_tokens=5,
             n_groups=2,
@@ -969,7 +959,7 @@ def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_generator_runs_tokenspeed_tr
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton CSA indexer cache test")
 
-    values = DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+    values = CSAInputs(
         DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
             num_tokens=4,
             batch_size=1,
@@ -1020,7 +1010,7 @@ def test_deepseek_v4_sparse_compress_cache_insert_generator_runs_tokenspeed_trit
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton sparse-compress test")
 
-    values = DeepSeekV4SparseCompressCacheInsertInputs(
+    values = CSAInputs(
         DeepSeekV4SparseCompressCacheInsertInputConfig(
             num_tokens=4,
             batch_size=1,
@@ -1074,7 +1064,7 @@ def test_deepseek_v4_indexer_mxfp4_cache_write_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton MXFP4 cache-write test")
 
-    values = DeepSeekV4IndexerMXFP4CacheWriteInputs(
+    values = CSAInputs(
         DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
             num_rows=5,
             num_cache_blocks=2,
@@ -1105,7 +1095,7 @@ def test_deepseek_v4_indexer_mxfp4_cache_gather_generator_runs_tokenspeed_triton
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton MXFP4 cache-gather test")
 
-    values = DeepSeekV4IndexerMXFP4CacheGatherInputs(
+    values = CSAInputs(
         DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
             num_rows=6,
             num_cache_blocks=2,
@@ -1138,7 +1128,7 @@ def test_deepseek_v4_k_cache_gather_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton K-cache gather test")
 
-    values = DeepSeekV4KCacheGatherInputs(
+    values = CSAInputs(
         DeepSeekV4KCacheGatherInputConfig(
             batch_size=3,
             max_seq_len=9,
@@ -1173,7 +1163,7 @@ def test_deepseek_v4_paged_index_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton paged-index tests")
 
-    values = DeepSeekV4PagedIndexInputs(
+    values = CSAInputs(
         DeepSeekV4PagedIndexInputConfig(
             batch_size=3,
             total_cached_tokens=18,
@@ -1268,7 +1258,7 @@ def test_deepseek_v4_paged_index_generator_runs_tokenspeed_triton(
 
 
 def test_deepseek_v4_local_compressed_generator_runs_tokenspeed_cpu() -> None:
-    values = DeepSeekV4SparsePrefillIndexInputs(
+    values = CSAInputs(
         DeepSeekV4SparsePrefillIndexInputConfig(
             batch_size=3,
             total_cached_tokens=18,
@@ -1312,7 +1302,7 @@ def test_deepseek_v4_sparse_prefill_combine_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton sparse-prefill index tests")
 
-    values = DeepSeekV4SparsePrefillIndexInputs(
+    values = CSAInputs(
         DeepSeekV4SparsePrefillIndexInputConfig(
             batch_size=3,
             total_cached_tokens=18,

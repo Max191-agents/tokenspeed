@@ -60,82 +60,68 @@ from tokenspeed_numerics_input_generators.rotary import build_rope_cos_sin_cache
 
 __all__ = [
     "AttentionMergeStateInputConfig",
-    "AttentionMergeStateInputs",
     "AttentionMergeStateInputValues",
     "attention_generate",
     "attention_merge_state_reference",
+    "CSAInputConfig",
+    "CSAInputs",
+    "CSAInputValues",
+    "CSAHistoryConfig",
+    "CSAHistoryValues",
+    "CSAIndexerConfig",
+    "CSAIndexerValues",
+    "CSASlidingWindowValues",
+    "DSAInputs",
     "DSADecodeTopKInputConfig",
-    "DSADecodeTopKInputs",
     "DSADecodeTopKInputValues",
     "dsa_decode_topk_reference",
     "DSASparseDecodeKVPackInputConfig",
-    "DSASparseDecodeKVPackInputs",
     "DSASparseDecodeKVPackInputValues",
     "DSATopKSlotInputConfig",
-    "DSATopKSlotInputs",
     "DSATopKSlotInputValues",
     "dsa_sparse_decode_kv_pack_reference",
     "dsa_sparse_decode_row_bytes",
     "dsa_full_context_topk_to_global_slots_reference",
     "dsa_local_topk_to_global_slots_reference",
+    "GDNInputs",
     "GDNQKVSplitInputConfig",
-    "GDNQKVSplitInputs",
     "GDNQKVSplitInputValues",
     "GDNChunkPrefillInputConfig",
-    "GDNChunkPrefillInputs",
     "GDNChunkPrefillInputValues",
     "GDNChunkPrefillReferenceValues",
     "gdn_chunk_prefill_reference",
     "gdn_qkv_split_reference",
-    "CompressedSequenceAttentionInputConfig",
-    "CompressedSequenceAttentionInputs",
-    "CompressedSequenceAttentionInputValues",
-    "CompressedSequenceAttentionHistoryConfig",
-    "CompressedSequenceAttentionHistoryValues",
-    "CompressedSequenceAttentionIndexerConfig",
-    "CompressedSequenceAttentionIndexerValues",
-    "CompressedSequenceAttentionSlidingWindowValues",
     "DeepSeekV4CompressorStateInputConfig",
-    "DeepSeekV4CompressorStateInputs",
     "DeepSeekV4CompressorStateInputValues",
     "deepseek_v4_save_compressor_state_reference",
     "DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig",
-    "DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs",
     "DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues",
     "deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference",
     "DeepSeekV4InvRoPEFP8QuantInputConfig",
-    "DeepSeekV4InvRoPEFP8QuantInputs",
     "DeepSeekV4InvRoPEFP8QuantInputValues",
     "deepseek_v4_inv_rope_fp8_quant_reference",
     "DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig",
-    "DeepSeekV4CSAIndexerMXFP4CacheInsertInputs",
     "DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues",
     "deepseek_v4_csa_indexer_mxfp4_cache_insert_reference",
     "DeepSeekV4SparseCompressCacheInsertInputConfig",
-    "DeepSeekV4SparseCompressCacheInsertInputs",
     "DeepSeekV4SparseCompressCacheInsertInputValues",
     "deepseek_v4_sparse_compress_cache_insert_reference",
     "DeepSeekV4IndexerMXFP4CacheWriteInputConfig",
-    "DeepSeekV4IndexerMXFP4CacheWriteInputs",
     "DeepSeekV4IndexerMXFP4CacheWriteInputValues",
     "deepseek_v4_indexer_mxfp4_cache_write_reference",
     "DeepSeekV4IndexerMXFP4CacheGatherInputConfig",
-    "DeepSeekV4IndexerMXFP4CacheGatherInputs",
     "DeepSeekV4IndexerMXFP4CacheGatherInputValues",
     "deepseek_v4_indexer_mxfp4_cache_gather_reference",
     "DeepSeekV4KCacheGatherInputConfig",
-    "DeepSeekV4KCacheGatherInputs",
     "DeepSeekV4KCacheGatherInputValues",
     "deepseek_v4_dequantize_and_gather_k_cache_reference",
     "DeepSeekV4PagedIndexInputConfig",
-    "DeepSeekV4PagedIndexInputs",
     "DeepSeekV4PagedIndexValues",
     "deepseek_v4_compressed_slot_mapping_reference",
     "deepseek_v4_compute_global_topk_indices_and_lens_reference",
     "deepseek_v4_decode_swa_indices_and_lens_reference",
     "deepseek_v4_indexer_decode_metadata_reference",
     "DeepSeekV4SparsePrefillIndexInputConfig",
-    "DeepSeekV4SparsePrefillIndexInputs",
     "DeepSeekV4SparsePrefillIndexValues",
     "deepseek_v4_build_dense_prefill_local_compressed_indices_reference",
     "deepseek_v4_combine_dense_swa_indices_reference",
@@ -151,7 +137,6 @@ __all__ = [
     "MLAReferenceValues",
     "mla_reference",
     "PackedQKVComplexRotaryInputConfig",
-    "PackedQKVComplexRotaryInputs",
     "PackedQKVComplexRotaryInputValues",
     "packed_qkv_complex_rotary_reference",
 ]
@@ -641,7 +626,7 @@ class AttentionMergeStateInputConfig:
 
 
 @dataclass(init=False)
-class AttentionMergeStateInputs(NumericsInputGenerator):
+class _AttentionMergeStateGenerator(NumericsInputGenerator):
     """Generator for attention merge-state inputs."""
 
     config: AttentionMergeStateInputConfig
@@ -692,7 +677,7 @@ class AttentionMergeStateInputs(NumericsInputGenerator):
         self.__post_init__()
         if self.out_a_input is None or self.out_b_input is None:
             raise ValueError(
-                "AttentionMergeStateInputs child generators must be initialized"
+                "_AttentionMergeStateGenerator child generators must be initialized"
             )
         target_device = _resolve_device(self.config.device, device)
         lse_generator = torch.Generator(
@@ -846,7 +831,7 @@ class GDNQKVSplitInputConfig:
 
 
 @dataclass(init=False)
-class GDNQKVSplitInputs(NumericsInputGenerator):
+class _GDNQKVSplitGenerator(NumericsInputGenerator):
     """Generator for packed GDN QKV split inputs."""
 
     config: GDNQKVSplitInputConfig
@@ -1092,7 +1077,7 @@ class GDNChunkPrefillInputConfig:
 
 
 @dataclass(init=False)
-class GDNChunkPrefillInputs(NumericsInputGenerator):
+class _GDNChunkPrefillGenerator(NumericsInputGenerator):
     """Generator for gated-delta-rule chunked prefill inputs."""
 
     config: GDNChunkPrefillInputConfig
@@ -1148,7 +1133,7 @@ class GDNChunkPrefillInputs(NumericsInputGenerator):
             or self.initial_state_input is None
         ):
             raise ValueError(
-                "GDNChunkPrefillInputs child generators must be initialized"
+                "_GDNChunkPrefillGenerator child generators must be initialized"
             )
         metadata_seed, value_seed = _resolve_attention_seeds(
             seed=seed,
@@ -1628,7 +1613,7 @@ class PackedQKVComplexRotaryInputConfig:
 
 
 @dataclass(init=False)
-class PackedQKVComplexRotaryInputs(NumericsInputGenerator):
+class _PackedQKVComplexRotaryGenerator(NumericsInputGenerator):
     """Generator for packed QKV complex rotary inputs."""
 
     config: PackedQKVComplexRotaryInputConfig
@@ -1845,7 +1830,7 @@ class DSASparseDecodeKVPackInputConfig:
 
 
 @dataclass(init=False)
-class DSASparseDecodeKVPackInputs(NumericsInputGenerator):
+class _DSASparseDecodeKVPackGenerator(NumericsInputGenerator):
     """Generator for DSA sparse decode KV row packing."""
 
     config: DSASparseDecodeKVPackInputConfig
@@ -1899,7 +1884,7 @@ class DSASparseDecodeKVPackInputs(NumericsInputGenerator):
         target_device = _resolve_device(self.config.device, device)
         if self.cache_k_nope_input is None or self.cache_k_rope_input is None:
             raise ValueError(
-                "DSASparseDecodeKVPackInputs child generators must be initialized"
+                "_DSASparseDecodeKVPackGenerator child generators must be initialized"
             )
 
         self.cache_k_nope_input.shape = self._source_shape(self.config.nope_dim)
@@ -2141,7 +2126,7 @@ class DSADecodeTopKInputConfig:
 
 
 @dataclass(init=False)
-class DSADecodeTopKInputs(NumericsInputGenerator):
+class _DSADecodeTopKGenerator(NumericsInputGenerator):
     """Generator for deterministic DSA decode top-k logits and output buffers."""
 
     config: DSADecodeTopKInputConfig
@@ -2364,7 +2349,7 @@ class DSATopKSlotInputConfig:
 
 
 @dataclass(init=False)
-class DSATopKSlotInputs(NumericsInputGenerator):
+class _DSATopKSlotGenerator(NumericsInputGenerator):
     """Generator for DSA sparse top-k slot-conversion metadata."""
 
     config: DSATopKSlotInputConfig
@@ -2803,7 +2788,7 @@ class CompressedSequenceAttentionInputConfig:
 
 
 @dataclass(init=False)
-class CompressedSequenceAttentionInputs(NumericsInputGenerator):
+class _CompressedSequenceAttentionGenerator(NumericsInputGenerator):
     """Generator for compressed sequence attention inputs."""
 
     config: CompressedSequenceAttentionInputConfig
@@ -3223,7 +3208,7 @@ class CompressedSequenceAttentionInputs(NumericsInputGenerator):
             return None
         metadata_config = self._shared_metadata_config(cache_layout="paged")
         dense_metadata_config = self._shared_metadata_config(cache_layout="dense")
-        paged_index = DeepSeekV4PagedIndexInputs(
+        paged_index = _DeepSeekV4PagedIndexGenerator(
             DeepSeekV4PagedIndexInputConfig(
                 batch_size=self.config.batch_size,
                 total_cached_tokens=self.config.total_cached_tokens,
@@ -3241,7 +3226,7 @@ class CompressedSequenceAttentionInputs(NumericsInputGenerator):
                 device=self.config.device,
             )
         ).generate(seed=metadata_seed, device=device)
-        sparse_prefill_index = DeepSeekV4SparsePrefillIndexInputs(
+        sparse_prefill_index = _DeepSeekV4SparsePrefillIndexGenerator(
             DeepSeekV4SparsePrefillIndexInputConfig(
                 batch_size=self.config.batch_size,
                 total_cached_tokens=self.config.total_cached_tokens,
@@ -3258,7 +3243,7 @@ class CompressedSequenceAttentionInputs(NumericsInputGenerator):
             compressed.compress_ratio,
             self.config.total_cached_tokens + self.config.total_new_q_tokens,
         )
-        compressor_state = DeepSeekV4CompressorStateInputs(
+        compressor_state = _DeepSeekV4CompressorStateGenerator(
             DeepSeekV4CompressorStateInputConfig(
                 num_tokens=self.config.total_new_q_tokens,
                 state_width=_DEEPSEEK_V4_HEAD_DIM * (2 if compressed.overlap else 1),
@@ -3274,7 +3259,7 @@ class CompressedSequenceAttentionInputs(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 12),
             device=device,
         )
-        cache_insert = DeepSeekV4SparseCompressCacheInsertInputs(
+        cache_insert = _DeepSeekV4SparseCompressCacheInsertGenerator(
             DeepSeekV4SparseCompressCacheInsertInputConfig(
                 num_tokens=self.config.total_new_q_tokens,
                 batch_size=self.config.batch_size,
@@ -3300,7 +3285,7 @@ class CompressedSequenceAttentionInputs(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 13),
             device=device,
         )
-        k_cache_gather = DeepSeekV4KCacheGatherInputs(
+        k_cache_gather = _DeepSeekV4KCacheGatherGenerator(
             DeepSeekV4KCacheGatherInputConfig(
                 batch_size=self.config.batch_size,
                 max_seq_len=max_seq_len,
@@ -3340,7 +3325,7 @@ class CompressedSequenceAttentionInputs(NumericsInputGenerator):
         if compressed is None or indexer is None:
             return None
         max_seq_len = max(1, self.config.total_cached_tokens + self.config.total_new_q_tokens)
-        q_rope = DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+        q_rope = _DeepSeekV4IndexerQRoPEHadamardMXFP4Generator(
             DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
                 num_tokens=self.config.total_new_q_tokens,
                 num_heads=indexer.num_heads,
@@ -3356,7 +3341,7 @@ class CompressedSequenceAttentionInputs(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 20),
             device=device,
         )
-        cache_insert = DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+        cache_insert = _DeepSeekV4CSAIndexerMXFP4CacheInsertGenerator(
             DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
                 num_tokens=self.config.total_new_q_tokens,
                 batch_size=self.config.batch_size,
@@ -3381,7 +3366,7 @@ class CompressedSequenceAttentionInputs(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 21),
             device=device,
         )
-        cache_write = DeepSeekV4IndexerMXFP4CacheWriteInputs(
+        cache_write = _DeepSeekV4IndexerMXFP4CacheWriteGenerator(
             DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
                 num_rows=self.config.total_new_q_tokens,
                 num_cache_blocks=indexer.num_cache_blocks,
@@ -3396,7 +3381,7 @@ class CompressedSequenceAttentionInputs(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 22),
             device=device,
         )
-        cache_gather = DeepSeekV4IndexerMXFP4CacheGatherInputs(
+        cache_gather = _DeepSeekV4IndexerMXFP4CacheGatherGenerator(
             DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
                 num_rows=self.config.total_new_q_tokens,
                 num_cache_blocks=indexer.num_cache_blocks,
@@ -3542,7 +3527,7 @@ class DeepSeekV4CompressorStateInputConfig:
 
 
 @dataclass(init=False)
-class DeepSeekV4CompressorStateInputs(NumericsInputGenerator):
+class _DeepSeekV4CompressorStateGenerator(NumericsInputGenerator):
     """Generator for DeepSeek V4 compressor-state save inputs."""
 
     config: DeepSeekV4CompressorStateInputConfig
@@ -3598,7 +3583,7 @@ class DeepSeekV4CompressorStateInputs(NumericsInputGenerator):
             or self.state_cache_input is None
         ):
             raise ValueError(
-                "DeepSeekV4CompressorStateInputs child generators must be initialized"
+                "_DeepSeekV4CompressorStateGenerator child generators must be initialized"
             )
         metadata_seed, value_seed = _resolve_attention_seeds(
             seed=seed,
@@ -3932,7 +3917,7 @@ class DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig:
 
 
 @dataclass(init=False)
-class DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(NumericsInputGenerator):
+class _DeepSeekV4IndexerQRoPEHadamardMXFP4Generator(NumericsInputGenerator):
     """Generator for DeepSeek V4 indexer-Q RoPE/Hadamard/MXFP4 inputs."""
 
     config: DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig
@@ -4336,7 +4321,7 @@ class DeepSeekV4InvRoPEFP8QuantInputConfig:
 
 
 @dataclass(init=False)
-class DeepSeekV4InvRoPEFP8QuantInputs(NumericsInputGenerator):
+class _DeepSeekV4InvRoPEFP8QuantGenerator(NumericsInputGenerator):
     """Generator for DeepSeek V4 inverse-RoPE FP8 output quantization inputs."""
 
     config: DeepSeekV4InvRoPEFP8QuantInputConfig
@@ -4717,7 +4702,7 @@ class DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig:
 
 
 @dataclass(init=False)
-class DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(NumericsInputGenerator):
+class _DeepSeekV4CSAIndexerMXFP4CacheInsertGenerator(NumericsInputGenerator):
     """Generator for DeepSeek V4 CSA indexer MXFP4 cache-insert inputs."""
 
     config: DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig
@@ -5388,7 +5373,7 @@ class DeepSeekV4SparseCompressCacheInsertInputConfig:
 
 
 @dataclass(init=False)
-class DeepSeekV4SparseCompressCacheInsertInputs(NumericsInputGenerator):
+class _DeepSeekV4SparseCompressCacheInsertGenerator(NumericsInputGenerator):
     """Generator for DeepSeek V4 sparse-compress K-cache insert inputs."""
 
     config: DeepSeekV4SparseCompressCacheInsertInputConfig
@@ -6076,7 +6061,7 @@ class DeepSeekV4IndexerMXFP4CacheWriteInputConfig:
 
 
 @dataclass(init=False)
-class DeepSeekV4IndexerMXFP4CacheWriteInputs(NumericsInputGenerator):
+class _DeepSeekV4IndexerMXFP4CacheWriteGenerator(NumericsInputGenerator):
     """Generator for DeepSeek V4 indexer MXFP4 cache-write inputs."""
 
     config: DeepSeekV4IndexerMXFP4CacheWriteInputConfig
@@ -6429,7 +6414,7 @@ class DeepSeekV4IndexerMXFP4CacheGatherInputConfig:
 
 
 @dataclass(init=False)
-class DeepSeekV4IndexerMXFP4CacheGatherInputs(NumericsInputGenerator):
+class _DeepSeekV4IndexerMXFP4CacheGatherGenerator(NumericsInputGenerator):
     """Generator for DeepSeek V4 indexer MXFP4 cache-gather inputs."""
 
     config: DeepSeekV4IndexerMXFP4CacheGatherInputConfig
@@ -6700,7 +6685,7 @@ class DeepSeekV4KCacheGatherInputConfig:
 
 
 @dataclass(init=False)
-class DeepSeekV4KCacheGatherInputs(NumericsInputGenerator):
+class _DeepSeekV4KCacheGatherGenerator(NumericsInputGenerator):
     """Generator for DeepSeek V4 paged K-cache gather/dequantization inputs."""
 
     config: DeepSeekV4KCacheGatherInputConfig
@@ -7224,7 +7209,7 @@ class DeepSeekV4PagedIndexInputConfig:
 
 
 @dataclass(init=False)
-class DeepSeekV4PagedIndexInputs(NumericsInputGenerator):
+class _DeepSeekV4PagedIndexGenerator(NumericsInputGenerator):
     """Generator for DeepSeek V4 paged index metadata inputs."""
 
     config: DeepSeekV4PagedIndexInputConfig
@@ -7805,7 +7790,7 @@ class DeepSeekV4SparsePrefillIndexInputConfig:
 
 
 @dataclass(init=False)
-class DeepSeekV4SparsePrefillIndexInputs(NumericsInputGenerator):
+class _DeepSeekV4SparsePrefillIndexGenerator(NumericsInputGenerator):
     """Generator for DeepSeek V4 sparse-prefill index-construction inputs."""
 
     config: DeepSeekV4SparsePrefillIndexInputConfig
@@ -8212,6 +8197,160 @@ def deepseek_v4_combine_dense_swa_indices_reference(
         combined_lens[token_idx] = compressed_len + swa_len
 
     return combined_indices, combined_lens
+
+
+CSAHistoryConfig = CompressedSequenceAttentionHistoryConfig
+CSAHistoryValues = CompressedSequenceAttentionHistoryValues
+CSAIndexerConfig = CompressedSequenceAttentionIndexerConfig
+CSAIndexerValues = CompressedSequenceAttentionIndexerValues
+CSAInputConfig = CompressedSequenceAttentionInputConfig
+CSAInputValues = CompressedSequenceAttentionInputValues
+CSASlidingWindowValues = CompressedSequenceAttentionSlidingWindowValues
+
+
+@dataclass(init=False)
+class CSAInputs(NumericsInputGenerator):
+    """Family generator for compressed sequence attention inputs.
+
+    ``CSAInputConfig`` is the canonical full-family configuration. The
+    DeepSeek V4 helper configs are accepted as TokenSpeed compatibility
+    configurations so helper-kernel tests use the CSA family entry point
+    without exposing one generator per helper.
+    """
+
+    config: object
+    _generator: NumericsInputGenerator
+
+    def __init__(self, config: object) -> None:
+        self.config = config
+        self._generator = self._make_generator(config)
+
+    @staticmethod
+    def _make_generator(config: object) -> NumericsInputGenerator:
+        if isinstance(config, CompressedSequenceAttentionInputConfig):
+            return _CompressedSequenceAttentionGenerator(config)
+        if isinstance(config, DeepSeekV4CompressorStateInputConfig):
+            return _DeepSeekV4CompressorStateGenerator(config)
+        if isinstance(config, DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig):
+            return _DeepSeekV4IndexerQRoPEHadamardMXFP4Generator(config)
+        if isinstance(config, DeepSeekV4InvRoPEFP8QuantInputConfig):
+            return _DeepSeekV4InvRoPEFP8QuantGenerator(config)
+        if isinstance(config, DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig):
+            return _DeepSeekV4CSAIndexerMXFP4CacheInsertGenerator(config)
+        if isinstance(config, DeepSeekV4SparseCompressCacheInsertInputConfig):
+            return _DeepSeekV4SparseCompressCacheInsertGenerator(config)
+        if isinstance(config, DeepSeekV4IndexerMXFP4CacheWriteInputConfig):
+            return _DeepSeekV4IndexerMXFP4CacheWriteGenerator(config)
+        if isinstance(config, DeepSeekV4IndexerMXFP4CacheGatherInputConfig):
+            return _DeepSeekV4IndexerMXFP4CacheGatherGenerator(config)
+        if isinstance(config, DeepSeekV4KCacheGatherInputConfig):
+            return _DeepSeekV4KCacheGatherGenerator(config)
+        if isinstance(config, DeepSeekV4PagedIndexInputConfig):
+            return _DeepSeekV4PagedIndexGenerator(config)
+        if isinstance(config, DeepSeekV4SparsePrefillIndexInputConfig):
+            return _DeepSeekV4SparsePrefillIndexGenerator(config)
+        raise TypeError(f"unsupported CSA input config: {type(config).__name__}")
+
+    def generate(
+        self,
+        *,
+        seed: int | None = None,
+        metadata_seed: int | None = None,
+        value_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> object:
+        if isinstance(
+            self._generator,
+            (_DeepSeekV4PagedIndexGenerator, _DeepSeekV4SparsePrefillIndexGenerator),
+        ):
+            resolved_seed = seed if seed is not None else metadata_seed
+            if resolved_seed is None:
+                resolved_seed = value_seed
+            if resolved_seed is None:
+                raise ValueError("seed is required for CSA metadata generation")
+            return self._generator.generate(seed=resolved_seed, device=device)
+        return self._generator.generate(
+            seed=seed,
+            metadata_seed=metadata_seed,
+            value_seed=value_seed,
+            device=device,
+        )
+
+
+@dataclass(init=False)
+class DSAInputs(NumericsInputGenerator):
+    """Family generator for DSA sparse decode inputs."""
+
+    config: object
+    _generator: NumericsInputGenerator
+
+    def __init__(self, config: object) -> None:
+        self.config = config
+        self._generator = self._make_generator(config)
+
+    @staticmethod
+    def _make_generator(config: object) -> NumericsInputGenerator:
+        if isinstance(config, DSASparseDecodeKVPackInputConfig):
+            return _DSASparseDecodeKVPackGenerator(config)
+        if isinstance(config, DSADecodeTopKInputConfig):
+            return _DSADecodeTopKGenerator(config)
+        if isinstance(config, DSATopKSlotInputConfig):
+            return _DSATopKSlotGenerator(config)
+        raise TypeError(f"unsupported DSA input config: {type(config).__name__}")
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> object:
+        if isinstance(self._generator, _DSASparseDecodeKVPackGenerator):
+            return self._generator.generate(
+                seed=seed,
+                metadata_seed=metadata_seed,
+                device=device,
+            )
+        return self._generator.generate(seed=seed, device=device)
+
+
+@dataclass(init=False)
+class GDNInputs(NumericsInputGenerator):
+    """Family generator for Gated DeltaNet attention inputs."""
+
+    config: object
+    _generator: NumericsInputGenerator
+
+    def __init__(self, config: object) -> None:
+        self.config = config
+        self._generator = self._make_generator(config)
+
+    @staticmethod
+    def _make_generator(config: object) -> NumericsInputGenerator:
+        if isinstance(config, GDNQKVSplitInputConfig):
+            return _GDNQKVSplitGenerator(config)
+        if isinstance(config, GDNChunkPrefillInputConfig):
+            return _GDNChunkPrefillGenerator(config)
+        raise TypeError(f"unsupported GDN input config: {type(config).__name__}")
+
+    def generate(
+        self,
+        *,
+        seed: int | None = None,
+        metadata_seed: int | None = None,
+        value_seed: int | None = None,
+        device: DeviceLike = None,
+    ) -> object:
+        if isinstance(self._generator, _GDNChunkPrefillGenerator):
+            return self._generator.generate(
+                seed=seed,
+                metadata_seed=metadata_seed,
+                value_seed=value_seed,
+                device=device,
+            )
+        if seed is None:
+            raise ValueError("seed is required for GDN QKV split generation")
+        return self._generator.generate(seed=seed, device=device)
 
 
 @dataclass

@@ -30,9 +30,9 @@ from tokenspeed_kernel.thirdparty.cuda.merge_state import (
     LSE_LOG2,
     merge_state,
 )
+from tokenspeed_numerics_input_generators.attention import _AttentionMergeStateGenerator
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
-    AttentionMergeStateInputs,
     attention_merge_state_reference,
 )
 
@@ -51,7 +51,7 @@ def _make_inputs(
     seed: int = 0,
     lse_scale_log2: float = LSE_LN,
 ):
-    return AttentionMergeStateInputs(
+    return _AttentionMergeStateGenerator(
         AttentionMergeStateInputConfig(
             total_q=T,
             num_heads=H,

@@ -41,8 +41,6 @@ from tokenspeed_kernel.numerics.inputs import (
 )
 from tokenspeed_kernel.numerics.tolerance import Tolerance, set_family_tolerance
 from tokenspeed_numerics_input_generators import (
-    AttentionMergeStateInputConfig,
-    AttentionMergeStateInputs,
     MHAInputConfig,
     MHAInputs,
     MHARequestMetadataInputConfig,
@@ -482,23 +480,49 @@ class AttentionMergeStateInputGenerator(InputGenerator):
         lse_scale_log2: float = math.log2(math.e),
         lse_bound: float = 6.0,
     ) -> dict[str, Any]:
-        values = AttentionMergeStateInputs(
-            AttentionMergeStateInputConfig(
-                total_q=total_q,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                dtype=self.dtype,
-                lse_scale_log2=lse_scale_log2,
-                lse_bound=lse_bound,
-                device=self.device,
+        target_device = torch.device("cpu" if self.device is None else self.device)
+        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=rng_device).manual_seed(self.seed)
+        out_shape = (total_q, num_heads, head_dim)
+        lse_shape = (total_q, num_heads)
+        out_a = torch.randn(
+            out_shape,
+            dtype=torch.float32,
+            device=target_device,
+            generator=generator,
+        ).to(self.dtype)
+        out_b = torch.randn(
+            out_shape,
+            dtype=torch.float32,
+            device=target_device,
+            generator=generator,
+        ).to(self.dtype)
+        lse_a = (
+            torch.rand(
+                lse_shape,
+                dtype=torch.float32,
+                device=target_device,
+                generator=generator,
             )
-        ).generate(seed=self.seed, device=self.device)
+            * (2.0 * lse_bound)
+            - lse_bound
+        )
+        lse_b = (
+            torch.rand(
+                lse_shape,
+                dtype=torch.float32,
+                device=target_device,
+                generator=generator,
+            )
+            * (2.0 * lse_bound)
+            - lse_bound
+        )
         return {
-            "out_a": values.out_a,
-            "lse_a": values.lse_a,
-            "out_b": values.out_b,
-            "lse_b": values.lse_b,
-            "lse_scale_log2": values.lse_scale_log2,
+            "out_a": out_a,
+            "lse_a": lse_a,
+            "out_b": out_b,
+            "lse_b": lse_b,
+            "lse_scale_log2": float(lse_scale_log2),
         }
 
 

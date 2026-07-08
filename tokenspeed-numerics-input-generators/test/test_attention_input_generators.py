@@ -22,43 +22,33 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_numerics_input_generators.attention import (
+    _AttentionMergeStateGenerator,
+    _PackedQKVComplexRotaryGenerator,
+)
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
-    AttentionMergeStateInputs,
-    CompressedSequenceAttentionHistoryConfig,
-    CompressedSequenceAttentionIndexerConfig,
-    CompressedSequenceAttentionInputConfig,
-    CompressedSequenceAttentionInputs,
+    CSAHistoryConfig,
+    CSAIndexerConfig,
+    CSAInputConfig,
+    CSAInputs,
     DeepSeekV4CompressorStateInputConfig,
-    DeepSeekV4CompressorStateInputs,
     DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig,
-    DeepSeekV4CSAIndexerMXFP4CacheInsertInputs,
     DeepSeekV4IndexerMXFP4CacheGatherInputConfig,
-    DeepSeekV4IndexerMXFP4CacheGatherInputs,
     DeepSeekV4IndexerMXFP4CacheWriteInputConfig,
-    DeepSeekV4IndexerMXFP4CacheWriteInputs,
     DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig,
-    DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs,
     DeepSeekV4InvRoPEFP8QuantInputConfig,
-    DeepSeekV4InvRoPEFP8QuantInputs,
     DeepSeekV4KCacheGatherInputConfig,
-    DeepSeekV4KCacheGatherInputs,
     DeepSeekV4PagedIndexInputConfig,
-    DeepSeekV4PagedIndexInputs,
     DeepSeekV4SparseCompressCacheInsertInputConfig,
-    DeepSeekV4SparseCompressCacheInsertInputs,
     DeepSeekV4SparsePrefillIndexInputConfig,
-    DeepSeekV4SparsePrefillIndexInputs,
     DSADecodeTopKInputConfig,
-    DSADecodeTopKInputs,
+    DSAInputs,
     DSASparseDecodeKVPackInputConfig,
-    DSASparseDecodeKVPackInputs,
     DSATopKSlotInputConfig,
-    DSATopKSlotInputs,
     GDNChunkPrefillInputConfig,
-    GDNChunkPrefillInputs,
+    GDNInputs,
     GDNQKVSplitInputConfig,
-    GDNQKVSplitInputs,
     KVCacheInput,
     KVCacheInputConfig,
     MHAInputConfig,
@@ -70,7 +60,6 @@ from tokenspeed_numerics_input_generators import (
     MLAKVCacheInput,
     MLAKVCacheInputConfig,
     PackedQKVComplexRotaryInputConfig,
-    PackedQKVComplexRotaryInputs,
     PageTableInput,
     PageTableInputConfig,
     SlotMappingInput,
@@ -202,7 +191,7 @@ def _mla_config(
 
 
 def test_attention_merge_state_inputs_generate_values_and_reference() -> None:
-    values = AttentionMergeStateInputs(
+    values = _AttentionMergeStateGenerator(
         AttentionMergeStateInputConfig(
             total_q=7,
             num_heads=3,
@@ -237,7 +226,7 @@ def test_attention_merge_state_inputs_generate_values_and_reference() -> None:
 
 
 def test_attention_merge_state_inputs_support_log2_lse_scale() -> None:
-    values = AttentionMergeStateInputs(
+    values = _AttentionMergeStateGenerator(
         AttentionMergeStateInputConfig(
             total_q=5,
             num_heads=2,
@@ -264,7 +253,7 @@ def test_attention_merge_state_inputs_support_log2_lse_scale() -> None:
 
 def test_attention_merge_state_rejects_invalid_config() -> None:
     with pytest.raises(ValueError, match="lse_scale_log2"):
-        AttentionMergeStateInputs(
+        _AttentionMergeStateGenerator(
             AttentionMergeStateInputConfig(
                 total_q=7,
                 num_heads=3,
@@ -275,7 +264,7 @@ def test_attention_merge_state_rejects_invalid_config() -> None:
 
 
 def test_gdn_qkv_split_inputs_generate_plain_split_reference() -> None:
-    values = GDNQKVSplitInputs(
+    values = GDNInputs(
         GDNQKVSplitInputConfig(
             num_tokens=5,
             num_q_heads=4,
@@ -300,7 +289,7 @@ def test_gdn_qkv_split_inputs_generate_plain_split_reference() -> None:
 
 
 def test_gdn_qkv_split_inputs_generate_l2norm_reference() -> None:
-    values = GDNQKVSplitInputs(
+    values = GDNInputs(
         GDNQKVSplitInputConfig(
             num_tokens=7,
             num_q_heads=3,
@@ -333,7 +322,7 @@ def test_gdn_qkv_split_inputs_generate_l2norm_reference() -> None:
 
 def test_gdn_qkv_split_inputs_reject_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="head_q"):
-        GDNQKVSplitInputs(
+        GDNInputs(
             GDNQKVSplitInputConfig(
                 num_tokens=5,
                 num_q_heads=4,
@@ -347,7 +336,7 @@ def test_gdn_qkv_split_inputs_reject_invalid_configs_and_values() -> None:
         )
 
     with pytest.raises(ValueError, match="l2norm_eps"):
-        GDNQKVSplitInputs(
+        GDNInputs(
             GDNQKVSplitInputConfig(
                 num_tokens=5,
                 num_q_heads=4,
@@ -361,7 +350,7 @@ def test_gdn_qkv_split_inputs_reject_invalid_configs_and_values() -> None:
             )
         )
 
-    values = GDNQKVSplitInputs(
+    values = GDNInputs(
         GDNQKVSplitInputConfig(
             num_tokens=5,
             num_q_heads=4,
@@ -379,7 +368,7 @@ def test_gdn_qkv_split_inputs_reject_invalid_configs_and_values() -> None:
 
 
 def test_gdn_chunk_prefill_inputs_generate_values_and_reference() -> None:
-    values = GDNChunkPrefillInputs(
+    values = GDNInputs(
         GDNChunkPrefillInputConfig(
             batch_size=3,
             total_tokens=18,
@@ -430,7 +419,7 @@ def test_gdn_chunk_prefill_inputs_generate_values_and_reference() -> None:
 
 
 def test_gdn_chunk_prefill_inputs_support_batch_axis_and_checkpoints() -> None:
-    values = GDNChunkPrefillInputs(
+    values = GDNInputs(
         GDNChunkPrefillInputConfig(
             batch_size=2,
             total_tokens=128,
@@ -457,7 +446,7 @@ def test_gdn_chunk_prefill_inputs_support_batch_axis_and_checkpoints() -> None:
 
 
 def test_gdn_chunk_prefill_inputs_keep_metadata_seed_independent() -> None:
-    generator = GDNChunkPrefillInputs(
+    generator = GDNInputs(
         GDNChunkPrefillInputConfig(
             batch_size=4,
             total_tokens=23,
@@ -488,7 +477,7 @@ def test_gdn_chunk_prefill_inputs_keep_metadata_seed_independent() -> None:
 
 def test_gdn_chunk_prefill_inputs_reject_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="num_v_heads must be >= num_q_heads"):
-        GDNChunkPrefillInputs(
+        GDNInputs(
             GDNChunkPrefillInputConfig(
                 batch_size=2,
                 total_tokens=8,
@@ -500,7 +489,7 @@ def test_gdn_chunk_prefill_inputs_reject_invalid_configs_and_values() -> None:
         )
 
     with pytest.raises(ValueError, match="integer multiple"):
-        GDNChunkPrefillInputs(
+        GDNInputs(
             GDNChunkPrefillInputConfig(
                 batch_size=2,
                 total_tokens=8,
@@ -512,7 +501,7 @@ def test_gdn_chunk_prefill_inputs_reject_invalid_configs_and_values() -> None:
         )
 
     with pytest.raises(ValueError, match="total_tokens must be >= batch_size"):
-        GDNChunkPrefillInputs(
+        GDNInputs(
             GDNChunkPrefillInputConfig(
                 batch_size=4,
                 total_tokens=3,
@@ -523,7 +512,7 @@ def test_gdn_chunk_prefill_inputs_reject_invalid_configs_and_values() -> None:
             )
         )
 
-    values = GDNChunkPrefillInputs(
+    values = GDNInputs(
         GDNChunkPrefillInputConfig(
             batch_size=2,
             total_tokens=8,
@@ -539,7 +528,7 @@ def test_gdn_chunk_prefill_inputs_reject_invalid_configs_and_values() -> None:
 
 
 def test_packed_qkv_complex_rotary_inputs_generate_values_and_reference() -> None:
-    values = PackedQKVComplexRotaryInputs(
+    values = _PackedQKVComplexRotaryGenerator(
         PackedQKVComplexRotaryInputConfig(
             num_tokens=5,
             num_heads=2,
@@ -574,7 +563,7 @@ def test_packed_qkv_complex_rotary_inputs_generate_values_and_reference() -> Non
 
 
 def test_packed_qkv_complex_rotary_inputs_support_copy_v() -> None:
-    values = PackedQKVComplexRotaryInputs(
+    values = _PackedQKVComplexRotaryGenerator(
         PackedQKVComplexRotaryInputConfig(
             num_tokens=3,
             num_heads=2,
@@ -592,7 +581,7 @@ def test_packed_qkv_complex_rotary_inputs_support_copy_v() -> None:
 
 def test_packed_qkv_complex_rotary_inputs_reject_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="head_dim"):
-        PackedQKVComplexRotaryInputs(
+        _PackedQKVComplexRotaryGenerator(
             PackedQKVComplexRotaryInputConfig(
                 num_tokens=5,
                 num_heads=2,
@@ -601,7 +590,7 @@ def test_packed_qkv_complex_rotary_inputs_reject_invalid_configs_and_values() ->
             )
         )
 
-    values = PackedQKVComplexRotaryInputs(
+    values = _PackedQKVComplexRotaryGenerator(
         PackedQKVComplexRotaryInputConfig(
             num_tokens=5,
             num_heads=2,
@@ -613,7 +602,7 @@ def test_packed_qkv_complex_rotary_inputs_reject_invalid_configs_and_values() ->
     with pytest.raises(ValueError, match="freqs_cis"):
         packed_qkv_complex_rotary_reference(values)
 
-    values = PackedQKVComplexRotaryInputs(
+    values = _PackedQKVComplexRotaryGenerator(
         PackedQKVComplexRotaryInputConfig(
             num_tokens=5,
             num_heads=2,
@@ -627,7 +616,7 @@ def test_packed_qkv_complex_rotary_inputs_reject_invalid_configs_and_values() ->
 
 
 def test_dsa_sparse_decode_kv_pack_inputs_generate_values_and_reference() -> None:
-    values = DSASparseDecodeKVPackInputs(
+    values = DSAInputs(
         DSASparseDecodeKVPackInputConfig(
             num_tokens=5,
             num_slots=9,
@@ -662,7 +651,7 @@ def test_dsa_sparse_decode_kv_pack_inputs_generate_values_and_reference() -> Non
 
 
 def test_dsa_sparse_decode_kv_pack_supports_head_axis_and_zero_tokens() -> None:
-    values = DSASparseDecodeKVPackInputs(
+    values = DSAInputs(
         DSASparseDecodeKVPackInputConfig(
             num_tokens=0,
             num_slots=3,
@@ -682,7 +671,7 @@ def test_dsa_sparse_decode_kv_pack_supports_head_axis_and_zero_tokens() -> None:
 
 def test_dsa_sparse_decode_kv_pack_rejects_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="num_tokens"):
-        DSASparseDecodeKVPackInputs(
+        DSAInputs(
             DSASparseDecodeKVPackInputConfig(
                 num_tokens=4,
                 num_slots=3,
@@ -692,7 +681,7 @@ def test_dsa_sparse_decode_kv_pack_rejects_invalid_configs_and_values() -> None:
         )
 
     with pytest.raises(ValueError, match="divisible"):
-        DSASparseDecodeKVPackInputs(
+        DSAInputs(
             DSASparseDecodeKVPackInputConfig(
                 num_tokens=2,
                 num_slots=3,
@@ -702,7 +691,7 @@ def test_dsa_sparse_decode_kv_pack_rejects_invalid_configs_and_values() -> None:
         )
 
     with pytest.raises(ValueError, match="power of two"):
-        DSASparseDecodeKVPackInputs(
+        DSAInputs(
             DSASparseDecodeKVPackInputConfig(
                 num_tokens=2,
                 num_slots=3,
@@ -711,7 +700,7 @@ def test_dsa_sparse_decode_kv_pack_rejects_invalid_configs_and_values() -> None:
             )
         )
 
-    values = DSASparseDecodeKVPackInputs(
+    values = DSAInputs(
         DSASparseDecodeKVPackInputConfig(
             num_tokens=3,
             num_slots=5,
@@ -725,7 +714,7 @@ def test_dsa_sparse_decode_kv_pack_rejects_invalid_configs_and_values() -> None:
 
 
 def test_dsa_decode_topk_inputs_generate_stable_tie_values() -> None:
-    values = DSADecodeTopKInputs(
+    values = DSAInputs(
         DSADecodeTopKInputConfig(
             num_rows=4,
             vocab_size=12,
@@ -753,7 +742,7 @@ def test_dsa_decode_topk_inputs_generate_stable_tie_values() -> None:
 
 
 def test_dsa_decode_topk_reference_matches_manual_ordering() -> None:
-    values = DSADecodeTopKInputs(
+    values = DSAInputs(
         DSADecodeTopKInputConfig(
             num_rows=1,
             vocab_size=5,
@@ -778,7 +767,7 @@ def test_dsa_decode_topk_reference_matches_manual_ordering() -> None:
 
 def test_dsa_decode_topk_inputs_reject_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="topk must be <= vocab_size"):
-        DSADecodeTopKInputs(
+        DSAInputs(
             DSADecodeTopKInputConfig(
                 num_rows=1,
                 vocab_size=4,
@@ -788,7 +777,7 @@ def test_dsa_decode_topk_inputs_reject_invalid_configs_and_values() -> None:
         )
 
     with pytest.raises(ValueError, match="min_valid_len must be >= topk"):
-        DSADecodeTopKInputs(
+        DSAInputs(
             DSADecodeTopKInputConfig(
                 num_rows=1,
                 vocab_size=8,
@@ -798,7 +787,7 @@ def test_dsa_decode_topk_inputs_reject_invalid_configs_and_values() -> None:
             )
         )
 
-    values = DSADecodeTopKInputs(
+    values = DSAInputs(
         DSADecodeTopKInputConfig(
             num_rows=1,
             vocab_size=8,
@@ -815,7 +804,7 @@ def test_dsa_decode_topk_inputs_reject_invalid_configs_and_values() -> None:
 
 
 def test_dsa_topk_slot_inputs_generate_values_and_references() -> None:
-    values = DSATopKSlotInputs(
+    values = DSAInputs(
         DSATopKSlotInputConfig(
             num_tokens=5,
             topk=4,
@@ -853,7 +842,7 @@ def test_dsa_topk_slot_inputs_generate_values_and_references() -> None:
 
 
 def test_dsa_topk_slot_reference_supports_no_seq_lens_local_mode() -> None:
-    values = DSATopKSlotInputs(
+    values = DSAInputs(
         DSATopKSlotInputConfig(
             num_tokens=3,
             topk=5,
@@ -875,7 +864,7 @@ def test_dsa_topk_slot_reference_supports_no_seq_lens_local_mode() -> None:
 
 
 def test_dsa_topk_slot_inputs_support_zero_tokens() -> None:
-    values = DSATopKSlotInputs(
+    values = DSAInputs(
         DSATopKSlotInputConfig(
             num_tokens=0,
             topk=5,
@@ -895,7 +884,7 @@ def test_dsa_topk_slot_inputs_support_zero_tokens() -> None:
 
 def test_dsa_topk_slot_inputs_reject_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="topk"):
-        DSATopKSlotInputs(
+        DSAInputs(
             DSATopKSlotInputConfig(
                 num_tokens=3,
                 topk=0,
@@ -905,7 +894,7 @@ def test_dsa_topk_slot_inputs_reject_invalid_configs_and_values() -> None:
         )
 
     with pytest.raises(ValueError, match="page_table_input.batch_size"):
-        DSATopKSlotInputs(
+        DSAInputs(
             DSATopKSlotInputConfig(
                 num_tokens=3,
                 topk=4,
@@ -918,7 +907,7 @@ def test_dsa_topk_slot_inputs_reject_invalid_configs_and_values() -> None:
             )
         )
 
-    values = DSATopKSlotInputs(
+    values = DSAInputs(
         DSATopKSlotInputConfig(
             num_tokens=3,
             topk=4,
@@ -932,8 +921,8 @@ def test_dsa_topk_slot_inputs_reject_invalid_configs_and_values() -> None:
 
 
 def test_compressed_sequence_attention_generates_swa_only_values() -> None:
-    values = CompressedSequenceAttentionInputs(
-        CompressedSequenceAttentionInputConfig(
+    values = CSAInputs(
+        CSAInputConfig(
             batch_size=2,
             total_cached_tokens=8,
             total_new_q_tokens=4,
@@ -963,8 +952,8 @@ def test_compressed_sequence_attention_generates_swa_only_values() -> None:
 
 
 def test_compressed_sequence_attention_generates_hca_values() -> None:
-    values = CompressedSequenceAttentionInputs(
-        CompressedSequenceAttentionInputConfig(
+    values = CSAInputs(
+        CSAInputConfig(
             batch_size=2,
             total_cached_tokens=16,
             total_new_q_tokens=4,
@@ -972,7 +961,7 @@ def test_compressed_sequence_attention_generates_hca_values() -> None:
             num_q_heads=2,
             page_size=4,
             window_size=5,
-            compressed=CompressedSequenceAttentionHistoryConfig(
+            compressed=CSAHistoryConfig(
                 compress_ratio=128,
                 topk=3,
                 num_state_cache_blocks=2,
@@ -1020,8 +1009,8 @@ def test_compressed_sequence_attention_generates_hca_values() -> None:
 
 
 def test_compressed_sequence_attention_generates_csa_indexer_values() -> None:
-    values = CompressedSequenceAttentionInputs(
-        CompressedSequenceAttentionInputConfig(
+    values = CSAInputs(
+        CSAInputConfig(
             batch_size=2,
             total_cached_tokens=16,
             total_new_q_tokens=4,
@@ -1029,7 +1018,7 @@ def test_compressed_sequence_attention_generates_csa_indexer_values() -> None:
             num_q_heads=2,
             page_size=4,
             window_size=5,
-            compressed=CompressedSequenceAttentionHistoryConfig(
+            compressed=CSAHistoryConfig(
                 compress_ratio=4,
                 topk=3,
                 num_state_cache_blocks=2,
@@ -1037,7 +1026,7 @@ def test_compressed_sequence_attention_generates_csa_indexer_values() -> None:
                 num_kv_cache_blocks=2,
                 kv_cache_block_size=4,
             ),
-            indexer=CompressedSequenceAttentionIndexerConfig(
+            indexer=CSAIndexerConfig(
                 num_heads=2,
                 num_state_cache_blocks=2,
                 compressor_block_size=4,
@@ -1084,8 +1073,8 @@ def test_compressed_sequence_attention_generates_csa_indexer_values() -> None:
 
 def test_compressed_sequence_attention_rejects_invalid_component_mix() -> None:
     with pytest.raises(ValueError, match="indexer requires compressed"):
-        CompressedSequenceAttentionInputs(
-            CompressedSequenceAttentionInputConfig(
+        CSAInputs(
+            CSAInputConfig(
                 batch_size=1,
                 total_cached_tokens=1,
                 total_new_q_tokens=1,
@@ -1093,13 +1082,13 @@ def test_compressed_sequence_attention_rejects_invalid_component_mix() -> None:
                 num_q_heads=1,
                 page_size=1,
                 window_size=1,
-                indexer=CompressedSequenceAttentionIndexerConfig(),
+                indexer=CSAIndexerConfig(),
             )
         )
 
     with pytest.raises(ValueError, match="only valid for CSA"):
-        CompressedSequenceAttentionInputs(
-            CompressedSequenceAttentionInputConfig(
+        CSAInputs(
+            CSAInputConfig(
                 batch_size=1,
                 total_cached_tokens=1,
                 total_new_q_tokens=1,
@@ -1107,16 +1096,16 @@ def test_compressed_sequence_attention_rejects_invalid_component_mix() -> None:
                 num_q_heads=1,
                 page_size=1,
                 window_size=1,
-                compressed=CompressedSequenceAttentionHistoryConfig(
+                compressed=CSAHistoryConfig(
                     compress_ratio=128,
                 ),
-                indexer=CompressedSequenceAttentionIndexerConfig(),
+                indexer=CSAIndexerConfig(),
             )
         )
 
 
 def test_deepseek_v4_compressor_state_inputs_generate_values_and_reference() -> None:
-    values = DeepSeekV4CompressorStateInputs(
+    values = CSAInputs(
         DeepSeekV4CompressorStateInputConfig(
             num_tokens=6,
             state_width=16,
@@ -1173,7 +1162,7 @@ def test_deepseek_v4_compressor_state_inputs_generate_values_and_reference() -> 
 
 
 def test_deepseek_v4_compressor_state_reference_matches_c4_overlap_ape_layout() -> None:
-    values = DeepSeekV4CompressorStateInputs(
+    values = CSAInputs(
         DeepSeekV4CompressorStateInputConfig(
             num_tokens=1,
             state_width=8,
@@ -1200,7 +1189,7 @@ def test_deepseek_v4_compressor_state_reference_matches_c4_overlap_ape_layout() 
 
 
 def test_deepseek_v4_compressor_state_inputs_keep_metadata_seed_independent() -> None:
-    generator = DeepSeekV4CompressorStateInputs(
+    generator = CSAInputs(
         DeepSeekV4CompressorStateInputConfig(
             num_tokens=5,
             state_width=8,
@@ -1225,7 +1214,7 @@ def test_deepseek_v4_compressor_state_inputs_keep_metadata_seed_independent() ->
 
 def test_deepseek_v4_compressor_state_rejects_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="valid generated tokens"):
-        DeepSeekV4CompressorStateInputs(
+        CSAInputs(
             DeepSeekV4CompressorStateInputConfig(
                 num_tokens=5,
                 state_width=8,
@@ -1236,7 +1225,7 @@ def test_deepseek_v4_compressor_state_rejects_invalid_configs_and_values() -> No
             )
         )
 
-    values = DeepSeekV4CompressorStateInputs(
+    values = CSAInputs(
         DeepSeekV4CompressorStateInputConfig(
             num_tokens=2,
             state_width=8,
@@ -1252,7 +1241,7 @@ def test_deepseek_v4_compressor_state_rejects_invalid_configs_and_values() -> No
 
 
 def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_generate_reference() -> None:
-    values = DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+    values = CSAInputs(
         DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
             num_tokens=4,
             num_heads=3,
@@ -1282,7 +1271,7 @@ def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_generate_reference() -> None:
 
 
 def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference_zero_row() -> None:
-    values = DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+    values = CSAInputs(
         DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
             num_tokens=1,
             num_heads=1,
@@ -1306,7 +1295,7 @@ def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference_zero_row() -> None:
 def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_keeps_metadata_seed_independent() -> (
     None
 ):
-    generator = DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+    generator = CSAInputs(
         DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
             num_tokens=4,
             num_heads=2,
@@ -1330,7 +1319,7 @@ def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_keeps_metadata_seed_independe
 
 def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="max_position"):
-        DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+        CSAInputs(
             DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
                 num_tokens=1,
                 num_heads=1,
@@ -1339,7 +1328,7 @@ def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_rejects_invalid_values() -> N
             )
         )
     with pytest.raises(TypeError, match="position_dtype"):
-        DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+        CSAInputs(
             DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
                 num_tokens=1,
                 num_heads=1,
@@ -1348,7 +1337,7 @@ def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_rejects_invalid_values() -> N
             )
         )
 
-    values = DeepSeekV4IndexerQRoPEHadamardMXFP4Inputs(
+    values = CSAInputs(
         DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
             num_tokens=1,
             num_heads=1,
@@ -1362,7 +1351,7 @@ def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_rejects_invalid_values() -> N
 
 
 def test_deepseek_v4_inv_rope_fp8_quant_inputs_generate_tma_reference() -> None:
-    values = DeepSeekV4InvRoPEFP8QuantInputs(
+    values = CSAInputs(
         DeepSeekV4InvRoPEFP8QuantInputConfig(
             num_tokens=5,
             n_groups=2,
@@ -1387,7 +1376,7 @@ def test_deepseek_v4_inv_rope_fp8_quant_inputs_generate_tma_reference() -> None:
 
 
 def test_deepseek_v4_inv_rope_fp8_quant_inputs_generate_float_scale_reference() -> None:
-    values = DeepSeekV4InvRoPEFP8QuantInputs(
+    values = CSAInputs(
         DeepSeekV4InvRoPEFP8QuantInputConfig(
             num_tokens=3,
             n_groups=1,
@@ -1407,7 +1396,7 @@ def test_deepseek_v4_inv_rope_fp8_quant_inputs_generate_float_scale_reference() 
 
 
 def test_deepseek_v4_inv_rope_fp8_quant_keeps_metadata_seed_independent() -> None:
-    generator = DeepSeekV4InvRoPEFP8QuantInputs(
+    generator = CSAInputs(
         DeepSeekV4InvRoPEFP8QuantInputConfig(
             num_tokens=4,
             n_groups=2,
@@ -1430,7 +1419,7 @@ def test_deepseek_v4_inv_rope_fp8_quant_keeps_metadata_seed_independent() -> Non
 
 def test_deepseek_v4_inv_rope_fp8_quant_rejects_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="nope_dim \\+ rope_dim"):
-        DeepSeekV4InvRoPEFP8QuantInputs(
+        CSAInputs(
             DeepSeekV4InvRoPEFP8QuantInputConfig(
                 num_tokens=1,
                 n_groups=1,
@@ -1442,7 +1431,7 @@ def test_deepseek_v4_inv_rope_fp8_quant_rejects_invalid_configs_and_values() -> 
             )
         )
     with pytest.raises(ValueError, match="tma_aligned_scales"):
-        DeepSeekV4InvRoPEFP8QuantInputs(
+        CSAInputs(
             DeepSeekV4InvRoPEFP8QuantInputConfig(
                 num_tokens=1,
                 n_groups=1,
@@ -1455,7 +1444,7 @@ def test_deepseek_v4_inv_rope_fp8_quant_rejects_invalid_configs_and_values() -> 
             )
         )
 
-    values = DeepSeekV4InvRoPEFP8QuantInputs(
+    values = CSAInputs(
         DeepSeekV4InvRoPEFP8QuantInputConfig(
             num_tokens=1,
             n_groups=1,
@@ -1470,7 +1459,7 @@ def test_deepseek_v4_inv_rope_fp8_quant_rejects_invalid_configs_and_values() -> 
 
 
 def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_inputs_generate_reference() -> None:
-    values = DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+    values = CSAInputs(
         DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
             num_tokens=6,
             batch_size=2,
@@ -1523,7 +1512,7 @@ def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_inputs_generate_reference() 
 
 
 def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_skips_invalid_rows() -> None:
-    values = DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+    values = CSAInputs(
         DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
             num_tokens=3,
             batch_size=1,
@@ -1562,7 +1551,7 @@ def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_skips_invalid_rows() -> None
 def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_keeps_metadata_seed_independent() -> (
     None
 ):
-    generator = DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+    generator = CSAInputs(
         DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
             num_tokens=5,
             batch_size=2,
@@ -1594,7 +1583,7 @@ def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_keeps_metadata_seed_independ
 
 def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="compressor slots"):
-        DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+        CSAInputs(
             DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
                 num_tokens=5,
                 batch_size=1,
@@ -1607,7 +1596,7 @@ def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_rejects_invalid_values() -> 
             )
         )
     with pytest.raises(ValueError, match="compress_ratio=4"):
-        DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+        CSAInputs(
             DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
                 num_tokens=1,
                 batch_size=1,
@@ -1621,7 +1610,7 @@ def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_rejects_invalid_values() -> 
             )
         )
 
-    values = DeepSeekV4CSAIndexerMXFP4CacheInsertInputs(
+    values = CSAInputs(
         DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
             num_tokens=2,
             batch_size=1,
@@ -1650,7 +1639,7 @@ def test_deepseek_v4_sparse_compress_cache_insert_inputs_generate_reference(
     overlap: bool,
     expected_state_width: int,
 ) -> None:
-    values = DeepSeekV4SparseCompressCacheInsertInputs(
+    values = CSAInputs(
         DeepSeekV4SparseCompressCacheInsertInputConfig(
             num_tokens=6,
             batch_size=2,
@@ -1705,7 +1694,7 @@ def test_deepseek_v4_sparse_compress_cache_insert_inputs_generate_reference(
 
 
 def test_deepseek_v4_sparse_compress_cache_insert_skips_invalid_rows() -> None:
-    values = DeepSeekV4SparseCompressCacheInsertInputs(
+    values = CSAInputs(
         DeepSeekV4SparseCompressCacheInsertInputConfig(
             num_tokens=3,
             batch_size=1,
@@ -1751,7 +1740,7 @@ def test_deepseek_v4_sparse_compress_cache_insert_skips_invalid_rows() -> None:
 def test_deepseek_v4_sparse_compress_cache_insert_keeps_metadata_seed_independent() -> (
     None
 ):
-    generator = DeepSeekV4SparseCompressCacheInsertInputs(
+    generator = CSAInputs(
         DeepSeekV4SparseCompressCacheInsertInputConfig(
             num_tokens=5,
             batch_size=2,
@@ -1785,7 +1774,7 @@ def test_deepseek_v4_sparse_compress_cache_insert_keeps_metadata_seed_independen
 
 def test_deepseek_v4_sparse_compress_cache_insert_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="compressor slots"):
-        DeepSeekV4SparseCompressCacheInsertInputs(
+        CSAInputs(
             DeepSeekV4SparseCompressCacheInsertInputConfig(
                 num_tokens=5,
                 batch_size=1,
@@ -1800,7 +1789,7 @@ def test_deepseek_v4_sparse_compress_cache_insert_rejects_invalid_values() -> No
             )
         )
     with pytest.raises(ValueError, match="compression boundary"):
-        DeepSeekV4SparseCompressCacheInsertInputs(
+        CSAInputs(
             DeepSeekV4SparseCompressCacheInsertInputConfig(
                 num_tokens=1,
                 batch_size=1,
@@ -1815,7 +1804,7 @@ def test_deepseek_v4_sparse_compress_cache_insert_rejects_invalid_values() -> No
             )
         )
 
-    values = DeepSeekV4SparseCompressCacheInsertInputs(
+    values = CSAInputs(
         DeepSeekV4SparseCompressCacheInsertInputConfig(
             num_tokens=2,
             batch_size=1,
@@ -1836,7 +1825,7 @@ def test_deepseek_v4_sparse_compress_cache_insert_rejects_invalid_values() -> No
 
 
 def test_deepseek_v4_indexer_mxfp4_cache_write_inputs_generate_reference() -> None:
-    values = DeepSeekV4IndexerMXFP4CacheWriteInputs(
+    values = CSAInputs(
         DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
             num_rows=5,
             num_cache_blocks=2,
@@ -1900,7 +1889,7 @@ def test_deepseek_v4_indexer_mxfp4_cache_write_inputs_generate_reference() -> No
 
 
 def test_deepseek_v4_indexer_mxfp4_cache_write_reference_known_zero_row() -> None:
-    values = DeepSeekV4IndexerMXFP4CacheWriteInputs(
+    values = CSAInputs(
         DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
             num_rows=1,
             num_cache_blocks=1,
@@ -1925,7 +1914,7 @@ def test_deepseek_v4_indexer_mxfp4_cache_write_reference_known_zero_row() -> Non
 def test_deepseek_v4_indexer_mxfp4_cache_write_keeps_metadata_seed_independent() -> (
     None
 ):
-    generator = DeepSeekV4IndexerMXFP4CacheWriteInputs(
+    generator = CSAInputs(
         DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
             num_rows=4,
             num_cache_blocks=1,
@@ -1951,7 +1940,7 @@ def test_deepseek_v4_indexer_mxfp4_cache_write_rejects_invalid_configs_and_value
     None
 ):
     with pytest.raises(ValueError, match="non-negative slots"):
-        DeepSeekV4IndexerMXFP4CacheWriteInputs(
+        CSAInputs(
             DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
                 num_rows=5,
                 num_cache_blocks=1,
@@ -1960,7 +1949,7 @@ def test_deepseek_v4_indexer_mxfp4_cache_write_rejects_invalid_configs_and_value
             )
         )
 
-    values = DeepSeekV4IndexerMXFP4CacheWriteInputs(
+    values = CSAInputs(
         DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
             num_rows=2,
             num_cache_blocks=1,
@@ -1975,7 +1964,7 @@ def test_deepseek_v4_indexer_mxfp4_cache_write_rejects_invalid_configs_and_value
 
 
 def test_deepseek_v4_indexer_mxfp4_cache_gather_inputs_generate_reference() -> None:
-    values = DeepSeekV4IndexerMXFP4CacheGatherInputs(
+    values = CSAInputs(
         DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
             num_rows=6,
             num_cache_blocks=2,
@@ -2033,7 +2022,7 @@ def test_deepseek_v4_indexer_mxfp4_cache_gather_inputs_generate_reference() -> N
 def test_deepseek_v4_indexer_mxfp4_cache_gather_keeps_metadata_seed_independent() -> (
     None
 ):
-    generator = DeepSeekV4IndexerMXFP4CacheGatherInputs(
+    generator = CSAInputs(
         DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
             num_rows=4,
             num_cache_blocks=2,
@@ -2058,7 +2047,7 @@ def test_deepseek_v4_indexer_mxfp4_cache_gather_rejects_invalid_configs_and_valu
     None
 ):
     with pytest.raises(ValueError, match="negative_slot_count"):
-        DeepSeekV4IndexerMXFP4CacheGatherInputs(
+        CSAInputs(
             DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
                 num_rows=1,
                 num_cache_blocks=1,
@@ -2067,7 +2056,7 @@ def test_deepseek_v4_indexer_mxfp4_cache_gather_rejects_invalid_configs_and_valu
             )
         )
 
-    values = DeepSeekV4IndexerMXFP4CacheGatherInputs(
+    values = CSAInputs(
         DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
             num_rows=1,
             num_cache_blocks=1,
@@ -2080,7 +2069,7 @@ def test_deepseek_v4_indexer_mxfp4_cache_gather_rejects_invalid_configs_and_valu
 
 
 def test_deepseek_v4_k_cache_gather_inputs_generate_reference() -> None:
-    values = DeepSeekV4KCacheGatherInputs(
+    values = CSAInputs(
         DeepSeekV4KCacheGatherInputConfig(
             batch_size=3,
             max_seq_len=9,
@@ -2124,7 +2113,7 @@ def test_deepseek_v4_k_cache_gather_inputs_generate_reference() -> None:
 
 
 def test_deepseek_v4_k_cache_gather_keeps_metadata_seed_independent() -> None:
-    generator = DeepSeekV4KCacheGatherInputs(
+    generator = CSAInputs(
         DeepSeekV4KCacheGatherInputConfig(
             batch_size=2,
             max_seq_len=8,
@@ -2147,7 +2136,7 @@ def test_deepseek_v4_k_cache_gather_keeps_metadata_seed_independent() -> None:
 
 
 def test_deepseek_v4_k_cache_gather_supports_full_sequence_gather() -> None:
-    values = DeepSeekV4KCacheGatherInputs(
+    values = CSAInputs(
         DeepSeekV4KCacheGatherInputConfig(
             batch_size=2,
             max_seq_len=6,
@@ -2165,7 +2154,7 @@ def test_deepseek_v4_k_cache_gather_supports_full_sequence_gather() -> None:
 
 def test_deepseek_v4_k_cache_gather_rejects_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="max_gather_len"):
-        DeepSeekV4KCacheGatherInputs(
+        CSAInputs(
             DeepSeekV4KCacheGatherInputConfig(
                 batch_size=1,
                 max_seq_len=4,
@@ -2174,7 +2163,7 @@ def test_deepseek_v4_k_cache_gather_rejects_invalid_configs_and_values() -> None
             )
         )
     with pytest.raises(ValueError, match="num_cache_blocks"):
-        DeepSeekV4KCacheGatherInputs(
+        CSAInputs(
             DeepSeekV4KCacheGatherInputConfig(
                 batch_size=2,
                 max_seq_len=4,
@@ -2183,7 +2172,7 @@ def test_deepseek_v4_k_cache_gather_rejects_invalid_configs_and_values() -> None
             )
         )
 
-    values = DeepSeekV4KCacheGatherInputs(
+    values = CSAInputs(
         DeepSeekV4KCacheGatherInputConfig(
             batch_size=1,
             max_seq_len=4,
@@ -2198,7 +2187,7 @@ def test_deepseek_v4_k_cache_gather_rejects_invalid_configs_and_values() -> None
 
 
 def test_deepseek_v4_paged_index_inputs_generate_values_and_refs() -> None:
-    values = DeepSeekV4PagedIndexInputs(
+    values = CSAInputs(
         DeepSeekV4PagedIndexInputConfig(
             batch_size=3,
             total_cached_tokens=18,
@@ -2263,7 +2252,7 @@ def test_deepseek_v4_paged_index_inputs_generate_values_and_refs() -> None:
 
 
 def test_deepseek_v4_paged_index_inputs_support_base_offsets() -> None:
-    values = DeepSeekV4PagedIndexInputs(
+    values = CSAInputs(
         DeepSeekV4PagedIndexInputConfig(
             batch_size=2,
             total_cached_tokens=16,
@@ -2311,9 +2300,9 @@ def test_deepseek_v4_paged_index_inputs_keep_metadata_seeded() -> None:
         indexing="random",
     )
 
-    first = DeepSeekV4PagedIndexInputs(config).generate(seed=13, device="cpu")
-    second = DeepSeekV4PagedIndexInputs(config).generate(seed=13, device="cpu")
-    third = DeepSeekV4PagedIndexInputs(config).generate(seed=14, device="cpu")
+    first = CSAInputs(config).generate(seed=13, device="cpu")
+    second = CSAInputs(config).generate(seed=13, device="cpu")
+    third = CSAInputs(config).generate(seed=14, device="cpu")
 
     assert torch.equal(first.positions, second.positions)
     assert torch.equal(first.token_to_req_indices, second.token_to_req_indices)
@@ -2324,7 +2313,7 @@ def test_deepseek_v4_paged_index_inputs_keep_metadata_seeded() -> None:
 
 def test_deepseek_v4_paged_index_inputs_reject_invalid_configs() -> None:
     with pytest.raises(ValueError, match="compress_ratio"):
-        DeepSeekV4PagedIndexInputs(
+        CSAInputs(
             DeepSeekV4PagedIndexInputConfig(
                 batch_size=2,
                 total_cached_tokens=8,
@@ -2337,7 +2326,7 @@ def test_deepseek_v4_paged_index_inputs_reject_invalid_configs() -> None:
         )
 
     with pytest.raises(ValueError, match="metadata_input.total_new_kv_tokens"):
-        DeepSeekV4PagedIndexInputs(
+        CSAInputs(
             DeepSeekV4PagedIndexInputConfig(
                 batch_size=2,
                 total_cached_tokens=8,
@@ -2358,7 +2347,7 @@ def test_deepseek_v4_paged_index_inputs_reject_invalid_configs() -> None:
         )
 
     with pytest.raises(ValueError, match="page_table_input.batch_size"):
-        DeepSeekV4PagedIndexInputs(
+        CSAInputs(
             DeepSeekV4PagedIndexInputConfig(
                 batch_size=2,
                 total_cached_tokens=8,
@@ -2376,7 +2365,7 @@ def test_deepseek_v4_paged_index_inputs_reject_invalid_configs() -> None:
 
 
 def test_deepseek_v4_sparse_prefill_indices_generate_values_and_refs() -> None:
-    values = DeepSeekV4SparsePrefillIndexInputs(
+    values = CSAInputs(
         DeepSeekV4SparsePrefillIndexInputConfig(
             batch_size=3,
             total_cached_tokens=17,
@@ -2457,9 +2446,9 @@ def test_deepseek_v4_sparse_prefill_index_inputs_keep_seeded_metadata_stable() -
         ),
     )
 
-    first = DeepSeekV4SparsePrefillIndexInputs(config).generate(seed=23, device="cpu")
-    second = DeepSeekV4SparsePrefillIndexInputs(config).generate(seed=23, device="cpu")
-    third = DeepSeekV4SparsePrefillIndexInputs(config).generate(seed=24, device="cpu")
+    first = CSAInputs(config).generate(seed=23, device="cpu")
+    second = CSAInputs(config).generate(seed=23, device="cpu")
+    third = CSAInputs(config).generate(seed=24, device="cpu")
 
     assert torch.equal(first.positions, second.positions)
     assert torch.equal(first.token_to_req_indices, second.token_to_req_indices)
@@ -2468,7 +2457,7 @@ def test_deepseek_v4_sparse_prefill_index_inputs_keep_seeded_metadata_stable() -
 
 
 def test_deepseek_v4_sparse_prefill_index_inputs_support_identity_topk() -> None:
-    values = DeepSeekV4SparsePrefillIndexInputs(
+    values = CSAInputs(
         DeepSeekV4SparsePrefillIndexInputConfig(
             batch_size=1,
             total_cached_tokens=12,
@@ -2497,7 +2486,7 @@ def test_deepseek_v4_sparse_prefill_index_inputs_support_identity_topk() -> None
 
 def test_deepseek_v4_sparse_prefill_index_inputs_reject_invalid_configs() -> None:
     with pytest.raises(ValueError, match="compress_ratio"):
-        DeepSeekV4SparsePrefillIndexInputs(
+        CSAInputs(
             DeepSeekV4SparsePrefillIndexInputConfig(
                 batch_size=2,
                 total_cached_tokens=0,
@@ -2509,7 +2498,7 @@ def test_deepseek_v4_sparse_prefill_index_inputs_reject_invalid_configs() -> Non
         )
 
     with pytest.raises(ValueError, match="total_new_kv_tokens"):
-        DeepSeekV4SparsePrefillIndexInputs(
+        CSAInputs(
             DeepSeekV4SparsePrefillIndexInputConfig(
                 batch_size=2,
                 total_cached_tokens=0,
@@ -2529,7 +2518,7 @@ def test_deepseek_v4_sparse_prefill_index_inputs_reject_invalid_configs() -> Non
         )
 
     with pytest.raises(ValueError, match="workspace_width"):
-        DeepSeekV4SparsePrefillIndexInputs(
+        CSAInputs(
             DeepSeekV4SparsePrefillIndexInputConfig(
                 batch_size=1,
                 total_cached_tokens=8,

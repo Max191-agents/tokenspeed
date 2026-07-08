@@ -1,9 +1,11 @@
 # Attention Input Generators
 
-Attention generators cover operation-level inputs for multi-head attention
-families and related attention utility primitives. They describe query/K/V
-tensors, request metadata, optional cache contents, and merge states without
-depending on a specific backend API.
+Attention input generation is organized around five operation families:
+`MHAInputs`, `MLAInputs`, `CSAInputs`, `DSAInputs`, and `GDNInputs`. These are
+the public generator entry points. Config objects select the concrete mode
+within a family, so variants such as prefill/decode, paged/dense cache, sparse
+decode packing, and GDN QKV split are represented as configurations of the
+family generator rather than separate generator families.
 
 ## Operation Semantics
 
@@ -22,281 +24,118 @@ consistent cumulative sequence metadata.
 
 `MLAInputs` represents multi-head latent attention. It shares the same request
 metadata and cache-layout concepts as MHA, but uses MLA-specific operand shapes:
-query-nope, query positional embedding channels, compressed KV cache contents,
-and optional new compressed KV inputs.
+query-NoPE channels, query positional embedding channels, compressed KV cache
+contents, and optional new compressed KV inputs.
 
 `mla_reference` evaluates generated MLA values at the operation level. Uncached
 inputs use explicit varlen Q/K/V attention, including grouped KV heads when the
 generated head counts require expansion. Paged-cache inputs gather compressed
 cache rows through the generated page table and compute absorbed MLA decode
-outputs over the latent KV channels. FP8 prefill is represented by configuring
-the generated Q, K, and V dtypes on `MLAInputs` directly.
+outputs over the latent KV channels.
 
-### GDN Packed QKV Split
+### CSA
 
-`GDNQKVSplitInputs` represents splitting a packed post-projection QKV tensor
-into query, key, and value tensors:
+`CSAInputs` represents compressed sequence attention input generation. The
+current layout support is DeepSeek V4-style. The sliding-window attention
+portion is always generated; optional compressed-history and indexer configs
+add the generated values needed by CSA/HCA cache, sparse-index, and gather
+paths.
 
-```text
-mixed_qkv[t] = concat(q[t], k[t], v[t])
-q -> [1, tokens, num_q_heads, head_q]
-k -> [1, tokens, num_k_heads, head_k]
-v -> [1, tokens, num_v_heads, head_v]
-```
+The compressed-history config covers both supported compression ratios:
 
-Some GDN prefill paths also fuse per-head L2 normalization of Q and K into this
-split:
+- `compress_ratio == 128`: HCA-style compressed history.
+- `compress_ratio == 4`: CSA-style compressed history with optional indexer
+  inputs.
 
-```text
-q[t, h] = q[t, h] / sqrt(sum(q[t, h] ** 2) + eps)
-k[t, h] = k[t, h] / sqrt(sum(k[t, h] ** 2) + eps)
-```
+CSA values intentionally contain nested bundles for the narrower helper
+operations consumed by TokenSpeed tests and references. Callers should still
+construct those values through `CSAInputs` instead of using one generator per
+helper kernel.
 
-V is always copied without normalization. The generator owns the packed-width
-relationships between head counts and per-head dimensions, and its reference
-implements both the plain split and fused-normalization variants.
+### DSA
 
-### GDN Chunked Prefill
+`DSAInputs` represents dynamic sparse attention metadata and cache helper
+inputs. Its configs cover:
 
-`GDNChunkPrefillInputs` represents the prompt-side recurrent scan for
-Gated DeltaNet-style linear attention. Unlike softmax attention, the operation
-does not materialize pairwise attention over all prior tokens. It maintains a
-per-sequence, per-value-head matrix state with shape `[head_dim, head_dim]`.
-Each token decays the previous state, applies a delta-rule correction, writes
-the corrected value back through the key vector, and reads the updated state
-with the query vector:
+- sparse decode KV packing, where BF16 NoPE/RoPE key rows are packed into
+  physical cache slots with FP8 E4M3 NoPE blocks and FP32 per-block scales;
+- sparse top-k slot mapping, where token-local context offsets are translated
+  through a block table into physical KV-cache slots;
+- deterministic decode top-k selection over pre-masked indexer logits.
 
-```text
-state = exp(g_t) * state
-delta = beta_t * (v_t - k_t @ state)
-state = state + outer(k_t, delta)
-out_t = scale * (q_t @ state)
-```
+The selected top-k indices are token-local context offsets. Slot-mapping
+configs convert those offsets into physical cache slots when a backend needs
+cache addresses.
 
-The generated Q and K rows are L2-normalized because the chunked prefill fast
-paths expect normalized Q/K inputs. `g` is generated in log space, so `exp(g)`
-is the multiplicative state decay. `beta` is generated as a bounded update gate
-in `[0.05, 0.95]`. Sequence metadata is represented by `cu_seqlens`, which
-partitions the flattened prompt stream into independent recurrent scans.
+### GDN
 
-The generator supports equal Q/V head counts and grouped-value attention where
-`num_v_heads` is an integer multiple of `num_q_heads`. In the grouped-value
-case, multiple value/state heads share one Q/K head. The optional
-`include_batch_dim` setting only controls whether tensors include the leading
-singleton batch axis accepted by TokenSpeed's wrapper; the operation is still
-defined by the flattened token stream and `cu_seqlens`.
+`GDNInputs` represents Gated DeltaNet inputs. Its configs cover packed QKV
+split and chunked prefill.
 
-When `output_h` is requested, the reference returns recurrent-state
-checkpoints after each full 64-token chunk in every sequence, along with
-`checkpoint_cu_starts` metadata describing how many checkpoints belong to each
-sequence.
+Packed QKV split starts from a post-projection tensor whose last dimension is
+`q_width + k_width + v_width`, then returns separate Q, K, and V views or
+outputs. Some GDN paths also fuse per-head L2 normalization of Q and K into the
+split; V is copied without normalization.
 
-### Packed QKV Complex Rotary
+Chunked prefill represents the prompt-side recurrent scan for Gated
+DeltaNet-style linear attention. Unlike softmax attention, it does not
+materialize pairwise attention over all prior tokens. It maintains a
+per-sequence, per-value-head matrix state, applies log-space decay gates,
+applies a delta-rule correction, and reads the updated state with the query
+vector.
 
-`PackedQKVComplexRotaryInputs` represents splitting equal-width packed Q/K/V
-segments while applying complex RoPE to Q and K:
+## Shared Components
 
-```text
-qkv[t] = concat(q[t], k[t], v[t])
-z_q = q_even + i * q_odd
-z_k = k_even + i * k_odd
-q_rot = z_q * freqs_cis[t]
-k_rot = z_k * freqs_cis[t]
-v_out = v
-```
+The attention family generators reuse lower-level metadata and cache
+components:
 
-`freqs_cis` is generated as unit complex values with shape
-`[tokens, head_dim / 2]`. The generator requires an even `head_dim` because
-adjacent real channels form one complex pair. The `copy_v` option controls
-whether consumers should materialize V or can treat the V output as a view of
-the packed V segment; the represented V values are unchanged either way.
+- `MHARequestMetadataInput`: request token lengths, cumulative offsets, visible
+  KV lengths, and cache sequence lengths.
+- `PageTableInput`: paged-cache page/block tables.
+- `SlotMappingInput`: flat token-row to cache-slot mappings.
+- `KVCacheInput` and `MLAKVCacheInput`: dense or paged cache storage for MHA
+  and MLA cache layouts.
 
-### DSA Sparse Decode KV Pack
-
-`DSASparseDecodeKVPackInputs` represents packing per-token sparse-decode K
-rows into physical cache slots. Each generated token row contains BF16 NoPE key
-channels and BF16 RoPE key channels. The packed physical row layout is:
-
-```text
-[NoPE FP8 E4M3 bytes][FP32 scale bytes per 128 NoPE channels][RoPE BF16 bytes]
-```
-
-The NoPE channels are split into 128-channel blocks. Each block gets one FP32
-scale equal to `amax(abs(block)) / 448`, clamped away from zero, and stores the
-scaled values as FP8 E4M3 bytes. RoPE channels are copied as raw BF16 bytes.
-Generated slot locations are unique so the represented operation has no
-write-after-write race between token rows.
-
-### DSA Sparse Top-K Slots
-
-`DSATopKSlotInputs` represents sparse DSA metadata that maps token-local
-context offsets through a token-row page table into physical KV-cache slots:
-
-```text
-block = local_offset // block_size
-offset = local_offset % block_size
-slot = block_table[token, block] * block_size + offset
-```
-
-The same generated values support two related operations. Local top-k mode uses
-generated `local_topk_offsets[token, topk]` and counts valid offsets for each
-token. Full-context mode ignores `local_topk_offsets` and maps the first `topk`
-logical positions for each token context. In both cases, `seq_lens` bounds the
-valid logical context range and the block table bounds the physical page range.
-
-### DSA Decode Top-K
-
-`DSADecodeTopKInputs` represents deterministic sparse DSA decode top-k
-selection over pre-masked indexer logits:
-
-```text
-valid_logits = logits[row, 0:valid_len[row]]
-logits[row, valid_len[row]:] = -inf
-indices = topk(valid_logits, k=topk, tie_break=smallest_index)
-```
-
-The selected indices are token-local context offsets, not physical cache slots.
-The generator returns `valid_lens` to document and validate the masking
-relationship, while the operation input consumed by a top-k implementation is
-the already-masked `logits` tensor plus the output index buffer and `topk`.
-By default, generated rows include an equal-logit boundary case so references
-and kernels must use a deterministic smallest-index tie-break.
-
-### Compressed Sequence Attention
-
-`CompressedSequenceAttentionInputs` is the canonical generator for compressed
-sequence attention input generation. It represents sliding-window attention
-plus optional compressed-history attention and optional CSA indexer inputs. The
-current shape/layout support is DeepSeek V4-style.
-
-The sliding-window portion is always generated. It contains Q, attention sink,
-request metadata, absolute token positions, token-to-request indices, visible
-sequence lengths, a page table, and a paged byte cache.
-
-The optional `compressed` config adds compressed-history inputs. A
-`compress_ratio` of `128` represents HCA-style compressed history, while a
-`compress_ratio` of `4` represents CSA-style compressed history. The generated
-compressed values include paged/sparse index metadata, compressor-state cache
-values, sparse K-cache insert values, and sparse K-cache gather values.
-
-The optional `indexer` config is valid only for CSA. It adds the generated
-indexer-Q RoPE/Hadamard/MXFP4 transform values, CSA indexer cache-insert
-values, and indexer cache write/gather values.
-
-The nested values intentionally expose the narrower helper-operation bundles
-that TokenSpeed tests and references already consume, but callers should start
-from the single compressed sequence attention generator instead of constructing
-one generator per helper kernel.
-
-DeepSeek V4 inverse-RoPE FP8 quantization remains a separate generator because
-it is an output-projection preparation utility, not part of compressed
-attention input generation.
-
-### Merge State
-
-`AttentionMergeStateInputs` represents merging two partial attention outputs and
-their log-sum-exp states:
-
-```text
-lse_a_log2 = lse_a * lse_scale_log2
-lse_b_log2 = lse_b * lse_scale_log2
-lse_max = max(lse_a_log2, lse_b_log2)
-w_a = 2 ** (lse_a_log2 - lse_max)
-w_b = 2 ** (lse_b_log2 - lse_max)
-out = (out_a * w_a + out_b * w_b) / (w_a + w_b)
-lse = (lse_max + log2(w_a + w_b)) / lse_scale_log2
-```
-
-This operation is useful when an attention computation is split into partial
-contexts. It is independent of how those partial states were produced.
+Kernel-facing names such as `block_table`, `slot_mapping`,
+`kv_slot_mapping`, or `compressor_slot_mapping` should map back to these shared
+metadata concepts when their semantics match. Backend adapters are responsible
+for converting generated values into exact registry kwargs.
 
 ## Validation Contract
 
 The attention generators reject invalid operation inputs before returning
 values:
 
-- token totals must be non-negative
-- batch sizes, head counts, head dimensions, and page sizes must be positive
-- generated request-length metadata is internally consistent
-- cache configuration must match the requested cache layout
-- paged caches require consistent page-table configuration
-- MHA query heads must be compatible with KV heads for grouped attention
+- token totals must be non-negative;
+- batch sizes, head counts, head dimensions, and page sizes must be positive;
+- generated request-length metadata must be internally consistent;
+- cache configuration must match the requested cache layout;
+- paged caches require consistent page-table configuration;
+- MHA query heads must be compatible with KV heads for grouped attention;
 - MLA prefill references require matching Q/K dimensions and compatible
-  grouped K/V heads; MLA paged-decode references require valid page-table
-  metadata and compressed cache rows with one cached KV row per logical token
-- GDN QKV split inputs require positive head counts/dimensions, a packed last
-  dimension equal to `q_dim + k_dim + v_dim`, and a positive L2-normalization
-  epsilon when the fused normalization path is used
-- packed QKV complex-rotary inputs require equal Q/K/V packed widths, an even
-  head dimension, and complex frequencies with one value per token and channel
-  pair
-- DSA sparse top-k slot inputs require int32 local offsets, sequence lengths,
-  and block tables with one row per token and enough page columns to cover the
-  generated local context lengths
-- DSA decode top-k inputs require floating pre-masked logits, int32 output
-  buffers, `topk <= vocab_size`, per-row valid lengths in `[topk, vocab_size]`,
-  finite logits before each valid length, and `-inf` logits after each valid
-  length
-- DSA sparse decode KV pack inputs require BF16 source tensors, a 1-D integer
-  slot-location tensor with unique valid rows, a uint8 output buffer whose row
-  width matches the packed layout, a NoPE dimension that is a power of two and
-  divisible by 128, and a RoPE dimension that is a power of two
-- MLA K/V pack inputs require matching token/head dimensions for `k_nope` and
-  `v`, positive inverse scales, a broadcastable RoPE key tensor, and an FP8
-  output dtype
-- MLA FP8 prefill inputs require tied non-empty Q and K/V request lengths, FP8
-  Q/K/V storage, matching head counts, matching Q/K head dimensions, and a
-  positive softmax scale
-- compressed sequence attention inputs require tied Q/KV request lengths, the
-  currently supported DeepSeek V4-style 512-wide attention-head layout with a
-  64-channel RoPE suffix, positive paged-cache dimensions, and page tables wide
-  enough for the generated visible KV positions
-- compressed-history inputs require `compress_ratio` equal to 4 for CSA or 128
-  for HCA; CSA requires overlapping compressor state, and HCA requires
-  non-overlapping compressor state
-- CSA indexer inputs require compressed-history inputs with
-  `compress_ratio == 4`, valid MXFP4 indexer-cache layouts, and generated
-  slot mappings that avoid out-of-bounds cache accesses
-- DeepSeek V4 inverse-RoPE FP8 quantization inputs require grouped head counts
-  matching the attention-output head dimension, an even rotary suffix, a head
-  dimension divisible by the quantization group size, and a rotary suffix that
-  fits in the final quantization group
-- merge-state outputs must have shape `[total_q, num_heads, head_dim]`
-- merge-state LSE tensors must have shape `[total_q, num_heads]` and use fp32
-  generated values
-- merge-state `lse_scale_log2` and generated LSE bounds must be positive
+  grouped K/V heads;
+- DSA sparse packing and slot-mapping configs require integer slot metadata,
+  valid packed row widths, and no out-of-bounds cache addresses;
+- CSA compressed-history and indexer configs require supported compression
+  ratios, page metadata wide enough for visible KV positions, and cache/indexer
+  layouts that match the selected mode;
+- GDN packed split configs require positive head counts/dimensions and a packed
+  last dimension equal to `q_width + k_width + v_width`;
+- GDN chunked-prefill configs require consistent recurrent-state shapes,
+  positive chunk metadata, and valid per-sequence cumulative lengths.
 
-Metadata-oriented values such as request lengths and page mappings are generated
-from metadata seeds. Numerical tensors are generated from value seeds so tests
-can reuse the same request/cache layout across different value draws.
-
-`MHARequestMetadataInput`, `PageTableInput`, and `SlotMappingInput` are the
-shared metadata primitives for attention-style generators. Use them for request
-lengths/cumulative offsets, page or block tables, and row-to-cache-slot
-mappings before adding operation-specific metadata generation. Many
-TokenSpeed-facing names are aliases for these concepts: `block_table` is a
-page table when it maps request-local pages to physical cache pages, and
-`slot_mapping`, `kv_slot_mapping`, and `compressor_slot_mapping` are flat slot
-mappings with different consumers.
+Metadata-oriented values such as request lengths and page mappings are
+generated from metadata seeds. Numerical tensors are generated from value seeds
+so tests can reuse the same request/cache layout across different value draws.
 
 ## TokenSpeed API Mapping
 
-TokenSpeed has several attention registry entry points: MHA prefill, MHA
-extend/decode with KV cache, MLA prefill, MLA decode with KV cache, and
-attention merge-state. TokenSpeed also exposes GDN QKV split, packed QKV rotary,
-DSA sparse decode KV packing, DSA sparse slot conversion, deterministic DSA
-decode top-k selection, and helpers that map directly to
-`GDNQKVSplitInputValues`, `PackedQKVComplexRotaryInputValues`,
-`DSASparseDecodeKVPackInputValues`, `DSATopKSlotInputValues`,
-and `DSADecodeTopKInputValues`.
-
-Compressed sequence attention tests should start from
-`CompressedSequenceAttentionInputValues`. Its nested `sliding_window`,
-`compressed`, and `indexer` values contain the narrower bundles consumed by
-TokenSpeed's SWA, HCA, CSA, indexer, cache-insert, cache-gather, and sparse
-index helpers for DeepSeek V4-style kernels. The DeepSeek V4 inverse-RoPE FP8
-quantization helper remains a separate utility and consumes
-`DeepSeekV4InvRoPEFP8QuantInputValues`.
+TokenSpeed exposes several helper kernels whose input bundles are narrower than
+the five family generators. Tests should construct the corresponding family
+generator and then use the nested generated values required by the helper
+kernel. For example, DSA sparse decode packing comes from `DSAInputs`, GDN QKV
+split comes from `GDNInputs`, and DeepSeek V4-style compressed-cache/indexer
+helpers come from `CSAInputs`.
 
 Generator values are operation-level values. Tests or adapters are responsible
 for converting generated values into the exact keyword arguments expected by a

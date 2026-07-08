@@ -38,9 +38,9 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mla_prefill_kwargs,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_numerics_input_generators.attention import _AttentionMergeStateGenerator
 from tokenspeed_numerics_input_generators import (
     AttentionMergeStateInputConfig,
-    AttentionMergeStateInputs,
     MHAInputConfig,
     MHAInputs,
     MHARequestMetadataInputConfig,
@@ -450,7 +450,7 @@ def test_attn_merge_state(
 ) -> None:
     require("attention", "attn_merge_state", solution, dtype, "out_a")
 
-    values = AttentionMergeStateInputs(
+    values = _AttentionMergeStateGenerator(
         AttentionMergeStateInputConfig(
             total_q=31,
             num_heads=num_heads,
