@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Sparse DSA row layout and top-k slot kernels."""
+"""DeepSeek sparse attention row layout and top-k slot kernels."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def _sparse_decode_row_bytes(nope_dim: int, rope_dim: int) -> int:
     rope_dim = int(rope_dim)
     if nope_dim % _FP8_QUANT_BLOCK != 0:
         raise ValueError(
-            "DSA sparse decode NoPE dim must be divisible by "
+            "DeepSeek sparse attention decode NoPE dim must be divisible by "
             f"{_FP8_QUANT_BLOCK}, got {nope_dim}"
         )
     return (
@@ -140,24 +140,24 @@ def _prepare_pack_inputs(
     rope_dim = int(cache_k_rope.shape[1])
     if not _is_power_of_2(nope_dim) or not _is_power_of_2(rope_dim):
         raise ValueError(
-            "DSA sparse decode pack requires power-of-two NoPE/RoPE dims for "
+            "DeepSeek sparse attention pack requires power-of-two NoPE/RoPE dims for "
             f"Triton arange blocks, got nope_dim={nope_dim}, rope_dim={rope_dim}"
         )
     expected_row_bytes = _sparse_decode_row_bytes(nope_dim, rope_dim)
     if out.dim() != 2 or out.shape[1] != expected_row_bytes:
         raise ValueError(
-            "out must be [slots, row_bytes] for DSA sparse decode, got "
+            "out must be [slots, row_bytes] for DeepSeek sparse attention, got "
             f"{tuple(out.shape)}, expected row_bytes={expected_row_bytes}"
         )
     if cache_k_nope.shape[0] != loc.numel() or cache_k_rope.shape[0] != loc.numel():
         raise ValueError(
-            "DSA sparse decode pack token mismatch: "
+            "DeepSeek sparse attention pack token mismatch: "
             f"loc={loc.numel()}, nope={cache_k_nope.shape[0]}, "
             f"rope={cache_k_rope.shape[0]}"
         )
     if cache_k_nope.dtype != torch.bfloat16 or cache_k_rope.dtype != torch.bfloat16:
         raise TypeError(
-            "DSA sparse decode cache pack requires BF16 source tensors, got "
+            "DeepSeek sparse attention cache pack requires BF16 source tensors, got "
             f"nope={cache_k_nope.dtype}, rope={cache_k_rope.dtype}"
         )
     return cache_k_nope.contiguous(), cache_k_rope.contiguous(), nope_dim, rope_dim
@@ -181,7 +181,9 @@ def pack_sparse_decode_kv(
     if not (
         out.is_cuda and loc.is_cuda and cache_k_nope.is_cuda and cache_k_rope.is_cuda
     ):
-        raise RuntimeError("DSA sparse decode KV packing requires CUDA tensors.")
+        raise RuntimeError(
+            "DeepSeek sparse attention KV packing requires CUDA tensors."
+        )
 
     _pack_sparse_decode_kv_kernel[(loc.numel(),)](
         out,
@@ -329,7 +331,9 @@ def local_topk_to_global_slots(
         return global_slots, lens
 
     if not local_topk_offsets.is_cuda:
-        raise RuntimeError("DSA local top-k slot conversion requires CUDA tensors.")
+        raise RuntimeError(
+            "DeepSeek sparse attention local top-k slot conversion requires CUDA tensors."
+        )
 
     block_table = block_table.to(device=local_topk_offsets.device, dtype=torch.int32)
     if seq_lens is not None:
@@ -456,7 +460,7 @@ def full_context_topk_to_global_slots(
 
     if not seq_lens.is_cuda:
         raise RuntimeError(
-            "DSA full-context top-k slot conversion requires CUDA tensors."
+            "DeepSeek sparse attention full-context top-k slot conversion requires CUDA tensors."
         )
 
     _full_context_topk_to_global_slots_kernel[(num_tokens,)](

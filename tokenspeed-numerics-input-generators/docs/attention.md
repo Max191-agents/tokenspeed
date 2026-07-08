@@ -54,7 +54,7 @@ helper kernel.
 
 ### DSA
 
-`DSAInputs` represents dynamic sparse attention metadata and cache helper
+`DSAInputs` represents DeepSeek sparse attention metadata and cache helper
 inputs. Its configs cover:
 
 - sparse decode KV packing, where BF16 NoPE/RoPE key rows are packed into
@@ -114,8 +114,8 @@ values:
 - MHA query heads must be compatible with KV heads for grouped attention;
 - MLA prefill references require matching Q/K dimensions and compatible
   grouped K/V heads;
-- DSA sparse packing and slot-mapping configs require integer slot metadata,
-  valid packed row widths, and no out-of-bounds cache addresses;
+- DeepSeek sparse attention packing and slot-mapping configs require integer
+  slot metadata, valid packed row widths, and no out-of-bounds cache addresses;
 - CSA compressed-history and indexer configs require supported compression
   ratios, page metadata wide enough for visible KV positions, and cache/indexer
   layouts that match the selected mode;
@@ -133,9 +133,9 @@ so tests can reuse the same request/cache layout across different value draws.
 TokenSpeed exposes several helper kernels whose input bundles are narrower than
 the five family generators. Tests should construct the corresponding family
 generator and then use the nested generated values required by the helper
-kernel. For example, DSA sparse decode packing comes from `DSAInputs`, GDN QKV
-split comes from `GDNInputs`, and DeepSeek V4-style compressed-cache/indexer
-helpers come from `CSAInputs`.
+kernel. For example, DeepSeek sparse attention decode packing comes from
+`DSAInputs`, GDN QKV split comes from `GDNInputs`, and DeepSeek V4-style
+compressed-cache/indexer helpers come from `CSAInputs`.
 
 Generator values are operation-level values. Tests or adapters are responsible
 for converting generated values into the exact keyword arguments expected by a

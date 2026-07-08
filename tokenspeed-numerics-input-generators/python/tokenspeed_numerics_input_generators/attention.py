@@ -1762,7 +1762,7 @@ def dsa_sparse_decode_row_bytes(nope_dim: int, rope_dim: int) -> int:
     rope_dim = int(rope_dim)
     if nope_dim % _DSA_SPARSE_DECODE_FP8_QUANT_BLOCK != 0:
         raise ValueError(
-            "DSA sparse decode NoPE dim must be divisible by "
+            "DeepSeek sparse attention decode NoPE dim must be divisible by "
             f"{_DSA_SPARSE_DECODE_FP8_QUANT_BLOCK}, got {nope_dim}"
         )
     return (
@@ -1776,7 +1776,7 @@ def dsa_sparse_decode_row_bytes(nope_dim: int, rope_dim: int) -> int:
 
 @dataclass
 class DSASparseDecodeKVPackInputValues:
-    """Generated values for DSA sparse decode KV row packing.
+    """Generated values for DeepSeek sparse attention decode KV row packing.
 
     The represented output row layout is:
 
@@ -1793,7 +1793,7 @@ class DSASparseDecodeKVPackInputValues:
 
 @dataclass
 class DSASparseDecodeKVPackInputConfig:
-    """Initialization parameters for DSA sparse decode KV row packing.
+    """Initialization parameters for DeepSeek sparse attention KV row packing.
 
     The operation packs per-token sparse-decode K-cache rows into physical
     cache slots. Non-RoPE key channels are dynamically scaled per 128-channel
@@ -1831,7 +1831,7 @@ class DSASparseDecodeKVPackInputConfig:
 
 @dataclass(init=False)
 class _DSASparseDecodeKVPackGenerator(NumericsInputGenerator):
-    """Generator for DSA sparse decode KV row packing."""
+    """Generator for DeepSeek sparse attention decode KV row packing."""
 
     config: DSASparseDecodeKVPackInputConfig
     cache_k_nope_input: TensorInput | None
@@ -1903,7 +1903,9 @@ class _DSASparseDecodeKVPackGenerator(NumericsInputGenerator):
             device=target_device,
         ).values
         if cache_k_nope is None or cache_k_rope is None:
-            raise ValueError("DSA sparse decode K source tensors must be generated")
+            raise ValueError(
+                "DeepSeek sparse attention K source tensors must be generated"
+            )
 
         out = self._generate_out(seed=_child_seed(seed, 3), device=target_device)
         loc_seed = seed if metadata_seed is None else metadata_seed
@@ -2080,7 +2082,7 @@ def dsa_sparse_decode_kv_pack_reference(
 
 @dataclass
 class DSADecodeTopKInputValues:
-    """Generated values for deterministic DSA decode top-k selection."""
+    """Generated values for deterministic DeepSeek sparse attention top-k."""
 
     logits: torch.Tensor
     out: torch.Tensor
@@ -2090,12 +2092,12 @@ class DSADecodeTopKInputValues:
 
 @dataclass
 class DSADecodeTopKInputConfig:
-    """Initialization parameters for deterministic DSA decode top-k inputs.
+    """Initialization parameters for deterministic DeepSeek sparse attention top-k.
 
     The represented operation selects the top-k local context offsets from each
-    row of pre-masked DSA decode indexer logits. Logits beyond each row's valid
-    context length are set to ``-inf``. Ties are resolved by choosing the
-    smaller local offset first.
+    row of pre-masked DeepSeek sparse attention decode indexer logits. Logits
+    beyond each row's valid context length are set to ``-inf``. Ties are
+    resolved by choosing the smaller local offset first.
     """
 
     # Required: number of independent decode rows.
@@ -2127,7 +2129,7 @@ class DSADecodeTopKInputConfig:
 
 @dataclass(init=False)
 class _DSADecodeTopKGenerator(NumericsInputGenerator):
-    """Generator for deterministic DSA decode top-k logits and output buffers."""
+    """Generator for deterministic DeepSeek sparse attention top-k buffers."""
 
     config: DSADecodeTopKInputConfig
 
@@ -2269,7 +2271,7 @@ def _validate_dsa_decode_topk_values(values: DSADecodeTopKInputValues) -> None:
 
 
 def dsa_decode_topk_reference(values: DSADecodeTopKInputValues) -> torch.Tensor:
-    """Return stable top-k local offsets for pre-masked DSA decode logits."""
+    """Return stable top-k offsets for DeepSeek sparse attention decode logits."""
 
     _validate_dsa_decode_topk_values(values)
     logits_cpu = values.logits.detach().cpu().float()
@@ -2293,7 +2295,7 @@ def dsa_decode_topk_reference(values: DSADecodeTopKInputValues) -> torch.Tensor:
 
 @dataclass
 class DSATopKSlotInputValues:
-    """Generated values for DSA sparse top-k slot conversion."""
+    """Generated values for DeepSeek sparse attention top-k slot conversion."""
 
     local_topk_offsets: torch.Tensor
     seq_lens: torch.Tensor
@@ -2306,7 +2308,7 @@ class DSATopKSlotInputValues:
 
 @dataclass
 class DSATopKSlotInputConfig:
-    """Initialization parameters for DSA sparse top-k slot conversion.
+    """Initialization parameters for DeepSeek sparse attention slot conversion.
 
     The represented metadata operation maps per-token local offsets through a
     token-row page table. Local offsets address logical positions in the
@@ -2350,7 +2352,7 @@ class DSATopKSlotInputConfig:
 
 @dataclass(init=False)
 class _DSATopKSlotGenerator(NumericsInputGenerator):
-    """Generator for DSA sparse top-k slot-conversion metadata."""
+    """Generator for DeepSeek sparse attention top-k slot metadata."""
 
     config: DSATopKSlotInputConfig
     page_table_input: PageTableInput | None
@@ -2528,7 +2530,7 @@ def dsa_local_topk_to_global_slots_reference(
     *,
     use_seq_lens: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return global cache slots for generated DSA local top-k offsets."""
+    """Return global cache slots for DeepSeek sparse attention local offsets."""
 
     _validate_dsa_topk_slot_values(values)
     local = values.local_topk_offsets
@@ -8279,7 +8281,7 @@ class CSAInputs(NumericsInputGenerator):
 
 @dataclass(init=False)
 class DSAInputs(NumericsInputGenerator):
-    """Family generator for DSA sparse decode inputs."""
+    """Family generator for DeepSeek sparse attention inputs."""
 
     config: object
     _generator: NumericsInputGenerator
