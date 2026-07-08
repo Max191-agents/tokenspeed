@@ -81,36 +81,29 @@ from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
 )
 from tokenspeed_kernel.ops.attention.triton.qkv_rotary import packed_qkv_complex_rotary
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_numerics_input_generators.attention import (
-    _AttentionMergeStateGenerator,
-    _PackedQKVComplexRotaryGenerator,
-)
 from tokenspeed_numerics_input_generators import (
-    AttentionMergeStateInputConfig,
-    DeepSeekV4CompressorStateInputConfig,
+    AttentionMergeStateInputValues,
+    CSAHistoryConfig,
+    CSAIndexerConfig,
+    CSAInputConfig,
     CSAInputs,
-    DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig,
-    DeepSeekV4IndexerMXFP4CacheGatherInputConfig,
-    DeepSeekV4IndexerMXFP4CacheWriteInputConfig,
-    DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig,
-    DeepSeekV4InvRoPEFP8QuantInputConfig,
-    DeepSeekV4KCacheGatherInputConfig,
-    DeepSeekV4PagedIndexInputConfig,
-    DeepSeekV4SparseCompressCacheInsertInputConfig,
-    DeepSeekV4SparsePrefillIndexInputConfig,
-    DSADecodeTopKInputConfig,
+    DeepSeekV4InvRoPEFP8QuantInputValues,
+    DSADecodeTopKInputValues,
+    DSAInputConfig,
+    DSAInputValues,
     DSAInputs,
-    DSASparseDecodeKVPackInputConfig,
-    DSATopKSlotInputConfig,
-    GDNChunkPrefillInputConfig,
+    DSASparseDecodeKVPackInputValues,
+    DSATopKSlotInputValues,
+    GDNInputConfig,
+    GDNInputValues,
     GDNInputs,
-    GDNQKVSplitInputConfig,
+    GDNQKVSplitInputValues,
     MHAInputConfig,
     MHAInputs,
     MHARequestMetadataInputConfig,
     MLAInputConfig,
     MLAInputs,
-    PackedQKVComplexRotaryInputConfig,
+    PackedQKVComplexRotaryInputValues,
     attention_merge_state_reference,
     deepseek_v4_build_dense_prefill_local_compressed_indices_reference,
     deepseek_v4_combine_dense_swa_indices_reference,
@@ -220,6 +213,263 @@ def _mla_config(
     )
 
 
+def _rng_device(device: str | torch.device) -> str:
+    return "cuda" if torch.device(device).type == "cuda" else "cpu"
+
+
+def _attention_merge_state_values(
+    *,
+    total_q: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+    lse_scale_log2: float = math.log2(math.e),
+    lse_bound: float = 6.0,
+) -> AttentionMergeStateInputValues:
+    generator = torch.Generator(device=_rng_device(device)).manual_seed(seed)
+    out_shape = (total_q, num_heads, head_dim)
+    lse_shape = (total_q, num_heads)
+    return AttentionMergeStateInputValues(
+        out_a=torch.randn(
+            out_shape,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        ).contiguous(),
+        lse_a=(
+            torch.rand(
+                lse_shape,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            * (2.0 * lse_bound)
+            - lse_bound
+        ).contiguous(),
+        out_b=torch.randn(
+            out_shape,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        ).contiguous(),
+        lse_b=(
+            torch.rand(
+                lse_shape,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            * (2.0 * lse_bound)
+            - lse_bound
+        ).contiguous(),
+        lse_scale_log2=lse_scale_log2,
+    )
+
+
+def _gdn_qkv_split_values(
+    values: GDNInputValues,
+    *,
+    fuse_l2norm: bool,
+) -> GDNQKVSplitInputValues:
+    q = values.q.squeeze(0) if values.q.ndim == 4 else values.q
+    k = values.k.squeeze(0) if values.k.ndim == 4 else values.k
+    v = values.v.squeeze(0) if values.v.ndim == 4 else values.v
+    return GDNQKVSplitInputValues(
+        mixed_qkv=torch.cat(
+            [
+                q.reshape(q.shape[0], -1),
+                k.reshape(k.shape[0], -1),
+                v.reshape(v.shape[0], -1),
+            ],
+            dim=-1,
+        ).contiguous(),
+        num_q_heads=q.shape[1],
+        num_k_heads=k.shape[1],
+        num_v_heads=v.shape[1],
+        head_q=q.shape[2],
+        head_k=k.shape[2],
+        head_v=v.shape[2],
+        fuse_l2norm=fuse_l2norm,
+        l2norm_eps=1.0e-6,
+    )
+
+
+def _packed_qkv_complex_rotary_values(
+    *,
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    copy_v: bool,
+    seed: int,
+    device: str,
+) -> PackedQKVComplexRotaryInputValues:
+    mha_values = MHAInputs(
+        _mha_config(
+            batch_size=1,
+            total_cached_tokens=0,
+            total_new_q_tokens=num_tokens,
+            num_q_heads=num_heads,
+            num_kv_heads=num_heads,
+            head_dim=head_dim,
+            q_dtype=dtype,
+            metadata_kwargs={"new_q_length_mode": "fixed_per_request"},
+        )
+    ).generate(seed=seed, device=device)
+    if mha_values.k is None or mha_values.v is None:
+        raise ValueError("packed QKV adapter requires generated K and V")
+    qkv = torch.cat(
+        [
+            mha_values.q.reshape(num_tokens, -1),
+            mha_values.k.reshape(num_tokens, -1),
+            mha_values.v.reshape(num_tokens, -1),
+        ],
+        dim=-1,
+    ).contiguous()
+    generator = torch.Generator(device=_rng_device(device)).manual_seed(seed + 1)
+    angles = (
+        torch.rand(
+            (num_tokens, head_dim // 2),
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        )
+        * (2.0 * math.pi)
+        - math.pi
+    )
+    return PackedQKVComplexRotaryInputValues(
+        qkv=qkv,
+        freqs_cis=torch.complex(torch.cos(angles), torch.sin(angles)).contiguous(),
+        num_heads=num_heads,
+        head_dim=head_dim,
+        copy_v=copy_v,
+    )
+
+
+def _dsa_pack_values(values: DSAInputValues) -> DSASparseDecodeKVPackInputValues:
+    return DSASparseDecodeKVPackInputValues(
+        out=values.packed_kv_out,
+        loc=values.slot_mapping,
+        cache_k_nope=values.cache_k_nope,
+        cache_k_rope=values.cache_k_rope,
+    )
+
+
+def _dsa_topk_values(values: DSAInputValues) -> DSADecodeTopKInputValues:
+    return DSADecodeTopKInputValues(
+        logits=values.logits,
+        out=values.topk_out,
+        valid_lens=values.valid_lens,
+        topk=values.topk,
+    )
+
+
+def _dsa_slot_values(values: DSAInputValues) -> DSATopKSlotInputValues:
+    return DSATopKSlotInputValues(
+        local_topk_offsets=values.local_topk_offsets,
+        seq_lens=values.seq_lens,
+        block_table=values.block_table,
+        block_table_cpu=values.block_table_cpu,
+        block_table_values=values.block_table_values,
+        block_size=values.block_size,
+        topk=values.topk,
+    )
+
+
+def _csa_values(
+    *,
+    batch_size: int = 3,
+    total_cached_tokens: int = 18,
+    total_new_q_tokens: int = 9,
+    dtype: torch.dtype = torch.float32,
+    num_q_heads: int = 4,
+    page_size: int = 4,
+    window_size: int = 8,
+    compress_ratio: int = 4,
+    topk: int = 4,
+    include_indexer: bool = False,
+    include_valid_token_mask: bool = False,
+    include_block_table_base_offsets: bool = False,
+    seed: int = 209,
+    device: str = "cpu",
+):
+    compressed = CSAHistoryConfig(
+        compress_ratio=compress_ratio,
+        topk=topk,
+        num_state_cache_blocks=max(1, batch_size),
+        compressor_block_size=4 if compress_ratio == 4 else 8,
+        num_kv_cache_blocks=max(1, batch_size),
+        kv_cache_block_size=page_size,
+        include_valid_token_mask=include_valid_token_mask,
+        include_block_table_base_offsets=include_block_table_base_offsets,
+    )
+    indexer = None
+    if include_indexer:
+        indexer = CSAIndexerConfig(
+            num_heads=num_q_heads,
+            num_state_cache_blocks=max(1, batch_size),
+            compressor_block_size=4,
+            num_kv_cache_blocks=max(1, batch_size),
+            kv_cache_block_size=page_size,
+            num_cache_blocks=max(1, batch_size),
+            block_size=page_size,
+        )
+    return CSAInputs(
+        CSAInputConfig(
+            batch_size=batch_size,
+            total_cached_tokens=total_cached_tokens,
+            total_new_q_tokens=total_new_q_tokens,
+            dtype=dtype,
+            num_q_heads=num_q_heads,
+            page_size=page_size,
+            window_size=window_size,
+            compressed=compressed,
+            indexer=indexer,
+            indexing="identity",
+            metadata_input=MHARequestMetadataInputConfig(
+                batch_size=batch_size,
+                total_cached_tokens=total_cached_tokens,
+                total_new_q_tokens=total_new_q_tokens,
+                cache_layout="paged",
+                cached_length_mode="regular",
+                new_q_length_mode="fixed_per_request",
+            ),
+        )
+    ).generate(seed=seed, device=device)
+
+
+def _inv_rope_fp8_quant_values_from_csa(
+    *,
+    seed: int,
+    device: str,
+) -> DeepSeekV4InvRoPEFP8QuantInputValues:
+    values = _csa_values(
+        batch_size=1,
+        total_cached_tokens=4,
+        total_new_q_tokens=5,
+        dtype=torch.bfloat16,
+        num_q_heads=4,
+        include_indexer=True,
+        seed=seed,
+        device=device,
+    )
+    if values.indexer is None:
+        raise ValueError("inverse RoPE adapter requires CSA indexer values")
+    return DeepSeekV4InvRoPEFP8QuantInputValues(
+        o=values.sliding_window.q,
+        positions=values.sliding_window.positions.to(torch.int64),
+        cos_sin_cache=values.indexer.q_rope_hadamard_mxfp4.cos_sin_cache,
+        n_groups=2,
+        heads_per_group=2,
+        nope_dim=448,
+        rope_dim=64,
+        quant_group_size=128,
+        tma_aligned_scales=True,
+    )
+
+
 def _skip_if_attention_extension_unavailable(exc: BaseException) -> None:
     message = str(exc)
     skip_fragments = (
@@ -251,14 +501,14 @@ def test_attention_merge_state_generator_runs_triton_kernel(
     solution = "triton"
     require("attention", "attn_merge_state", solution, dtype, "out_a")
 
-    values = _AttentionMergeStateGenerator(
-        AttentionMergeStateInputConfig(
-            total_q=31,
-            num_heads=8,
-            head_dim=64,
-            dtype=dtype,
-        )
-    ).generate(seed=301, device=device)
+    values = _attention_merge_state_values(
+        total_q=31,
+        num_heads=8,
+        head_dim=64,
+        dtype=dtype,
+        seed=301,
+        device=device,
+    )
     expected_out, expected_lse = attention_merge_state_reference(values)
 
     out, lse = attn_merge_state(
@@ -570,19 +820,17 @@ def test_gdn_qkv_split_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for GDN QKV split Triton test")
 
-    values = GDNInputs(
-        GDNQKVSplitInputConfig(
-            num_tokens=13,
-            num_q_heads=4,
-            num_k_heads=2,
-            num_v_heads=2,
-            head_q=16,
-            head_k=16,
-            head_v=16,
+    gdn_values = GDNInputs(
+        GDNInputConfig(
+            batch_size=1,
+            total_tokens=13,
+            num_q_heads=2,
+            num_v_heads=4,
+            head_dim=16,
             dtype=torch.bfloat16,
-            fuse_l2norm=fuse_l2norm,
         )
     ).generate(seed=208, device=device)
+    values = _gdn_qkv_split_values(gdn_values, fuse_l2norm=fuse_l2norm)
     expected_q, expected_k, expected_v = gdn_qkv_split_reference(values)
 
     actual_q, actual_k, actual_v = fused_qkv_split_gdn_prefill(
@@ -613,7 +861,7 @@ def test_gdn_chunk_prefill_generator_runs_tokenspeed_flashinfer(device: str) -> 
         pytest.skip("CUDA GPU is required for FlashInfer GDN chunk-prefill test")
 
     values = GDNInputs(
-        GDNChunkPrefillInputConfig(
+        GDNInputConfig(
             batch_size=2,
             total_tokens=32,
             num_q_heads=2,
@@ -659,15 +907,15 @@ def test_packed_qkv_complex_rotary_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for packed QKV rotary Triton test")
 
-    values = _PackedQKVComplexRotaryGenerator(
-        PackedQKVComplexRotaryInputConfig(
-            num_tokens=17,
-            num_heads=4,
-            head_dim=16,
-            dtype=torch.bfloat16,
-            copy_v=copy_v,
-        )
-    ).generate(seed=211, device=device)
+    values = _packed_qkv_complex_rotary_values(
+        num_tokens=17,
+        num_heads=4,
+        head_dim=16,
+        dtype=torch.bfloat16,
+        copy_v=copy_v,
+        seed=211,
+        device=device,
+    )
     expected_q, expected_k, expected_v = packed_qkv_complex_rotary_reference(values)
     q_size = values.num_heads * values.head_dim
     kv_size = q_size
@@ -702,15 +950,21 @@ def test_dsa_sparse_decode_kv_pack_generator_runs_tokenspeed_triton(
             "CUDA/ROCm GPU is required for dynamic sparse attention pack Triton test"
         )
 
-    values = DSAInputs(
-        DSASparseDecodeKVPackInputConfig(
+    dsa_values = DSAInputs(
+        DSAInputConfig(
             num_tokens=7,
             num_slots=11,
             nope_dim=128,
             rope_dim=64,
+            vocab_size=16,
+            topk=4,
+            block_size=8,
+            max_pages_per_token=4,
+            dtype=torch.float32,
             include_head_axis=include_head_axis,
         )
     ).generate(seed=213, metadata_seed=214, device=device)
+    values = _dsa_pack_values(dsa_values)
     expected = dsa_sparse_decode_kv_pack_reference(values)
     actual = values.out.clone()
 
@@ -751,15 +1005,21 @@ def test_dsa_topk_slot_generator_runs_tokenspeed_triton(
             "CUDA/ROCm GPU is required for dynamic sparse attention top-k slot test"
         )
 
-    values = DSAInputs(
-        DSATopKSlotInputConfig(
+    dsa_values = DSAInputs(
+        DSAInputConfig(
             num_tokens=7,
+            num_slots=11,
+            nope_dim=128,
+            rope_dim=64,
+            vocab_size=32,
             topk=6,
             block_size=8,
             max_pages_per_token=4,
             max_seq_len=24,
+            dtype=torch.float32,
         )
     ).generate(seed=212, device=device)
+    values = _dsa_slot_values(dsa_values)
 
     expected_local_slots, expected_local_lens = (
         dsa_local_topk_to_global_slots_reference(values)
@@ -795,16 +1055,22 @@ def test_dsa_decode_topk_generator_runs_flashinfer_kernel(device: str) -> None:
             "and flashinfer"
         )
 
-    values = DSAInputs(
-        DSADecodeTopKInputConfig(
-            num_rows=5,
+    dsa_values = DSAInputs(
+        DSAInputConfig(
+            num_tokens=5,
+            num_slots=8,
+            nope_dim=128,
+            rope_dim=64,
             vocab_size=32,
             topk=6,
+            block_size=8,
+            max_pages_per_token=4,
             dtype=torch.float32,
             min_valid_len=8,
             max_valid_len=32,
         )
     ).generate(seed=213, device=device)
+    values = _dsa_topk_values(dsa_values)
     expected = dsa_decode_topk_reference(values)
 
     deterministic_decode_topk(values.logits, values.out, values.topk)
@@ -814,27 +1080,13 @@ def test_dsa_decode_topk_generator_runs_flashinfer_kernel(device: str) -> None:
 
 
 def test_deepseek_v4_global_topk_generator_runs_tokenspeed_cpu() -> None:
-    values = CSAInputs(
-        DeepSeekV4PagedIndexInputConfig(
-            batch_size=3,
-            total_cached_tokens=18,
-            total_new_q_tokens=9,
-            block_size=4,
-            compress_ratio=3,
-            window_size=8,
-            topk=4,
-            include_valid_token_mask=True,
-            invalid_token_probability=0.5,
-            metadata_input=MHARequestMetadataInputConfig(
-                batch_size=3,
-                total_cached_tokens=18,
-                total_new_q_tokens=9,
-                cache_layout="paged",
-                cached_length_mode="regular",
-                new_q_length_mode="fixed_per_request",
-            ),
-        )
-    ).generate(seed=209, device="cpu")
+    csa_values = _csa_values(
+        include_valid_token_mask=True,
+        seed=209,
+        device="cpu",
+    )
+    assert csa_values.compressed is not None
+    values = csa_values.compressed.paged_index
     expected_indices, expected_lens = (
         deepseek_v4_compute_global_topk_indices_and_lens_reference(values)
     )
@@ -857,17 +1109,16 @@ def test_deepseek_v4_compressor_state_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton compressor-state test")
 
-    values = CSAInputs(
-        DeepSeekV4CompressorStateInputConfig(
-            num_tokens=6,
-            state_width=16,
-            num_cache_blocks=2,
-            block_size=4,
-            compress_ratio=4,
-            dtype=torch.bfloat16,
-            invalid_token_count=1,
-        )
-    ).generate(seed=2091, device=device)
+    csa_values = _csa_values(
+        batch_size=2,
+        total_cached_tokens=8,
+        total_new_q_tokens=6,
+        dtype=torch.bfloat16,
+        seed=2091,
+        device=device,
+    )
+    assert csa_values.compressed is not None
+    values = csa_values.compressed.compressor_state
     expected = deepseek_v4_save_compressor_state_reference(values)
     actual = values.state_cache.clone()
 
@@ -892,16 +1143,20 @@ def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_generator_runs_tokenspeed_tri
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton indexer-Q MXFP4 test")
 
-    values = CSAInputs(
-        DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
-            num_tokens=4,
-            num_heads=3,
-            dtype=torch.bfloat16,
-            max_position=32,
-            softmax_scale=0.25,
-            head_scale=2.0,
-        )
-    ).generate(seed=2092, device=device)
+    csa_values = _csa_values(
+        batch_size=1,
+        total_cached_tokens=4,
+        total_new_q_tokens=4,
+        dtype=torch.bfloat16,
+        num_q_heads=3,
+        include_indexer=True,
+        seed=2092,
+        device=device,
+    )
+    assert csa_values.indexer is not None
+    values = csa_values.indexer.q_rope_hadamard_mxfp4
+    values.softmax_scale = 0.25
+    values.head_scale = 2.0
     values.index_q.zero_()
     values.index_q[..., 0] = 4.0
     (expected_q_packed, expected_q_scale), expected_weights = (
@@ -931,16 +1186,7 @@ def test_deepseek_v4_inv_rope_fp8_quant_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton inverse-RoPE FP8 test")
 
-    values = CSAInputs(
-        DeepSeekV4InvRoPEFP8QuantInputConfig(
-            num_tokens=5,
-            n_groups=2,
-            heads_per_group=2,
-            dtype=torch.bfloat16,
-            max_position=32,
-            value_scale=0.25,
-        )
-    ).generate(seed=2093, device=device)
+    values = _inv_rope_fp8_quant_values_from_csa(seed=2093, device=device)
     expected_fp8, expected_scale = deepseek_v4_inv_rope_fp8_quant_reference(values)
 
     actual_fp8, actual_scale = deepseek_v4_fused_inv_rope_fp8_quant(
@@ -966,19 +1212,17 @@ def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_generator_runs_tokenspeed_tr
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton CSA indexer cache test")
 
-    values = CSAInputs(
-        DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
-            num_tokens=4,
-            batch_size=1,
-            max_seq_len=4,
-            num_state_cache_blocks=1,
-            compressor_block_size=4,
-            num_kv_cache_blocks=1,
-            kv_cache_block_size=4,
-            dtype=torch.bfloat16,
-            value_scale=0.0,
-        )
-    ).generate(seed=2094, device=device)
+    csa_values = _csa_values(
+        batch_size=1,
+        total_cached_tokens=4,
+        total_new_q_tokens=4,
+        dtype=torch.bfloat16,
+        include_indexer=True,
+        seed=2094,
+        device=device,
+    )
+    assert csa_values.indexer is not None
+    values = csa_values.indexer.cache_insert
     values.token_to_req_indices.zero_()
     values.positions.fill_(3)
     values.compressor_slot_mapping = torch.arange(4, dtype=torch.int64, device=device)
@@ -1017,21 +1261,16 @@ def test_deepseek_v4_sparse_compress_cache_insert_generator_runs_tokenspeed_trit
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton sparse-compress test")
 
-    values = CSAInputs(
-        DeepSeekV4SparseCompressCacheInsertInputConfig(
-            num_tokens=4,
-            batch_size=1,
-            max_seq_len=4,
-            num_state_cache_blocks=1,
-            compressor_block_size=4,
-            num_kv_cache_blocks=1,
-            kv_cache_block_size=4,
-            compress_ratio=4,
-            overlap=True,
-            dtype=torch.bfloat16,
-            value_scale=0.0,
-        )
-    ).generate(seed=2095, device=device)
+    csa_values = _csa_values(
+        batch_size=1,
+        total_cached_tokens=4,
+        total_new_q_tokens=4,
+        dtype=torch.bfloat16,
+        seed=2095,
+        device=device,
+    )
+    assert csa_values.compressed is not None
+    values = csa_values.compressed.cache_insert
     values.token_to_req_indices.zero_()
     values.positions.fill_(3)
     values.compressor_slot_mapping = torch.arange(4, dtype=torch.int64, device=device)
@@ -1071,16 +1310,17 @@ def test_deepseek_v4_indexer_mxfp4_cache_write_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton MXFP4 cache-write test")
 
-    values = CSAInputs(
-        DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
-            num_rows=5,
-            num_cache_blocks=2,
-            block_size=4,
-            dtype=torch.bfloat16,
-            negative_slot_count=1,
-            masked_row_count=1,
-        )
-    ).generate(seed=2092, device=device)
+    csa_values = _csa_values(
+        batch_size=2,
+        total_cached_tokens=8,
+        total_new_q_tokens=5,
+        dtype=torch.bfloat16,
+        include_indexer=True,
+        seed=2092,
+        device=device,
+    )
+    assert csa_values.indexer is not None
+    values = csa_values.indexer.cache_write
     expected = deepseek_v4_indexer_mxfp4_cache_write_reference(values)
     actual = values.cache_2d.clone()
 
@@ -1102,14 +1342,16 @@ def test_deepseek_v4_indexer_mxfp4_cache_gather_generator_runs_tokenspeed_triton
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton MXFP4 cache-gather test")
 
-    values = CSAInputs(
-        DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
-            num_rows=6,
-            num_cache_blocks=2,
-            block_size=4,
-            negative_slot_count=2,
-        )
-    ).generate(seed=2093, device=device)
+    csa_values = _csa_values(
+        batch_size=2,
+        total_cached_tokens=8,
+        total_new_q_tokens=6,
+        include_indexer=True,
+        seed=2093,
+        device=device,
+    )
+    assert csa_values.indexer is not None
+    values = csa_values.indexer.cache_gather
     expected_values, expected_scales = deepseek_v4_indexer_mxfp4_cache_gather_reference(
         values
     )
@@ -1135,17 +1377,16 @@ def test_deepseek_v4_k_cache_gather_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton K-cache gather test")
 
-    values = CSAInputs(
-        DeepSeekV4KCacheGatherInputConfig(
-            batch_size=3,
-            max_seq_len=9,
-            block_size=4,
-            max_gather_len=5,
-            offset=2,
-            include_gather_lens=True,
-            include_block_table_base_offsets=True,
-        )
-    ).generate(seed=2094, device=device)
+    csa_values = _csa_values(
+        batch_size=3,
+        total_cached_tokens=18,
+        total_new_q_tokens=9,
+        include_block_table_base_offsets=True,
+        seed=2094,
+        device=device,
+    )
+    assert csa_values.compressed is not None
+    values = csa_values.compressed.k_cache_gather
     expected = deepseek_v4_dequantize_and_gather_k_cache_reference(values)
     actual = values.out.clone()
 
@@ -1170,26 +1411,9 @@ def test_deepseek_v4_paged_index_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton paged-index tests")
 
-    values = CSAInputs(
-        DeepSeekV4PagedIndexInputConfig(
-            batch_size=3,
-            total_cached_tokens=18,
-            total_new_q_tokens=9,
-            block_size=4,
-            compress_ratio=3,
-            window_size=8,
-            topk=4,
-            indexing="identity",
-            metadata_input=MHARequestMetadataInputConfig(
-                batch_size=3,
-                total_cached_tokens=18,
-                total_new_q_tokens=9,
-                cache_layout="paged",
-                cached_length_mode="regular",
-                new_q_length_mode="fixed_per_request",
-            ),
-        )
-    ).generate(seed=210, device=device)
+    csa_values = _csa_values(seed=210, device=device)
+    assert csa_values.compressed is not None
+    values = csa_values.compressed.paged_index
 
     expected_topk_indices, expected_topk_lens = (
         deepseek_v4_compute_global_topk_indices_and_lens_reference(values)
@@ -1265,24 +1489,9 @@ def test_deepseek_v4_paged_index_generator_runs_tokenspeed_triton(
 
 
 def test_deepseek_v4_local_compressed_generator_runs_tokenspeed_cpu() -> None:
-    values = CSAInputs(
-        DeepSeekV4SparsePrefillIndexInputConfig(
-            batch_size=3,
-            total_cached_tokens=18,
-            total_new_q_tokens=9,
-            topk=4,
-            window_size=8,
-            compress_ratio=3,
-            metadata_input=MHARequestMetadataInputConfig(
-                batch_size=3,
-                total_cached_tokens=18,
-                total_new_q_tokens=9,
-                cache_layout="dense",
-                cached_length_mode="regular",
-                new_q_length_mode="fixed_per_request",
-            ),
-        )
-    ).generate(seed=207, device="cpu")
+    csa_values = _csa_values(seed=207, device="cpu")
+    assert csa_values.compressed is not None
+    values = csa_values.compressed.sparse_prefill_index
     out = torch.empty(
         values.positions.numel(),
         values.compressed_base,
@@ -1309,24 +1518,9 @@ def test_deepseek_v4_sparse_prefill_combine_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton sparse-prefill index tests")
 
-    values = CSAInputs(
-        DeepSeekV4SparsePrefillIndexInputConfig(
-            batch_size=3,
-            total_cached_tokens=18,
-            total_new_q_tokens=9,
-            topk=4,
-            window_size=8,
-            compress_ratio=3,
-            metadata_input=MHARequestMetadataInputConfig(
-                batch_size=3,
-                total_cached_tokens=18,
-                total_new_q_tokens=9,
-                cache_layout="dense",
-                cached_length_mode="regular",
-                new_q_length_mode="fixed_per_request",
-            ),
-        )
-    ).generate(seed=208, device=device)
+    csa_values = _csa_values(seed=208, device=device)
+    assert csa_values.compressed is not None
+    values = csa_values.compressed.sparse_prefill_index
 
     expected_topk_indices, expected_topk_lens = (
         deepseek_v4_combine_topk_swa_indices_reference(values)

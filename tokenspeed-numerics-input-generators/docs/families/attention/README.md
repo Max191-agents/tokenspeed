@@ -9,15 +9,16 @@ Attention input generation is organized around five operation families:
 - `CSAInputs`: compressed sequence attention. This includes sliding-window
   attention and optional compressed-history/indexer inputs for DeepSeek
   V4-style CSA/HCA paths.
-- `DSAInputs`: dynamic sparse attention helper inputs, including sparse
-  decode KV packing, sparse slot mapping, and deterministic decode top-k
-  selection.
-- `GDNInputs`: Gated DeltaNet inputs, including packed QKV split and chunked
-  prefill configurations.
+- `DSAInputs`: dynamic sparse attention decode values, including source K
+  rows, sparse-index logits, selected offsets, slot mappings, and page-table
+  metadata.
+- `GDNInputs`: Gated DeltaNet recurrent-scan values, including Q/K/V tensors,
+  gates, beta, initial state, and sequence metadata.
 
 These are the public attention-family generator entry points. Configuration
-objects select the concrete mode within each family, similar to how MHA and MLA
-configs select prefill, decode, cache layout, and ragged metadata behavior.
+objects configure operation-level shape, cache, and metadata relationships.
+Backend-specific helper-kernel argument bundles should be derived outside the
+generator package.
 
 ## Shared Components
 
@@ -34,6 +35,11 @@ Kernel-specific names such as `block_table`, `slot_mapping`,
 `kv_slot_mapping`, or `compressor_slot_mapping` should map back to these shared
 metadata concepts when their semantics match. Kernel registry adapters are
 responsible for flattening generated values into backend-specific kwargs.
+
+Helper kernels are not separate generator families. For example, TokenSpeed
+tests can pack GDN Q/K/V into a QKV split input, adapt `DSAInputs` into sparse
+decode pack or top-k slot arguments, and pull DeepSeek V4-style cache/indexer
+helper values from `CSAInputs`.
 
 ## Generated Values
 

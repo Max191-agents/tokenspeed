@@ -59,7 +59,6 @@ from tokenspeed_numerics_input_generators.core import (
 from tokenspeed_numerics_input_generators.rotary import build_rope_cos_sin_cache
 
 __all__ = [
-    "AttentionMergeStateInputConfig",
     "AttentionMergeStateInputValues",
     "attention_generate",
     "attention_merge_state_reference",
@@ -71,57 +70,46 @@ __all__ = [
     "CSAIndexerConfig",
     "CSAIndexerValues",
     "CSASlidingWindowValues",
+    "DSAInputConfig",
+    "DSAInputValues",
     "DSAInputs",
-    "DSADecodeTopKInputConfig",
     "DSADecodeTopKInputValues",
     "dsa_decode_topk_reference",
-    "DSASparseDecodeKVPackInputConfig",
     "DSASparseDecodeKVPackInputValues",
-    "DSATopKSlotInputConfig",
     "DSATopKSlotInputValues",
     "dsa_sparse_decode_kv_pack_reference",
     "dsa_sparse_decode_row_bytes",
     "dsa_full_context_topk_to_global_slots_reference",
     "dsa_local_topk_to_global_slots_reference",
     "GDNInputs",
-    "GDNQKVSplitInputConfig",
+    "GDNInputConfig",
+    "GDNInputValues",
     "GDNQKVSplitInputValues",
-    "GDNChunkPrefillInputConfig",
     "GDNChunkPrefillInputValues",
     "GDNChunkPrefillReferenceValues",
     "gdn_chunk_prefill_reference",
     "gdn_qkv_split_reference",
-    "DeepSeekV4CompressorStateInputConfig",
     "DeepSeekV4CompressorStateInputValues",
     "deepseek_v4_save_compressor_state_reference",
-    "DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig",
     "DeepSeekV4IndexerQRoPEHadamardMXFP4InputValues",
     "deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference",
-    "DeepSeekV4InvRoPEFP8QuantInputConfig",
     "DeepSeekV4InvRoPEFP8QuantInputValues",
     "deepseek_v4_inv_rope_fp8_quant_reference",
-    "DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig",
     "DeepSeekV4CSAIndexerMXFP4CacheInsertInputValues",
     "deepseek_v4_csa_indexer_mxfp4_cache_insert_reference",
-    "DeepSeekV4SparseCompressCacheInsertInputConfig",
     "DeepSeekV4SparseCompressCacheInsertInputValues",
     "deepseek_v4_sparse_compress_cache_insert_reference",
-    "DeepSeekV4IndexerMXFP4CacheWriteInputConfig",
     "DeepSeekV4IndexerMXFP4CacheWriteInputValues",
     "deepseek_v4_indexer_mxfp4_cache_write_reference",
-    "DeepSeekV4IndexerMXFP4CacheGatherInputConfig",
     "DeepSeekV4IndexerMXFP4CacheGatherInputValues",
     "deepseek_v4_indexer_mxfp4_cache_gather_reference",
-    "DeepSeekV4KCacheGatherInputConfig",
     "DeepSeekV4KCacheGatherInputValues",
     "deepseek_v4_dequantize_and_gather_k_cache_reference",
-    "DeepSeekV4PagedIndexInputConfig",
     "DeepSeekV4PagedIndexValues",
     "deepseek_v4_compressed_slot_mapping_reference",
     "deepseek_v4_compute_global_topk_indices_and_lens_reference",
     "deepseek_v4_decode_swa_indices_and_lens_reference",
     "deepseek_v4_indexer_decode_metadata_reference",
-    "DeepSeekV4SparsePrefillIndexInputConfig",
     "DeepSeekV4SparsePrefillIndexValues",
     "deepseek_v4_build_dense_prefill_local_compressed_indices_reference",
     "deepseek_v4_combine_dense_swa_indices_reference",
@@ -136,7 +124,6 @@ __all__ = [
     "MLAInputs",
     "MLAReferenceValues",
     "mla_reference",
-    "PackedQKVComplexRotaryInputConfig",
     "PackedQKVComplexRotaryInputValues",
     "packed_qkv_complex_rotary_reference",
 ]
@@ -626,7 +613,7 @@ class AttentionMergeStateInputConfig:
 
 
 @dataclass(init=False)
-class _AttentionMergeStateGenerator(NumericsInputGenerator):
+class _AttentionMergeStateBuilder:
     """Generator for attention merge-state inputs."""
 
     config: AttentionMergeStateInputConfig
@@ -677,7 +664,7 @@ class _AttentionMergeStateGenerator(NumericsInputGenerator):
         self.__post_init__()
         if self.out_a_input is None or self.out_b_input is None:
             raise ValueError(
-                "_AttentionMergeStateGenerator child generators must be initialized"
+                "_AttentionMergeStateBuilder child generators must be initialized"
             )
         target_device = _resolve_device(self.config.device, device)
         lse_generator = torch.Generator(
@@ -831,7 +818,7 @@ class GDNQKVSplitInputConfig:
 
 
 @dataclass(init=False)
-class _GDNQKVSplitGenerator(NumericsInputGenerator):
+class _GDNQKVSplitBuilder:
     """Generator for packed GDN QKV split inputs."""
 
     config: GDNQKVSplitInputConfig
@@ -1076,17 +1063,21 @@ class GDNChunkPrefillInputConfig:
     device: DeviceLike = None
 
 
-@dataclass(init=False)
-class _GDNChunkPrefillGenerator(NumericsInputGenerator):
-    """Generator for gated-delta-rule chunked prefill inputs."""
+GDNInputValues = GDNChunkPrefillInputValues
+GDNInputConfig = GDNChunkPrefillInputConfig
 
-    config: GDNChunkPrefillInputConfig
+
+@dataclass(init=False)
+class GDNInputs(NumericsInputGenerator):
+    """Generator for core Gated DeltaNet recurrent attention inputs."""
+
+    config: GDNInputConfig
     q_input: TensorInput | None
     k_input: TensorInput | None
     v_input: TensorInput | None
     initial_state_input: TensorInput | None
 
-    def __init__(self, config: GDNChunkPrefillInputConfig) -> None:
+    def __init__(self, config: GDNInputConfig) -> None:
         self.config = config
         self.q_input = None
         self.k_input = None
@@ -1132,9 +1123,7 @@ class _GDNChunkPrefillGenerator(NumericsInputGenerator):
             or self.v_input is None
             or self.initial_state_input is None
         ):
-            raise ValueError(
-                "_GDNChunkPrefillGenerator child generators must be initialized"
-            )
+            raise ValueError("GDNInputs child generators must be initialized")
         metadata_seed, value_seed = _resolve_attention_seeds(
             seed=seed,
             metadata_seed=metadata_seed,
@@ -1613,7 +1602,7 @@ class PackedQKVComplexRotaryInputConfig:
 
 
 @dataclass(init=False)
-class _PackedQKVComplexRotaryGenerator(NumericsInputGenerator):
+class _PackedQKVComplexRotaryBuilder:
     """Generator for packed QKV complex rotary inputs."""
 
     config: PackedQKVComplexRotaryInputConfig
@@ -1830,7 +1819,7 @@ class DSASparseDecodeKVPackInputConfig:
 
 
 @dataclass(init=False)
-class _DSASparseDecodeKVPackGenerator(NumericsInputGenerator):
+class _DSASparseDecodeKVPackBuilder:
     """Generator for dynamic sparse attention decode KV row packing."""
 
     config: DSASparseDecodeKVPackInputConfig
@@ -1884,7 +1873,7 @@ class _DSASparseDecodeKVPackGenerator(NumericsInputGenerator):
         target_device = _resolve_device(self.config.device, device)
         if self.cache_k_nope_input is None or self.cache_k_rope_input is None:
             raise ValueError(
-                "_DSASparseDecodeKVPackGenerator child generators must be initialized"
+                "_DSASparseDecodeKVPackBuilder child generators must be initialized"
             )
 
         self.cache_k_nope_input.shape = self._source_shape(self.config.nope_dim)
@@ -2128,7 +2117,7 @@ class DSADecodeTopKInputConfig:
 
 
 @dataclass(init=False)
-class _DSADecodeTopKGenerator(NumericsInputGenerator):
+class _DSADecodeTopKBuilder:
     """Generator for deterministic dynamic sparse attention top-k buffers."""
 
     config: DSADecodeTopKInputConfig
@@ -2350,8 +2339,96 @@ class DSATopKSlotInputConfig:
     device: DeviceLike = None
 
 
+@dataclass
+class DSAInputValues:
+    """Generated core values for dynamic sparse attention.
+
+    The values describe the mathematical inputs shared by sparse decode KV
+    packing, decode top-k selection, and local-offset to cache-slot mapping.
+    Helper kernels can adapt these fields into their narrower argument lists.
+    """
+
+    cache_k_nope: torch.Tensor
+    cache_k_rope: torch.Tensor
+    packed_kv_out: torch.Tensor
+    slot_mapping: torch.Tensor
+    logits: torch.Tensor
+    topk_out: torch.Tensor
+    valid_lens: torch.Tensor
+    local_topk_offsets: torch.Tensor
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    block_table_cpu: list[list[int]]
+    block_table_values: PageTableValues
+    block_size: int
+    topk: int
+
+
+@dataclass
+class DSAInputConfig:
+    """Initialization parameters for ``DSAInputs``.
+
+    This config describes one dynamic sparse attention decode surface. It
+    generates source K rows, physical write slots, masked indexer logits,
+    selected local offsets, and page-table metadata. Helper kernels that only
+    need one subset should adapt from the generated values.
+    """
+
+    # Required: number of token rows represented by the generated values.
+    num_tokens: int
+
+    # Required: number of physical output rows available for sparse KV packing.
+    num_slots: int
+
+    # Required: non-RoPE key width. Must be a power of two and divisible by 128.
+    nope_dim: int
+
+    # Required: RoPE key width. Must be a power of two.
+    rope_dim: int
+
+    # Required: maximum number of local context offsets in each logit row.
+    vocab_size: int
+
+    # Required: number of selected offsets per token row.
+    topk: int
+
+    # Required: physical page size for local-offset to page/offset mapping.
+    block_size: int
+
+    # Required: page-table width per token row.
+    max_pages_per_token: int
+
+    # Required: generated logit dtype.
+    dtype: torch.dtype
+
+    # Optional: include singleton KV-head axis for generated source K tensors.
+    include_head_axis: bool = False
+
+    # Optional: minimum generated valid context length. Defaults to topk.
+    min_valid_len: int | None = None
+
+    # Optional: maximum generated valid context length. Defaults to vocab_size.
+    max_valid_len: int | None = None
+
+    # Optional: plant a deterministic equal-logit boundary case.
+    include_boundary_tie: bool = True
+
+    # Optional: upper bound for generated per-token sequence lengths. Defaults
+    # to max_pages_per_token * block_size.
+    max_seq_len: int | None = None
+
+    # Optional: physical-page assignment policy for the token-row page table.
+    indexing: PageTableIndexing = "random"
+
+    # Optional: nested page-table config override.
+    page_table_input: PageTableInputConfig | None = None
+
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
 @dataclass(init=False)
-class _DSATopKSlotGenerator(NumericsInputGenerator):
+class _DSATopKSlotBuilder:
     """Generator for dynamic sparse attention top-k slot metadata."""
 
     config: DSATopKSlotInputConfig
@@ -2790,7 +2867,7 @@ class CompressedSequenceAttentionInputConfig:
 
 
 @dataclass(init=False)
-class _CompressedSequenceAttentionGenerator(NumericsInputGenerator):
+class CSAInputs(NumericsInputGenerator):
     """Generator for compressed sequence attention inputs."""
 
     config: CompressedSequenceAttentionInputConfig
@@ -3210,7 +3287,7 @@ class _CompressedSequenceAttentionGenerator(NumericsInputGenerator):
             return None
         metadata_config = self._shared_metadata_config(cache_layout="paged")
         dense_metadata_config = self._shared_metadata_config(cache_layout="dense")
-        paged_index = _DeepSeekV4PagedIndexGenerator(
+        paged_index = _DeepSeekV4PagedIndexBuilder(
             DeepSeekV4PagedIndexInputConfig(
                 batch_size=self.config.batch_size,
                 total_cached_tokens=self.config.total_cached_tokens,
@@ -3228,7 +3305,7 @@ class _CompressedSequenceAttentionGenerator(NumericsInputGenerator):
                 device=self.config.device,
             )
         ).generate(seed=metadata_seed, device=device)
-        sparse_prefill_index = _DeepSeekV4SparsePrefillIndexGenerator(
+        sparse_prefill_index = _DeepSeekV4SparsePrefillIndexBuilder(
             DeepSeekV4SparsePrefillIndexInputConfig(
                 batch_size=self.config.batch_size,
                 total_cached_tokens=self.config.total_cached_tokens,
@@ -3245,7 +3322,7 @@ class _CompressedSequenceAttentionGenerator(NumericsInputGenerator):
             compressed.compress_ratio,
             self.config.total_cached_tokens + self.config.total_new_q_tokens,
         )
-        compressor_state = _DeepSeekV4CompressorStateGenerator(
+        compressor_state = _DeepSeekV4CompressorStateBuilder(
             DeepSeekV4CompressorStateInputConfig(
                 num_tokens=self.config.total_new_q_tokens,
                 state_width=_DEEPSEEK_V4_HEAD_DIM * (2 if compressed.overlap else 1),
@@ -3261,7 +3338,7 @@ class _CompressedSequenceAttentionGenerator(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 12),
             device=device,
         )
-        cache_insert = _DeepSeekV4SparseCompressCacheInsertGenerator(
+        cache_insert = _DeepSeekV4SparseCompressCacheInsertBuilder(
             DeepSeekV4SparseCompressCacheInsertInputConfig(
                 num_tokens=self.config.total_new_q_tokens,
                 batch_size=self.config.batch_size,
@@ -3287,7 +3364,7 @@ class _CompressedSequenceAttentionGenerator(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 13),
             device=device,
         )
-        k_cache_gather = _DeepSeekV4KCacheGatherGenerator(
+        k_cache_gather = _DeepSeekV4KCacheGatherBuilder(
             DeepSeekV4KCacheGatherInputConfig(
                 batch_size=self.config.batch_size,
                 max_seq_len=max_seq_len,
@@ -3327,7 +3404,7 @@ class _CompressedSequenceAttentionGenerator(NumericsInputGenerator):
         if compressed is None or indexer is None:
             return None
         max_seq_len = max(1, self.config.total_cached_tokens + self.config.total_new_q_tokens)
-        q_rope = _DeepSeekV4IndexerQRoPEHadamardMXFP4Generator(
+        q_rope = _DeepSeekV4IndexerQRoPEHadamardMXFP4Builder(
             DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
                 num_tokens=self.config.total_new_q_tokens,
                 num_heads=indexer.num_heads,
@@ -3343,7 +3420,7 @@ class _CompressedSequenceAttentionGenerator(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 20),
             device=device,
         )
-        cache_insert = _DeepSeekV4CSAIndexerMXFP4CacheInsertGenerator(
+        cache_insert = _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder(
             DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
                 num_tokens=self.config.total_new_q_tokens,
                 batch_size=self.config.batch_size,
@@ -3368,7 +3445,7 @@ class _CompressedSequenceAttentionGenerator(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 21),
             device=device,
         )
-        cache_write = _DeepSeekV4IndexerMXFP4CacheWriteGenerator(
+        cache_write = _DeepSeekV4IndexerMXFP4CacheWriteBuilder(
             DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
                 num_rows=self.config.total_new_q_tokens,
                 num_cache_blocks=indexer.num_cache_blocks,
@@ -3383,7 +3460,7 @@ class _CompressedSequenceAttentionGenerator(NumericsInputGenerator):
             value_seed=_child_seed(value_seed, 22),
             device=device,
         )
-        cache_gather = _DeepSeekV4IndexerMXFP4CacheGatherGenerator(
+        cache_gather = _DeepSeekV4IndexerMXFP4CacheGatherBuilder(
             DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
                 num_rows=self.config.total_new_q_tokens,
                 num_cache_blocks=indexer.num_cache_blocks,
@@ -3529,7 +3606,7 @@ class DeepSeekV4CompressorStateInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4CompressorStateGenerator(NumericsInputGenerator):
+class _DeepSeekV4CompressorStateBuilder:
     """Generator for DeepSeek V4 compressor-state save inputs."""
 
     config: DeepSeekV4CompressorStateInputConfig
@@ -3585,7 +3662,7 @@ class _DeepSeekV4CompressorStateGenerator(NumericsInputGenerator):
             or self.state_cache_input is None
         ):
             raise ValueError(
-                "_DeepSeekV4CompressorStateGenerator child generators must be initialized"
+                "_DeepSeekV4CompressorStateBuilder child generators must be initialized"
             )
         metadata_seed, value_seed = _resolve_attention_seeds(
             seed=seed,
@@ -3919,7 +3996,7 @@ class DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4IndexerQRoPEHadamardMXFP4Generator(NumericsInputGenerator):
+class _DeepSeekV4IndexerQRoPEHadamardMXFP4Builder:
     """Generator for DeepSeek V4 indexer-Q RoPE/Hadamard/MXFP4 inputs."""
 
     config: DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig
@@ -4323,7 +4400,7 @@ class DeepSeekV4InvRoPEFP8QuantInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4InvRoPEFP8QuantGenerator(NumericsInputGenerator):
+class _DeepSeekV4InvRoPEFP8QuantBuilder:
     """Generator for DeepSeek V4 inverse-RoPE FP8 output quantization inputs."""
 
     config: DeepSeekV4InvRoPEFP8QuantInputConfig
@@ -4704,7 +4781,7 @@ class DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4CSAIndexerMXFP4CacheInsertGenerator(NumericsInputGenerator):
+class _DeepSeekV4CSAIndexerMXFP4CacheInsertBuilder:
     """Generator for DeepSeek V4 CSA indexer MXFP4 cache-insert inputs."""
 
     config: DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig
@@ -5375,7 +5452,7 @@ class DeepSeekV4SparseCompressCacheInsertInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4SparseCompressCacheInsertGenerator(NumericsInputGenerator):
+class _DeepSeekV4SparseCompressCacheInsertBuilder:
     """Generator for DeepSeek V4 sparse-compress K-cache insert inputs."""
 
     config: DeepSeekV4SparseCompressCacheInsertInputConfig
@@ -6063,7 +6140,7 @@ class DeepSeekV4IndexerMXFP4CacheWriteInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4IndexerMXFP4CacheWriteGenerator(NumericsInputGenerator):
+class _DeepSeekV4IndexerMXFP4CacheWriteBuilder:
     """Generator for DeepSeek V4 indexer MXFP4 cache-write inputs."""
 
     config: DeepSeekV4IndexerMXFP4CacheWriteInputConfig
@@ -6416,7 +6493,7 @@ class DeepSeekV4IndexerMXFP4CacheGatherInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4IndexerMXFP4CacheGatherGenerator(NumericsInputGenerator):
+class _DeepSeekV4IndexerMXFP4CacheGatherBuilder:
     """Generator for DeepSeek V4 indexer MXFP4 cache-gather inputs."""
 
     config: DeepSeekV4IndexerMXFP4CacheGatherInputConfig
@@ -6687,7 +6764,7 @@ class DeepSeekV4KCacheGatherInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4KCacheGatherGenerator(NumericsInputGenerator):
+class _DeepSeekV4KCacheGatherBuilder:
     """Generator for DeepSeek V4 paged K-cache gather/dequantization inputs."""
 
     config: DeepSeekV4KCacheGatherInputConfig
@@ -7211,7 +7288,7 @@ class DeepSeekV4PagedIndexInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4PagedIndexGenerator(NumericsInputGenerator):
+class _DeepSeekV4PagedIndexBuilder:
     """Generator for DeepSeek V4 paged index metadata inputs."""
 
     config: DeepSeekV4PagedIndexInputConfig
@@ -7792,7 +7869,7 @@ class DeepSeekV4SparsePrefillIndexInputConfig:
 
 
 @dataclass(init=False)
-class _DeepSeekV4SparsePrefillIndexGenerator(NumericsInputGenerator):
+class _DeepSeekV4SparsePrefillIndexBuilder:
     """Generator for DeepSeek V4 sparse-prefill index-construction inputs."""
 
     config: DeepSeekV4SparsePrefillIndexInputConfig
@@ -8209,96 +8286,39 @@ CSAInputConfig = CompressedSequenceAttentionInputConfig
 CSAInputValues = CompressedSequenceAttentionInputValues
 CSASlidingWindowValues = CompressedSequenceAttentionSlidingWindowValues
 
-
-@dataclass(init=False)
-class CSAInputs(NumericsInputGenerator):
-    """Family generator for compressed sequence attention inputs.
-
-    ``CSAInputConfig`` is the canonical full-family configuration. The
-    DeepSeek V4 helper configs are accepted as TokenSpeed compatibility
-    configurations so helper-kernel tests use the CSA family entry point
-    without exposing one generator per helper.
-    """
-
-    config: object
-    _generator: NumericsInputGenerator
-
-    def __init__(self, config: object) -> None:
-        self.config = config
-        self._generator = self._make_generator(config)
-
-    @staticmethod
-    def _make_generator(config: object) -> NumericsInputGenerator:
-        if isinstance(config, CompressedSequenceAttentionInputConfig):
-            return _CompressedSequenceAttentionGenerator(config)
-        if isinstance(config, DeepSeekV4CompressorStateInputConfig):
-            return _DeepSeekV4CompressorStateGenerator(config)
-        if isinstance(config, DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig):
-            return _DeepSeekV4IndexerQRoPEHadamardMXFP4Generator(config)
-        if isinstance(config, DeepSeekV4InvRoPEFP8QuantInputConfig):
-            return _DeepSeekV4InvRoPEFP8QuantGenerator(config)
-        if isinstance(config, DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig):
-            return _DeepSeekV4CSAIndexerMXFP4CacheInsertGenerator(config)
-        if isinstance(config, DeepSeekV4SparseCompressCacheInsertInputConfig):
-            return _DeepSeekV4SparseCompressCacheInsertGenerator(config)
-        if isinstance(config, DeepSeekV4IndexerMXFP4CacheWriteInputConfig):
-            return _DeepSeekV4IndexerMXFP4CacheWriteGenerator(config)
-        if isinstance(config, DeepSeekV4IndexerMXFP4CacheGatherInputConfig):
-            return _DeepSeekV4IndexerMXFP4CacheGatherGenerator(config)
-        if isinstance(config, DeepSeekV4KCacheGatherInputConfig):
-            return _DeepSeekV4KCacheGatherGenerator(config)
-        if isinstance(config, DeepSeekV4PagedIndexInputConfig):
-            return _DeepSeekV4PagedIndexGenerator(config)
-        if isinstance(config, DeepSeekV4SparsePrefillIndexInputConfig):
-            return _DeepSeekV4SparsePrefillIndexGenerator(config)
-        raise TypeError(f"unsupported CSA input config: {type(config).__name__}")
-
-    def generate(
-        self,
-        *,
-        seed: int | None = None,
-        metadata_seed: int | None = None,
-        value_seed: int | None = None,
-        device: DeviceLike = None,
-    ) -> object:
-        if isinstance(
-            self._generator,
-            (_DeepSeekV4PagedIndexGenerator, _DeepSeekV4SparsePrefillIndexGenerator),
-        ):
-            resolved_seed = seed if seed is not None else metadata_seed
-            if resolved_seed is None:
-                resolved_seed = value_seed
-            if resolved_seed is None:
-                raise ValueError("seed is required for CSA metadata generation")
-            return self._generator.generate(seed=resolved_seed, device=device)
-        return self._generator.generate(
-            seed=seed,
-            metadata_seed=metadata_seed,
-            value_seed=value_seed,
-            device=device,
-        )
-
-
 @dataclass(init=False)
 class DSAInputs(NumericsInputGenerator):
     """Family generator for dynamic sparse attention inputs."""
 
-    config: object
-    _generator: NumericsInputGenerator
+    config: DSAInputConfig
+    cache_k_nope_input: TensorInput | None
+    cache_k_rope_input: TensorInput | None
+    page_table_input: PageTableInput | None
 
-    def __init__(self, config: object) -> None:
+    def __init__(self, config: DSAInputConfig) -> None:
         self.config = config
-        self._generator = self._make_generator(config)
+        self.cache_k_nope_input = None
+        self.cache_k_rope_input = None
+        self.page_table_input = None
+        self.__post_init__()
 
-    @staticmethod
-    def _make_generator(config: object) -> NumericsInputGenerator:
-        if isinstance(config, DSASparseDecodeKVPackInputConfig):
-            return _DSASparseDecodeKVPackGenerator(config)
-        if isinstance(config, DSADecodeTopKInputConfig):
-            return _DSADecodeTopKGenerator(config)
-        if isinstance(config, DSATopKSlotInputConfig):
-            return _DSATopKSlotGenerator(config)
-        raise TypeError(f"unsupported DSA input config: {type(config).__name__}")
+    def __post_init__(self) -> None:
+        self._normalize_config()
+        self.cache_k_nope_input = self.cache_k_nope_input or TensorInput(
+            self._source_shape(self.config.nope_dim),
+            torch.bfloat16,
+            device=self.config.device,
+        )
+        self.cache_k_rope_input = self.cache_k_rope_input or TensorInput(
+            self._source_shape(self.config.rope_dim),
+            torch.bfloat16,
+            device=self.config.device,
+        )
+        self.page_table_input = self.page_table_input or PageTableInput(
+            self.config.page_table_input or self._make_page_table_config()
+        )
+        self._verify_page_table_config_matches_parent()
+        self.config.page_table_input = self.page_table_input.config
 
     def generate(
         self,
@@ -8306,54 +8326,338 @@ class DSAInputs(NumericsInputGenerator):
         seed: int,
         metadata_seed: int | None = None,
         device: DeviceLike = None,
-    ) -> object:
-        if isinstance(self._generator, _DSASparseDecodeKVPackGenerator):
-            return self._generator.generate(
-                seed=seed,
-                metadata_seed=metadata_seed,
-                device=device,
+    ) -> DSAInputValues:
+        self.__post_init__()
+        if (
+            self.cache_k_nope_input is None
+            or self.cache_k_rope_input is None
+            or self.page_table_input is None
+        ):
+            raise ValueError("DSAInputs child generators must be initialized")
+        target_device = _resolve_device(self.config.device, device)
+        metadata_seed = seed if metadata_seed is None else metadata_seed
+
+        self.cache_k_nope_input.shape = self._source_shape(self.config.nope_dim)
+        self.cache_k_nope_input.dtype = torch.bfloat16
+        self.cache_k_nope_input.device = self.config.device
+        self.cache_k_rope_input.shape = self._source_shape(self.config.rope_dim)
+        self.cache_k_rope_input.dtype = torch.bfloat16
+        self.cache_k_rope_input.device = self.config.device
+
+        cache_k_nope = _require_tensor(
+            self.cache_k_nope_input.generate(
+                seed=_child_seed(seed, 1),
+                device=target_device,
+            ).values,
+            "cache_k_nope",
+        )
+        cache_k_rope = _require_tensor(
+            self.cache_k_rope_input.generate(
+                seed=_child_seed(seed, 2),
+                device=target_device,
+            ).values,
+            "cache_k_rope",
+        )
+        packed_kv_out = self._generate_packed_kv_out(
+            seed=_child_seed(seed, 3),
+            device=target_device,
+        )
+        slot_mapping = self._generate_slot_mapping(
+            seed=_child_seed(metadata_seed, 4),
+            device=target_device,
+        )
+        logits, valid_lens = self._generate_logits_and_lens(
+            seed=_child_seed(seed, 5),
+            metadata_seed=_child_seed(metadata_seed, 5),
+            device=target_device,
+        )
+        topk_out = torch.full(
+            (self.config.num_tokens, self.config.topk),
+            -1,
+            dtype=torch.int32,
+            device=target_device,
+        )
+        page_table_values = self._generate_page_table(
+            seed=_child_seed(metadata_seed, 6),
+            device=target_device,
+        )
+        seq_lens_cpu = self._generate_seq_lens(
+            seed=_child_seed(metadata_seed, 7),
+            max_seq_len=self._max_generated_seq_len(page_table_values),
+        )
+        local_topk_offsets = self._generate_local_topk_offsets(
+            seed=_child_seed(metadata_seed, 8),
+            seq_lens=seq_lens_cpu,
+        ).to(target_device)
+
+        values = DSAInputValues(
+            cache_k_nope=cache_k_nope,
+            cache_k_rope=cache_k_rope,
+            packed_kv_out=packed_kv_out,
+            slot_mapping=slot_mapping,
+            logits=logits,
+            topk_out=topk_out,
+            valid_lens=valid_lens,
+            local_topk_offsets=local_topk_offsets,
+            seq_lens=torch.tensor(
+                seq_lens_cpu,
+                dtype=torch.int32,
+                device=target_device,
+            ),
+            block_table=page_table_values.page_table,
+            block_table_cpu=page_table_values.page_table_cpu,
+            block_table_values=page_table_values,
+            block_size=self.config.block_size,
+            topk=self.config.topk,
+        )
+        self._validate_values(values)
+        return values
+
+    def _normalize_config(self) -> None:
+        self.config.num_tokens = _check_nonnegative(
+            "num_tokens",
+            self.config.num_tokens,
+        )
+        self.config.num_slots = _check_positive("num_slots", self.config.num_slots)
+        if self.config.num_tokens > self.config.num_slots:
+            raise ValueError(
+                "num_tokens must be <= num_slots so generated slot locations "
+                f"are unique, got num_tokens={self.config.num_tokens}, "
+                f"num_slots={self.config.num_slots}"
             )
-        return self._generator.generate(seed=seed, device=device)
+        self.config.nope_dim = _check_power_of_2("nope_dim", self.config.nope_dim)
+        if self.config.nope_dim % _DSA_SPARSE_DECODE_FP8_QUANT_BLOCK != 0:
+            raise ValueError(
+                "nope_dim must be divisible by "
+                f"{_DSA_SPARSE_DECODE_FP8_QUANT_BLOCK}, got {self.config.nope_dim}"
+            )
+        self.config.rope_dim = _check_power_of_2("rope_dim", self.config.rope_dim)
+        self.config.vocab_size = _check_positive("vocab_size", self.config.vocab_size)
+        self.config.topk = _check_positive("topk", self.config.topk)
+        if self.config.topk > self.config.vocab_size:
+            raise ValueError("topk must be <= vocab_size")
+        self.config.block_size = _check_positive("block_size", self.config.block_size)
+        self.config.max_pages_per_token = _check_positive(
+            "max_pages_per_token",
+            self.config.max_pages_per_token,
+        )
+        self.config.dtype = _check_float_dtype("dtype", self.config.dtype)
+        min_valid_len = (
+            self.config.topk
+            if self.config.min_valid_len is None
+            else _check_positive("min_valid_len", self.config.min_valid_len)
+        )
+        max_valid_len = (
+            self.config.vocab_size
+            if self.config.max_valid_len is None
+            else _check_positive("max_valid_len", self.config.max_valid_len)
+        )
+        if min_valid_len < self.config.topk:
+            raise ValueError("min_valid_len must be >= topk")
+        if max_valid_len > self.config.vocab_size:
+            raise ValueError("max_valid_len must be <= vocab_size")
+        if min_valid_len > max_valid_len:
+            raise ValueError("min_valid_len must be <= max_valid_len")
+        self.config.min_valid_len = min_valid_len
+        self.config.max_valid_len = max_valid_len
+        if self.config.max_seq_len is not None:
+            self.config.max_seq_len = _check_positive(
+                "max_seq_len",
+                self.config.max_seq_len,
+            )
+        self.config.indexing = _check_page_table_indexing(self.config.indexing)
 
+    def _source_shape(self, dim: int) -> tuple[int, ...]:
+        if self.config.include_head_axis:
+            return (self.config.num_tokens, 1, int(dim))
+        return (self.config.num_tokens, int(dim))
 
-@dataclass(init=False)
-class GDNInputs(NumericsInputGenerator):
-    """Family generator for Gated DeltaNet attention inputs."""
+    def _make_page_table_config(self) -> PageTableInputConfig:
+        return PageTableInputConfig(
+            batch_size=max(1, self.config.num_tokens),
+            max_pages_per_request=self.config.max_pages_per_token,
+            indexing=self.config.indexing,
+            device=self.config.device,
+        )
 
-    config: object
-    _generator: NumericsInputGenerator
+    def _verify_page_table_config_matches_parent(self) -> None:
+        if self.page_table_input is None:
+            raise ValueError("page_table_input must be initialized")
+        _check_matches(
+            parent_name="DSAInputConfig.num_tokens",
+            child_name="page_table_input.batch_size",
+            parent_value=max(1, self.config.num_tokens),
+            child_value=self.page_table_input.config.batch_size,
+        )
 
-    def __init__(self, config: object) -> None:
-        self.config = config
-        self._generator = self._make_generator(config)
-
-    @staticmethod
-    def _make_generator(config: object) -> NumericsInputGenerator:
-        if isinstance(config, GDNQKVSplitInputConfig):
-            return _GDNQKVSplitGenerator(config)
-        if isinstance(config, GDNChunkPrefillInputConfig):
-            return _GDNChunkPrefillGenerator(config)
-        raise TypeError(f"unsupported GDN input config: {type(config).__name__}")
-
-    def generate(
+    def _generate_packed_kv_out(
         self,
         *,
-        seed: int | None = None,
-        metadata_seed: int | None = None,
-        value_seed: int | None = None,
-        device: DeviceLike = None,
-    ) -> object:
-        if isinstance(self._generator, _GDNChunkPrefillGenerator):
-            return self._generator.generate(
-                seed=seed,
-                metadata_seed=metadata_seed,
-                value_seed=value_seed,
-                device=device,
-            )
-        if seed is None:
-            raise ValueError("seed is required for GDN QKV split generation")
-        return self._generator.generate(seed=seed, device=device)
+        seed: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        generator = _rng_for_device(device, seed)
+        row_bytes = dsa_sparse_decode_row_bytes(
+            self.config.nope_dim,
+            self.config.rope_dim,
+        )
+        return torch.randint(
+            0,
+            256,
+            (self.config.num_slots, row_bytes),
+            dtype=torch.uint8,
+            device=device,
+            generator=generator,
+        )
 
+    def _generate_slot_mapping(
+        self,
+        *,
+        seed: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        return torch.randperm(
+            self.config.num_slots,
+            dtype=torch.int64,
+            generator=generator,
+        )[: self.config.num_tokens].to(device)
+
+    def _generate_logits_and_lens(
+        self,
+        *,
+        seed: int,
+        metadata_seed: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        value_generator = _rng_for_device(device, seed)
+        logits = -1.0 - 3.0 * torch.rand(
+            (self.config.num_tokens, self.config.vocab_size),
+            dtype=torch.float32,
+            device=device,
+            generator=value_generator,
+        )
+        valid_lens = self._generate_valid_lens(seed=metadata_seed).to(device)
+        for row_idx, valid_len_tensor in enumerate(valid_lens.cpu()):
+            valid_len = int(valid_len_tensor.item())
+            if valid_len < self.config.vocab_size:
+                logits[row_idx, valid_len:] = -float("inf")
+            self._plant_topk_row(logits[row_idx], valid_len=valid_len)
+        return logits.to(self.config.dtype), valid_lens
+
+    def _generate_valid_lens(self, *, seed: int) -> torch.Tensor:
+        if self.config.num_tokens == 0:
+            return torch.empty((0,), dtype=torch.int32)
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        return torch.randint(
+            int(self.config.min_valid_len),
+            int(self.config.max_valid_len) + 1,
+            (self.config.num_tokens,),
+            dtype=torch.int32,
+            generator=rng,
+        )
+
+    def _plant_topk_row(self, row: torch.Tensor, *, valid_len: int) -> None:
+        if valid_len <= 0:
+            return
+        if self.config.include_boundary_tie and valid_len > self.config.topk:
+            for rank in range(self.config.topk - 1):
+                row[rank] = 32.0 - float(rank)
+            row[valid_len - 2] = 1.0
+            row[valid_len - 1] = 1.0
+            return
+        for rank in range(self.config.topk):
+            row[rank] = 32.0 - float(rank)
+
+    def _generate_page_table(
+        self,
+        *,
+        seed: int,
+        device: torch.device,
+    ) -> PageTableValues:
+        if self.page_table_input is None:
+            raise ValueError("page_table_input must be initialized")
+        self.page_table_input.config.batch_size = max(1, self.config.num_tokens)
+        self.page_table_input.config.max_pages_per_request = max(
+            self.page_table_input.config.max_pages_per_request,
+            self.config.max_pages_per_token,
+        )
+        self.page_table_input.config.indexing = self.config.indexing
+        return self.page_table_input.generate(seed=seed, device=device)
+
+    def _max_generated_seq_len(self, page_table_values: PageTableValues) -> int:
+        max_context_len = page_table_values.page_table.shape[1] * self.config.block_size
+        if self.config.max_seq_len is None:
+            return max_context_len
+        return min(self.config.max_seq_len, max_context_len)
+
+    def _generate_seq_lens(self, *, seed: int, max_seq_len: int) -> list[int]:
+        if self.config.num_tokens == 0:
+            return []
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        return torch.randint(
+            1,
+            max_seq_len + 1,
+            (self.config.num_tokens,),
+            dtype=torch.int32,
+            generator=rng,
+        ).tolist()
+
+    def _generate_local_topk_offsets(
+        self,
+        *,
+        seed: int,
+        seq_lens: list[int],
+    ) -> torch.Tensor:
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        local_topk = torch.full(
+            (self.config.num_tokens, self.config.topk),
+            -1,
+            dtype=torch.int32,
+        )
+        for token_idx, seq_len in enumerate(seq_lens):
+            valid_count = int(
+                torch.randint(
+                    1,
+                    min(int(seq_len), self.config.topk) + 1,
+                    (1,),
+                    generator=rng,
+                ).item()
+            )
+            selected = torch.randperm(int(seq_len), generator=rng)[:valid_count].to(
+                torch.int32
+            )
+            local_topk[token_idx, :valid_count] = selected
+        return local_topk
+
+    def _validate_values(self, values: DSAInputValues) -> None:
+        _validate_dsa_sparse_decode_kv_pack_values(
+            DSASparseDecodeKVPackInputValues(
+                out=values.packed_kv_out,
+                loc=values.slot_mapping,
+                cache_k_nope=values.cache_k_nope,
+                cache_k_rope=values.cache_k_rope,
+            )
+        )
+        _validate_dsa_decode_topk_values(
+            DSADecodeTopKInputValues(
+                logits=values.logits,
+                out=values.topk_out,
+                valid_lens=values.valid_lens,
+                topk=values.topk,
+            )
+        )
+        _validate_dsa_topk_slot_values(
+            DSATopKSlotInputValues(
+                local_topk_offsets=values.local_topk_offsets,
+                seq_lens=values.seq_lens,
+                block_table=values.block_table,
+                block_table_cpu=values.block_table_cpu,
+                block_table_values=values.block_table_values,
+                block_size=values.block_size,
+                topk=values.topk,
+            )
+        )
 
 @dataclass
 class MHAInputValues:

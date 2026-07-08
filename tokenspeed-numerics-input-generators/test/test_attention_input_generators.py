@@ -22,33 +22,22 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_numerics_input_generators.attention import (
-    _AttentionMergeStateGenerator,
-    _PackedQKVComplexRotaryGenerator,
-)
 from tokenspeed_numerics_input_generators import (
-    AttentionMergeStateInputConfig,
+    AttentionMergeStateInputValues,
     CSAHistoryConfig,
     CSAIndexerConfig,
     CSAInputConfig,
     CSAInputs,
-    DeepSeekV4CompressorStateInputConfig,
-    DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig,
-    DeepSeekV4IndexerMXFP4CacheGatherInputConfig,
-    DeepSeekV4IndexerMXFP4CacheWriteInputConfig,
-    DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig,
-    DeepSeekV4InvRoPEFP8QuantInputConfig,
-    DeepSeekV4KCacheGatherInputConfig,
-    DeepSeekV4PagedIndexInputConfig,
-    DeepSeekV4SparseCompressCacheInsertInputConfig,
-    DeepSeekV4SparsePrefillIndexInputConfig,
-    DSADecodeTopKInputConfig,
+    DSADecodeTopKInputValues,
+    DSAInputConfig,
+    DSAInputValues,
     DSAInputs,
-    DSASparseDecodeKVPackInputConfig,
-    DSATopKSlotInputConfig,
-    GDNChunkPrefillInputConfig,
+    DSASparseDecodeKVPackInputValues,
+    DSATopKSlotInputValues,
+    GDNInputConfig,
+    GDNInputValues,
     GDNInputs,
-    GDNQKVSplitInputConfig,
+    GDNQKVSplitInputValues,
     KVCacheInput,
     KVCacheInputConfig,
     MHAInputConfig,
@@ -59,25 +48,19 @@ from tokenspeed_numerics_input_generators import (
     MLAInputs,
     MLAKVCacheInput,
     MLAKVCacheInputConfig,
-    PackedQKVComplexRotaryInputConfig,
+    PackedQKVComplexRotaryInputValues,
     PageTableInput,
     PageTableInputConfig,
     SlotMappingInput,
     SlotMappingInputConfig,
     attention_merge_state_reference,
-    deepseek_v4_build_dense_prefill_local_compressed_indices_reference,
     deepseek_v4_combine_dense_swa_indices_reference,
-    deepseek_v4_combine_topk_swa_indices_reference,
-    deepseek_v4_compressed_slot_mapping_reference,
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
     deepseek_v4_csa_indexer_mxfp4_cache_insert_reference,
-    deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_dequantize_and_gather_k_cache_reference,
-    deepseek_v4_indexer_decode_metadata_reference,
     deepseek_v4_indexer_mxfp4_cache_gather_reference,
     deepseek_v4_indexer_mxfp4_cache_write_reference,
     deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference,
-    deepseek_v4_inv_rope_fp8_quant_reference,
     deepseek_v4_save_compressor_state_reference,
     deepseek_v4_sparse_compress_cache_insert_reference,
     dsa_decode_topk_reference,
@@ -190,16 +173,128 @@ def _mla_config(
     )
 
 
-def test_attention_merge_state_inputs_generate_values_and_reference() -> None:
-    values = _AttentionMergeStateGenerator(
-        AttentionMergeStateInputConfig(
-            total_q=7,
-            num_heads=3,
-            head_dim=16,
+def _attention_merge_state_values(
+    *,
+    total_q: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    seed: int,
+    lse_scale_log2: float = 1.4426950408889634,
+    lse_bound: float = 6.0,
+) -> AttentionMergeStateInputValues:
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    out_shape = (total_q, num_heads, head_dim)
+    lse_shape = (total_q, num_heads)
+    return AttentionMergeStateInputValues(
+        out_a=torch.randn(out_shape, dtype=dtype, generator=generator).contiguous(),
+        lse_a=(
+            torch.rand(lse_shape, dtype=torch.float32, generator=generator)
+            * (2.0 * lse_bound)
+            - lse_bound
+        ).contiguous(),
+        out_b=torch.randn(out_shape, dtype=dtype, generator=generator).contiguous(),
+        lse_b=(
+            torch.rand(lse_shape, dtype=torch.float32, generator=generator)
+            * (2.0 * lse_bound)
+            - lse_bound
+        ).contiguous(),
+        lse_scale_log2=lse_scale_log2,
+    )
+
+
+def _packed_qkv_complex_rotary_values(
+    *,
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    copy_v: bool,
+    seed: int,
+) -> PackedQKVComplexRotaryInputValues:
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    qkv = torch.randn(
+        (num_tokens, 3 * num_heads * head_dim),
+        dtype=dtype,
+        generator=generator,
+    ).contiguous()
+    angles = (
+        torch.rand(
+            (num_tokens, head_dim // 2),
             dtype=torch.float32,
-            lse_bound=4.0,
+            generator=generator,
         )
-    ).generate(seed=1, device="cpu")
+        * (2.0 * torch.pi)
+        - torch.pi
+    )
+    return PackedQKVComplexRotaryInputValues(
+        qkv=qkv,
+        freqs_cis=torch.complex(torch.cos(angles), torch.sin(angles)).contiguous(),
+        num_heads=num_heads,
+        head_dim=head_dim,
+        copy_v=copy_v,
+    )
+
+
+def _gdn_qkv_split_values(values: GDNInputValues) -> GDNQKVSplitInputValues:
+    q = values.q.squeeze(0) if values.q.ndim == 4 else values.q
+    k = values.k.squeeze(0) if values.k.ndim == 4 else values.k
+    v = values.v.squeeze(0) if values.v.ndim == 4 else values.v
+    return GDNQKVSplitInputValues(
+        mixed_qkv=torch.cat(
+            [q.reshape(q.shape[0], -1), k.reshape(k.shape[0], -1), v.reshape(v.shape[0], -1)],
+            dim=-1,
+        ).contiguous(),
+        num_q_heads=q.shape[1],
+        num_k_heads=k.shape[1],
+        num_v_heads=v.shape[1],
+        head_q=q.shape[2],
+        head_k=k.shape[2],
+        head_v=v.shape[2],
+        fuse_l2norm=False,
+        l2norm_eps=1.0e-6,
+    )
+
+
+def _dsa_pack_values(values: DSAInputValues) -> DSASparseDecodeKVPackInputValues:
+    return DSASparseDecodeKVPackInputValues(
+        out=values.packed_kv_out,
+        loc=values.slot_mapping,
+        cache_k_nope=values.cache_k_nope,
+        cache_k_rope=values.cache_k_rope,
+    )
+
+
+def _dsa_topk_values(values: DSAInputValues) -> DSADecodeTopKInputValues:
+    return DSADecodeTopKInputValues(
+        logits=values.logits,
+        out=values.topk_out,
+        valid_lens=values.valid_lens,
+        topk=values.topk,
+    )
+
+
+def _dsa_slot_values(values: DSAInputValues) -> DSATopKSlotInputValues:
+    return DSATopKSlotInputValues(
+        local_topk_offsets=values.local_topk_offsets,
+        seq_lens=values.seq_lens,
+        block_table=values.block_table,
+        block_table_cpu=values.block_table_cpu,
+        block_table_values=values.block_table_values,
+        block_size=values.block_size,
+        topk=values.topk,
+    )
+
+
+def test_attention_merge_state_inputs_generate_values_and_reference() -> None:
+    values = _attention_merge_state_values(
+        total_q=7,
+        num_heads=3,
+        head_dim=16,
+        dtype=torch.float32,
+        lse_bound=4.0,
+        seed=1,
+    )
 
     assert values.out_a.shape == (7, 3, 16)
     assert values.out_b.shape == (7, 3, 16)
@@ -226,15 +321,14 @@ def test_attention_merge_state_inputs_generate_values_and_reference() -> None:
 
 
 def test_attention_merge_state_inputs_support_log2_lse_scale() -> None:
-    values = _AttentionMergeStateGenerator(
-        AttentionMergeStateInputConfig(
-            total_q=5,
-            num_heads=2,
-            head_dim=8,
-            dtype=torch.float32,
-            lse_scale_log2=1.0,
-        )
-    ).generate(seed=2, device="cpu")
+    values = _attention_merge_state_values(
+        total_q=5,
+        num_heads=2,
+        head_dim=8,
+        dtype=torch.float32,
+        lse_scale_log2=1.0,
+        seed=2,
+    )
 
     out, lse = attention_merge_state_reference(values)
     lse_ref = torch.maximum(values.lse_a, values.lse_b)
@@ -252,116 +346,54 @@ def test_attention_merge_state_inputs_support_log2_lse_scale() -> None:
 
 
 def test_attention_merge_state_rejects_invalid_config() -> None:
+    values = _attention_merge_state_values(
+        total_q=7,
+        num_heads=3,
+        head_dim=16,
+        dtype=torch.float32,
+        lse_scale_log2=0.0,
+        seed=3,
+    )
     with pytest.raises(ValueError, match="lse_scale_log2"):
-        _AttentionMergeStateGenerator(
-            AttentionMergeStateInputConfig(
-                total_q=7,
-                num_heads=3,
-                head_dim=16,
-                lse_scale_log2=0.0,
-            )
-        )
+        attention_merge_state_reference(values)
 
 
 def test_gdn_qkv_split_inputs_generate_plain_split_reference() -> None:
-    values = GDNInputs(
-        GDNQKVSplitInputConfig(
-            num_tokens=5,
-            num_q_heads=4,
-            num_k_heads=2,
-            num_v_heads=2,
-            head_q=8,
-            head_k=8,
-            head_v=6,
+    gdn_values = GDNInputs(
+        GDNInputConfig(
+            batch_size=1,
+            total_tokens=5,
+            num_q_heads=2,
+            num_v_heads=4,
+            head_dim=8,
             dtype=torch.float32,
         )
     ).generate(seed=101, device="cpu")
+    values = _gdn_qkv_split_values(gdn_values)
 
     q, k, v = gdn_qkv_split_reference(values)
 
-    assert values.mixed_qkv.shape == (5, 60)
-    assert q.shape == (1, 5, 4, 8)
+    assert values.mixed_qkv.shape == (5, 64)
+    assert q.shape == (1, 5, 2, 8)
     assert k.shape == (1, 5, 2, 8)
-    assert v.shape == (1, 5, 2, 6)
-    torch.testing.assert_close(q.reshape(5, -1), values.mixed_qkv[:, :32])
-    torch.testing.assert_close(k.reshape(5, -1), values.mixed_qkv[:, 32:48])
-    torch.testing.assert_close(v.reshape(5, -1), values.mixed_qkv[:, 48:])
-
-
-def test_gdn_qkv_split_inputs_generate_l2norm_reference() -> None:
-    values = GDNInputs(
-        GDNQKVSplitInputConfig(
-            num_tokens=7,
-            num_q_heads=3,
-            num_k_heads=2,
-            num_v_heads=2,
-            head_q=8,
-            head_k=8,
-            head_v=8,
-            dtype=torch.float32,
-            fuse_l2norm=True,
-        )
-    ).generate(seed=102, device="cpu")
-
-    q, k, v = gdn_qkv_split_reference(values)
-
-    torch.testing.assert_close(
-        torch.linalg.vector_norm(q, dim=-1),
-        torch.ones((1, 7, 3)),
-        rtol=1e-5,
-        atol=1e-5,
-    )
-    torch.testing.assert_close(
-        torch.linalg.vector_norm(k, dim=-1),
-        torch.ones((1, 7, 2)),
-        rtol=1e-5,
-        atol=1e-5,
-    )
-    torch.testing.assert_close(v.reshape(7, -1), values.mixed_qkv[:, -16:])
+    assert v.shape == (1, 5, 4, 8)
+    torch.testing.assert_close(q.reshape(5, -1), values.mixed_qkv[:, :16])
+    torch.testing.assert_close(k.reshape(5, -1), values.mixed_qkv[:, 16:32])
+    torch.testing.assert_close(v.reshape(5, -1), values.mixed_qkv[:, 32:])
 
 
 def test_gdn_qkv_split_inputs_reject_invalid_configs_and_values() -> None:
-    with pytest.raises(ValueError, match="head_q"):
-        GDNInputs(
-            GDNQKVSplitInputConfig(
-                num_tokens=5,
-                num_q_heads=4,
-                num_k_heads=2,
-                num_v_heads=2,
-                head_q=0,
-                head_k=8,
-                head_v=8,
-                dtype=torch.float32,
-            )
-        )
-
-    with pytest.raises(ValueError, match="l2norm_eps"):
-        GDNInputs(
-            GDNQKVSplitInputConfig(
-                num_tokens=5,
-                num_q_heads=4,
-                num_k_heads=2,
-                num_v_heads=2,
-                head_q=8,
-                head_k=8,
-                head_v=8,
-                dtype=torch.float32,
-                l2norm_eps=0.0,
-            )
-        )
-
-    values = GDNInputs(
-        GDNQKVSplitInputConfig(
-            num_tokens=5,
-            num_q_heads=4,
-            num_k_heads=2,
+    gdn_values = GDNInputs(
+        GDNInputConfig(
+            batch_size=1,
+            total_tokens=5,
+            num_q_heads=2,
             num_v_heads=2,
-            head_q=8,
-            head_k=8,
-            head_v=8,
+            head_dim=8,
             dtype=torch.float32,
         )
     ).generate(seed=103, device="cpu")
+    values = _gdn_qkv_split_values(gdn_values)
     values.mixed_qkv = values.mixed_qkv[:, :-1]
     with pytest.raises(ValueError, match="last dimension"):
         gdn_qkv_split_reference(values)
@@ -369,7 +401,7 @@ def test_gdn_qkv_split_inputs_reject_invalid_configs_and_values() -> None:
 
 def test_gdn_chunk_prefill_inputs_generate_values_and_reference() -> None:
     values = GDNInputs(
-        GDNChunkPrefillInputConfig(
+        GDNInputConfig(
             batch_size=3,
             total_tokens=18,
             num_q_heads=2,
@@ -420,7 +452,7 @@ def test_gdn_chunk_prefill_inputs_generate_values_and_reference() -> None:
 
 def test_gdn_chunk_prefill_inputs_support_batch_axis_and_checkpoints() -> None:
     values = GDNInputs(
-        GDNChunkPrefillInputConfig(
+        GDNInputConfig(
             batch_size=2,
             total_tokens=128,
             num_q_heads=2,
@@ -447,7 +479,7 @@ def test_gdn_chunk_prefill_inputs_support_batch_axis_and_checkpoints() -> None:
 
 def test_gdn_chunk_prefill_inputs_keep_metadata_seed_independent() -> None:
     generator = GDNInputs(
-        GDNChunkPrefillInputConfig(
+        GDNInputConfig(
             batch_size=4,
             total_tokens=23,
             num_q_heads=1,
@@ -478,7 +510,7 @@ def test_gdn_chunk_prefill_inputs_keep_metadata_seed_independent() -> None:
 def test_gdn_chunk_prefill_inputs_reject_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="num_v_heads must be >= num_q_heads"):
         GDNInputs(
-            GDNChunkPrefillInputConfig(
+            GDNInputConfig(
                 batch_size=2,
                 total_tokens=8,
                 num_q_heads=4,
@@ -490,7 +522,7 @@ def test_gdn_chunk_prefill_inputs_reject_invalid_configs_and_values() -> None:
 
     with pytest.raises(ValueError, match="integer multiple"):
         GDNInputs(
-            GDNChunkPrefillInputConfig(
+            GDNInputConfig(
                 batch_size=2,
                 total_tokens=8,
                 num_q_heads=2,
@@ -502,7 +534,7 @@ def test_gdn_chunk_prefill_inputs_reject_invalid_configs_and_values() -> None:
 
     with pytest.raises(ValueError, match="total_tokens must be >= batch_size"):
         GDNInputs(
-            GDNChunkPrefillInputConfig(
+            GDNInputConfig(
                 batch_size=4,
                 total_tokens=3,
                 num_q_heads=2,
@@ -513,7 +545,7 @@ def test_gdn_chunk_prefill_inputs_reject_invalid_configs_and_values() -> None:
         )
 
     values = GDNInputs(
-        GDNChunkPrefillInputConfig(
+        GDNInputConfig(
             batch_size=2,
             total_tokens=8,
             num_q_heads=2,
@@ -528,14 +560,14 @@ def test_gdn_chunk_prefill_inputs_reject_invalid_configs_and_values() -> None:
 
 
 def test_packed_qkv_complex_rotary_inputs_generate_values_and_reference() -> None:
-    values = _PackedQKVComplexRotaryGenerator(
-        PackedQKVComplexRotaryInputConfig(
-            num_tokens=5,
-            num_heads=2,
-            head_dim=8,
-            dtype=torch.float32,
-        )
-    ).generate(seed=111, device="cpu")
+    values = _packed_qkv_complex_rotary_values(
+        num_tokens=5,
+        num_heads=2,
+        head_dim=8,
+        dtype=torch.float32,
+        copy_v=False,
+        seed=111,
+    )
 
     q, k, v = packed_qkv_complex_rotary_reference(values)
 
@@ -563,15 +595,14 @@ def test_packed_qkv_complex_rotary_inputs_generate_values_and_reference() -> Non
 
 
 def test_packed_qkv_complex_rotary_inputs_support_copy_v() -> None:
-    values = _PackedQKVComplexRotaryGenerator(
-        PackedQKVComplexRotaryInputConfig(
-            num_tokens=3,
-            num_heads=2,
-            head_dim=6,
-            dtype=torch.float32,
-            copy_v=True,
-        )
-    ).generate(seed=112, device="cpu")
+    values = _packed_qkv_complex_rotary_values(
+        num_tokens=3,
+        num_heads=2,
+        head_dim=6,
+        dtype=torch.float32,
+        copy_v=True,
+        seed=112,
+    )
 
     _, _, v = packed_qkv_complex_rotary_reference(values)
 
@@ -580,36 +611,38 @@ def test_packed_qkv_complex_rotary_inputs_support_copy_v() -> None:
 
 
 def test_packed_qkv_complex_rotary_inputs_reject_invalid_configs_and_values() -> None:
+    values = _packed_qkv_complex_rotary_values(
+        num_tokens=5,
+        num_heads=2,
+        head_dim=8,
+        dtype=torch.float32,
+        copy_v=False,
+        seed=113,
+    )
+    values.head_dim = 7
     with pytest.raises(ValueError, match="head_dim"):
-        _PackedQKVComplexRotaryGenerator(
-            PackedQKVComplexRotaryInputConfig(
-                num_tokens=5,
-                num_heads=2,
-                head_dim=7,
-                dtype=torch.float32,
-            )
-        )
+        packed_qkv_complex_rotary_reference(values)
 
-    values = _PackedQKVComplexRotaryGenerator(
-        PackedQKVComplexRotaryInputConfig(
-            num_tokens=5,
-            num_heads=2,
-            head_dim=8,
-            dtype=torch.float32,
-        )
-    ).generate(seed=113, device="cpu")
+    values = _packed_qkv_complex_rotary_values(
+        num_tokens=5,
+        num_heads=2,
+        head_dim=8,
+        dtype=torch.float32,
+        copy_v=False,
+        seed=114,
+    )
     values.freqs_cis = values.freqs_cis[:-1]
     with pytest.raises(ValueError, match="freqs_cis"):
         packed_qkv_complex_rotary_reference(values)
 
-    values = _PackedQKVComplexRotaryGenerator(
-        PackedQKVComplexRotaryInputConfig(
-            num_tokens=5,
-            num_heads=2,
-            head_dim=8,
-            dtype=torch.float32,
-        )
-    ).generate(seed=114, device="cpu")
+    values = _packed_qkv_complex_rotary_values(
+        num_tokens=5,
+        num_heads=2,
+        head_dim=8,
+        dtype=torch.float32,
+        copy_v=False,
+        seed=115,
+    )
     values.freqs_cis = values.freqs_cis.real
     with pytest.raises(TypeError, match="complex"):
         packed_qkv_complex_rotary_reference(values)
@@ -617,31 +650,37 @@ def test_packed_qkv_complex_rotary_inputs_reject_invalid_configs_and_values() ->
 
 def test_dsa_sparse_decode_kv_pack_inputs_generate_values_and_reference() -> None:
     values = DSAInputs(
-        DSASparseDecodeKVPackInputConfig(
+        DSAInputConfig(
             num_tokens=5,
             num_slots=9,
             nope_dim=128,
             rope_dim=64,
+            vocab_size=12,
+            topk=3,
+            block_size=8,
+            max_pages_per_token=4,
+            dtype=torch.float32,
         )
     ).generate(seed=118, metadata_seed=119, device="cpu")
+    pack_values = _dsa_pack_values(values)
 
     expected_row_bytes = dsa_sparse_decode_row_bytes(128, 64)
-    packed = dsa_sparse_decode_kv_pack_reference(values)
-    loc = values.loc.to(torch.int64)
+    packed = dsa_sparse_decode_kv_pack_reference(pack_values)
+    loc = values.slot_mapping.to(torch.int64)
     scale_offset = 128
     rope_offset = scale_offset + 4
 
-    assert values.out.shape == (9, expected_row_bytes)
-    assert values.loc.shape == (5,)
-    assert torch.unique(values.loc).numel() == values.loc.numel()
+    assert values.packed_kv_out.shape == (9, expected_row_bytes)
+    assert values.slot_mapping.shape == (5,)
+    assert torch.unique(values.slot_mapping).numel() == values.slot_mapping.numel()
     assert values.cache_k_nope.shape == (5, 128)
     assert values.cache_k_rope.shape == (5, 64)
-    assert packed.shape == values.out.shape
+    assert packed.shape == values.packed_kv_out.shape
     assert packed.dtype == torch.uint8
 
-    written_mask = torch.zeros(values.out.shape[0], dtype=torch.bool)
+    written_mask = torch.zeros(values.packed_kv_out.shape[0], dtype=torch.bool)
     written_mask[loc.cpu()] = True
-    assert torch.equal(packed[~written_mask], values.out[~written_mask])
+    assert torch.equal(packed[~written_mask], values.packed_kv_out[~written_mask])
 
     scales = packed[loc, scale_offset:rope_offset].contiguous().view(torch.float32)
     assert scales.shape == (5, 1)
@@ -652,84 +691,117 @@ def test_dsa_sparse_decode_kv_pack_inputs_generate_values_and_reference() -> Non
 
 def test_dsa_sparse_decode_kv_pack_supports_head_axis_and_zero_tokens() -> None:
     values = DSAInputs(
-        DSASparseDecodeKVPackInputConfig(
+        DSAInputConfig(
             num_tokens=0,
             num_slots=3,
             nope_dim=128,
             rope_dim=32,
+            vocab_size=8,
+            topk=2,
+            block_size=4,
+            max_pages_per_token=3,
+            dtype=torch.float32,
             include_head_axis=True,
         )
     ).generate(seed=120, device="cpu")
+    pack_values = _dsa_pack_values(values)
 
-    packed = dsa_sparse_decode_kv_pack_reference(values)
+    packed = dsa_sparse_decode_kv_pack_reference(pack_values)
 
-    assert values.loc.shape == (0,)
+    assert values.slot_mapping.shape == (0,)
     assert values.cache_k_nope.shape == (0, 1, 128)
     assert values.cache_k_rope.shape == (0, 1, 32)
-    assert torch.equal(packed, values.out)
+    assert torch.equal(packed, values.packed_kv_out)
 
 
 def test_dsa_sparse_decode_kv_pack_rejects_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="num_tokens"):
         DSAInputs(
-            DSASparseDecodeKVPackInputConfig(
+            DSAInputConfig(
                 num_tokens=4,
                 num_slots=3,
                 nope_dim=128,
                 rope_dim=64,
+                vocab_size=8,
+                topk=2,
+                block_size=4,
+                max_pages_per_token=3,
+                dtype=torch.float32,
             )
         )
 
     with pytest.raises(ValueError, match="divisible"):
         DSAInputs(
-            DSASparseDecodeKVPackInputConfig(
+            DSAInputConfig(
                 num_tokens=2,
                 num_slots=3,
                 nope_dim=64,
                 rope_dim=64,
+                vocab_size=8,
+                topk=2,
+                block_size=4,
+                max_pages_per_token=3,
+                dtype=torch.float32,
             )
         )
 
     with pytest.raises(ValueError, match="power of two"):
         DSAInputs(
-            DSASparseDecodeKVPackInputConfig(
+            DSAInputConfig(
                 num_tokens=2,
                 num_slots=3,
                 nope_dim=128,
                 rope_dim=48,
+                vocab_size=8,
+                topk=2,
+                block_size=4,
+                max_pages_per_token=3,
+                dtype=torch.float32,
             )
         )
 
     values = DSAInputs(
-        DSASparseDecodeKVPackInputConfig(
+        DSAInputConfig(
             num_tokens=3,
             num_slots=5,
             nope_dim=128,
             rope_dim=64,
+            vocab_size=8,
+            topk=2,
+            block_size=4,
+            max_pages_per_token=3,
+            dtype=torch.float32,
         )
     ).generate(seed=121, device="cpu")
-    values.loc = torch.tensor([0, 0, 1], dtype=torch.int64)
+    pack_values = _dsa_pack_values(values)
+    pack_values.loc = torch.tensor([0, 0, 1], dtype=torch.int64)
     with pytest.raises(ValueError, match="unique"):
-        dsa_sparse_decode_kv_pack_reference(values)
+        dsa_sparse_decode_kv_pack_reference(pack_values)
 
 
 def test_dsa_decode_topk_inputs_generate_stable_tie_values() -> None:
     values = DSAInputs(
-        DSADecodeTopKInputConfig(
-            num_rows=4,
+        DSAInputConfig(
+            num_tokens=4,
+            num_slots=6,
+            nope_dim=128,
+            rope_dim=64,
             vocab_size=12,
             topk=3,
+            block_size=8,
+            max_pages_per_token=4,
             dtype=torch.float32,
             min_valid_len=6,
             max_valid_len=12,
         )
     ).generate(seed=188, device="cpu")
+    topk_values = _dsa_topk_values(values)
 
-    expected = dsa_decode_topk_reference(values)
+    expected = dsa_decode_topk_reference(topk_values)
 
     assert values.logits.shape == (4, 12)
-    assert values.out.shape == (4, 3)
-    assert values.out.dtype == torch.int32
+    assert values.topk_out.shape == (4, 3)
+    assert values.topk_out.dtype == torch.int32
     assert values.valid_lens.shape == (4,)
     assert values.valid_lens.dtype == torch.int32
     assert expected.shape == (4, 3)
@@ -743,19 +815,25 @@ def test_dsa_decode_topk_inputs_generate_stable_tie_values() -> None:
 
 def test_dsa_decode_topk_reference_matches_manual_ordering() -> None:
     values = DSAInputs(
-        DSADecodeTopKInputConfig(
-            num_rows=1,
+        DSAInputConfig(
+            num_tokens=1,
+            num_slots=2,
+            nope_dim=128,
+            rope_dim=64,
             vocab_size=5,
             topk=3,
+            block_size=4,
+            max_pages_per_token=2,
             dtype=torch.float32,
             min_valid_len=5,
             max_valid_len=5,
         )
     ).generate(seed=189, device="cpu")
-    values.logits[0] = torch.tensor([1.0, 3.0, 3.0, 2.0, -float("inf")])
-    values.valid_lens[0] = 4
+    topk_values = _dsa_topk_values(values)
+    topk_values.logits[0] = torch.tensor([1.0, 3.0, 3.0, 2.0, -float("inf")])
+    topk_values.valid_lens[0] = 4
 
-    expected = dsa_decode_topk_reference(values)
+    expected = dsa_decode_topk_reference(topk_values)
 
     torch.testing.assert_close(
         expected,
@@ -768,55 +846,77 @@ def test_dsa_decode_topk_reference_matches_manual_ordering() -> None:
 def test_dsa_decode_topk_inputs_reject_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="topk must be <= vocab_size"):
         DSAInputs(
-            DSADecodeTopKInputConfig(
-                num_rows=1,
+            DSAInputConfig(
+                num_tokens=1,
+                num_slots=2,
+                nope_dim=128,
+                rope_dim=64,
                 vocab_size=4,
                 topk=5,
+                block_size=4,
+                max_pages_per_token=2,
                 dtype=torch.float32,
             )
         )
 
     with pytest.raises(ValueError, match="min_valid_len must be >= topk"):
         DSAInputs(
-            DSADecodeTopKInputConfig(
-                num_rows=1,
+            DSAInputConfig(
+                num_tokens=1,
+                num_slots=2,
+                nope_dim=128,
+                rope_dim=64,
                 vocab_size=8,
                 topk=4,
+                block_size=4,
+                max_pages_per_token=2,
                 dtype=torch.float32,
                 min_valid_len=3,
             )
         )
 
     values = DSAInputs(
-        DSADecodeTopKInputConfig(
-            num_rows=1,
+        DSAInputConfig(
+            num_tokens=1,
+            num_slots=2,
+            nope_dim=128,
+            rope_dim=64,
             vocab_size=8,
             topk=4,
+            block_size=4,
+            max_pages_per_token=2,
             dtype=torch.float32,
             min_valid_len=6,
             max_valid_len=6,
         )
     ).generate(seed=190, device="cpu")
-    values.logits[0, int(values.valid_lens[0].item()) :] = 0.0
+    topk_values = _dsa_topk_values(values)
+    topk_values.logits[0, int(topk_values.valid_lens[0].item()) :] = 0.0
 
     with pytest.raises(ValueError, match="masked with -inf"):
-        dsa_decode_topk_reference(values)
+        dsa_decode_topk_reference(topk_values)
 
 
 def test_dsa_topk_slot_inputs_generate_values_and_references() -> None:
     values = DSAInputs(
-        DSATopKSlotInputConfig(
+        DSAInputConfig(
             num_tokens=5,
+            num_slots=7,
+            nope_dim=128,
+            rope_dim=64,
+            vocab_size=16,
             topk=4,
             block_size=8,
             max_pages_per_token=4,
             max_seq_len=24,
+            dtype=torch.float32,
             indexing="identity",
         )
     ).generate(seed=121, device="cpu")
+    slot_values = _dsa_slot_values(values)
 
-    local_slots, local_lens = dsa_local_topk_to_global_slots_reference(values)
-    full_slots, full_lens = dsa_full_context_topk_to_global_slots_reference(values)
+    local_slots, local_lens = dsa_local_topk_to_global_slots_reference(slot_values)
+    full_slots, full_lens = dsa_full_context_topk_to_global_slots_reference(slot_values)
 
     assert values.local_topk_offsets.shape == (5, 4)
     assert values.seq_lens.shape == (5,)
@@ -843,18 +943,24 @@ def test_dsa_topk_slot_inputs_generate_values_and_references() -> None:
 
 def test_dsa_topk_slot_reference_supports_no_seq_lens_local_mode() -> None:
     values = DSAInputs(
-        DSATopKSlotInputConfig(
+        DSAInputConfig(
             num_tokens=3,
+            num_slots=5,
+            nope_dim=128,
+            rope_dim=64,
+            vocab_size=12,
             topk=5,
             block_size=4,
             max_pages_per_token=3,
             max_seq_len=12,
+            dtype=torch.float32,
             indexing="identity",
         )
     ).generate(seed=122, device="cpu")
+    slot_values = _dsa_slot_values(values)
 
     slots, lens = dsa_local_topk_to_global_slots_reference(
-        values,
+        slot_values,
         use_seq_lens=False,
     )
 
@@ -865,15 +971,21 @@ def test_dsa_topk_slot_reference_supports_no_seq_lens_local_mode() -> None:
 
 def test_dsa_topk_slot_inputs_support_zero_tokens() -> None:
     values = DSAInputs(
-        DSATopKSlotInputConfig(
+        DSAInputConfig(
             num_tokens=0,
+            num_slots=3,
+            nope_dim=128,
+            rope_dim=64,
+            vocab_size=8,
             topk=5,
             block_size=4,
             max_pages_per_token=3,
+            dtype=torch.float32,
         )
     ).generate(seed=124, device="cpu")
+    slot_values = _dsa_slot_values(values)
 
-    slots, lens = dsa_full_context_topk_to_global_slots_reference(values)
+    slots, lens = dsa_full_context_topk_to_global_slots_reference(slot_values)
 
     assert values.local_topk_offsets.shape == (0, 5)
     assert values.seq_lens.shape == (0,)
@@ -885,21 +997,31 @@ def test_dsa_topk_slot_inputs_support_zero_tokens() -> None:
 def test_dsa_topk_slot_inputs_reject_invalid_configs_and_values() -> None:
     with pytest.raises(ValueError, match="topk"):
         DSAInputs(
-            DSATopKSlotInputConfig(
+            DSAInputConfig(
                 num_tokens=3,
+                num_slots=5,
+                nope_dim=128,
+                rope_dim=64,
+                vocab_size=8,
                 topk=0,
                 block_size=8,
                 max_pages_per_token=2,
+                dtype=torch.float32,
             )
         )
 
     with pytest.raises(ValueError, match="page_table_input.batch_size"):
         DSAInputs(
-            DSATopKSlotInputConfig(
+            DSAInputConfig(
                 num_tokens=3,
+                num_slots=5,
+                nope_dim=128,
+                rope_dim=64,
+                vocab_size=8,
                 topk=4,
                 block_size=8,
                 max_pages_per_token=2,
+                dtype=torch.float32,
                 page_table_input=PageTableInputConfig(
                     batch_size=2,
                     max_pages_per_request=2,
@@ -908,16 +1030,22 @@ def test_dsa_topk_slot_inputs_reject_invalid_configs_and_values() -> None:
         )
 
     values = DSAInputs(
-        DSATopKSlotInputConfig(
+        DSAInputConfig(
             num_tokens=3,
+            num_slots=5,
+            nope_dim=128,
+            rope_dim=64,
+            vocab_size=8,
             topk=4,
             block_size=8,
             max_pages_per_token=2,
+            dtype=torch.float32,
         )
     ).generate(seed=123, device="cpu")
-    values.seq_lens = values.seq_lens[:-1]
+    slot_values = _dsa_slot_values(values)
+    slot_values.seq_lens = slot_values.seq_lens[:-1]
     with pytest.raises(ValueError, match="seq_lens"):
-        dsa_local_topk_to_global_slots_reference(values)
+        dsa_local_topk_to_global_slots_reference(slot_values)
 
 
 def test_compressed_sequence_attention_generates_swa_only_values() -> None:
@@ -1102,1434 +1230,6 @@ def test_compressed_sequence_attention_rejects_invalid_component_mix() -> None:
                 indexer=CSAIndexerConfig(),
             )
         )
-
-
-def test_deepseek_v4_compressor_state_inputs_generate_values_and_reference() -> None:
-    values = CSAInputs(
-        DeepSeekV4CompressorStateInputConfig(
-            num_tokens=6,
-            state_width=16,
-            num_cache_blocks=2,
-            block_size=4,
-            compress_ratio=8,
-            dtype=torch.bfloat16,
-            invalid_token_count=2,
-        )
-    ).generate(metadata_seed=23, value_seed=37, device="cpu")
-
-    expected = deepseek_v4_save_compressor_state_reference(values)
-
-    assert values.kv.shape == (6, 16)
-    assert values.score.shape == (6, 16)
-    assert values.ape.shape == (8, 16)
-    assert values.state_cache.shape == (2, 4, 32)
-    assert values.positions.tolist() == list(range(6))
-    assert int((values.slot_mapping < 0).sum().item()) == 2
-    assert expected.shape == values.state_cache.shape
-
-    slots = values.slot_mapping.to(torch.int64)
-    for token_idx, slot in enumerate(slots.tolist()):
-        if slot < 0:
-            continue
-        block_idx = slot // values.block_size
-        pos_in_block = slot % values.block_size
-        ape_row = int(values.positions[token_idx].item()) % values.compress_ratio
-        torch.testing.assert_close(
-            expected[block_idx, pos_in_block, :16],
-            values.kv[token_idx].float(),
-            rtol=0.0,
-            atol=0.0,
-        )
-        torch.testing.assert_close(
-            expected[block_idx, pos_in_block, 16:],
-            values.score[token_idx].float() + values.ape[ape_row],
-            rtol=0.0,
-            atol=0.0,
-        )
-
-    written_slots = {int(slot) for slot in slots.tolist() if slot >= 0}
-    for slot in range(values.state_cache.shape[0] * values.block_size):
-        if slot in written_slots:
-            continue
-        block_idx = slot // values.block_size
-        pos_in_block = slot % values.block_size
-        torch.testing.assert_close(
-            expected[block_idx, pos_in_block],
-            values.state_cache[block_idx, pos_in_block],
-            rtol=0.0,
-            atol=0.0,
-        )
-
-
-def test_deepseek_v4_compressor_state_reference_matches_c4_overlap_ape_layout() -> None:
-    values = CSAInputs(
-        DeepSeekV4CompressorStateInputConfig(
-            num_tokens=1,
-            state_width=8,
-            num_cache_blocks=1,
-            block_size=1,
-            compress_ratio=4,
-            dtype=torch.float32,
-        )
-    ).generate(seed=41, device="cpu")
-    values.kv = torch.arange(8, dtype=torch.float32).reshape(1, 8)
-    values.score = torch.zeros((1, 8), dtype=torch.float32)
-    values.ape = torch.arange(32, dtype=torch.float32).reshape(4, 8)
-    values.state_cache = torch.zeros((1, 1, 16), dtype=torch.float32)
-    values.slot_mapping = torch.tensor([0], dtype=torch.int64)
-    values.positions = torch.tensor([1], dtype=torch.int64)
-
-    expected = deepseek_v4_save_compressor_state_reference(values)
-
-    torch.testing.assert_close(expected[0, 0, :8], values.kv[0])
-    torch.testing.assert_close(
-        expected[0, 0, 8:],
-        torch.tensor([4, 5, 6, 7, 20, 21, 22, 23], dtype=torch.float32),
-    )
-
-
-def test_deepseek_v4_compressor_state_inputs_keep_metadata_seed_independent() -> None:
-    generator = CSAInputs(
-        DeepSeekV4CompressorStateInputConfig(
-            num_tokens=5,
-            state_width=8,
-            num_cache_blocks=2,
-            block_size=3,
-            compress_ratio=4,
-            dtype=torch.float32,
-            invalid_token_count=1,
-        )
-    )
-
-    first = generator.generate(metadata_seed=51, value_seed=61, device="cpu")
-    same_metadata = generator.generate(metadata_seed=51, value_seed=62, device="cpu")
-    same_values = generator.generate(metadata_seed=52, value_seed=61, device="cpu")
-
-    torch.testing.assert_close(first.slot_mapping, same_metadata.slot_mapping)
-    torch.testing.assert_close(first.positions, same_metadata.positions)
-    assert not torch.equal(first.kv, same_metadata.kv)
-    torch.testing.assert_close(first.kv, same_values.kv)
-    assert not torch.equal(first.slot_mapping, same_values.slot_mapping)
-
-
-def test_deepseek_v4_compressor_state_rejects_invalid_configs_and_values() -> None:
-    with pytest.raises(ValueError, match="valid generated tokens"):
-        CSAInputs(
-            DeepSeekV4CompressorStateInputConfig(
-                num_tokens=5,
-                state_width=8,
-                num_cache_blocks=1,
-                block_size=4,
-                compress_ratio=4,
-                dtype=torch.float32,
-            )
-        )
-
-    values = CSAInputs(
-        DeepSeekV4CompressorStateInputConfig(
-            num_tokens=2,
-            state_width=8,
-            num_cache_blocks=1,
-            block_size=4,
-            compress_ratio=4,
-            dtype=torch.float32,
-        )
-    ).generate(seed=71, device="cpu")
-    values.slot_mapping = torch.tensor([0, 0], dtype=torch.int64)
-    with pytest.raises(ValueError, match="unique"):
-        deepseek_v4_save_compressor_state_reference(values)
-
-
-def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_generate_reference() -> None:
-    values = CSAInputs(
-        DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
-            num_tokens=4,
-            num_heads=3,
-            dtype=torch.bfloat16,
-            max_position=32,
-            softmax_scale=0.25,
-            head_scale=2.0,
-        )
-    ).generate(metadata_seed=51, value_seed=61, device="cpu")
-
-    (q_packed, q_scale), weights = deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(
-        values
-    )
-
-    assert values.index_q.shape == (4, 3, 128)
-    assert values.positions.shape == (4,)
-    assert values.cos_sin_cache.shape == (32, 64)
-    assert values.weights.shape == (4, 3)
-    assert q_packed.shape == (4, 3, 64)
-    assert q_scale.shape == (4, 3)
-    assert q_packed.dtype == torch.uint8
-    assert q_scale.dtype == torch.int32
-    assert weights.shape == values.weights.shape
-    assert torch.isfinite(weights).all()
-    assert int(values.positions.min().item()) >= 0
-    assert int(values.positions.max().item()) < values.cos_sin_cache.shape[0]
-
-
-def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference_zero_row() -> None:
-    values = CSAInputs(
-        DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
-            num_tokens=1,
-            num_heads=1,
-            dtype=torch.float32,
-            max_position=4,
-        )
-    ).generate(seed=71, device="cpu")
-    values.index_q = torch.zeros_like(values.index_q)
-    values.weights = torch.ones_like(values.weights)
-
-    (q_packed, q_scale), weights = deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(
-        values
-    )
-
-    torch.testing.assert_close(q_packed, torch.zeros_like(q_packed), rtol=0, atol=0)
-    expected_scale = torch.full((1, 1, 4), 112, dtype=torch.uint8).view(torch.int32)
-    torch.testing.assert_close(q_scale, expected_scale.squeeze(-1), rtol=0, atol=0)
-    torch.testing.assert_close(weights, torch.ones_like(weights))
-
-
-def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_keeps_metadata_seed_independent() -> (
-    None
-):
-    generator = CSAInputs(
-        DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
-            num_tokens=4,
-            num_heads=2,
-            dtype=torch.float32,
-            max_position=128,
-        )
-    )
-
-    first = generator.generate(metadata_seed=81, value_seed=91, device="cpu")
-    same_metadata = generator.generate(metadata_seed=81, value_seed=92, device="cpu")
-    same_values = generator.generate(metadata_seed=82, value_seed=91, device="cpu")
-
-    torch.testing.assert_close(first.positions, same_metadata.positions)
-    torch.testing.assert_close(first.cos_sin_cache, same_metadata.cos_sin_cache)
-    assert not torch.equal(first.index_q, same_metadata.index_q)
-    assert not torch.equal(first.weights, same_metadata.weights)
-    torch.testing.assert_close(first.index_q, same_values.index_q)
-    torch.testing.assert_close(first.weights, same_values.weights)
-    assert not torch.equal(first.positions, same_values.positions)
-
-
-def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_rejects_invalid_values() -> None:
-    with pytest.raises(ValueError, match="max_position"):
-        CSAInputs(
-            DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
-                num_tokens=1,
-                num_heads=1,
-                dtype=torch.float32,
-                max_position=0,
-            )
-        )
-    with pytest.raises(TypeError, match="position_dtype"):
-        CSAInputs(
-            DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
-                num_tokens=1,
-                num_heads=1,
-                dtype=torch.float32,
-                position_dtype=torch.float32,
-            )
-        )
-
-    values = CSAInputs(
-        DeepSeekV4IndexerQRoPEHadamardMXFP4InputConfig(
-            num_tokens=1,
-            num_heads=1,
-            dtype=torch.float32,
-            max_position=2,
-        )
-    ).generate(seed=101, device="cpu")
-    values.positions = torch.tensor([2], dtype=torch.int64)
-    with pytest.raises(ValueError, match="positions"):
-        deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference(values)
-
-
-def test_deepseek_v4_inv_rope_fp8_quant_inputs_generate_tma_reference() -> None:
-    values = CSAInputs(
-        DeepSeekV4InvRoPEFP8QuantInputConfig(
-            num_tokens=5,
-            n_groups=2,
-            heads_per_group=2,
-            dtype=torch.bfloat16,
-            max_position=32,
-            value_scale=0.25,
-        )
-    ).generate(metadata_seed=111, value_seed=121, device="cpu")
-
-    fp8, scales = deepseek_v4_inv_rope_fp8_quant_reference(values)
-
-    assert values.o.shape == (5, 4, 512)
-    assert values.positions.shape == (5,)
-    assert values.cos_sin_cache.shape == (32, 64)
-    assert fp8.shape == (5, 2, 1024)
-    assert fp8.dtype == torch.float8_e4m3fn
-    assert scales.shape == (5, 2, 2)
-    assert scales.dtype == torch.int32
-    assert int(values.positions.min().item()) >= 0
-    assert int(values.positions.max().item()) < values.cos_sin_cache.shape[0]
-
-
-def test_deepseek_v4_inv_rope_fp8_quant_inputs_generate_float_scale_reference() -> None:
-    values = CSAInputs(
-        DeepSeekV4InvRoPEFP8QuantInputConfig(
-            num_tokens=3,
-            n_groups=1,
-            heads_per_group=2,
-            dtype=torch.float32,
-            tma_aligned_scales=False,
-            value_scale=0.25,
-        )
-    ).generate(seed=131, device="cpu")
-
-    fp8, scales = deepseek_v4_inv_rope_fp8_quant_reference(values)
-
-    assert fp8.shape == (3, 1, 1024)
-    assert scales.shape == (3, 1, 8)
-    assert scales.dtype == torch.float32
-    assert torch.all(scales > 0)
-
-
-def test_deepseek_v4_inv_rope_fp8_quant_keeps_metadata_seed_independent() -> None:
-    generator = CSAInputs(
-        DeepSeekV4InvRoPEFP8QuantInputConfig(
-            num_tokens=4,
-            n_groups=2,
-            heads_per_group=1,
-            dtype=torch.float32,
-            max_position=128,
-        )
-    )
-
-    first = generator.generate(metadata_seed=141, value_seed=151, device="cpu")
-    same_metadata = generator.generate(metadata_seed=141, value_seed=152, device="cpu")
-    same_values = generator.generate(metadata_seed=142, value_seed=151, device="cpu")
-
-    torch.testing.assert_close(first.positions, same_metadata.positions)
-    torch.testing.assert_close(first.cos_sin_cache, same_metadata.cos_sin_cache)
-    assert not torch.equal(first.o, same_metadata.o)
-    torch.testing.assert_close(first.o, same_values.o)
-    assert not torch.equal(first.positions, same_values.positions)
-
-
-def test_deepseek_v4_inv_rope_fp8_quant_rejects_invalid_configs_and_values() -> None:
-    with pytest.raises(ValueError, match="nope_dim \\+ rope_dim"):
-        CSAInputs(
-            DeepSeekV4InvRoPEFP8QuantInputConfig(
-                num_tokens=1,
-                n_groups=1,
-                heads_per_group=1,
-                dtype=torch.float32,
-                head_dim=512,
-                nope_dim=384,
-                rope_dim=64,
-            )
-        )
-    with pytest.raises(ValueError, match="tma_aligned_scales"):
-        CSAInputs(
-            DeepSeekV4InvRoPEFP8QuantInputConfig(
-                num_tokens=1,
-                n_groups=1,
-                heads_per_group=1,
-                dtype=torch.float32,
-                head_dim=256,
-                nope_dim=192,
-                rope_dim=64,
-                tma_aligned_scales=True,
-            )
-        )
-
-    values = CSAInputs(
-        DeepSeekV4InvRoPEFP8QuantInputConfig(
-            num_tokens=1,
-            n_groups=1,
-            heads_per_group=1,
-            dtype=torch.float32,
-            max_position=2,
-        )
-    ).generate(seed=161, device="cpu")
-    values.positions = torch.tensor([2], dtype=torch.int64)
-    with pytest.raises(ValueError, match="positions"):
-        deepseek_v4_inv_rope_fp8_quant_reference(values)
-
-
-def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_inputs_generate_reference() -> None:
-    values = CSAInputs(
-        DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
-            num_tokens=6,
-            batch_size=2,
-            max_seq_len=12,
-            num_state_cache_blocks=4,
-            compressor_block_size=4,
-            num_kv_cache_blocks=2,
-            kv_cache_block_size=4,
-            dtype=torch.bfloat16,
-            non_boundary_token_count=1,
-            include_block_table_base_offsets=True,
-            value_scale=0.25,
-        )
-    ).generate(metadata_seed=171, value_seed=181, device="cpu")
-
-    expected = deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(values)
-
-    assert values.state_cache.shape == (4, 4, 512)
-    assert values.block_table.shape == (2, 3)
-    assert values.kv_cache_2d.shape == (2, 4 * 68)
-    assert values.rms_norm_weight.shape == (128,)
-    assert values.cos_sin_cache.shape == (12, 64)
-    assert values.block_table_base_offsets is not None
-    assert expected.shape == values.kv_cache_2d.shape
-
-    writable_slots = []
-    for row_idx in range(values.positions.numel()):
-        slot = int(values.kv_slot_mapping[row_idx].item())
-        writable = (
-            int(values.compressor_slot_mapping[row_idx].item()) >= 0
-            and slot >= 0
-            and (int(values.positions[row_idx].item()) + 1) % values.compress_ratio == 0
-        )
-        if not writable:
-            continue
-        writable_slots.append(slot)
-        page = slot // values.kv_cache_block_size
-        pos = slot % values.kv_cache_block_size
-        value_base = pos * 64
-        scale_base = values.kv_cache_block_size * 64 + pos * 4
-        assert not torch.equal(
-            expected[page, value_base : value_base + 64],
-            values.kv_cache_2d[page, value_base : value_base + 64],
-        )
-        assert not torch.equal(
-            expected[page, scale_base : scale_base + 4],
-            values.kv_cache_2d[page, scale_base : scale_base + 4],
-        )
-    assert writable_slots
-
-
-def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_skips_invalid_rows() -> None:
-    values = CSAInputs(
-        DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
-            num_tokens=3,
-            batch_size=1,
-            max_seq_len=4,
-            num_state_cache_blocks=1,
-            compressor_block_size=4,
-            num_kv_cache_blocks=1,
-            kv_cache_block_size=4,
-            dtype=torch.float32,
-            non_boundary_token_count=1,
-            negative_compressor_slot_count=1,
-            negative_kv_slot_count=1,
-        )
-    ).generate(seed=191, device="cpu")
-    values.positions = torch.tensor([3, 2, 3], dtype=torch.int64)
-    values.compressor_slot_mapping = torch.tensor([0, 1, -1], dtype=torch.int64)
-    values.kv_slot_mapping = torch.tensor([0, -1, 2], dtype=torch.int64)
-
-    expected = deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(values)
-
-    assert not torch.equal(expected[0, :64], values.kv_cache_2d[0, :64])
-    torch.testing.assert_close(
-        expected[0, 64:128],
-        values.kv_cache_2d[0, 64:128],
-        rtol=0,
-        atol=0,
-    )
-    torch.testing.assert_close(
-        expected[0, 128:192],
-        values.kv_cache_2d[0, 128:192],
-        rtol=0,
-        atol=0,
-    )
-
-
-def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_keeps_metadata_seed_independent() -> (
-    None
-):
-    generator = CSAInputs(
-        DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
-            num_tokens=5,
-            batch_size=2,
-            max_seq_len=8,
-            num_state_cache_blocks=3,
-            compressor_block_size=4,
-            num_kv_cache_blocks=2,
-            kv_cache_block_size=4,
-            dtype=torch.float32,
-            non_boundary_token_count=1,
-        )
-    )
-
-    first = generator.generate(metadata_seed=201, value_seed=211, device="cpu")
-    same_metadata = generator.generate(metadata_seed=201, value_seed=212, device="cpu")
-    same_values = generator.generate(metadata_seed=202, value_seed=211, device="cpu")
-
-    torch.testing.assert_close(first.positions, same_metadata.positions)
-    torch.testing.assert_close(
-        first.compressor_slot_mapping,
-        same_metadata.compressor_slot_mapping,
-    )
-    torch.testing.assert_close(first.kv_slot_mapping, same_metadata.kv_slot_mapping)
-    torch.testing.assert_close(first.block_table, same_metadata.block_table)
-    assert not torch.equal(first.state_cache, same_metadata.state_cache)
-    torch.testing.assert_close(first.state_cache, same_values.state_cache)
-    assert not torch.equal(first.positions, same_values.positions)
-
-
-def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_rejects_invalid_values() -> None:
-    with pytest.raises(ValueError, match="compressor slots"):
-        CSAInputs(
-            DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
-                num_tokens=5,
-                batch_size=1,
-                max_seq_len=4,
-                num_state_cache_blocks=1,
-                compressor_block_size=4,
-                num_kv_cache_blocks=2,
-                kv_cache_block_size=4,
-                dtype=torch.float32,
-            )
-        )
-    with pytest.raises(ValueError, match="compress_ratio=4"):
-        CSAInputs(
-            DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
-                num_tokens=1,
-                batch_size=1,
-                max_seq_len=4,
-                num_state_cache_blocks=1,
-                compressor_block_size=4,
-                num_kv_cache_blocks=1,
-                kv_cache_block_size=4,
-                dtype=torch.float32,
-                compress_ratio=8,
-            )
-        )
-
-    values = CSAInputs(
-        DeepSeekV4CSAIndexerMXFP4CacheInsertInputConfig(
-            num_tokens=2,
-            batch_size=1,
-            max_seq_len=4,
-            num_state_cache_blocks=1,
-            compressor_block_size=4,
-            num_kv_cache_blocks=1,
-            kv_cache_block_size=4,
-            dtype=torch.float32,
-        )
-    ).generate(seed=221, device="cpu")
-    values.kv_slot_mapping = torch.tensor([0, 0], dtype=torch.int64)
-    values.positions = torch.tensor([3, 3], dtype=torch.int64)
-    with pytest.raises(ValueError, match="unique"):
-        deepseek_v4_csa_indexer_mxfp4_cache_insert_reference(values)
-
-
-@pytest.mark.parametrize(
-    ("overlap", "expected_state_width"),
-    [
-        (False, 1024),
-        (True, 2048),
-    ],
-)
-def test_deepseek_v4_sparse_compress_cache_insert_inputs_generate_reference(
-    overlap: bool,
-    expected_state_width: int,
-) -> None:
-    values = CSAInputs(
-        DeepSeekV4SparseCompressCacheInsertInputConfig(
-            num_tokens=6,
-            batch_size=2,
-            max_seq_len=8,
-            num_state_cache_blocks=4,
-            compressor_block_size=4,
-            num_kv_cache_blocks=2,
-            kv_cache_block_size=4,
-            compress_ratio=4,
-            overlap=overlap,
-            dtype=torch.bfloat16,
-            non_boundary_token_count=1,
-            include_block_table_base_offsets=True,
-            value_scale=0.25,
-        )
-    ).generate(metadata_seed=231, value_seed=241, device="cpu")
-
-    expected = deepseek_v4_sparse_compress_cache_insert_reference(values)
-
-    assert values.state_cache.shape == (4, 4, expected_state_width)
-    assert values.block_table.shape == (2, 2)
-    assert values.kv_cache_2d.shape == (2, 4 * (576 + 8))
-    assert values.rms_norm_weight.shape == (512,)
-    assert values.cos_sin_cache.shape == (8, 64)
-    assert values.block_table_base_offsets is not None
-    assert expected.shape == values.kv_cache_2d.shape
-
-    writable_slots = []
-    for row_idx in range(values.positions.numel()):
-        slot = int(values.kv_slot_mapping[row_idx].item())
-        writable = (
-            int(values.compressor_slot_mapping[row_idx].item()) >= 0
-            and slot >= 0
-            and (int(values.positions[row_idx].item()) + 1) % values.compress_ratio == 0
-        )
-        if not writable:
-            continue
-        writable_slots.append(slot)
-        page = slot // values.kv_cache_block_size
-        pos = slot % values.kv_cache_block_size
-        token_base = pos * 576
-        scale_base = values.kv_cache_block_size * 576 + pos * 8
-        assert not torch.equal(
-            expected[page, token_base : token_base + 576],
-            values.kv_cache_2d[page, token_base : token_base + 576],
-        )
-        assert not torch.equal(
-            expected[page, scale_base : scale_base + 8],
-            values.kv_cache_2d[page, scale_base : scale_base + 8],
-        )
-    assert writable_slots
-
-
-def test_deepseek_v4_sparse_compress_cache_insert_skips_invalid_rows() -> None:
-    values = CSAInputs(
-        DeepSeekV4SparseCompressCacheInsertInputConfig(
-            num_tokens=3,
-            batch_size=1,
-            max_seq_len=4,
-            num_state_cache_blocks=1,
-            compressor_block_size=4,
-            num_kv_cache_blocks=1,
-            kv_cache_block_size=4,
-            compress_ratio=4,
-            overlap=True,
-            dtype=torch.float32,
-            non_boundary_token_count=1,
-            negative_compressor_slot_count=1,
-        )
-    ).generate(seed=251, device="cpu")
-    values.token_to_req_indices.zero_()
-    values.positions = torch.tensor([3, 2, 3], dtype=torch.int64)
-    values.compressor_slot_mapping = torch.tensor([0, 1, -1], dtype=torch.int64)
-    values.kv_slot_mapping = torch.tensor([0, 1, 2], dtype=torch.int64)
-    values.block_table.zero_()
-    values.kv_cache_2d.zero_()
-    values.state_cache.zero_()
-    values.state_cache[:, :, 512:1024] = 1.0
-    values.rms_norm_weight.fill_(1.0)
-
-    expected = deepseek_v4_sparse_compress_cache_insert_reference(values)
-
-    assert not torch.equal(expected[0, :576], values.kv_cache_2d[0, :576])
-    torch.testing.assert_close(
-        expected[0, 576:1152],
-        values.kv_cache_2d[0, 576:1152],
-        rtol=0,
-        atol=0,
-    )
-    torch.testing.assert_close(
-        expected[0, 1152:1728],
-        values.kv_cache_2d[0, 1152:1728],
-        rtol=0,
-        atol=0,
-    )
-
-
-def test_deepseek_v4_sparse_compress_cache_insert_keeps_metadata_seed_independent() -> (
-    None
-):
-    generator = CSAInputs(
-        DeepSeekV4SparseCompressCacheInsertInputConfig(
-            num_tokens=5,
-            batch_size=2,
-            max_seq_len=8,
-            num_state_cache_blocks=3,
-            compressor_block_size=4,
-            num_kv_cache_blocks=2,
-            kv_cache_block_size=4,
-            compress_ratio=4,
-            overlap=False,
-            dtype=torch.float32,
-            non_boundary_token_count=1,
-        )
-    )
-
-    first = generator.generate(metadata_seed=261, value_seed=271, device="cpu")
-    same_metadata = generator.generate(metadata_seed=261, value_seed=272, device="cpu")
-    same_values = generator.generate(metadata_seed=262, value_seed=271, device="cpu")
-
-    torch.testing.assert_close(first.positions, same_metadata.positions)
-    torch.testing.assert_close(
-        first.compressor_slot_mapping,
-        same_metadata.compressor_slot_mapping,
-    )
-    torch.testing.assert_close(first.kv_slot_mapping, same_metadata.kv_slot_mapping)
-    torch.testing.assert_close(first.block_table, same_metadata.block_table)
-    assert not torch.equal(first.state_cache, same_metadata.state_cache)
-    torch.testing.assert_close(first.state_cache, same_values.state_cache)
-    assert not torch.equal(first.positions, same_values.positions)
-
-
-def test_deepseek_v4_sparse_compress_cache_insert_rejects_invalid_values() -> None:
-    with pytest.raises(ValueError, match="compressor slots"):
-        CSAInputs(
-            DeepSeekV4SparseCompressCacheInsertInputConfig(
-                num_tokens=5,
-                batch_size=1,
-                max_seq_len=4,
-                num_state_cache_blocks=1,
-                compressor_block_size=4,
-                num_kv_cache_blocks=2,
-                kv_cache_block_size=4,
-                compress_ratio=4,
-                overlap=False,
-                dtype=torch.float32,
-            )
-        )
-    with pytest.raises(ValueError, match="compression boundary"):
-        CSAInputs(
-            DeepSeekV4SparseCompressCacheInsertInputConfig(
-                num_tokens=1,
-                batch_size=1,
-                max_seq_len=3,
-                num_state_cache_blocks=1,
-                compressor_block_size=4,
-                num_kv_cache_blocks=1,
-                kv_cache_block_size=4,
-                compress_ratio=4,
-                overlap=True,
-                dtype=torch.float32,
-            )
-        )
-
-    values = CSAInputs(
-        DeepSeekV4SparseCompressCacheInsertInputConfig(
-            num_tokens=2,
-            batch_size=1,
-            max_seq_len=4,
-            num_state_cache_blocks=1,
-            compressor_block_size=4,
-            num_kv_cache_blocks=1,
-            kv_cache_block_size=4,
-            compress_ratio=4,
-            overlap=True,
-            dtype=torch.float32,
-        )
-    ).generate(seed=281, device="cpu")
-    values.kv_slot_mapping = torch.tensor([0, 0], dtype=torch.int64)
-    values.positions = torch.tensor([3, 3], dtype=torch.int64)
-    with pytest.raises(ValueError, match="unique"):
-        deepseek_v4_sparse_compress_cache_insert_reference(values)
-
-
-def test_deepseek_v4_indexer_mxfp4_cache_write_inputs_generate_reference() -> None:
-    values = CSAInputs(
-        DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
-            num_rows=5,
-            num_cache_blocks=2,
-            block_size=4,
-            dtype=torch.bfloat16,
-            negative_slot_count=1,
-            masked_row_count=1,
-        )
-    ).generate(metadata_seed=81, value_seed=91, device="cpu")
-
-    expected = deepseek_v4_indexer_mxfp4_cache_write_reference(values)
-
-    assert values.index_k.shape == (5, 128)
-    assert values.cache_2d.shape == (2, 4 * 68)
-    assert values.slot_mapping.shape == (5,)
-    assert values.valid.shape == (5,)
-    assert int((values.slot_mapping < 0).sum().item()) == 1
-    assert int((~values.valid).sum().item()) == 1
-    assert expected.shape == values.cache_2d.shape
-
-    slots = values.slot_mapping.to(torch.int64)
-    writable_slots = []
-    for row_idx, slot in enumerate(slots.tolist()):
-        if slot < 0 or not bool(values.valid[row_idx].item()):
-            continue
-        writable_slots.append(slot)
-        page = slot // values.block_size
-        pos = slot % values.block_size
-        value_base = pos * 64
-        scale_base = values.block_size * 64 + pos * 4
-        assert not torch.equal(
-            expected[page, value_base : value_base + 64],
-            values.cache_2d[page, value_base : value_base + 64],
-        )
-        assert not torch.equal(
-            expected[page, scale_base : scale_base + 4],
-            values.cache_2d[page, scale_base : scale_base + 4],
-        )
-
-    assert writable_slots
-    writable_slot_set = set(writable_slots)
-    for slot in range(values.cache_2d.shape[0] * values.block_size):
-        if slot in writable_slot_set:
-            continue
-        page = slot // values.block_size
-        pos = slot % values.block_size
-        value_base = pos * 64
-        scale_base = values.block_size * 64 + pos * 4
-        torch.testing.assert_close(
-            expected[page, value_base : value_base + 64],
-            values.cache_2d[page, value_base : value_base + 64],
-            rtol=0,
-            atol=0,
-        )
-        torch.testing.assert_close(
-            expected[page, scale_base : scale_base + 4],
-            values.cache_2d[page, scale_base : scale_base + 4],
-            rtol=0,
-            atol=0,
-        )
-
-
-def test_deepseek_v4_indexer_mxfp4_cache_write_reference_known_zero_row() -> None:
-    values = CSAInputs(
-        DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
-            num_rows=1,
-            num_cache_blocks=1,
-            block_size=1,
-            dtype=torch.float32,
-        )
-    ).generate(seed=101, device="cpu")
-    values.index_k = torch.zeros((1, 128), dtype=torch.float32)
-    values.cache_2d = torch.full((1, 68), 255, dtype=torch.uint8)
-    values.slot_mapping = torch.tensor([0], dtype=torch.int64)
-    values.valid = torch.tensor([True], dtype=torch.bool)
-
-    expected = deepseek_v4_indexer_mxfp4_cache_write_reference(values)
-
-    torch.testing.assert_close(expected[0, :64], torch.zeros(64, dtype=torch.uint8))
-    torch.testing.assert_close(
-        expected[0, 64:68],
-        torch.full((4,), 112, dtype=torch.uint8),
-    )
-
-
-def test_deepseek_v4_indexer_mxfp4_cache_write_keeps_metadata_seed_independent() -> (
-    None
-):
-    generator = CSAInputs(
-        DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
-            num_rows=4,
-            num_cache_blocks=1,
-            block_size=4,
-            dtype=torch.float32,
-            negative_slot_count=1,
-            masked_row_count=1,
-        )
-    )
-
-    first = generator.generate(metadata_seed=111, value_seed=121, device="cpu")
-    same_metadata = generator.generate(metadata_seed=111, value_seed=122, device="cpu")
-    same_values = generator.generate(metadata_seed=112, value_seed=121, device="cpu")
-
-    torch.testing.assert_close(first.slot_mapping, same_metadata.slot_mapping)
-    torch.testing.assert_close(first.valid, same_metadata.valid)
-    assert not torch.equal(first.index_k, same_metadata.index_k)
-    torch.testing.assert_close(first.index_k, same_values.index_k)
-    assert not torch.equal(first.slot_mapping, same_values.slot_mapping)
-
-
-def test_deepseek_v4_indexer_mxfp4_cache_write_rejects_invalid_configs_and_values() -> (
-    None
-):
-    with pytest.raises(ValueError, match="non-negative slots"):
-        CSAInputs(
-            DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
-                num_rows=5,
-                num_cache_blocks=1,
-                block_size=4,
-                dtype=torch.float32,
-            )
-        )
-
-    values = CSAInputs(
-        DeepSeekV4IndexerMXFP4CacheWriteInputConfig(
-            num_rows=2,
-            num_cache_blocks=1,
-            block_size=4,
-            dtype=torch.float32,
-        )
-    ).generate(seed=131, device="cpu")
-    values.slot_mapping = torch.tensor([0, 0], dtype=torch.int64)
-    values.valid = torch.tensor([True, True], dtype=torch.bool)
-    with pytest.raises(ValueError, match="unique"):
-        deepseek_v4_indexer_mxfp4_cache_write_reference(values)
-
-
-def test_deepseek_v4_indexer_mxfp4_cache_gather_inputs_generate_reference() -> None:
-    values = CSAInputs(
-        DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
-            num_rows=6,
-            num_cache_blocks=2,
-            block_size=4,
-            negative_slot_count=2,
-        )
-    ).generate(metadata_seed=141, value_seed=151, device="cpu")
-
-    expected_values, expected_scales = deepseek_v4_indexer_mxfp4_cache_gather_reference(
-        values
-    )
-
-    assert values.cache_2d.shape == (2, 4 * 68)
-    assert values.slot_mapping.shape == (6,)
-    assert values.values_out.shape == (6, 64)
-    assert values.scales_out.shape == (6, 4)
-    assert int((values.slot_mapping < 0).sum().item()) == 2
-    assert expected_values.shape == values.values_out.shape
-    assert expected_scales.shape == values.scales_out.shape
-
-    for row_idx, slot in enumerate(values.slot_mapping.to(torch.int64).tolist()):
-        if slot < 0:
-            torch.testing.assert_close(
-                expected_values[row_idx, :64],
-                torch.zeros((64,), dtype=torch.uint8),
-                rtol=0,
-                atol=0,
-            )
-            torch.testing.assert_close(
-                expected_scales[row_idx, :4],
-                torch.zeros((4,), dtype=torch.uint8),
-                rtol=0,
-                atol=0,
-            )
-            continue
-
-        page = slot // values.block_size
-        pos = slot % values.block_size
-        value_base = pos * 64
-        scale_base = values.block_size * 64 + pos * 4
-        torch.testing.assert_close(
-            expected_values[row_idx, :64],
-            values.cache_2d[page, value_base : value_base + 64],
-            rtol=0,
-            atol=0,
-        )
-        torch.testing.assert_close(
-            expected_scales[row_idx, :4],
-            values.cache_2d[page, scale_base : scale_base + 4],
-            rtol=0,
-            atol=0,
-        )
-
-
-def test_deepseek_v4_indexer_mxfp4_cache_gather_keeps_metadata_seed_independent() -> (
-    None
-):
-    generator = CSAInputs(
-        DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
-            num_rows=4,
-            num_cache_blocks=2,
-            block_size=2,
-            negative_slot_count=1,
-        )
-    )
-
-    first = generator.generate(metadata_seed=161, value_seed=171, device="cpu")
-    same_metadata = generator.generate(metadata_seed=161, value_seed=172, device="cpu")
-    same_values = generator.generate(metadata_seed=162, value_seed=171, device="cpu")
-
-    torch.testing.assert_close(first.slot_mapping, same_metadata.slot_mapping)
-    assert not torch.equal(first.cache_2d, same_metadata.cache_2d)
-    assert not torch.equal(first.values_out, same_metadata.values_out)
-    torch.testing.assert_close(first.cache_2d, same_values.cache_2d)
-    torch.testing.assert_close(first.values_out, same_values.values_out)
-    torch.testing.assert_close(first.scales_out, same_values.scales_out)
-
-
-def test_deepseek_v4_indexer_mxfp4_cache_gather_rejects_invalid_configs_and_values() -> (
-    None
-):
-    with pytest.raises(ValueError, match="negative_slot_count"):
-        CSAInputs(
-            DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
-                num_rows=1,
-                num_cache_blocks=1,
-                block_size=2,
-                negative_slot_count=2,
-            )
-        )
-
-    values = CSAInputs(
-        DeepSeekV4IndexerMXFP4CacheGatherInputConfig(
-            num_rows=1,
-            num_cache_blocks=1,
-            block_size=2,
-        )
-    ).generate(seed=181, device="cpu")
-    values.slot_mapping = torch.tensor([2], dtype=torch.int64)
-    with pytest.raises(ValueError, match="slot_mapping entries"):
-        deepseek_v4_indexer_mxfp4_cache_gather_reference(values)
-
-
-def test_deepseek_v4_k_cache_gather_inputs_generate_reference() -> None:
-    values = CSAInputs(
-        DeepSeekV4KCacheGatherInputConfig(
-            batch_size=3,
-            max_seq_len=9,
-            block_size=4,
-            max_gather_len=5,
-            offset=2,
-            include_gather_lens=True,
-            include_block_table_base_offsets=True,
-        )
-    ).generate(metadata_seed=191, value_seed=201, device="cpu")
-
-    expected = deepseek_v4_dequantize_and_gather_k_cache_reference(values)
-
-    assert values.out.shape == (3, 7, 512)
-    assert values.cache_2d.shape == (9, 4 * (576 + 8))
-    assert values.seq_lens.shape == (3,)
-    assert values.gather_lens is not None
-    assert values.gather_lens.shape == (3,)
-    assert values.block_table.shape == (3, 3)
-    assert values.block_table_base_offsets is not None
-    torch.testing.assert_close(expected[:, :2], values.out[:, :2], rtol=0, atol=0)
-
-    for batch_idx in range(values.seq_lens.numel()):
-        seq_len = int(values.seq_lens[batch_idx].item())
-        gather_len = int(values.gather_lens[batch_idx].item())
-        start_pos = seq_len - gather_len
-        base_offset = int(values.block_table_base_offsets[batch_idx].item())
-        for gather_idx in range(gather_len):
-            pos = start_pos + gather_idx
-            table_idx = pos // values.block_size - base_offset
-            physical = int(values.block_table[batch_idx, table_idx].item())
-            pos_in_block = pos % values.block_size
-            rope_start = pos_in_block * 576 + 448
-            rope_end = rope_start + 128
-            torch.testing.assert_close(
-                expected[batch_idx, values.offset + gather_idx, 448:],
-                values.cache_2d[physical, rope_start:rope_end].view(torch.bfloat16),
-                rtol=0,
-                atol=0,
-            )
-
-
-def test_deepseek_v4_k_cache_gather_keeps_metadata_seed_independent() -> None:
-    generator = CSAInputs(
-        DeepSeekV4KCacheGatherInputConfig(
-            batch_size=2,
-            max_seq_len=8,
-            block_size=4,
-            max_gather_len=4,
-        )
-    )
-
-    first = generator.generate(metadata_seed=211, value_seed=221, device="cpu")
-    same_metadata = generator.generate(metadata_seed=211, value_seed=222, device="cpu")
-    same_values = generator.generate(metadata_seed=212, value_seed=221, device="cpu")
-
-    torch.testing.assert_close(first.seq_lens, same_metadata.seq_lens)
-    assert first.gather_lens is not None and same_metadata.gather_lens is not None
-    torch.testing.assert_close(first.gather_lens, same_metadata.gather_lens)
-    torch.testing.assert_close(first.block_table, same_metadata.block_table)
-    assert not torch.equal(first.cache_2d, same_metadata.cache_2d)
-    torch.testing.assert_close(first.cache_2d, same_values.cache_2d)
-    torch.testing.assert_close(first.out, same_values.out)
-
-
-def test_deepseek_v4_k_cache_gather_supports_full_sequence_gather() -> None:
-    values = CSAInputs(
-        DeepSeekV4KCacheGatherInputConfig(
-            batch_size=2,
-            max_seq_len=6,
-            block_size=3,
-            include_gather_lens=False,
-        )
-    ).generate(seed=231, device="cpu")
-
-    expected = deepseek_v4_dequantize_and_gather_k_cache_reference(values)
-
-    assert values.gather_lens is None
-    assert expected.shape == values.out.shape
-    assert torch.isfinite(expected.float()).all()
-
-
-def test_deepseek_v4_k_cache_gather_rejects_invalid_configs_and_values() -> None:
-    with pytest.raises(ValueError, match="max_gather_len"):
-        CSAInputs(
-            DeepSeekV4KCacheGatherInputConfig(
-                batch_size=1,
-                max_seq_len=4,
-                block_size=2,
-                max_gather_len=5,
-            )
-        )
-    with pytest.raises(ValueError, match="num_cache_blocks"):
-        CSAInputs(
-            DeepSeekV4KCacheGatherInputConfig(
-                batch_size=2,
-                max_seq_len=4,
-                block_size=2,
-                num_cache_blocks=3,
-            )
-        )
-
-    values = CSAInputs(
-        DeepSeekV4KCacheGatherInputConfig(
-            batch_size=1,
-            max_seq_len=4,
-            block_size=2,
-            max_gather_len=2,
-        )
-    ).generate(seed=241, device="cpu")
-    assert values.gather_lens is not None
-    values.gather_lens = values.seq_lens + 1
-    with pytest.raises(ValueError, match="gather_lens entries"):
-        deepseek_v4_dequantize_and_gather_k_cache_reference(values)
-
-
-def test_deepseek_v4_paged_index_inputs_generate_values_and_refs() -> None:
-    values = CSAInputs(
-        DeepSeekV4PagedIndexInputConfig(
-            batch_size=3,
-            total_cached_tokens=18,
-            total_new_q_tokens=9,
-            block_size=4,
-            compress_ratio=3,
-            window_size=5,
-            topk=4,
-            indexing="identity",
-            include_valid_token_mask=True,
-            invalid_token_probability=0.85,
-            metadata_input=MHARequestMetadataInputConfig(
-                batch_size=3,
-                total_cached_tokens=18,
-                total_new_q_tokens=9,
-                cache_layout="paged",
-                cached_length_mode="regular",
-                new_q_length_mode="fixed_per_request",
-            ),
-        )
-    ).generate(seed=11, device="cpu")
-
-    assert values.positions.shape == (9,)
-    assert values.token_to_req_indices.shape == (9,)
-    assert values.local_topk_indices.shape == (9, 4)
-    assert values.seq_lens.shape == (3,)
-    assert values.block_table.shape[0] == 3
-    assert values.block_table.shape[1] >= 3
-    assert values.is_valid_token is not None
-    assert values.is_valid_token.shape == (9,)
-
-    global_topk, global_lens = (
-        deepseek_v4_compute_global_topk_indices_and_lens_reference(values)
-    )
-    swa_indices, swa_lens = deepseek_v4_decode_swa_indices_and_lens_reference(values)
-    slot_mapping = deepseek_v4_compressed_slot_mapping_reference(values)
-    context_lens, out_block_tables = deepseek_v4_indexer_decode_metadata_reference(
-        values
-    )
-
-    assert global_topk.shape == values.local_topk_indices.shape
-    assert global_lens.shape == (9,)
-    assert swa_indices.shape == (9, values.window_size)
-    assert swa_lens.shape == (9,)
-    assert slot_mapping.shape == (9,)
-    assert context_lens.shape == (9,)
-    assert out_block_tables.shape == (9, values.max_blocks)
-    assert torch.all(global_lens <= values.topk)
-    assert torch.all(swa_lens <= values.window_size)
-    invalid = ~values.is_valid_token
-    assert torch.all(global_lens[invalid] == 0)
-    assert torch.all(swa_lens[invalid] == 0)
-
-    valid_compressed = [
-        idx
-        for idx, pos in enumerate(values.positions.tolist())
-        if (pos + 1) % values.compress_ratio == 0
-    ]
-    assert valid_compressed
-    assert torch.all(slot_mapping[valid_compressed] >= 0)
-    assert torch.all(context_lens >= 0)
-
-
-def test_deepseek_v4_paged_index_inputs_support_base_offsets() -> None:
-    values = CSAInputs(
-        DeepSeekV4PagedIndexInputConfig(
-            batch_size=2,
-            total_cached_tokens=16,
-            total_new_q_tokens=6,
-            block_size=4,
-            compress_ratio=2,
-            window_size=4,
-            topk=3,
-            include_block_table_base_offsets=True,
-            indexing="identity",
-            metadata_input=MHARequestMetadataInputConfig(
-                batch_size=2,
-                total_cached_tokens=16,
-                total_new_q_tokens=6,
-                cache_layout="paged",
-                cached_length_mode="regular",
-                new_q_length_mode="fixed_per_request",
-            ),
-        )
-    ).generate(seed=12, device="cpu")
-
-    assert values.block_table_base_offsets is not None
-    assert values.block_table_base_offsets.shape == (2,)
-
-    swa_indices, swa_lens = deepseek_v4_decode_swa_indices_and_lens_reference(values)
-    context_lens, out_block_tables = deepseek_v4_indexer_decode_metadata_reference(
-        values
-    )
-
-    assert swa_indices.shape == (6, 4)
-    assert torch.all(swa_lens <= 4)
-    assert context_lens.shape == (6,)
-    assert out_block_tables.shape == (6, values.max_blocks)
-
-
-def test_deepseek_v4_paged_index_inputs_keep_metadata_seeded() -> None:
-    config = DeepSeekV4PagedIndexInputConfig(
-        batch_size=2,
-        total_cached_tokens=13,
-        total_new_q_tokens=7,
-        block_size=4,
-        compress_ratio=2,
-        window_size=4,
-        topk=3,
-        indexing="random",
-    )
-
-    first = CSAInputs(config).generate(seed=13, device="cpu")
-    second = CSAInputs(config).generate(seed=13, device="cpu")
-    third = CSAInputs(config).generate(seed=14, device="cpu")
-
-    assert torch.equal(first.positions, second.positions)
-    assert torch.equal(first.token_to_req_indices, second.token_to_req_indices)
-    assert torch.equal(first.block_table, second.block_table)
-    assert torch.equal(first.local_topk_indices, second.local_topk_indices)
-    assert not torch.equal(first.block_table, third.block_table)
-
-
-def test_deepseek_v4_paged_index_inputs_reject_invalid_configs() -> None:
-    with pytest.raises(ValueError, match="compress_ratio"):
-        CSAInputs(
-            DeepSeekV4PagedIndexInputConfig(
-                batch_size=2,
-                total_cached_tokens=8,
-                total_new_q_tokens=4,
-                block_size=4,
-                compress_ratio=1,
-                window_size=4,
-                topk=2,
-            )
-        )
-
-    with pytest.raises(ValueError, match="metadata_input.total_new_kv_tokens"):
-        CSAInputs(
-            DeepSeekV4PagedIndexInputConfig(
-                batch_size=2,
-                total_cached_tokens=8,
-                total_new_q_tokens=4,
-                block_size=4,
-                compress_ratio=2,
-                window_size=4,
-                topk=2,
-                metadata_input=MHARequestMetadataInputConfig(
-                    batch_size=2,
-                    total_cached_tokens=8,
-                    total_new_q_tokens=4,
-                    total_new_kv_tokens=3,
-                    cache_layout="paged",
-                    tie_new_kv_to_query=False,
-                ),
-            )
-        )
-
-    with pytest.raises(ValueError, match="page_table_input.batch_size"):
-        CSAInputs(
-            DeepSeekV4PagedIndexInputConfig(
-                batch_size=2,
-                total_cached_tokens=8,
-                total_new_q_tokens=4,
-                block_size=4,
-                compress_ratio=2,
-                window_size=4,
-                topk=2,
-                page_table_input=PageTableInputConfig(
-                    batch_size=1,
-                    max_pages_per_request=4,
-                ),
-            )
-        )
-
-
-def test_deepseek_v4_sparse_prefill_indices_generate_values_and_refs() -> None:
-    values = CSAInputs(
-        DeepSeekV4SparsePrefillIndexInputConfig(
-            batch_size=3,
-            total_cached_tokens=17,
-            total_new_q_tokens=9,
-            topk=4,
-            window_size=5,
-            compress_ratio=3,
-            metadata_input=MHARequestMetadataInputConfig(
-                batch_size=3,
-                total_cached_tokens=17,
-                total_new_q_tokens=9,
-                cache_layout="dense",
-                cached_length_mode="regular",
-                new_q_length_mode="fixed_per_request",
-            ),
-        )
-    ).generate(seed=17, device="cpu")
-
-    assert values.topk_indices.shape == (9, 4)
-    assert values.positions.shape == (9,)
-    assert values.token_to_req_indices.shape == (9,)
-    assert values.seq_lens.shape == (3,)
-    assert values.gather_lens.shape == (3,)
-    assert values.compressed_lens.shape == (3,)
-    assert values.topk_indices.dtype == torch.int32
-    assert values.positions.dtype == torch.int32
-    assert values.workspace_width >= (
-        values.compressed_base + int(values.gather_lens.max().item())
-    )
-
-    local = deepseek_v4_build_dense_prefill_local_compressed_indices_reference(values)
-    topk_indices, topk_lens = deepseek_v4_combine_topk_swa_indices_reference(values)
-    dense_indices, dense_lens = deepseek_v4_combine_dense_swa_indices_reference(values)
-
-    assert local.shape == (9, values.compressed_base)
-    assert topk_indices.shape == (9, 128)
-    assert dense_indices.shape == (9, 128)
-    assert topk_lens.shape == (9,)
-    assert dense_lens.shape == (9,)
-    assert torch.all(topk_lens > 0)
-    assert torch.all(dense_lens > 0)
-    for token_idx, pos in enumerate(values.positions.tolist()):
-        req = int(values.token_to_req_indices[token_idx].item())
-        expected_topk_len = min((pos + 1) // values.compress_ratio, values.topk)
-        expected_swa_len = min(pos + 1, values.window_size)
-        expected_dense_len = min(
-            (pos + 1) // values.compress_ratio,
-            int(values.compressed_lens[req].item()),
-        )
-        assert int(topk_lens[token_idx].item()) == (
-            expected_topk_len + expected_swa_len
-        )
-        assert int(dense_lens[token_idx].item()) == (
-            expected_dense_len + expected_swa_len
-        )
-        topk_len = int(topk_lens[token_idx].item())
-        dense_len = int(dense_lens[token_idx].item())
-        assert torch.all(topk_indices[token_idx, topk_len:] == -1)
-        assert torch.all(dense_indices[token_idx, dense_len:] == -1)
-
-
-def test_deepseek_v4_sparse_prefill_index_inputs_keep_seeded_metadata_stable() -> None:
-    config = DeepSeekV4SparsePrefillIndexInputConfig(
-        batch_size=2,
-        total_cached_tokens=20,
-        total_new_q_tokens=8,
-        topk=3,
-        window_size=4,
-        compress_ratio=2,
-        topk_indexing="random",
-        metadata_input=MHARequestMetadataInputConfig(
-            batch_size=2,
-            total_cached_tokens=20,
-            total_new_q_tokens=8,
-            cache_layout="dense",
-            cached_length_mode="regular",
-            new_q_length_mode="fixed_per_request",
-        ),
-    )
-
-    first = CSAInputs(config).generate(seed=23, device="cpu")
-    second = CSAInputs(config).generate(seed=23, device="cpu")
-    third = CSAInputs(config).generate(seed=24, device="cpu")
-
-    assert torch.equal(first.positions, second.positions)
-    assert torch.equal(first.token_to_req_indices, second.token_to_req_indices)
-    assert torch.equal(first.topk_indices, second.topk_indices)
-    assert not torch.equal(first.topk_indices, third.topk_indices)
-
-
-def test_deepseek_v4_sparse_prefill_index_inputs_support_identity_topk() -> None:
-    values = CSAInputs(
-        DeepSeekV4SparsePrefillIndexInputConfig(
-            batch_size=1,
-            total_cached_tokens=12,
-            total_new_q_tokens=4,
-            topk=4,
-            window_size=3,
-            compress_ratio=2,
-            topk_indexing="identity",
-            metadata_input=MHARequestMetadataInputConfig(
-                batch_size=1,
-                total_cached_tokens=12,
-                total_new_q_tokens=4,
-                cache_layout="dense",
-                new_q_length_mode="fixed_per_request",
-            ),
-        )
-    ).generate(seed=31, device="cpu")
-
-    for token_idx, pos in enumerate(values.positions.tolist()):
-        valid = min((pos + 1) // values.compress_ratio, values.topk)
-        assert torch.equal(
-            values.topk_indices[token_idx, :valid],
-            torch.arange(valid, dtype=torch.int32),
-        )
-
-
-def test_deepseek_v4_sparse_prefill_index_inputs_reject_invalid_configs() -> None:
-    with pytest.raises(ValueError, match="compress_ratio"):
-        CSAInputs(
-            DeepSeekV4SparsePrefillIndexInputConfig(
-                batch_size=2,
-                total_cached_tokens=0,
-                total_new_q_tokens=4,
-                topk=2,
-                window_size=4,
-                compress_ratio=1,
-            )
-        )
-
-    with pytest.raises(ValueError, match="total_new_kv_tokens"):
-        CSAInputs(
-            DeepSeekV4SparsePrefillIndexInputConfig(
-                batch_size=2,
-                total_cached_tokens=0,
-                total_new_q_tokens=4,
-                topk=2,
-                window_size=4,
-                compress_ratio=2,
-                metadata_input=MHARequestMetadataInputConfig(
-                    batch_size=2,
-                    total_cached_tokens=0,
-                    total_new_q_tokens=4,
-                    total_new_kv_tokens=3,
-                    tie_new_kv_to_query=False,
-                    allow_untied_non_cached_kv=True,
-                ),
-            )
-        )
-
-    with pytest.raises(ValueError, match="workspace_width"):
-        CSAInputs(
-            DeepSeekV4SparsePrefillIndexInputConfig(
-                batch_size=1,
-                total_cached_tokens=8,
-                total_new_q_tokens=4,
-                topk=2,
-                window_size=4,
-                compress_ratio=2,
-                compressed_base=6,
-                workspace_width=7,
-            )
-        ).generate(seed=1, device="cpu")
 
 
 def test_page_table_input_generates_identity_and_random_indexing() -> None:

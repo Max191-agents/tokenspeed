@@ -2,10 +2,10 @@
 
 Attention input generation is organized around five operation families:
 `MHAInputs`, `MLAInputs`, `CSAInputs`, `DSAInputs`, and `GDNInputs`. These are
-the public generator entry points. Config objects select the concrete mode
-within a family, so variants such as prefill/decode, paged/dense cache, sparse
-decode packing, and GDN QKV split are represented as configurations of the
-family generator rather than separate generator families.
+the public generator entry points. They model operation-level inputs, not every
+TokenSpeed helper-kernel argument bundle. Frontend or kernel tests should adapt
+the generated values when a helper kernel wants a packed view, a cache-write
+subset, or backend-specific metadata names.
 
 ## Operation Semantics
 
@@ -38,8 +38,8 @@ outputs over the latent KV channels.
 `CSAInputs` represents compressed sequence attention input generation. The
 current layout support is DeepSeek V4-style. The sliding-window attention
 portion is always generated; optional compressed-history and indexer configs
-add the generated values needed by CSA/HCA cache, sparse-index, and gather
-paths.
+add the core values needed for CSA/HCA compressed history and sparse indexer
+state.
 
 The compressed-history config covers both supported compression ratios:
 
@@ -47,42 +47,32 @@ The compressed-history config covers both supported compression ratios:
 - `compress_ratio == 4`: CSA-style compressed history with optional indexer
   inputs.
 
-CSA values intentionally contain nested bundles for the narrower helper
-operations consumed by TokenSpeed tests and references. Callers should still
-construct those values through `CSAInputs` instead of using one generator per
-helper kernel.
+CSA values may contain nested structured values that TokenSpeed adapters can
+use for narrower helper kernels, but those helpers are not separate generator
+families.
 
 ### DSA
 
-`DSAInputs` represents dynamic sparse attention metadata and cache helper
-inputs. Its configs cover:
+`DSAInputs` represents dynamic sparse attention decode inputs. It generates the
+core values shared by DSA helper kernels:
 
-- sparse decode KV packing, where BF16 NoPE/RoPE key rows are packed into
-  physical cache slots with FP8 E4M3 NoPE blocks and FP32 per-block scales;
-- sparse top-k slot mapping, where token-local context offsets are translated
-  through a block table into physical KV-cache slots;
-- deterministic decode top-k selection over pre-masked indexer logits.
+- source NoPE/RoPE key rows and physical cache slots;
+- masked indexer logits plus top-k output storage;
+- token-local offsets, sequence lengths, and page-table metadata.
 
-The selected top-k indices are token-local context offsets. Slot-mapping
-configs convert those offsets into physical cache slots when a backend needs
-cache addresses.
+TokenSpeed adapters derive sparse KV pack, decode top-k, and local-offset to
+global-slot argument bundles from these core values.
 
 ### GDN
 
-`GDNInputs` represents Gated DeltaNet inputs. Its configs cover packed QKV
-split and chunked prefill.
+`GDNInputs` represents Gated DeltaNet inputs for the prompt-side recurrent
+scan. Unlike softmax attention, it does not materialize pairwise attention over
+all prior tokens. It maintains a per-sequence, per-value-head matrix state,
+applies log-space decay gates, applies a delta-rule correction, and reads the
+updated state with the query vector.
 
-Packed QKV split starts from a post-projection tensor whose last dimension is
-`q_width + k_width + v_width`, then returns separate Q, K, and V views or
-outputs. Some GDN paths also fuse per-head L2 normalization of Q and K into the
-split; V is copied without normalization.
-
-Chunked prefill represents the prompt-side recurrent scan for Gated
-DeltaNet-style linear attention. Unlike softmax attention, it does not
-materialize pairwise attention over all prior tokens. It maintains a
-per-sequence, per-value-head matrix state, applies log-space decay gates,
-applies a delta-rule correction, and reads the updated state with the query
-vector.
+TokenSpeed helper kernels that consume packed QKV can pack the generated Q, K,
+and V values outside the generator.
 
 ## Shared Components
 
@@ -114,15 +104,13 @@ values:
 - MHA query heads must be compatible with KV heads for grouped attention;
 - MLA prefill references require matching Q/K dimensions and compatible
   grouped K/V heads;
-- Dynamic sparse attention packing and slot-mapping configs require integer
-  slot metadata, valid packed row widths, and no out-of-bounds cache addresses;
+- Dynamic sparse attention configs require integer slot metadata, valid row
+  widths, and no out-of-bounds cache addresses;
 - CSA compressed-history and indexer configs require supported compression
   ratios, page metadata wide enough for visible KV positions, and cache/indexer
-  layouts that match the selected mode;
-- GDN packed split configs require positive head counts/dimensions and a packed
-  last dimension equal to `q_width + k_width + v_width`;
-- GDN chunked-prefill configs require consistent recurrent-state shapes,
-  positive chunk metadata, and valid per-sequence cumulative lengths.
+  layouts that match the selected CSA/HCA components;
+- GDN configs require consistent recurrent-state shapes, positive chunk
+  metadata, and valid per-sequence cumulative lengths.
 
 Metadata-oriented values such as request lengths and page mappings are
 generated from metadata seeds. Numerical tensors are generated from value seeds
@@ -131,11 +119,11 @@ so tests can reuse the same request/cache layout across different value draws.
 ## TokenSpeed API Mapping
 
 TokenSpeed exposes several helper kernels whose input bundles are narrower than
-the five family generators. Tests should construct the corresponding family
-generator and then use the nested generated values required by the helper
-kernel. For example, dynamic sparse attention decode packing comes from
-`DSAInputs`, GDN QKV split comes from `GDNInputs`, and DeepSeek V4-style
-compressed-cache/indexer helpers come from `CSAInputs`.
+the five family generators. Tests should construct the closest operation-family
+generator and adapt from its generated values. For example, dynamic sparse
+attention decode packing is derived from `DSAInputs`, GDN QKV split can be
+derived by packing `GDNInputs` Q/K/V tensors, and DeepSeek V4-style
+compressed-cache/indexer helper bundles come from nested `CSAInputs` values.
 
 Generator values are operation-level values. Tests or adapters are responsible
 for converting generated values into the exact keyword arguments expected by a

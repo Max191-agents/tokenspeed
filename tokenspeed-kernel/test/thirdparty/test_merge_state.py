@@ -30,9 +30,8 @@ from tokenspeed_kernel.thirdparty.cuda.merge_state import (
     LSE_LOG2,
     merge_state,
 )
-from tokenspeed_numerics_input_generators.attention import _AttentionMergeStateGenerator
 from tokenspeed_numerics_input_generators import (
-    AttentionMergeStateInputConfig,
+    AttentionMergeStateInputValues,
     attention_merge_state_reference,
 )
 
@@ -51,15 +50,46 @@ def _make_inputs(
     seed: int = 0,
     lse_scale_log2: float = LSE_LN,
 ):
-    return _AttentionMergeStateGenerator(
-        AttentionMergeStateInputConfig(
-            total_q=T,
-            num_heads=H,
-            head_dim=D,
+    generator = torch.Generator(
+        device="cuda" if torch.device(device).type == "cuda" else "cpu"
+    ).manual_seed(seed)
+    out_shape = (T, H, D)
+    lse_shape = (T, H)
+    return AttentionMergeStateInputValues(
+        out_a=torch.randn(
+            out_shape,
             dtype=v_dtype,
-            lse_scale_log2=lse_scale_log2,
-        )
-    ).generate(seed=seed, device=device)
+            device=device,
+            generator=generator,
+        ).contiguous(),
+        lse_a=(
+            torch.rand(
+                lse_shape,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            * 12.0
+            - 6.0
+        ).contiguous(),
+        out_b=torch.randn(
+            out_shape,
+            dtype=v_dtype,
+            device=device,
+            generator=generator,
+        ).contiguous(),
+        lse_b=(
+            torch.rand(
+                lse_shape,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            * 12.0
+            - 6.0
+        ).contiguous(),
+        lse_scale_log2=lse_scale_log2,
+    )
 
 
 def test_lse_constants() -> None:

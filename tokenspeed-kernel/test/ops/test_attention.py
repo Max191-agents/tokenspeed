@@ -38,9 +38,8 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mla_prefill_kwargs,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_numerics_input_generators.attention import _AttentionMergeStateGenerator
 from tokenspeed_numerics_input_generators import (
-    AttentionMergeStateInputConfig,
+    AttentionMergeStateInputValues,
     MHAInputConfig,
     MHAInputs,
     MHARequestMetadataInputConfig,
@@ -54,6 +53,57 @@ platform = current_platform()
 torch.manual_seed(42)
 
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
+
+
+def _attention_merge_state_values(
+    *,
+    total_q: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> AttentionMergeStateInputValues:
+    generator = torch.Generator(
+        device="cuda" if torch.device(device).type == "cuda" else "cpu"
+    ).manual_seed(seed)
+    out_shape = (total_q, num_heads, head_dim)
+    lse_shape = (total_q, num_heads)
+    return AttentionMergeStateInputValues(
+        out_a=torch.randn(
+            out_shape,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        ).contiguous(),
+        lse_a=(
+            torch.rand(
+                lse_shape,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            * 12.0
+            - 6.0
+        ).contiguous(),
+        out_b=torch.randn(
+            out_shape,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        ).contiguous(),
+        lse_b=(
+            torch.rand(
+                lse_shape,
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            * 12.0
+            - 6.0
+        ).contiguous(),
+        lse_scale_log2=1.4426950408889634,
+    )
 
 
 def _mha_config(
@@ -450,14 +500,14 @@ def test_attn_merge_state(
 ) -> None:
     require("attention", "attn_merge_state", solution, dtype, "out_a")
 
-    values = _AttentionMergeStateGenerator(
-        AttentionMergeStateInputConfig(
-            total_q=31,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            dtype=dtype,
-        )
-    ).generate(seed=503, device=device)
+    values = _attention_merge_state_values(
+        total_q=31,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        seed=503,
+        device=device,
+    )
     out_ref, lse_ref = attention_merge_state_reference(values)
 
     out, lse = attn_merge_state(
