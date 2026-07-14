@@ -20,8 +20,8 @@ NVFP4 GEMM + SwiGLU + NVFP4 quantization test can compose:
 
 - `GemmInputs` for the NVFP4 `A @ B.T` inputs.
 - `gemm_reference` for the GEMM result.
-- activation or quantization family references for the following SwiGLU and
-  output-quantization operation.
+- local operation references for the following SwiGLU and quantization-family
+  references for the output-quantization operation.
 
 This keeps each generator tied to one operation-level input contract while still
 making fused kernel tests easy to write.

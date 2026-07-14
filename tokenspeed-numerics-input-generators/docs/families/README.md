@@ -12,12 +12,8 @@ on the config and values classes in code.
 
 ## Families
 
-- [activation](activation/README.md): elementwise and gated activations,
-  including fused quantized SwiGLU.
 - [attention](attention/README.md): MHA, MLA, attention metadata, cache layouts,
   and related fused attention helpers.
-- [communication](communication/README.md): collective-style tensor movement and
-  expert-parallel routing inputs.
 - [core](core/README.md): shared base interfaces, tensor generation, and custom
   dtype semantics.
 - [embedding](embedding/README.md): rotary embedding inputs and references.

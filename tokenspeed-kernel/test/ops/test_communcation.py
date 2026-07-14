@@ -20,7 +20,6 @@
 
 import socket
 import traceback
-from typing import List
 
 import pytest
 import torch
@@ -35,20 +34,6 @@ from tokenspeed_kernel.ops.communication.triton import (
     reduce_scatter,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_numerics_input_generators import (
-    AllGatherInputConfig,
-    AllGatherInputs,
-    AllReduceInputConfig,
-    AllReduceInputs,
-    AllReduceResidualRMSNormInputConfig,
-    AllReduceResidualRMSNormInputs,
-    ReduceScatterInputConfig,
-    ReduceScatterInputs,
-    all_gather_reference,
-    all_reduce_residual_rmsnorm_reference,
-    all_reduce_sum_reference,
-    reduce_scatter_sum_reference,
-)
 
 
 def get_open_port() -> int:
@@ -57,7 +42,7 @@ def get_open_port() -> int:
         return sock.getsockname()[1]
 
 
-def token_cases(world_size: int) -> List[List[int]]:
+def token_cases(world_size: int) -> list[list[int]]:
     cases = [
         [8] * world_size,
         [8 + rank for rank in range(world_size)],
@@ -67,6 +52,67 @@ def token_cases(world_size: int) -> List[List[int]]:
     else:
         cases.append([3] + [0] * (world_size - 1))
     return cases
+
+
+def _randn_cpu(
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    seed: int,
+) -> torch.Tensor:
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    values = torch.randn(shape, dtype=torch.float32, generator=generator).clamp(
+        -3.0, 3.0
+    )
+    return values.to(dtype).contiguous()
+
+
+def _rank_inputs(
+    world_size: int,
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    seed: int,
+) -> list[torch.Tensor]:
+    return [
+        _randn_cpu(shape, dtype=dtype, seed=seed + rank) for rank in range(world_size)
+    ]
+
+
+def _sum_rank_inputs(rank_inputs: list[torch.Tensor]) -> torch.Tensor:
+    acc = torch.zeros_like(rank_inputs[0], dtype=torch.float32)
+    for tensor in rank_inputs:
+        acc = acc + tensor.float()
+    return acc.to(rank_inputs[0].dtype)
+
+
+def _sum_rank_inputs_for_rmsnorm(rank_inputs: list[torch.Tensor]) -> torch.Tensor:
+    acc = torch.zeros_like(rank_inputs[0], dtype=torch.float32)
+    for tensor in rank_inputs:
+        acc = acc + tensor.float()
+    return acc
+
+
+def _rmsnorm_rows(rows: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    variance = rows.pow(2).mean(dim=-1, keepdim=True)
+    return rows * torch.rsqrt(variance + eps) * weight.to(rows.dtype)
+
+
+def _all_gather_reference(rank_inputs: list[torch.Tensor]) -> torch.Tensor:
+    return torch.cat(rank_inputs, dim=0)
+
+
+def _reduce_scatter_reference(
+    rank_inputs: list[torch.Tensor],
+    tokens_per_rank: list[int],
+) -> list[torch.Tensor]:
+    reduced = _sum_rank_inputs(rank_inputs)
+    outputs: list[torch.Tensor] = []
+    offset = 0
+    for num_tokens in tokens_per_rank:
+        outputs.append(reduced[offset : offset + num_tokens].contiguous())
+        offset += num_tokens
+    return outputs
 
 
 def worker_fn(rank, world_size, port, hidden_size, error_dict):
@@ -108,25 +154,20 @@ def worker_main(rank: int, world_size: int, port: int, hidden_size: int) -> None
 
 
 def check_all_gather(
-    rsag, rank: int, world_size: int, tokens: List[int], hidden_size: int, device
+    rsag, rank: int, world_size: int, tokens: list[int], hidden_size: int, device
 ) -> None:
-    values = AllGatherInputs(
-        AllGatherInputConfig(
-            world_size=world_size,
-            total_tokens=sum(tokens),
-            hidden_size=hidden_size,
-            max_tokens_per_rank=max(tokens),
+    rank_inputs = [
+        _randn_cpu(
+            (num_tokens, hidden_size),
             dtype=torch.bfloat16,
+            seed=1_000 + sum(tokens) + hidden_size + input_rank,
         )
-    ).generate(
-        seed=1_000 + sum(tokens) + hidden_size,
-        metadata_seed=2_000 + sum(tokens) + max(tokens),
-        device="cpu",
-    )
-    local = values.rank_inputs[rank].to(device=device)
-    expected = all_gather_reference(values).to(device=device)
+        for input_rank, num_tokens in enumerate(tokens)
+    ]
+    local = rank_inputs[rank].to(device=device)
+    expected = _all_gather_reference(rank_inputs).to(device=device)
 
-    result = all_gather(rsag, local, token_list_in_group=values.tokens_per_rank)
+    result = all_gather(rsag, local, token_list_in_group=tokens)
 
     assert result.shape == expected.shape
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
@@ -142,15 +183,14 @@ def check_all_reduce(rank: int, world_size: int, device) -> None:
     )
 
     for numel in [2880, 20160, 23040, 92160, 184320]:
-        values = AllReduceInputs(
-            AllReduceInputConfig(
-                world_size=world_size,
-                shape=(numel,),
-                dtype=torch.bfloat16,
-            )
-        ).generate(seed=3_000 + numel, device="cpu")
-        tensor = values.rank_inputs[rank].to(device=device)
-        expected = all_reduce_sum_reference(values).to(device=device)
+        rank_inputs = _rank_inputs(
+            world_size,
+            (numel,),
+            dtype=torch.bfloat16,
+            seed=3_000 + numel,
+        )
+        tensor = rank_inputs[rank].to(device=device)
+        expected = _sum_rank_inputs(rank_inputs).to(device=device)
         assert all_reduce_can_run(state, tensor)
         result = all_reduce(state, tensor)
         assert result is tensor
@@ -170,29 +210,31 @@ def check_allreduce_residual_rmsnorm(rank: int, world_size: int, device) -> None
     eps = 1e-6
 
     for tokens in [1, 8, 32]:
-        values = AllReduceResidualRMSNormInputs(
-            AllReduceResidualRMSNormInputConfig(
-                world_size=world_size,
-                num_tokens=tokens,
-                hidden_size=hidden,
-                dtype=torch.bfloat16,
-                residual_dtype=torch.bfloat16,
-                weight_dtype=torch.float32,
-                eps=eps,
-            )
-        ).generate(seed=700 + tokens, device="cpu")
-        refs = all_reduce_residual_rmsnorm_reference(values)
-        x = values.rank_inputs[rank].to(device=device)
-        residual = values.residuals[rank].to(device=device)
-        weight = values.weight.to(device=device)
+        rank_inputs = _rank_inputs(
+            world_size,
+            (tokens, hidden),
+            dtype=torch.bfloat16,
+            seed=700 + tokens,
+        )
+        residuals = _rank_inputs(
+            world_size,
+            (tokens, hidden),
+            dtype=torch.bfloat16,
+            seed=900 + tokens,
+        )
+        weight = _randn_cpu((hidden,), dtype=torch.float32, seed=1_100 + tokens)
 
-        ref_residual = refs.residual_outputs[rank].to(device=device)
-        ref_norm = refs.norm_outputs[rank].to(device=device)
+        reduced = _sum_rank_inputs_for_rmsnorm(rank_inputs)
+        ref_residual = reduced + residuals[rank].float()
+        ref_norm = _rmsnorm_rows(ref_residual, weight, eps)
+        x = rank_inputs[rank].to(device=device)
+        residual = residuals[rank].to(device=device)
+        weight_device = weight.to(device=device)
 
         norm_out, residual_out, scale, partial = allreduce_residual_rmsnorm(
             input_tensor=x,
             residual=residual,
-            weight=weight,
+            weight=weight_device,
             rank=rank,
             group=dist.group.WORLD,
             eps=eps,
@@ -202,31 +244,33 @@ def check_allreduce_residual_rmsnorm(rank: int, world_size: int, device) -> None
         assert partial is None
 
         torch.testing.assert_close(
-            residual_out.float(), ref_residual, atol=2e-2, rtol=2e-2
+            residual_out.float(),
+            ref_residual.to(device=device),
+            atol=2e-2,
+            rtol=2e-2,
         )
-        torch.testing.assert_close(norm_out.float(), ref_norm, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(
+            norm_out.float(),
+            ref_norm.to(device=device),
+            atol=2e-2,
+            rtol=2e-2,
+        )
 
 
 def check_reduce_scatter(
-    rsag, rank: int, world_size: int, tokens: List[int], hidden_size: int, device
+    rsag, rank: int, world_size: int, tokens: list[int], hidden_size: int, device
 ) -> None:
-    values = ReduceScatterInputs(
-        ReduceScatterInputConfig(
-            world_size=world_size,
-            total_tokens=sum(tokens),
-            hidden_size=hidden_size,
-            max_tokens_per_rank=max(tokens),
-            dtype=torch.bfloat16,
-        )
-    ).generate(
-        seed=4_000 + sum(tokens) + hidden_size,
-        metadata_seed=5_000 + sum(tokens) + max(tokens),
-        device="cpu",
+    total_tokens = sum(tokens)
+    rank_inputs = _rank_inputs(
+        world_size,
+        (total_tokens, hidden_size),
+        dtype=torch.bfloat16,
+        seed=4_000 + total_tokens + hidden_size,
     )
-    full = values.rank_inputs[rank].to(device=device)
-    expected = reduce_scatter_sum_reference(values)[rank].to(device=device)
+    full = rank_inputs[rank].to(device=device)
+    expected = _reduce_scatter_reference(rank_inputs, tokens)[rank].to(device=device)
 
-    result = reduce_scatter(rsag, full, token_list_in_group=values.tokens_per_rank)
+    result = reduce_scatter(rsag, full, token_list_in_group=tokens)
 
     assert result.shape == expected.shape
     torch.testing.assert_close(result.float(), expected.float(), atol=2e-2, rtol=2e-2)

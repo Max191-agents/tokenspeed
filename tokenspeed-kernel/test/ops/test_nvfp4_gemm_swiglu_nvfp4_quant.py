@@ -27,15 +27,14 @@ import pytest
 import torch
 from tokenspeed_numerics_input_generators import (
     CustomDType,
-    FusedSwiGLUNVFP4QuantInputValues,
     GemmInputConfig,
-    GemmInputValues,
     GemmInputs,
+    GemmInputValues,
     TensorInput,
-    fused_swiglu_nvfp4_quant_reference,
     gemm_reference,
     gemm_scale_shape,
     nvfp4_dequantization_reference,
+    nvfp4_quantization_reference,
 )
 
 
@@ -140,12 +139,12 @@ def _nvfp4_gemm_swiglu_reference(
         alpha=values.fc1_alpha,
         out_dtype=torch.bfloat16,
     )
-    return fused_swiglu_nvfp4_quant_reference(
-        FusedSwiGLUNVFP4QuantInputValues(
-            gate_up=gate_up,
-            global_scale=values.output_global_scale_inv,
-            scale_size=values.scale_size,
-        )
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    swiglu = torch.nn.functional.silu(gate) * up
+    return nvfp4_quantization_reference(
+        swiglu,
+        scale=values.output_global_scale,
+        scale_size=values.scale_size,
     )
 
 

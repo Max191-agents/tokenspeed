@@ -17,7 +17,8 @@ scale sidecars configured on the relevant operands.
 Layer-level projections such as router projection and LM-head projection should
 map their domain names onto `M`, `N`, and `K` instead of using separate GEMM
 generators. Fused kernels should compose GEMM inputs with the other operation
-families they fuse, such as activation or quantization.
+references they fuse, such as local activation formulas and quantization
+references.
 
 ## Generated Values
 

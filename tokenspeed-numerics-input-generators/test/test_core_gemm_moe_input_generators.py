@@ -26,7 +26,6 @@ import pytest
 import torch
 from tokenspeed_numerics_input_generators import (
     CustomDType,
-    FusedSwiGLUNVFP4QuantInputValues,
     GemmInputConfig,
     GemmInputs,
     GemmInputValues,
@@ -53,7 +52,6 @@ from tokenspeed_numerics_input_generators import (
     MoESoftplusSqrtTopKRoutingInputValues,
     TensorInput,
     canonicalize_moe_align_block_size,
-    fused_swiglu_nvfp4_quant_reference,
     gemm_reference,
     gemm_scale_shape,
     moe_align_block_size_buffer_dims,
@@ -65,6 +63,7 @@ from tokenspeed_numerics_input_generators import (
     moe_softmax_topk_routing_reference,
     moe_softplus_sqrt_topk_routing_reference,
     nvfp4_dequantization_reference,
+    nvfp4_quantization_reference,
 )
 
 _fp8_dtype = torch.float8_e4m3fn
@@ -1063,19 +1062,18 @@ def test_composes_nvfp4_gemm_with_swiglu_quant_reference() -> None:
     assert values.A_scales is not None
     assert values.B_scales is not None
     output_global_scale = torch.tensor([0.01], dtype=torch.float32)
-    output_global_scale_inv = 1.0 / output_global_scale
 
     gate_up = gemm_reference(
         values,
         alpha=torch.tensor([1.0e-3], dtype=torch.float32),
         out_dtype=torch.bfloat16,
     )
-    packed, scales = fused_swiglu_nvfp4_quant_reference(
-        FusedSwiGLUNVFP4QuantInputValues(
-            gate_up=gate_up,
-            global_scale=output_global_scale_inv,
-            scale_size=16,
-        )
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    swiglu = torch.nn.functional.silu(gate) * up
+    packed, scales = nvfp4_quantization_reference(
+        swiglu,
+        scale=output_global_scale,
+        scale_size=16,
     )
 
     assert gate_up.shape == (3, 64)

@@ -22,14 +22,13 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
 import tokenspeed_numerics_input_generators as public
 
 _PUBLIC_MODULES = (
-    "activation",
     "attention",
     "attention_cache",
     "attention_metadata",
-    "communication",
     "core",
     "embedding",
     "gemm",
@@ -40,6 +39,11 @@ _PUBLIC_MODULES = (
     "rotary",
     "sampling",
     "transforms",
+)
+
+_REMOVED_MODULES = (
+    "activation",
+    "communication",
 )
 
 
@@ -63,3 +67,11 @@ def test_package_all_names_are_bound() -> None:
     missing = sorted(name for name in public.__all__ if not hasattr(public, name))
 
     assert missing == []
+
+
+def test_removed_family_modules_are_not_importable() -> None:
+    for module_name in _REMOVED_MODULES:
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(
+                f"tokenspeed_numerics_input_generators.{module_name}"
+            )
