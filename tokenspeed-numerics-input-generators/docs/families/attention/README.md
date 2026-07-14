@@ -38,8 +38,8 @@ responsible for flattening generated values into backend-specific kwargs.
 
 Helper kernels are not separate generator families. For example, TokenSpeed
 tests can pack GDN Q/K/V into a QKV split input, adapt `DSAInputs` into sparse
-decode pack or top-k slot arguments, and pull DeepSeek V4-style cache/indexer
-helper values from `CSAInputs`.
+decode pack or top-k slot arguments, and derive DeepSeek V4-style packed
+cache/indexer helper values from `CSAInputs` in TokenSpeed adapter code.
 
 ## Generated Values
 

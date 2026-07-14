@@ -68,13 +68,7 @@ from tokenspeed_numerics_input_generators import (
 from tokenspeed_numerics_input_generators.attention.csa import (
     csa_combine_dense_swa_indices_reference,
     csa_compute_global_topk_indices_and_lens_reference,
-    csa_dequantize_and_gather_k_cache_reference,
-    csa_indexer_mxfp4_cache_gather_reference,
-    csa_indexer_mxfp4_cache_insert_reference,
-    csa_indexer_mxfp4_cache_write_reference,
-    csa_indexer_q_rope_hadamard_mxfp4_reference,
     csa_save_compressor_state_reference,
-    csa_sparse_compress_cache_insert_reference,
 )
 
 _FP8_DTYPES = (
@@ -1077,7 +1071,6 @@ def test_compressed_sequence_attention_generates_swa_only_values() -> None:
     assert values.sliding_window.q.shape == (4, 3, 512)
     assert values.sliding_window.positions.shape == (4,)
     assert values.sliding_window.token_to_req_indices.tolist() == [0, 0, 1, 1]
-    assert values.sliding_window.cache_2d.dtype == torch.uint8
     assert values.sliding_window.page_table.shape[0] == 2
 
 
@@ -1096,8 +1089,6 @@ def test_compressed_sequence_attention_generates_hca_values() -> None:
                 topk=3,
                 num_state_cache_blocks=2,
                 compressor_block_size=8,
-                num_kv_cache_blocks=2,
-                kv_cache_block_size=4,
             ),
             metadata_input=MHARequestMetadataInputConfig(
                 batch_size=2,
@@ -1113,8 +1104,6 @@ def test_compressed_sequence_attention_generates_hca_values() -> None:
     assert values.kind == "hca"
     assert values.indexer is None
     assert values.compressed is not None
-    assert values.compressed.cache_insert.compress_ratio == 128
-    assert values.compressed.cache_insert.overlap is False
     assert values.compressed.compressor_state.compress_ratio == 128
     assert values.compressed.paged_index.compress_ratio == 128
     assert (
@@ -1127,7 +1116,6 @@ def test_compressed_sequence_attention_generates_hca_values() -> None:
     )
     assert torch.equal(values.compressed.paged_index.block_table, values.sliding_window.page_table)
 
-    csa_sparse_compress_cache_insert_reference(values.compressed.cache_insert)
     csa_save_compressor_state_reference(values.compressed.compressor_state)
     csa_compute_global_topk_indices_and_lens_reference(
         values.compressed.paged_index
@@ -1135,7 +1123,6 @@ def test_compressed_sequence_attention_generates_hca_values() -> None:
     csa_combine_dense_swa_indices_reference(
         values.compressed.sparse_prefill_index
     )
-    csa_dequantize_and_gather_k_cache_reference(values.compressed.k_cache_gather)
 
 
 def test_compressed_sequence_attention_generates_csa_indexer_values() -> None:
@@ -1153,17 +1140,9 @@ def test_compressed_sequence_attention_generates_csa_indexer_values() -> None:
                 topk=3,
                 num_state_cache_blocks=2,
                 compressor_block_size=4,
-                num_kv_cache_blocks=2,
-                kv_cache_block_size=4,
             ),
             indexer=CSAIndexerConfig(
                 num_heads=2,
-                num_state_cache_blocks=2,
-                compressor_block_size=4,
-                num_kv_cache_blocks=2,
-                kv_cache_block_size=4,
-                num_cache_blocks=2,
-                block_size=4,
             ),
             metadata_input=MHARequestMetadataInputConfig(
                 batch_size=2,
@@ -1179,10 +1158,8 @@ def test_compressed_sequence_attention_generates_csa_indexer_values() -> None:
     assert values.kind == "csa"
     assert values.compressed is not None
     assert values.indexer is not None
-    assert values.compressed.cache_insert.compress_ratio == 4
-    assert values.compressed.cache_insert.overlap is True
-    assert values.indexer.cache_insert.compress_ratio == 4
-    assert values.indexer.q_rope_hadamard_mxfp4.index_q.shape == (4, 2, 128)
+    assert values.compressed.compressor_state.compress_ratio == 4
+    assert values.indexer.query.index_q.shape == (4, 2, 128)
     assert (
         values.compressed.paged_index.metadata.new_q_lens_cpu
         == values.sliding_window.metadata.new_q_lens_cpu
@@ -1192,13 +1169,13 @@ def test_compressed_sequence_attention_generates_csa_indexer_values() -> None:
         == values.sliding_window.token_to_req_indices.tolist()
     )
 
-    csa_sparse_compress_cache_insert_reference(values.compressed.cache_insert)
-    csa_indexer_mxfp4_cache_insert_reference(values.indexer.cache_insert)
-    csa_indexer_q_rope_hadamard_mxfp4_reference(
-        values.indexer.q_rope_hadamard_mxfp4
+    csa_save_compressor_state_reference(values.compressed.compressor_state)
+    csa_compute_global_topk_indices_and_lens_reference(
+        values.compressed.paged_index
     )
-    csa_indexer_mxfp4_cache_write_reference(values.indexer.cache_write)
-    csa_indexer_mxfp4_cache_gather_reference(values.indexer.cache_gather)
+    csa_combine_dense_swa_indices_reference(
+        values.compressed.sparse_prefill_index
+    )
 
 
 def test_compressed_sequence_attention_rejects_invalid_component_mix() -> None:

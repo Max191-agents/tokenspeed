@@ -47,9 +47,10 @@ The compressed-history config covers both supported compression ratios:
 - `compress_ratio == 4`: CSA-style compressed history with optional indexer
   inputs.
 
-CSA values may contain nested structured values that TokenSpeed adapters can
-use for narrower helper kernels, but those helpers are not separate generator
-families.
+CSA values contain operation-level sliding-window, compressed-history, and
+indexer values. TokenSpeed adapters can derive narrower helper-kernel bundles
+from those values, but those helper bundles are not part of the generator
+family API.
 
 ### DSA
 
@@ -107,7 +108,7 @@ values:
 - Dynamic sparse attention configs require integer slot metadata, valid row
   widths, and no out-of-bounds cache addresses;
 - CSA compressed-history and indexer configs require supported compression
-  ratios, page metadata wide enough for visible KV positions, and cache/indexer
+  ratios, page metadata wide enough for visible KV positions, and metadata
   layouts that match the selected CSA/HCA components;
 - GDN configs require consistent recurrent-state shapes, positive chunk
   metadata, and valid per-sequence cumulative lengths.
@@ -122,8 +123,9 @@ TokenSpeed exposes several helper kernels whose input bundles are narrower than
 the five family generators. Tests should construct the closest operation-family
 generator and adapt from its generated values. For example, dynamic sparse
 attention decode packing is derived from `DSAInputs`, GDN QKV split can be
-derived by packing `GDNInputs` Q/K/V tensors, and DeepSeek V4-style
-compressed-cache/indexer helper bundles come from nested `CSAInputs` values.
+derived by packing `GDNInputs` Q/K/V tensors, and DeepSeek V4-style packed
+compressed-cache/indexer helper bundles are derived by TokenSpeed adapters from
+`CSAInputs` values.
 
 Generator values are operation-level values. Tests or adapters are responsible
 for converting generated values into the exact keyword arguments expected by a

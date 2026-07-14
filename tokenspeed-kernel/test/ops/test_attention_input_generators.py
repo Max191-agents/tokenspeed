@@ -40,22 +40,27 @@ from tokenspeed_kernel.numerics.attention_kernel_kwargs import (
     mla_prefill_kwargs,
 )
 from tokenspeed_kernel.numerics.deepseek_v4_attention import (
-    DeepSeekV4InvRoPEFP8QuantInputValues,
     deepseek_v4_build_dense_prefill_local_compressed_indices_reference,
     deepseek_v4_combine_dense_swa_indices_reference,
     deepseek_v4_combine_topk_swa_indices_reference,
     deepseek_v4_compressed_slot_mapping_reference,
     deepseek_v4_compute_global_topk_indices_and_lens_reference,
     deepseek_v4_csa_indexer_mxfp4_cache_insert_reference,
+    deepseek_v4_csa_indexer_mxfp4_cache_insert_values_from_csa,
     deepseek_v4_decode_swa_indices_and_lens_reference,
     deepseek_v4_dequantize_and_gather_k_cache_reference,
     deepseek_v4_indexer_decode_metadata_reference,
     deepseek_v4_indexer_mxfp4_cache_gather_reference,
+    deepseek_v4_indexer_mxfp4_cache_gather_values_from_csa,
     deepseek_v4_indexer_mxfp4_cache_write_reference,
+    deepseek_v4_indexer_mxfp4_cache_write_values_from_csa,
     deepseek_v4_indexer_q_rope_hadamard_mxfp4_reference,
     deepseek_v4_inv_rope_fp8_quant_reference,
+    deepseek_v4_inv_rope_fp8_quant_values_from_csa,
+    deepseek_v4_k_cache_gather_values_from_csa,
     deepseek_v4_save_compressor_state_reference,
     deepseek_v4_sparse_compress_cache_insert_reference,
+    deepseek_v4_sparse_compress_cache_insert_values_from_csa,
 )
 from tokenspeed_kernel.ops.attention.flash_attn import (
     flash_attn_func,
@@ -402,8 +407,6 @@ def _csa_values(
         topk=topk,
         num_state_cache_blocks=max(1, batch_size),
         compressor_block_size=4 if compress_ratio == 4 else 8,
-        num_kv_cache_blocks=max(1, batch_size),
-        kv_cache_block_size=page_size,
         include_valid_token_mask=include_valid_token_mask,
         include_block_table_base_offsets=include_block_table_base_offsets,
     )
@@ -411,12 +414,6 @@ def _csa_values(
     if include_indexer:
         indexer = CSAIndexerConfig(
             num_heads=num_q_heads,
-            num_state_cache_blocks=max(1, batch_size),
-            compressor_block_size=4,
-            num_kv_cache_blocks=max(1, batch_size),
-            kv_cache_block_size=page_size,
-            num_cache_blocks=max(1, batch_size),
-            block_size=page_size,
         )
     return CSAInputs(
         CSAInputConfig(
@@ -440,36 +437,6 @@ def _csa_values(
             ),
         )
     ).generate(seed=seed, device=device)
-
-
-def _inv_rope_fp8_quant_values_from_csa(
-    *,
-    seed: int,
-    device: str,
-) -> DeepSeekV4InvRoPEFP8QuantInputValues:
-    values = _csa_values(
-        batch_size=1,
-        total_cached_tokens=4,
-        total_new_q_tokens=5,
-        dtype=torch.bfloat16,
-        num_q_heads=4,
-        include_indexer=True,
-        seed=seed,
-        device=device,
-    )
-    if values.indexer is None:
-        raise ValueError("inverse RoPE adapter requires CSA indexer values")
-    return DeepSeekV4InvRoPEFP8QuantInputValues(
-        o=values.sliding_window.q,
-        positions=values.sliding_window.positions.to(torch.int64),
-        cos_sin_cache=values.indexer.q_rope_hadamard_mxfp4.cos_sin_cache,
-        n_groups=2,
-        heads_per_group=2,
-        nope_dim=448,
-        rope_dim=64,
-        quant_group_size=128,
-        tma_aligned_scales=True,
-    )
 
 
 def _skip_if_attention_extension_unavailable(exc: BaseException) -> None:
@@ -1156,7 +1123,7 @@ def test_deepseek_v4_indexer_q_rope_hadamard_mxfp4_generator_runs_tokenspeed_tri
         device=device,
     )
     assert csa_values.indexer is not None
-    values = csa_values.indexer.q_rope_hadamard_mxfp4
+    values = csa_values.indexer.query
     values.softmax_scale = 0.25
     values.head_scale = 2.0
     values.index_q.zero_()
@@ -1188,7 +1155,21 @@ def test_deepseek_v4_inv_rope_fp8_quant_generator_runs_tokenspeed_triton(
     if not torch.cuda.is_available():
         pytest.skip("CUDA/ROCm GPU is required for Triton inverse-RoPE FP8 test")
 
-    values = _inv_rope_fp8_quant_values_from_csa(seed=2093, device=device)
+    csa_values = _csa_values(
+        batch_size=1,
+        total_cached_tokens=4,
+        total_new_q_tokens=5,
+        dtype=torch.bfloat16,
+        num_q_heads=4,
+        include_indexer=True,
+        seed=2093,
+        device=device,
+    )
+    values = deepseek_v4_inv_rope_fp8_quant_values_from_csa(
+        csa_values,
+        n_groups=2,
+        heads_per_group=2,
+    )
     expected_fp8, expected_scale = deepseek_v4_inv_rope_fp8_quant_reference(values)
 
     actual_fp8, actual_scale = deepseek_v4_fused_inv_rope_fp8_quant(
@@ -1224,7 +1205,11 @@ def test_deepseek_v4_csa_indexer_mxfp4_cache_insert_generator_runs_tokenspeed_tr
         device=device,
     )
     assert csa_values.indexer is not None
-    values = csa_values.indexer.cache_insert
+    values = deepseek_v4_csa_indexer_mxfp4_cache_insert_values_from_csa(
+        csa_values,
+        seed=2094,
+        device=device,
+    )
     values.token_to_req_indices.zero_()
     values.positions.fill_(3)
     values.compressor_slot_mapping = torch.arange(4, dtype=torch.int64, device=device)
@@ -1272,7 +1257,11 @@ def test_deepseek_v4_sparse_compress_cache_insert_generator_runs_tokenspeed_trit
         device=device,
     )
     assert csa_values.compressed is not None
-    values = csa_values.compressed.cache_insert
+    values = deepseek_v4_sparse_compress_cache_insert_values_from_csa(
+        csa_values,
+        seed=2095,
+        device=device,
+    )
     values.token_to_req_indices.zero_()
     values.positions.fill_(3)
     values.compressor_slot_mapping = torch.arange(4, dtype=torch.int64, device=device)
@@ -1322,7 +1311,11 @@ def test_deepseek_v4_indexer_mxfp4_cache_write_generator_runs_tokenspeed_triton(
         device=device,
     )
     assert csa_values.indexer is not None
-    values = csa_values.indexer.cache_write
+    values = deepseek_v4_indexer_mxfp4_cache_write_values_from_csa(
+        csa_values,
+        seed=2092,
+        device=device,
+    )
     expected = deepseek_v4_indexer_mxfp4_cache_write_reference(values)
     actual = values.cache_2d.clone()
 
@@ -1353,7 +1346,11 @@ def test_deepseek_v4_indexer_mxfp4_cache_gather_generator_runs_tokenspeed_triton
         device=device,
     )
     assert csa_values.indexer is not None
-    values = csa_values.indexer.cache_gather
+    values = deepseek_v4_indexer_mxfp4_cache_gather_values_from_csa(
+        csa_values,
+        seed=2093,
+        device=device,
+    )
     expected_values, expected_scales = deepseek_v4_indexer_mxfp4_cache_gather_reference(
         values
     )
@@ -1388,7 +1385,11 @@ def test_deepseek_v4_k_cache_gather_generator_runs_tokenspeed_triton(
         device=device,
     )
     assert csa_values.compressed is not None
-    values = csa_values.compressed.k_cache_gather
+    values = deepseek_v4_k_cache_gather_values_from_csa(
+        csa_values,
+        seed=2094,
+        device=device,
+    )
     expected = deepseek_v4_dequantize_and_gather_k_cache_reference(values)
     actual = values.out.clone()
 
