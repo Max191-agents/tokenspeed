@@ -31,6 +31,11 @@ The attention generators reuse a few lower-level metadata components:
 - `KVCacheInput` and `MLAKVCacheInput`: dense or paged cache storage for MHA
   and MLA cache layouts.
 
+These support components are exported from both the package root and
+`tokenspeed_numerics_input_generators.attention`. Direct module imports should
+use `tokenspeed_numerics_input_generators.attention.cache` and
+`tokenspeed_numerics_input_generators.attention.metadata`.
+
 Kernel-specific names such as `block_table`, `slot_mapping`,
 `kv_slot_mapping`, or `compressor_slot_mapping` should map back to these shared
 metadata concepts when their semantics match. Kernel registry adapters are

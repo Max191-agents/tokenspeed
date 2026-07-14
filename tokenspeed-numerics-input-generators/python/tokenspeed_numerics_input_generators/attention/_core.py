@@ -27,7 +27,17 @@ from dataclasses import dataclass
 from typing import Generic, Literal, Protocol, TypeVar
 
 import torch
-from tokenspeed_numerics_input_generators.attention_cache import (
+from tokenspeed_numerics_input_generators.core import (
+    DeviceLike,
+    NumericsInputGenerator,
+    TensorInput,
+    _child_seed,
+    _resolve_device,
+    _rng_for_device,
+)
+from tokenspeed_numerics_input_generators.rotary import build_rope_cos_sin_cache
+
+from .cache import (
     KVCacheInput,
     KVCacheInputConfig,
     KVCacheValues,
@@ -38,7 +48,7 @@ from tokenspeed_numerics_input_generators.attention_cache import (
     PageTableInputConfig,
     PageTableValues,
 )
-from tokenspeed_numerics_input_generators.attention_metadata import (
+from .metadata import (
     CacheLayout,
     LengthMode,
     MHARequestMetadataInput,
@@ -48,15 +58,6 @@ from tokenspeed_numerics_input_generators.attention_metadata import (
     SlotMappingInput,
     SlotMappingInputConfig,
 )
-from tokenspeed_numerics_input_generators.core import (
-    DeviceLike,
-    NumericsInputGenerator,
-    TensorInput,
-    _child_seed,
-    _resolve_device,
-    _rng_for_device,
-)
-from tokenspeed_numerics_input_generators.rotary import build_rope_cos_sin_cache
 
 _AttentionCacheT = TypeVar("_AttentionCacheT")
 _DSA_SPARSE_DECODE_FP8_QUANT_BLOCK = 128
@@ -75,9 +76,7 @@ _CSA_INDEXER_DIM = 128
 _CSA_INDEXER_MXFP4_BLOCK_SIZE = 32
 _CSA_INDEXER_MXFP4_HALF_BLOCK = _CSA_INDEXER_MXFP4_BLOCK_SIZE // 2
 _CSA_INDEXER_MXFP4_VALUE_BYTES = _CSA_INDEXER_DIM // 2
-_CSA_INDEXER_MXFP4_SCALE_BYTES = (
-    _CSA_INDEXER_DIM // _CSA_INDEXER_MXFP4_BLOCK_SIZE
-)
+_CSA_INDEXER_MXFP4_SCALE_BYTES = _CSA_INDEXER_DIM // _CSA_INDEXER_MXFP4_BLOCK_SIZE
 _GDN_CHUNK_SIZE = 64
 
 
@@ -232,15 +231,19 @@ def _generate_slot_mapping_tensor(
 ) -> torch.Tensor:
     """Generate row-to-flat-cache-slot metadata."""
 
-    return SlotMappingInput(
-        SlotMappingInputConfig(
-            num_rows=num_rows,
-            total_slots=total_slots,
-            negative_count=negative_count,
-            unique=unique,
-            dtype=dtype,
+    return (
+        SlotMappingInput(
+            SlotMappingInputConfig(
+                num_rows=num_rows,
+                total_slots=total_slots,
+                negative_count=negative_count,
+                unique=unique,
+                dtype=dtype,
+            )
         )
-    ).generate(seed=seed, device=device).slot_mapping
+        .generate(seed=seed, device=device)
+        .slot_mapping
+    )
 
 
 def _generate_valid_mask(
@@ -497,6 +500,7 @@ def attention_generate(
         sinks=sinks,
         cache=cache,
     )
+
 
 __all__ = [
     "AttentionGeneratedValues",

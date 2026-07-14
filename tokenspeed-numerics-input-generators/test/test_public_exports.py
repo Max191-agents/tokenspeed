@@ -27,8 +27,8 @@ import tokenspeed_numerics_input_generators as public
 
 _PUBLIC_MODULES = (
     "attention",
-    "attention_cache",
-    "attention_metadata",
+    "attention.cache",
+    "attention.metadata",
     "core",
     "embedding",
     "gemm",
@@ -43,6 +43,8 @@ _PUBLIC_MODULES = (
 
 _REMOVED_MODULES = (
     "activation",
+    "attention_cache",
+    "attention_metadata",
     "communication",
 )
 
@@ -57,6 +59,25 @@ def test_package_root_reexports_public_family_names() -> None:
         )
         module_exports = set(getattr(module, "__all__", ()))
         module_missing = sorted(module_exports - root_exports)
+        if module_missing:
+            missing[module_name] = module_missing
+
+    assert missing == {}
+
+
+def test_attention_package_reexports_support_module_names() -> None:
+    attention = importlib.import_module(
+        "tokenspeed_numerics_input_generators.attention"
+    )
+    attention_exports = set(getattr(attention, "__all__", ()))
+    missing: dict[str, list[str]] = {}
+
+    for module_name in ("cache", "metadata"):
+        module = importlib.import_module(
+            f"tokenspeed_numerics_input_generators.attention.{module_name}"
+        )
+        module_exports = set(getattr(module, "__all__", ()))
+        module_missing = sorted(module_exports - attention_exports)
         if module_missing:
             missing[module_name] = module_missing
 

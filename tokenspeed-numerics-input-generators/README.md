@@ -236,16 +236,16 @@ reader enough context to choose the right generator and know where to look next.
 
 The library should be organized around those family boundaries, with shared core
 components and utilities factored out when they are genuinely reusable. The
-current package keeps a flat Python module surface for compatibility and a
+current package keeps stable package-root exports for public names and a
 separate family-doc navigation tree:
 
 ```text
 tokenspeed_numerics_input_generators/
   core.py                   # dtype, tensor, base interfaces
   gemm.py                   # GEMM-family generators
-  attention.py              # MHA/MLA/attention utility generators
-  attention_cache.py        # reusable cache/page-table generators
-  attention_metadata.py     # request metadata and slot mappings
+  attention/                # MHA/MLA/CSA/DSA/GDN generators
+    cache.py                # reusable cache/page-table generators
+    metadata.py             # request metadata and slot mappings
   moe.py                    # MoE-family generators
   transforms.py             # standalone deterministic tensor transforms
 
@@ -262,8 +262,11 @@ The exact names and module boundaries can evolve, but the conceptual split
 should remain: core primitives, optional shared utilities, and documented
 operation-family generators.
 
-The implementation modules use the flat Python import surface above, while the
-docs provide the family navigation structure expected by this design.
+The implementation modules keep shared attention support under the attention
+package. Public names remain exported from the package root, and attention
+support modules are imported as
+`tokenspeed_numerics_input_generators.attention.cache` and
+`tokenspeed_numerics_input_generators.attention.metadata`.
 
 ## Growth Model
 

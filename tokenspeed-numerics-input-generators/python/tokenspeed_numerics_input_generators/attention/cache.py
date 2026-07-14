@@ -27,9 +27,6 @@ from dataclasses import dataclass
 from typing import Literal, cast
 
 import torch
-from tokenspeed_numerics_input_generators.attention_metadata import (
-    PageTableIndexing,
-)
 from tokenspeed_numerics_input_generators.core import (
     DeviceLike,
     NumericsInputGenerator,
@@ -37,6 +34,8 @@ from tokenspeed_numerics_input_generators.core import (
     _child_seed,
     _resolve_device,
 )
+
+from .metadata import PageTableIndexing
 
 __all__ = [
     "AttentionCacheInput",

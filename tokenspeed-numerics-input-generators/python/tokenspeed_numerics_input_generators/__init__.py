@@ -72,7 +72,7 @@ from tokenspeed_numerics_input_generators.attention import (
     mla_reference,
     packed_qkv_complex_rotary_reference,
 )
-from tokenspeed_numerics_input_generators.attention_cache import (
+from tokenspeed_numerics_input_generators.attention.cache import (
     AttentionCacheInput,
     KVCacheInput,
     KVCacheInputConfig,
@@ -85,7 +85,7 @@ from tokenspeed_numerics_input_generators.attention_cache import (
     PageTableInputConfig,
     PageTableValues,
 )
-from tokenspeed_numerics_input_generators.attention_metadata import (
+from tokenspeed_numerics_input_generators.attention.metadata import (
     CacheLayout,
     LengthMode,
     MHARequestMetadataInput,
