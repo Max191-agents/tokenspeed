@@ -907,6 +907,155 @@ def test_dsa_prefill_topk_gluon_long_row_uses_radix_path() -> None:
     )
 
 
+def _make_grouped_radix_logits(
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    cols: int,
+    topk: int,
+) -> torch.Tensor:
+    generator = _generator("cuda", 1907)
+    logits = torch.empty(
+        (row_starts.numel(), cols),
+        device="cuda",
+        dtype=torch.float32,
+    ).uniform_(-1.0, 1.0, generator=generator)
+    high_count = topk - 32
+    starts = row_starts.cpu().tolist()
+    ends = row_ends.cpu().tolist()
+    for row, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        assert end - start >= topk + 32
+        high = torch.arange(start, start + high_count, device="cuda")
+        ties = torch.arange(
+            start + high_count,
+            start + high_count + 64,
+            device="cuda",
+        )
+        logits[row, high] = torch.linspace(4.0, 3.0, high_count, device="cuda")
+        logits[row, ties] = 2.0
+        neg_inf = torch.arange(start + high_count + 64, end, 257, device="cuda")
+        logits[row, neg_inf] = -float("inf")
+    return logits
+
+
+def _assert_grouped_radix_topk(
+    logits: torch.Tensor,
+    actual: torch.Tensor,
+    actual_lens: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+) -> None:
+    expected_lens = torch.minimum(
+        row_ends - row_starts,
+        torch.full_like(row_ends, topk),
+    )
+    torch.testing.assert_close(actual_lens.cpu(), expected_lens.cpu())
+    starts = row_starts.cpu().tolist()
+    ends = row_ends.cpu().tolist()
+    for row, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        count = int(expected_lens[row].item())
+        selected = actual[row, :count].long()
+        assert int(torch.unique(selected).numel()) == count
+        assert bool(((selected >= start) & (selected < end)).all())
+        actual_values = torch.sort(logits[row].index_select(0, selected)).values
+        expected_values = torch.sort(
+            torch.topk(logits[row, start:end], count).values
+        ).values
+        torch.testing.assert_close(actual_values.cpu(), expected_values.cpu())
+        assert bool((actual[row, count:] == -1).all())
+
+
+def test_dsa_prefill_radix_topk_groups_tiles_across_rows() -> None:
+    rows = 64
+    cols = 131072
+    topk = 2048
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = row_ids * 17
+    row_ends = cols - (rows - 1 - row_ids) * 31
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    tiles = dsa_topk_gfx950.triton.cdiv(cols, dsa_topk_gfx950._RADIX_TOPK_BLOCK_N)
+    groups = dsa_topk_gfx950._radix_groups_per_row(rows, tiles, logits.device)
+    assert groups < tiles
+    dsa_topk_gfx950._dsa_prefill_radix_topk(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+
+
+def test_dsa_decode_radix_topk_groups_tiles_for_batched_queries() -> None:
+    page_size = 64
+    q_len_per_req = 4
+    requests = 16
+    rows = requests * q_len_per_req
+    cols = 131072
+    topk = 2048
+    seq_lens = cols - torch.arange(requests, device="cuda", dtype=torch.int32) * 53
+    q_offsets = torch.arange(q_len_per_req, device="cuda", dtype=torch.int32)
+    row_ends = (seq_lens[:, None] - (q_len_per_req - 1) + q_offsets[None, :]).reshape(
+        -1
+    )
+    row_starts = torch.zeros((rows,), device="cuda", dtype=torch.int32)
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+    )
+    block_table = torch.arange(
+        math.ceil(cols / page_size),
+        device="cuda",
+        dtype=torch.int32,
+    ).repeat(requests, 1)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    tiles = dsa_topk_gfx950.triton.cdiv(cols, dsa_topk_gfx950._RADIX_TOPK_BLOCK_N)
+    groups = dsa_topk_gfx950._radix_groups_per_row(rows, tiles, logits.device)
+    assert groups < tiles
+    dsa_topk_gfx950._dsa_decode_radix_topk_slots(
+        logits,
+        block_table,
+        seq_lens,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+
+
 def _pack_sparse_kv(
     latent: torch.Tensor,
     rope: torch.Tensor,
