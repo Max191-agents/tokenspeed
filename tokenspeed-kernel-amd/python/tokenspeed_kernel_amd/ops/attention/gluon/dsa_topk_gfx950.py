@@ -728,17 +728,37 @@ def _dsa_prefill_radix_group_count_kernel(
     count_layout: gl.constexpr = _vector_layout(2, gl.num_warps(), 1)
     row_start = gl.load(row_starts + row).to(gl.int32)
     row_end = gl.load(row_ends + row).to(gl.int32)
+    candidate_logits = logits + row * logits_stride + row_start
+    candidate_len = gl.maximum(row_end - row_start, 0)
+    vector_end = candidate_len & -4
     threshold = gl.load(prefixes + row).to(gl.uint32)
     counts = gl.zeros([2], gl.int32, layout=count_layout)
 
     for tile in range(group, tiles_per_row, groups_per_row):
-        offsets = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
-        mask = (offsets >= row_start) & (offsets < row_end) & (offsets < n_cols)
-        values = gl.load(
-            logits + row * logits_stride + offsets,
-            mask=mask,
-            other=-float("inf"),
-        )
+        tile_start = tile * BLOCK_N
+        offsets = tile_start + gl.arange(0, BLOCK_N, layout=layout)
+        offsets = gl.max_contiguous(gl.multiple_of(offsets.to(gl.int32), 4), 4)
+        mask = offsets < candidate_len
+        if tile_start + BLOCK_N <= candidate_len:
+            values = gl.amd.cdna4.buffer_load(
+                ptr=candidate_logits,
+                offsets=offsets,
+            )
+        else:
+            vector_mask = gl.max_constancy(offsets < vector_end, 4)
+            vector_values = gl.amd.cdna4.buffer_load(
+                ptr=candidate_logits,
+                offsets=offsets,
+                mask=vector_mask,
+                other=-float("inf"),
+            )
+            tail_mask = (offsets >= vector_end) & mask
+            tail_values = gl.load(
+                candidate_logits + offsets,
+                mask=tail_mask,
+                other=-float("inf"),
+            )
+            values = gl.where(tail_mask, tail_values, vector_values)
         finite = values != -float("inf")
         keys = _fp32_to_ordered_key(values)
         greater = mask & finite & (keys > threshold)
@@ -819,6 +839,9 @@ def _dsa_prefill_radix_deterministic_scatter_kernel(
     layout: gl.constexpr = _vector_layout(BLOCK_N, gl.num_warps(), LOAD_ELEMS)
     row_start = gl.load(row_starts + row).to(gl.int32)
     row_end = gl.load(row_ends + row).to(gl.int32)
+    candidate_logits = logits + row * logits_stride + row_start
+    candidate_len = gl.maximum(row_end - row_start, 0)
+    vector_end = candidate_len & -4
     threshold = gl.load(prefixes + row).to(gl.uint32)
     keep_equal = gl.load(remaining + row).to(gl.int32)
     count_greater = topk - keep_equal
@@ -829,13 +852,30 @@ def _dsa_prefill_radix_deterministic_scatter_kernel(
     equal_cursor = 0
 
     for tile in range(group, tiles_per_row, groups_per_row):
-        offsets = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
-        mask = (offsets >= row_start) & (offsets < row_end) & (offsets < n_cols)
-        values = gl.load(
-            logits + row * logits_stride + offsets,
-            mask=mask,
-            other=-float("inf"),
-        )
+        tile_start = tile * BLOCK_N
+        offsets = tile_start + gl.arange(0, BLOCK_N, layout=layout)
+        offsets = gl.max_contiguous(gl.multiple_of(offsets.to(gl.int32), 4), 4)
+        mask = offsets < candidate_len
+        if tile_start + BLOCK_N <= candidate_len:
+            values = gl.amd.cdna4.buffer_load(
+                ptr=candidate_logits,
+                offsets=offsets,
+            )
+        else:
+            vector_mask = gl.max_constancy(offsets < vector_end, 4)
+            vector_values = gl.amd.cdna4.buffer_load(
+                ptr=candidate_logits,
+                offsets=offsets,
+                mask=vector_mask,
+                other=-float("inf"),
+            )
+            tail_mask = (offsets >= vector_end) & mask
+            tail_values = gl.load(
+                candidate_logits + offsets,
+                mask=tail_mask,
+                other=-float("inf"),
+            )
+            values = gl.where(tail_mask, tail_values, vector_values)
         finite = values != -float("inf")
         keys = _fp32_to_ordered_key(values)
         greater = mask & finite & (keys > threshold)
@@ -862,7 +902,7 @@ def _dsa_prefill_radix_deterministic_scatter_kernel(
         equal_write = (
             equal & (equal_pos < topk) & (equal_pos < count_greater + keep_equal)
         )
-        local = offsets.to(gl.int32)
+        local = row_start + offsets.to(gl.int32)
         gl.store(out + row * out_stride + greater_pos, local, mask=greater_write)
         gl.store(out + row * out_stride + equal_pos, local, mask=equal_write)
         greater_cursor += tile_greater
