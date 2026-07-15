@@ -143,23 +143,20 @@ def moe_reference(
 ) -> torch.Tensor:
     """Return the semantic routed MoE layer output for generated values."""
 
-    if values.hidden_states is None:
-        raise ValueError("hidden_states are required for moe_reference")
-    if values.hidden_states.ndim != 2:
+    routing = values.routing
+    if routing.hidden_states.ndim != 2:
         raise ValueError(
-            "hidden_states must be rank-2, got " f"{tuple(values.hidden_states.shape)}"
+            "hidden_states must be rank-2, got " f"{tuple(routing.hidden_states.shape)}"
         )
-    num_tokens, hidden_size = values.hidden_states.shape
-    if values.router_logits is not None:
-        if values.router_logits.ndim != 2:
-            raise ValueError(
-                "router_logits must be rank-2, got "
-                f"{tuple(values.router_logits.shape)}"
-            )
-        if values.router_logits.shape[0] != num_tokens:
-            raise ValueError(
-                "router_logits first dimension must match hidden_states tokens"
-            )
+    num_tokens, hidden_size = routing.hidden_states.shape
+    if routing.router_logits.ndim != 2:
+        raise ValueError(
+            "router_logits must be rank-2, got " f"{tuple(routing.router_logits.shape)}"
+        )
+    if routing.router_logits.shape[0] != num_tokens:
+        raise ValueError(
+            "router_logits first dimension must match hidden_states tokens"
+        )
     w13 = _moe_weight_operand(values.w13, name="w13", layout=w13_b_layout)
     w2 = _moe_weight_operand(values.w2, name="w2", layout=w2_b_layout)
     if w13.ndim != 3:
@@ -184,14 +181,11 @@ def moe_reference(
         )
     if w2_num_experts != num_experts:
         raise ValueError("w13 and w2 must have matching expert counts")
-    if (
-        values.router_logits is not None
-        and values.router_logits.shape[1] != num_experts
-    ):
+    if routing.router_logits.shape[1] != num_experts:
         raise ValueError("router_logits expert dimension must match weight experts")
     _validate_topk_values(
-        topk_ids=values.topk_ids,
-        topk_weights=values.topk_weights,
+        topk_ids=routing.topk_ids,
+        topk_weights=routing.topk_weights,
         num_tokens=num_tokens,
         num_experts=num_experts,
     )
@@ -212,15 +206,15 @@ def moe_reference(
     if not isinstance(output_dtype, torch.dtype):
         raise TypeError("output_dtype must be a torch.dtype")
 
-    hidden = values.hidden_states.float()
+    hidden = routing.hidden_states.float()
     output = torch.zeros(
         (num_tokens, hidden_size),
         dtype=torch.float32,
         device=hidden.device,
     )
-    for slot in range(values.topk_ids.shape[1]):
-        expert_ids = values.topk_ids[:, slot].to(torch.long)
-        route_weights = values.topk_weights[:, slot].float().reshape(num_tokens, 1)
+    for slot in range(routing.topk_ids.shape[1]):
+        expert_ids = routing.topk_ids[:, slot].to(torch.long)
+        route_weights = routing.topk_weights[:, slot].float().reshape(num_tokens, 1)
         w13_selected = w13[expert_ids].to(device=hidden.device)
         gate_up = torch.bmm(w13_selected.float(), hidden.unsqueeze(-1)).squeeze(-1)
         if values.w13_bias is not None:
@@ -278,7 +272,7 @@ def torch_moe_apply(
     values = getattr(w, "_tokenspeed_numerics_values", None)
     if values is None:
         raise ValueError("MoE reference requires generated values on weight module")
-    return moe_reference(values, output_dtype=values.hidden_states.dtype)
+    return moe_reference(values, output_dtype=values.routing.hidden_states.dtype)
 
 
 @register_kernel(
@@ -301,4 +295,4 @@ def torch_moe_process_weights(
     values = getattr(w, "_tokenspeed_numerics_values", None)
     if values is None:
         raise ValueError("MoE reference requires generated values on weight module")
-    return moe_reference(values, output_dtype=values.hidden_states.dtype)
+    return moe_reference(values, output_dtype=values.routing.hidden_states.dtype)

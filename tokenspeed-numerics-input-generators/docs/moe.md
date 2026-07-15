@@ -1,249 +1,141 @@
 # MoE Input Generators
 
-MoE-family generators cover routed mixture-of-experts inputs. The operation
-family is defined by hidden states, router outputs, selected expert ids, expert
-weights, and metadata used to dispatch token-expert work to expert-local GEMMs.
-The generators describe those operation-level inputs independently of any one
-fused MoE implementation.
+The MoE family is organized around the mathematical stages of a routed
+SwiGLU-style mixture of experts. Let:
 
-TokenSpeed kernels currently guide the first covered modes, but TokenSpeed
-registry signatures are adapter concerns. A consumer can use the generated
-values to call a fused kernel, a reference implementation, or a layer-level test
-that performs routing and expert computation itself.
+- `T` be the number of input tokens.
+- `H` be the model hidden size.
+- `E` be the number of routed experts.
+- `K` be the number of selected experts per token.
+- `I` be the expert intermediate size.
+- `R = T * K` be the number of routed token-expert rows.
 
-## Generators
+The package provides one generator for each fundamental stage and one generator
+for the external operands of the full fused operation.
 
-`MoeInputs` generates layer-level routed MoE inputs:
+## Routing
 
-- `hidden_states`: token activations with shape `[num_tokens, hidden_size]`.
-- `router_logits`: routing logits with shape `[num_tokens, num_experts]`.
-- `topk_ids`: selected expert ids with shape `[num_tokens, top_k]`.
-- `topk_weights`: normalized selected-expert routing weights with shape
-  `[num_tokens, top_k]`.
-- `w13` and `w2`: nested GEMM values for the gate/up and down expert weights.
-- Optional expert biases.
-- Optional per-expert activation scales for quantized W13 and W2 projection
-  inputs.
+`MoeRoutingInputs` generates:
 
-Generated `topk_ids` and `topk_weights` are derived from `router_logits` by
-softmax, top-k selection, and selected-weight renormalization. This keeps the
-default generated routing metadata consistent with the logits while still
-making the explicit top-k tensors available to consumers that test precomputed
-routing paths.
+- `hidden_states`: `[T, H]`.
+- `router_weight`: `[E, H]`.
+- Optional `router_bias`: `[E]`.
+- `router_logits`: `[T, E]`, derived from the generated hidden states and
+  router projection parameters.
+- Optional `correction_bias`: `[E]`, used for selection but not route weights.
+- `topk_ids`: `[T, K]` unique selected expert IDs.
+- `topk_weights`: `[T, K]` finite non-negative route weights.
 
-The nested weight generators reuse the GEMM family so dense, scaled, MXFP4, and
-MXINT4 weights share the same dtype and scale handling as standalone GEMMs.
-Activation operands are skipped for the nested weight GEMMs because the layer
-computation produces those intermediate activations.
+Router weights are scaled by `1 / sqrt(H)` before computing logits so the
+generated score distribution remains useful as hidden size grows. Routing can
+use softmax, sigmoid, or softplus-sqrt scores. Optional equal-size expert-group
+filtering restricts candidates before top-k selection. Selected weights can be
+renormalized and multiplied by a positive routing scale.
 
-Quantized MoE implementations may need scale tensors for activations entering
-the gate/up projection and the down projection. `MoeInputs` can generate those
-per-expert positive scale tensors when `activation_scale_dtype` is configured.
-The scales describe quantized projection inputs at the operation boundary;
-packing, precision-config objects, or backend-specific scale layout transforms
-remain adapter concerns.
+## Dispatch
 
-`MoeAlignBlockSizeInputs` generates inputs for the expert block-alignment
-metadata operation. This operation flattens top-k expert selections, groups the
-flattened token-expert slots by expert, and pads each expert group to a multiple
-of `block_size`. The output metadata identifies which flattened token slots are
-processed by each expert-local GEMM block.
+`MoeDispatchInputs` generates the inputs at the token-dispatch boundary:
 
-`MoESoftmaxTopKRoutingInputs` generates inputs for a router operation that
-converts router logits to probabilities, selects experts using a correction
-bias, and emits top-k expert ids and route weights. The operation is:
+- `hidden_states`: `[T, H]`.
+- `topk_ids`: `[T, K]` unique IDs in `[0, E)`.
+- `topk_weights`: `[T, K]` normalized route weights.
 
-1. `probs = softmax(logits, dim=-1)`.
-2. Select top-k expert ids from `probs + correction_bias`.
-3. Gather output weights from the original `probs`, not the biased scores.
-4. Optionally renormalize selected weights by their selected-weight sum.
-5. Multiply selected weights by `scaling_factor`.
-6. Replace selected expert ids greater than or equal to `num_experts_real` with
-   `-1` to represent padded zero experts.
+The generator does not choose a physical dispatch representation. Flattened
+slot IDs, expert offsets, block padding, permutations, inverse permutations,
+and distributed exchange layouts are implementation concerns derived from
+these values.
 
-The generated correction bias can intentionally force a padded expert into the
-selected top-k set. That gives consumers coverage for both ordinary expert
-selection and zero-expert masking without making the generator depend on any
-particular fused routing kernel.
+## Gate And Up
 
-`MoEBiasedGroupedTopKInputs` generates inputs for sigmoid/correction-bias MoE
-routing with optional expert-group filtering. The operation is:
+`MoeGateUpInputs` generates the inputs to the first expert projection:
 
-1. `scores = sigmoid(gating_output)`.
-2. `selection_scores = scores + correction_bias`.
-3. Partition experts into `num_expert_groups` equal-size groups.
-4. Score each group by summing the top two `selection_scores` in that group.
-5. Select `top_k_groups` groups and mask experts outside those groups.
-6. Select `top_k` experts from the remaining `selection_scores`.
-7. Gather route weights from the original sigmoid `scores`.
-8. If `renormalize` is enabled, normalize selected weights by their selected
-   sum and multiply by `routed_scaling_factor`.
-9. Optionally map logical expert ids through a generated physical-id
-   permutation and optionally mark padded token rows with output ids `-1`.
+- `routed_hidden_states`: `[R, H]`.
+- `expert_ids`: `[R]`.
+- `w13`: nested GEMM values containing expert weights logically shaped
+  `[E, 2I, H]` plus optional scale sidecars.
+- Optional `w13_bias`: `[E, 2I]`.
+- Optional per-expert activation scale: `[E]`.
 
-The generated `hidden_states` tensor represents the token rows associated with
-the router logits. Its values do not affect the grouped top-k computation, but
-it keeps the generated values aligned with implementation APIs that route a
-hidden-state batch.
+The represented computation splits the W13 result into gate and up halves and
+forms an activation such as `silu(gate) * up`. That resulting `[R, I]` tensor
+is an output of this stage, so it is generated as an input by the next stage
+rather than returned here.
 
-`MoESoftplusSqrtTopKRoutingInputs` generates inputs for a DeepSeek-style router
-that transforms each logit with `sqrt(softplus(x))`, normalizes selected
-weights, and applies a routed scaling factor. The generator supports two
-selection modes:
+## Down And Combine
 
-- In correction-bias mode, select top-k experts from
-  `sqrt(softplus(logits)) + correction_bias`.
-- In hash mode, use `input_ids` to gather selected expert ids from
-  `hash_indices_table`; the transformed logits only determine the normalized
-  weights for those selected experts.
+`MoeDownCombineInputs` generates:
 
-Both modes gather output weights from the un-biased transformed scores,
-normalize the selected weights by their selected sum, and multiply by
-`routed_scaling_factor`.
+- `activations`: `[R, I]`, representing post-gate/up activation rows.
+- `topk_ids`: `[T, K]`.
+- `topk_weights`: `[T, K]`.
+- `w2`: nested GEMM values containing expert weights logically shaped
+  `[E, H, I]` plus optional scale sidecars.
+- Optional `w2_bias`: `[E, H]`.
+- Optional per-expert activation scale: `[E]`.
+- Optional `shared_output`: `[T, H]`.
 
-`MoEDeepSeekV4MegaMoEStagingInputs` generates inputs and output buffers for the
-DeepSeek V4 MegaMoE staging operation. The operation prepares routed expert
-inputs before an FP8/FP4 MegaMoE GEMM:
+Flattening `topk_ids` associates each activation row with its expert. The down
+projection produces `[R, H]` expert outputs. Route weights then scale those
+rows before they are reduced back into `[T, H]` token order. A shared output,
+when present, is added after the routed reduction.
 
-1. Split each hidden-state row into 128-wide blocks.
-2. Split each block into four 32-wide groups.
-3. For each group, compute `amax = max(abs(group))`, clamped to at least
-   `1e-4`.
-4. Compute `scale = amax / 448`, round it up to the next power-of-two scale by
-   storing the biased FP32 exponent byte, and pack the four exponent bytes into
-   one int32 scale word per 128-wide block.
-5. Divide hidden values by the rounded per-group scale and cast to FP8 E4M3.
-6. Copy precomputed `topk_ids` and `topk_weights` to staged output buffers.
+## Full Fused MoE
 
-This generator treats top-k routing ids and weights as already-computed routing
-metadata. It does not define how routing was produced.
+`MoeInputs` generates the external operands for the complete fused routed MoE:
 
-`MoEFinalizeFuseSharedInputs` generates inputs for the routed-output finalize
-epilogue after expert-local down projections have already run. The operation
-takes permuted expert outputs `gemm2_out`, a flattened
-`expanded_idx_to_permuted_idx` map from token/top-k slots to rows in
-`gemm2_out`, per-slot `expert_weights`, and an optional `shared_output`
-residual. It computes:
+- Nested `routing` values containing hidden states, router projection tensors,
+  logits, and selected routes.
+- `w13` and `w2` expert weight operands with optional scale sidecars.
+- Optional W13 and W2 expert biases.
+- Optional per-expert W13 and W2 activation scales.
 
-```text
-out[t] = sum_k expert_weights[t, k] * gemm2_out[permuted_idx(t, k)]
-       + shared_output[t]  # when present
-```
+The full generator calls `MoeRoutingInputs` and reuses GEMM generation for the
+expert weights. It does not generate routed hidden states or post-gate/up
+activations because those are internal results of full execution.
 
-Dropped token/top-k slots use permute index `-1` and do not contribute to the
-sum. `gemm2_out` may use a padded hidden width; when `shared_output` is
-present, the logical output width is the shared-output width.
+## Dtypes And Quantization
 
-## TokenSpeed API Mapping
+Regular floating torch dtypes are supported for activations, routing tensors,
+and dense expert weights. Quantized expert weights use the same custom dtypes
+as core tensor and GEMM generation. Scale storage and block shapes are inferred
+from the custom dtype:
 
-TokenSpeed fused MoE kernels consume a runtime weight module plus a plan created
-by `moe_plan`. That module is a backend adapter concern. `MoeInputs` produces
-the operation-level tensors: hidden states, router logits, explicit top-k
-routing results, expert weights with optional scale sidecars, optional biases,
-and optional activation scales. Tests that exercise TokenSpeed kernels should
-build a small adapter module from those values, call `moe_process_weights` for
-the selected backend, and then pass the generated hidden/routing tensors to
-`moe_apply`.
+- `CustomDType.MXFP4`: packed E2M1 values with UE8M0 scales over 32 values.
+- `CustomDType.MXINT4`: packed signed INT4 values with BF16 scales over 32
+  values.
+- `CustomDType.NVFP4`: packed E2M1 values with FP8 scales over 16 values.
 
-For example, the MXFP4 Triton precomputed-routing path uses `MoeInputs` with
-MXFP4 expert weights and passes generated `topk_ids` and `topk_weights`
-directly to `moe_apply`. The generator does not own Triton-specific weight
-swizzling, precision-config objects, or module attributes such as `top_k` and
-`num_experts`; those remain in the TokenSpeed adapter/test layer.
+Scaled regular torch weights can provide an explicit scale dtype and block
+size. Projection input dimensions must be divisible by the selected scale
+block size so generated storage cannot represent a partial quantization group.
 
-Dense TokenSpeed MoE adapters follow the same pattern with ordinary torch
-weight tensors. `MoeInputs` provides the semantic expert weights in
-`w13.B` and `w2.B`; the adapter attaches them to a small module, calls
-`moe_process_weights` for the selected backend, and then compares `moe_apply`
-against a reference owned by TokenSpeed's numerical-testing layer.
-Backend-specific gate/up reordering is owned by `moe_process_weights`, not by
-the generator.
+## TokenSpeed Adapters
 
-The FlashInfer TRT-LLM MXINT4 path is a weight-only INT4 variant with BF16
-group scales. `MoeInputs(weight_format="mxint4")` generates the operation-level
-packed signed INT4 bytes and BF16 scales. A TokenSpeed adapter can convert
-those bytes into checkpoint-style int32 words, attach the BF16 scale tensors to
-the runtime weight module, and let `moe_process_weights` handle backend block
-layout conversion and scale interleaving.
+TokenSpeed's fused MoE API begins after the router projection: it consumes
+hidden states, router logits or precomputed top-k values, and a runtime expert
+weight module. Its numerics adapter therefore extracts those tensors from
+`MoeInputs.routing` and builds the runtime module from `w13`, `w2`, biases, and
+scales.
 
-The CUDA `routing_flash` helper maps directly to
-`MoESoftmaxTopKRoutingInputs`: generated `logits`, `correction_bias`, output
-buffers, `num_experts_real`, `scaling_factor`, and `renormalize` become the
-helper arguments. The generator keeps the routing operation independent of that
-helper's supported expert counts and extension-loading details; those remain
-adapter/test concerns.
+Standalone helper kernels use the nearest core stage:
 
-The Triton `minimax_biased_grouped_topk` helper maps directly to
-`MoEBiasedGroupedTopKInputs`: generated `hidden_states`, `gating_output`,
-`correction_bias`, `top_k`, `renormalize`, `num_expert_groups`,
-`top_k_groups`, `routed_scaling_factor`, optional
-`num_token_non_padded`, and optional `logical_to_physical_map` become the
-helper arguments. The generator describes the grouped routing operation; the
-wrapper's fast-path restrictions, such as specific `top_k` and group settings,
-remain implementation-specific details.
+- Block alignment and FP8 staging start from `MoeDispatchInputs`.
+- Router helpers start from `MoeRoutingInputs`; helper-specific output buffers,
+  padded-expert masks, hash tables, or physical expert maps are supplied by the
+  TokenSpeed test adapter.
+- Finalization helpers start from `MoeDownCombineInputs`; the adapter executes
+  or constructs down-projection outputs and converts logical route order into
+  the helper's permutation format.
 
-The CUDA `softplus_sqrt_topk_flash` and `hash_softplus_sqrt_topk_flash` helpers
-map to `MoESoftplusSqrtTopKRoutingInputs`. The non-hash helper consumes
-generated `logits`, `correction_bias`, output buffers, `routed_scaling_factor`,
-and `renormalize`. The hash helper consumes generated `logits`, `input_ids`,
-`hash_indices_table`, output buffers, `routed_scaling_factor`, and
-`renormalize`. TokenSpeed's CUDA helpers currently require FP32 logits, int32
-output ids, `top_k=6`, `renormalize=True`, and 256 or 384 experts; those are
-adapter requirements rather than additional operation semantics.
-
-The Triton `stage_deepseek_v4_mega_moe_inputs` helper maps directly to
-`MoEDeepSeekV4MegaMoEStagingInputs`: generated `hidden_states`, `topk_weights`,
-`topk_ids`, `x_fp8`, `x_sf`, `topk_idx_out`, and `topk_weights_out` become the
-helper arguments. The helper's requirement that hidden size is a multiple of
-128 is an operation invariant because scale words are packed once per 128-wide
-block.
-
-The CUDA `moe_finalize_fuse_shared` helper maps directly to
-`MoEFinalizeFuseSharedInputs`: generated `gemm2_out`,
-`expanded_idx_to_permuted_idx`, `expert_weights`, optional `shared_output`, and
-`top_k` derived from `expert_weights.shape[1]` become the helper arguments. The
-helper's SM90 requirement and extension-loading details remain adapter
-concerns.
+This keeps backend names, fused helper boundaries, output buffers, and physical
+layouts out of the standalone input-generation package.
 
 ## Verification
 
-MoE configs verify token counts, hidden/intermediate widths, expert counts,
-top-k constraints, block sizes, integer routing dtypes, and generated id
-ranges. Optional activation scales must use regular floating dtypes and
-positive finite scalar fill values. MXINT4 weights require BF16 group scales
-with shapes derived from the expert projection widths. Generated selected
-expert ids and weights are rank-2, shape-consistent, finite, non-negative,
-duplicate-free per token, and normalized across each token's selected experts.
-The align-block-size generator checks that top-k ids are rank-2 and within
-`[0, num_experts)` before returning them.
-
-Softmax top-k routing verifies that logits and correction bias are finite FP32
-tensors with matching expert width, output buffers are rank-2 with matching
-token/top-k shape, output indices use `torch.int32` or `torch.int64`, output
-weights use FP32, `num_experts_real` identifies a proper prefix of real experts,
-and `scaling_factor` is positive and finite.
-
-Biased grouped top-k routing verifies finite floating hidden/router tensors,
-finite FP32 correction bias, matching token/expert dimensions, equal-size expert
-groups with at least two experts per group, selected-group capacity sufficient
-for `top_k`, positive finite routed scaling, permutation validity for optional
-logical-to-physical maps, and in-range scalar padding cutoffs.
-
-Softplus-sqrt top-k routing verifies finite FP32 logits, rank-2 output buffers,
-int32 output ids, FP32 output weights, positive finite routed scaling, and
-`renormalize=True`. Correction-bias mode requires one finite FP32 bias per
-expert. Hash mode requires int32/int64 input ids, an int32 hash table with
-one unique in-range expert id per selected slot, and input ids that index valid
-hash-table rows.
-
-MegaMoE staging verifies finite floating hidden states, hidden width divisible
-by 128, rank-2 matching top-k ids and weights, in-range top-k ids, non-negative
-finite FP32 route weights, FP8 E4M3 hidden output buffers, int32 packed scale
-buffers with one scale word per 128 hidden channels, and staged top-k output
-buffers matching the input top-k tensors.
-
-Finalize-fuse-shared verifies BF16 permuted expert outputs, int32 flattened
-permute maps, unique non-dropped active indices, in-range or `-1` permute
-entries, FP32/BF16 expert weights, `top_k <= 64`, optional BF16 shared output
-with matching token rows and width no larger than `gemm2_out`, shared devices,
-and finite generated values.
+All generators reject invalid token, hidden, intermediate, expert, and top-k
+sizes. They verify floating and integer dtypes, finite positive routing and
+scale factors, expert-group divisibility and capacity, selected ID ranges,
+weight scale block divisibility, and the required shapes of every generated
+tensor. Generated top-k rows contain unique expert IDs and finite non-negative
+weights. Quantized weight configuration is also validated by the shared tensor
+and GEMM generators before values are returned.

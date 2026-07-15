@@ -26,9 +26,11 @@ from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (  # noqa: E402
     _gluon_mxfp4_fp8_warp_decode_moe,
 )
 from tokenspeed_numerics_input_generators import (  # noqa: E402
+    CustomDType,
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
+    MoeRoutingInputConfig,
 )
 
 try:
@@ -100,8 +102,6 @@ def _build_case_from_values(
     device: str,
 ) -> dict:
     """Adapt operation-level MoE values to the kernel's swizzled MXFP4 ABI."""
-    if values.hidden_states is None or values.router_logits is None:
-        raise AssertionError("MoeInputs must generate hidden states and router logits")
     if (
         values.w13.B is None
         or values.w13.B_scales is None
@@ -121,8 +121,8 @@ def _build_case_from_values(
         "topk": topk,
         "use_bias": use_bias,
         "values": values,
-        "hidden": values.hidden_states,
-        "router": values.router_logits,
+        "hidden": values.routing.hidden_states,
+        "router": values.routing.router_logits,
         "w13": values.w13.B,
         "w2": values.w2.B,
         "w13_scales": values.w13.B_scales,
@@ -152,13 +152,16 @@ def _build_case(
     """Construct kernel inputs from operation-level MoE generator values."""
     values = MoeInputs(
         MoeInputConfig(
-            num_tokens=M,
-            hidden_size=D,
+            routing=MoeRoutingInputConfig(
+                num_tokens=M,
+                hidden_size=D,
+                num_experts=E,
+                top_k=topk,
+                hidden_dtype=torch.bfloat16,
+                topk_weights_dtype=torch.bfloat16,
+            ),
             intermediate_size=I,
-            num_experts=E,
-            top_k=topk,
-            hidden_dtype=torch.bfloat16,
-            weight_format="mxfp4",
+            weight_dtype=CustomDType.MXFP4,
             bias_dtype=torch.float32 if use_bias else None,
         )
     ).generate(seed=seed, device=device)

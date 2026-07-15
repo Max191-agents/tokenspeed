@@ -45,11 +45,12 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_numerics_input_generators import (
     CustomDType,
-    MoeAlignBlockSizeInputConfig,
-    MoeAlignBlockSizeInputs,
+    MoeDispatchInputConfig,
+    MoeDispatchInputs,
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
+    MoeRoutingInputConfig,
 )
 
 
@@ -81,20 +82,21 @@ class MoeAlignBlockSizeInputGenerator(InputGenerator):
         num_experts: int,
         block_size: int,
     ) -> dict[str, Any]:
-        values = MoeAlignBlockSizeInputs(
-            MoeAlignBlockSizeInputConfig(
-                total_tokens=total_tokens,
+        values = MoeDispatchInputs(
+            MoeDispatchInputConfig(
+                num_tokens=total_tokens,
+                hidden_size=1,
                 top_k=top_k,
                 num_experts=num_experts,
-                block_size=block_size,
+                hidden_dtype=torch.float32,
                 topk_ids_dtype=self.dtype,
                 device=self.device,
             )
         ).generate(seed=self.seed, device=self.device)
         return {
             "topk_ids": values.topk_ids,
-            "block_size": values.block_size,
-            "num_experts": values.num_experts,
+            "block_size": block_size,
+            "num_experts": num_experts,
         }
 
 
@@ -122,8 +124,6 @@ def _make_moe_weight_module(
     weight_dtype: str,
     activation: str,
 ) -> torch.nn.Module:
-    if values.hidden_states is None or values.router_logits is None:
-        raise ValueError("MoE values must include hidden states and router logits")
     if values.w13.B is None or values.w2.B is None:
         raise ValueError("MoE values must include W13 and W2 weights")
 
@@ -135,7 +135,7 @@ def _make_moe_weight_module(
     layer.ep_rank = 0
     layer.tp_size = 1
     layer.tp_rank = 0
-    layer.top_k = int(values.topk_ids.shape[1])
+    layer.top_k = int(values.routing.topk_ids.shape[1])
     layer.activation = activation
     layer.swiglu_arg = None
     layer._tokenspeed_numerics_values = values
@@ -264,11 +264,9 @@ class MoeApplyInputGenerator(InputGenerator):
         resolved_weight_dtype = self._weight_dtype(weight_dtype)
         resolved_activation = self._activation(activation)
         if resolved_weight_dtype == "unquant":
-            weight_format = "dense"
             generated_weight_dtype: Any = self.dtype
             weight_scale_dtype = None
         elif resolved_weight_dtype == "mxfp4":
-            weight_format = "mxfp4"
             generated_weight_dtype = CustomDType.MXFP4
             weight_scale_dtype = None
         else:
@@ -279,14 +277,16 @@ class MoeApplyInputGenerator(InputGenerator):
 
         values = MoeInputs(
             MoeInputConfig(
-                num_tokens=num_tokens,
-                hidden_size=hidden_size,
+                routing=MoeRoutingInputConfig(
+                    num_tokens=num_tokens,
+                    hidden_size=hidden_size,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    hidden_dtype=self.dtype,
+                    router_dtype=self.dtype,
+                    topk_weights_dtype=self.dtype,
+                ),
                 intermediate_size=intermediate_size,
-                num_experts=num_experts,
-                top_k=top_k,
-                hidden_dtype=self.dtype,
-                router_dtype=self.dtype,
-                weight_format=weight_format,
                 weight_dtype=generated_weight_dtype,
                 weight_scale_dtype=weight_scale_dtype,
                 bias_dtype=(
@@ -299,8 +299,6 @@ class MoeApplyInputGenerator(InputGenerator):
                 ),
             )
         ).generate(seed=self.seed, device=self.device)
-        if values.hidden_states is None or values.router_logits is None:
-            raise ValueError("generated MoE inputs must include activations")
 
         layer = _make_moe_weight_module(
             values,
@@ -352,15 +350,16 @@ class MoeApplyInputGenerator(InputGenerator):
             layer,
             weight_dtype=resolved_weight_dtype,
         )
+        routing = values.routing
         return {
             "plan": plan,
-            "x": values.hidden_states,
+            "x": routing.hidden_states,
             "w": layer,
-            "router_logits": values.router_logits,
-            "topk_weights": values.topk_weights,
-            "topk_ids": values.topk_ids,
-            "num_tokens_global": values.hidden_states.shape[0],
-            "max_num_tokens_per_gpu": values.hidden_states.shape[0],
+            "router_logits": routing.router_logits,
+            "topk_weights": routing.topk_weights,
+            "topk_ids": routing.topk_ids,
+            "num_tokens_global": routing.hidden_states.shape[0],
+            "max_num_tokens_per_gpu": routing.hidden_states.shape[0],
             "do_finalize": True,
             "enable_pdl": False,
         }
@@ -434,8 +433,9 @@ def _process_weights_output(
     plan = inputs["plan"]
     w = inputs["w"]
     values = getattr(w, "_tokenspeed_numerics_values", None)
-    if values is None or values.hidden_states is None or values.router_logits is None:
+    if values is None:
         raise ValueError("processed MoE module must carry generated MoE values")
+    routing = values.routing
 
     apply_kernel_name = plan.get("apply_kernel_name")
     apply_kernel = KernelRegistry.get().get_impl(apply_kernel_name)
@@ -443,13 +443,13 @@ def _process_weights_output(
         raise ValueError(f"MoE apply kernel {apply_kernel_name!r} is not registered")
     return apply_kernel(
         plan=plan,
-        x=values.hidden_states,
+        x=routing.hidden_states,
         w=w,
-        router_logits=values.router_logits,
-        topk_weights=values.topk_weights,
-        topk_ids=values.topk_ids,
-        num_tokens_global=values.hidden_states.shape[0],
-        max_num_tokens_per_gpu=values.hidden_states.shape[0],
+        router_logits=routing.router_logits,
+        topk_weights=routing.topk_weights,
+        topk_ids=routing.topk_ids,
+        num_tokens_global=routing.hidden_states.shape[0],
+        max_num_tokens_per_gpu=routing.hidden_states.shape[0],
         do_finalize=True,
         enable_pdl=False,
     )

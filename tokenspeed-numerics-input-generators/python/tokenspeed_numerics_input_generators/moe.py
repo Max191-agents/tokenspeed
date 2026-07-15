@@ -18,12 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""MoE-family input generators for numerical correctness tests."""
+"""Input generators for the fundamental stages of routed MoE computation."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from tokenspeed_numerics_input_generators.core import (
@@ -43,47 +44,74 @@ from tokenspeed_numerics_input_generators.gemm import (
 )
 
 __all__ = [
-    "MoeAlignBlockSizeInputConfig",
-    "MoeAlignBlockSizeInputs",
-    "MoeAlignBlockSizeInputValues",
-    "MoESoftmaxTopKRoutingInputConfig",
-    "MoESoftmaxTopKRoutingInputs",
-    "MoESoftmaxTopKRoutingInputValues",
-    "MoEBiasedGroupedTopKInputConfig",
-    "MoEBiasedGroupedTopKInputs",
-    "MoEBiasedGroupedTopKInputValues",
-    "MoEDeepSeekV4MegaMoEStagingInputConfig",
-    "MoEDeepSeekV4MegaMoEStagingInputs",
-    "MoEDeepSeekV4MegaMoEStagingInputValues",
-    "MoEFinalizeFuseSharedInputConfig",
-    "MoEFinalizeFuseSharedInputs",
-    "MoEFinalizeFuseSharedInputValues",
-    "MoESoftplusSqrtTopKRoutingInputConfig",
-    "MoESoftplusSqrtTopKRoutingInputs",
-    "MoESoftplusSqrtTopKRoutingInputValues",
+    "MoeDispatchInputConfig",
+    "MoeDispatchInputs",
+    "MoeDispatchInputValues",
+    "MoeDownCombineInputConfig",
+    "MoeDownCombineInputs",
+    "MoeDownCombineInputValues",
+    "MoeGateUpInputConfig",
+    "MoeGateUpInputs",
+    "MoeGateUpInputValues",
     "MoeInputConfig",
-    "MoeInputValues",
     "MoeInputs",
+    "MoeInputValues",
+    "MoeRoutingInputConfig",
+    "MoeRoutingInputs",
+    "MoeRoutingInputValues",
 ]
 
+MoeRoutingScoreFunction = Literal["softmax", "sigmoid", "softplus_sqrt"]
 
-_TOPK_ID_DTYPES = {torch.int16, torch.int32, torch.int64}
-_REGULAR_FLOAT_DTYPES = {
+_FLOAT_DTYPES = {
     torch.float16,
     torch.bfloat16,
     torch.float32,
     torch.float64,
 }
-_DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE = 128
-_DEEPSEEK_V4_MEGAMOE_FP8_GROUP_SIZE = 32
-_MOE_FINALIZE_MAX_TOPK = 64
+_INTEGER_DTYPES = {torch.int16, torch.int32, torch.int64}
+_ROUTING_SCORE_FUNCTIONS = {"softmax", "sigmoid", "softplus_sqrt"}
+_DEFAULT_BLOCK_SIZE = {
+    CustomDType.MXFP4: 32,
+    CustomDType.MXINT4: 32,
+    CustomDType.NVFP4: 16,
+}
 
 
-def _check_moe_float_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+def _check_nonnegative(name: str, value: int) -> int:
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
+    return value
+
+
+def _check_positive(name: str, value: int) -> int:
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _check_float_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
     if not isinstance(dtype, torch.dtype):
         raise TypeError(f"{name} must be a torch.dtype")
-    if dtype not in _REGULAR_FLOAT_DTYPES:
+    if dtype not in _FLOAT_DTYPES:
         raise ValueError(f"{name} must be a regular floating torch dtype, got {dtype}")
+    return dtype
+
+
+def _check_optional_float_dtype(
+    name: str,
+    dtype: torch.dtype | None,
+) -> torch.dtype | None:
+    if dtype is None:
+        return None
+    return _check_float_dtype(name, dtype)
+
+
+def _check_integer_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+    if dtype not in _INTEGER_DTYPES:
+        raise ValueError(f"{name} must be torch.int16, torch.int32, or torch.int64")
     return dtype
 
 
@@ -94,563 +122,424 @@ def _check_positive_finite_float(name: str, value: float) -> float:
     return value
 
 
-def _check_nonnegative(name: str, value: int) -> int:
-    value = int(value)
-    if value < 0:
-        raise ValueError(f"{name} must be non-negative, got {value}")
-    return value
+def _check_top_k(*, top_k: int, num_experts: int) -> tuple[int, int]:
+    top_k = _check_positive("top_k", top_k)
+    num_experts = _check_positive("num_experts", num_experts)
+    if top_k > num_experts:
+        raise ValueError("top_k must be <= num_experts")
+    return top_k, num_experts
+
+
+def _resolved_weight_dtype(
+    weight_dtype: InputDType,
+    activation_dtype: torch.dtype,
+) -> InputDType:
+    return activation_dtype if weight_dtype is None else weight_dtype
+
+
+def _weight_block_size(
+    weight_dtype: InputDType,
+    weight_scale_dtype: InputDType,
+    configured_block_size: int,
+) -> int | None:
+    if weight_dtype in _DEFAULT_BLOCK_SIZE:
+        block_size = _DEFAULT_BLOCK_SIZE[weight_dtype]
+    elif weight_dtype == torch.float4_e2m1fn_x2:
+        block_size = 16
+    elif weight_scale_dtype is not None:
+        block_size = _check_positive("weight_scale_block_size", configured_block_size)
+    else:
+        return None
+    return block_size
+
+
+def _make_expert_weight_generator(
+    *,
+    num_rows: int,
+    output_size: int,
+    input_size: int,
+    num_experts: int,
+    activation_dtype: torch.dtype,
+    weight_dtype: InputDType,
+    weight_scale_dtype: InputDType,
+    weight_scale_block_size: int,
+    device: DeviceLike,
+) -> GemmInputs:
+    resolved_dtype = _resolved_weight_dtype(weight_dtype, activation_dtype)
+    block_size = _weight_block_size(
+        resolved_dtype,
+        weight_scale_dtype,
+        weight_scale_block_size,
+    )
+    if block_size is not None and input_size % block_size != 0:
+        raise ValueError(
+            "expert projection input size must be divisible by the weight scale "
+            f"block size; got input_size={input_size}, block_size={block_size}"
+        )
+    scale_shape = (
+        None
+        if block_size is None
+        else gemm_scale_shape(
+            "block",
+            "b",
+            M=num_rows,
+            N=output_size,
+            K=input_size,
+            batch_shape=(num_experts,),
+            block_shape=(block_size,),
+        )
+    )
+    return GemmInputs(
+        GemmInputConfig(
+            M=num_rows,
+            N=output_size,
+            K=input_size,
+            a_dtype=None,
+            b_dtype=resolved_dtype,
+            c_dtype=activation_dtype,
+            batch_shape=(num_experts,),
+            b_scale_shape=scale_shape,
+            b_scale_dtype=weight_scale_dtype,
+            b_device=device,
+            b_scale_device=device,
+            c_device=device,
+        )
+    )
+
+
+def _generate_routes(
+    *,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    ids_dtype: torch.dtype,
+    weights_dtype: torch.dtype,
+    seed: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rng_device = "cuda" if device.type == "cuda" else "cpu"
+    generator = torch.Generator(device=rng_device).manual_seed(seed)
+    random_scores = torch.rand(
+        (num_tokens, num_experts),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    )
+    topk_ids = random_scores.topk(top_k, dim=-1, sorted=False).indices.to(ids_dtype)
+    topk_weights = torch.rand(
+        (num_tokens, top_k),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    )
+    if num_tokens:
+        topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+    return topk_ids.contiguous(), topk_weights.to(weights_dtype).contiguous()
+
+
+def _routing_scores(
+    logits: torch.Tensor,
+    score_function: MoeRoutingScoreFunction,
+) -> torch.Tensor:
+    logits = logits.float()
+    if score_function == "softmax":
+        return torch.softmax(logits, dim=-1)
+    if score_function == "sigmoid":
+        return torch.sigmoid(logits)
+    if score_function == "softplus_sqrt":
+        return torch.sqrt(torch.nn.functional.softplus(logits))
+    raise ValueError(f"unsupported score_function={score_function!r}")
+
+
+def _select_routes(
+    *,
+    logits: torch.Tensor,
+    correction_bias: torch.Tensor | None,
+    score_function: MoeRoutingScoreFunction,
+    top_k: int,
+    num_expert_groups: int,
+    top_k_groups: int,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    ids_dtype: torch.dtype,
+    weights_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = _routing_scores(logits, score_function)
+    selection_scores = scores
+    if correction_bias is not None:
+        selection_scores = selection_scores + correction_bias.float().reshape(1, -1)
+
+    if num_expert_groups > 1:
+        num_tokens, num_experts = selection_scores.shape
+        experts_per_group = num_experts // num_expert_groups
+        grouped = selection_scores.reshape(
+            num_tokens,
+            num_expert_groups,
+            experts_per_group,
+        )
+        group_scores = grouped.topk(2, dim=-1).values.sum(dim=-1)
+        selected_groups = group_scores.topk(
+            top_k_groups,
+            dim=-1,
+            sorted=False,
+        ).indices
+        group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+        group_mask.scatter_(1, selected_groups, True)
+        expert_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(num_tokens, num_expert_groups, experts_per_group)
+            .reshape(num_tokens, num_experts)
+        )
+        selection_scores = selection_scores.masked_fill(~expert_mask, float("-inf"))
+
+    topk_ids = selection_scores.topk(top_k, dim=-1, sorted=False).indices
+    topk_weights = scores.gather(1, topk_ids)
+    if renormalize and topk_weights.shape[0]:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+            1.0e-12
+        )
+    topk_weights = topk_weights * routed_scaling_factor
+    return (
+        topk_ids.to(ids_dtype).contiguous(),
+        topk_weights.to(weights_dtype).contiguous(),
+    )
+
+
+def _make_activation_scale(
+    *,
+    num_experts: int,
+    dtype: torch.dtype | None,
+    value: float,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if dtype is None:
+        return None
+    return torch.full((num_experts,), value, dtype=dtype, device=device)
+
+
+def _validate_topk_values(
+    *,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    expected_weight_sum: float | None,
+) -> None:
+    expected_shape = (num_tokens, top_k)
+    if topk_ids.shape != expected_shape:
+        raise ValueError(
+            f"topk_ids must have shape {expected_shape}, got {tuple(topk_ids.shape)}"
+        )
+    if topk_weights.shape != expected_shape:
+        raise ValueError(
+            "topk_weights must have shape "
+            f"{expected_shape}, got {tuple(topk_weights.shape)}"
+        )
+    if topk_ids.dtype not in _INTEGER_DTYPES:
+        raise ValueError("topk_ids must use an integer dtype")
+    if topk_weights.dtype not in _FLOAT_DTYPES:
+        raise ValueError("topk_weights must use a regular floating dtype")
+    if topk_ids.numel():
+        if topk_ids.min().item() < 0 or topk_ids.max().item() >= num_experts:
+            raise ValueError("topk_ids must be in [0, num_experts)")
+        sorted_ids = topk_ids.to(torch.int64).sort(dim=-1).values
+        if top_k > 1 and torch.any(sorted_ids[:, 1:] == sorted_ids[:, :-1]):
+            raise ValueError("topk_ids must be unique within each token row")
+    if not torch.isfinite(topk_weights).all():
+        raise ValueError("topk_weights must be finite")
+    if torch.any(topk_weights < 0):
+        raise ValueError("topk_weights must be non-negative")
+    if expected_weight_sum is not None and num_tokens:
+        expected = torch.full(
+            (num_tokens,),
+            expected_weight_sum,
+            dtype=torch.float32,
+            device=topk_weights.device,
+        )
+        if not torch.allclose(
+            topk_weights.float().sum(dim=-1),
+            expected,
+            rtol=1.0e-3,
+            atol=1.0e-3,
+        ):
+            raise ValueError(f"topk_weights rows must sum to {expected_weight_sum}")
+
+
+def _validate_expert_weight_values(
+    *,
+    name: str,
+    values: GemmInputValues,
+    generator: GemmInputs,
+) -> None:
+    if values.A is not None:
+        raise ValueError(f"{name}.A must be omitted for expert weight generation")
+    if values.B is None:
+        raise ValueError(f"{name}.B expert weights are required")
+    expected_shape = generator._value_shape("b")
+    if values.B.shape != expected_shape:
+        raise ValueError(
+            f"{name}.B must have shape {expected_shape}, got {tuple(values.B.shape)}"
+        )
+    if values.A_scales is not None:
+        raise ValueError(f"{name}.A_scales must be omitted")
+    expected_scale_shape = generator.config.b_scale_shape
+    if expected_scale_shape is None:
+        if values.B_scales is not None:
+            raise ValueError(f"{name}.B_scales must be omitted for unscaled weights")
+    elif values.B_scales is None or values.B_scales.shape != expected_scale_shape:
+        actual_shape = None if values.B_scales is None else tuple(values.B_scales.shape)
+        raise ValueError(
+            f"{name}.B_scales must have shape {expected_scale_shape}, got {actual_shape}"
+        )
 
 
 @dataclass
-class MoeAlignBlockSizeInputValues:
-    """Generated values for ``MoeAlignBlockSizeInputs``."""
-
-    topk_ids: torch.Tensor
-    block_size: int
-    num_experts: int
-
-
-@dataclass
-class MoESoftmaxTopKRoutingInputValues:
-    """Generated values for softmax/bias top-k MoE routing."""
-
-    logits: torch.Tensor
-    correction_bias: torch.Tensor
-    topk_indices: torch.Tensor
-    topk_weights: torch.Tensor
-    num_experts_real: int
-    scaling_factor: float
-    renormalize: bool
-
-
-@dataclass
-class MoEBiasedGroupedTopKInputValues:
-    """Generated values for sigmoid/bias grouped top-k MoE routing."""
+class MoeRoutingInputValues:
+    """Generated values spanning router projection and top-k selection."""
 
     hidden_states: torch.Tensor
-    gating_output: torch.Tensor
-    correction_bias: torch.Tensor
-    top_k: int
-    renormalize: bool
-    num_expert_groups: int
-    top_k_groups: int
-    routed_scaling_factor: float
-    logical_to_physical_map: torch.Tensor | None
-    num_token_non_padded: torch.Tensor | None
-
-
-@dataclass
-class MoEDeepSeekV4MegaMoEStagingInputValues:
-    """Generated values for DeepSeek V4 MegaMoE input staging."""
-
-    hidden_states: torch.Tensor
-    topk_ids: torch.Tensor
-    topk_weights: torch.Tensor
-    x_fp8: torch.Tensor
-    x_sf: torch.Tensor
-    topk_idx_out: torch.Tensor
-    topk_weights_out: torch.Tensor
-    num_experts: int
-
-
-@dataclass
-class MoEFinalizeFuseSharedInputValues:
-    """Generated values for MoE routed-output finalization.
-
-    ``gemm2_out`` contains permuted expert down-projection outputs.
-    ``expanded_idx_to_permuted_idx`` maps each flattened token/top-k slot to a
-    row in ``gemm2_out``; ``-1`` drops the slot. ``expert_weights`` contains
-    route weights for each token/top-k slot. ``shared_output`` is an optional
-    per-token residual that is added after routed expert accumulation.
-    """
-
-    gemm2_out: torch.Tensor
-    expanded_idx_to_permuted_idx: torch.Tensor
-    expert_weights: torch.Tensor
-    shared_output: torch.Tensor | None
-
-
-@dataclass
-class MoEFinalizeFuseSharedInputConfig:
-    """Initialization parameters for MoE finalize + shared residual inputs.
-
-    The represented operation computes, for each token ``t``:
-
-    ``sum_k expert_weights[t, k] * gemm2_out[permuted_idx(t, k)]``
-
-    and optionally adds ``shared_output[t]``. Dropped top-k slots use permute
-    index ``-1`` and do not contribute to the sum.
-    """
-
-    # ------------------------------------------------------------------
-    # Required configuration fields.
-    # ------------------------------------------------------------------
-
-    # Required: number of token rows to finalize. Zero is valid for idle ranks.
-    num_tokens: int
-
-    # Required: logical output hidden width.
-    hidden_size: int
-
-    # Required: number of routed expert outputs combined per token.
-    top_k: int
-
-    # ------------------------------------------------------------------
-    # Optional shape and routing metadata configuration.
-    # ------------------------------------------------------------------
-
-    # Optional: physical width of rows in gemm2_out. This may be larger than
-    # hidden_size when the expert GEMM pads the hidden dimension.
-    hidden_size_padded: int | None = None
-
-    # Optional: physical number of rows in gemm2_out. When omitted, the
-    # generator uses the number of non-dropped token/top-k slots.
-    total_num_padded_tokens: int | None = None
-
-    # Optional: number of flattened token/top-k slots marked as dropped with
-    # permute index -1.
-    num_dropped_slots: int = 0
-
-    # Optional: generate shared_output and make the logical output width equal
-    # hidden_size. When false, the output width is hidden_size_padded.
-    include_shared_output: bool = True
-
-    # Optional: route-weight dtype. TokenSpeed's CUDA helper supports FP32 and
-    # BF16 expert weights.
-    expert_weights_dtype: torch.dtype = torch.float32
-
-    # Optional: generated tensor device override.
-    device: DeviceLike = None
-
-
-@dataclass
-class MoESoftplusSqrtTopKRoutingInputValues:
-    """Generated values for softplus-sqrt top-k MoE routing."""
-
-    logits: torch.Tensor
+    router_weight: torch.Tensor
+    router_bias: torch.Tensor | None
+    router_logits: torch.Tensor
     correction_bias: torch.Tensor | None
-    input_ids: torch.Tensor | None
-    hash_indices_table: torch.Tensor | None
-    topk_indices: torch.Tensor
+    topk_ids: torch.Tensor
     topk_weights: torch.Tensor
-    renormalize: bool
-    routed_scaling_factor: float
 
 
 @dataclass
-class MoeAlignBlockSizeInputConfig:
-    """Initialization parameters for ``MoeAlignBlockSizeInputs``.
+class MoeRoutingInputConfig:
+    """Initialization parameters for router projection and top-k selection."""
 
-    The represented operation takes top-k routing ids for a routed MoE layer,
-    groups flattened token-expert slots by selected expert, and pads each
-    expert's group to ``block_size`` slots so block GEMM launches can process
-    expert-local token groups.
-    """
-
-    # ------------------------------------------------------------------
-    # Required configuration fields.
-    # ------------------------------------------------------------------
-
-    # Required: number of input tokens before top-k routing expansion.
-    total_tokens: int
-
-    # Required: number of selected experts per token.
-    top_k: int
-
-    # Required: total number of routed experts.
-    num_experts: int
-
-    # Required: GEMM block size used to pad each expert's token slots.
-    block_size: int
-
-    # ------------------------------------------------------------------
-    # Optional generation configuration.
-    # ------------------------------------------------------------------
-
-    # Optional: dtype for generated top-k ids. Integer dtypes are supported.
-    topk_ids_dtype: torch.dtype = torch.int32
-
-    # Optional: generation device for top-k ids.
-    device: DeviceLike = None
-
-
-@dataclass
-class MoESoftmaxTopKRoutingInputConfig:
-    """Initialization parameters for softmax/bias top-k MoE routing.
-
-    The represented operation computes probabilities from router logits,
-    selects experts by adding a correction bias to those probabilities, and
-    emits selected expert ids plus route weights from the original softmax
-    probabilities. Expert ids greater than or equal to ``num_experts_real`` are
-    masked to ``-1`` to model padded zero experts.
-    """
-
-    # Required: number of token rows to route.
+    # Required: number of input token rows.
     num_tokens: int
-
-    # Required: total experts including padded/zero experts.
-    num_experts: int
-
-    # Required: number of real experts before the padded zero-expert range.
-    num_experts_real: int
-
-    # Required: number of selected experts per token.
-    top_k: int
-
-    # Optional: generated output index dtype.
-    topk_indices_dtype: torch.dtype = torch.int32
-
-    # Optional: multiply selected route weights by this positive scalar.
-    scaling_factor: float = 1.0
-
-    # Optional: renormalize selected probabilities before scaling.
-    renormalize: bool = False
-
-    # Optional: bias at least one padded expert into the selected top-k set.
-    include_zero_expert_selection: bool = True
-
-    # Optional: generated tensor device override.
-    device: DeviceLike = None
-
-
-@dataclass
-class MoEBiasedGroupedTopKInputConfig:
-    """Initialization parameters for sigmoid/bias grouped top-k MoE routing.
-
-    The represented operation computes sigmoid router scores, selects candidate
-    expert groups using correction-biased scores, then selects top-k experts
-    from those groups. Output weights come from the original sigmoid scores.
-    """
-
-    # Required: number of token rows to route.
-    num_tokens: int
-
-    # Required: hidden-state width associated with the routed token rows.
+    # Required: hidden-state width consumed by the router projection.
     hidden_size: int
-
-    # Required: total number of routed experts.
+    # Required: number of routed experts and router output columns.
     num_experts: int
-
-    # Required: number of selected experts per token.
+    # Required: number of experts selected per token.
     top_k: int
+    # Required: generated hidden-state dtype.
+    hidden_dtype: torch.dtype
 
+    # Optional: router weight, bias, and logits dtype.
+    router_dtype: torch.dtype = torch.float32
+    # Optional: generate a router projection bias with this dtype.
+    router_bias_dtype: torch.dtype | None = None
+    # Optional: transformation applied to router logits before selection.
+    score_function: MoeRoutingScoreFunction = "softmax"
+    # Optional: generate a correction bias used only for expert selection.
+    correction_bias_dtype: torch.dtype | None = None
     # Optional: number of equal-size expert groups used for candidate filtering.
     num_expert_groups: int = 1
-
-    # Optional: number of expert groups selected before expert-level top-k.
+    # Optional: number of groups retained before expert-level top-k selection.
     top_k_groups: int = 1
-
-    # Optional: generated hidden-state dtype. Hidden values identify token rows
-    # for implementation APIs but do not affect the routing scores.
-    hidden_dtype: torch.dtype = torch.float32
-
-    # Optional: generated router-logit dtype.
-    router_dtype: torch.dtype = torch.float32
-
-    # Optional: renormalize selected sigmoid weights before applying the scale.
-    renormalize: bool = False
-
-    # Optional: positive scale applied only when ``renormalize`` is enabled.
-    routed_scaling_factor: float = 1.0
-
-    # Optional: generate a logical-to-physical expert id permutation.
-    use_logical_to_physical_map: bool = False
-
-    # Optional: if set, rows at or after this token count get output ids ``-1``.
-    num_token_non_padded: int | None = None
-
-    # Optional: generated tensor device override.
-    device: DeviceLike = None
-
-
-@dataclass
-class MoEDeepSeekV4MegaMoEStagingInputConfig:
-    """Initialization parameters for DeepSeek V4 MegaMoE input staging.
-
-    The represented operation prepares routed MoE inputs by quantizing
-    hidden-state rows to FP8 in 128-wide blocks, packing four 32-wide scale
-    exponent groups per block, and copying precomputed top-k routing tensors
-    into staging outputs.
-    """
-
-    # Required: number of token rows to stage.
-    num_tokens: int
-
-    # Required: hidden-state width. Must be a multiple of 128.
-    hidden_size: int
-
-    # Required: total routed experts used to generate valid top-k ids.
-    num_experts: int
-
-    # Required: number of routed experts per token.
-    top_k: int
-
-    # Optional: generated hidden-state dtype.
-    hidden_dtype: torch.dtype = torch.bfloat16
-
-    # Optional: dtype for input and staged top-k ids.
-    topk_ids_dtype: torch.dtype = torch.int32
-
-    # Optional: dtype for staged FP8 hidden states.
-    fp8_dtype: torch.dtype = torch.float8_e4m3fn
-
-    # Optional: generated tensor device override.
-    device: DeviceLike = None
-
-
-@dataclass
-class MoESoftplusSqrtTopKRoutingInputConfig:
-    """Initialization parameters for softplus-sqrt top-k MoE routing.
-
-    The represented operation transforms router logits with
-    ``sqrt(softplus(x))`` and produces normalized top-k routing weights. In
-    non-hash mode, top-k experts are selected from transformed scores plus a
-    correction bias. In hash mode, selected experts come from an input-id keyed
-    hash table.
-    """
-
-    # Required: number of token rows to route.
-    num_tokens: int
-
-    # Required: number of experts in the router logit row.
-    num_experts: int
-
-    # Optional: number of selected experts per token. TokenSpeed's CUDA helper
-    # is specialized for six, but the represented routing operation is generic.
-    top_k: int = 6
-
-    # Optional: use token-id keyed hash routing instead of correction-bias top-k.
-    use_hash_table: bool = False
-
-    # Optional: hash-table row count when ``use_hash_table`` is enabled.
-    hash_table_size: int | None = None
-
-    # Optional: generated input-id dtype for hash routing.
-    input_ids_dtype: torch.dtype = torch.int64
-
-    # Optional: this operation always normalizes selected weights.
+    # Optional: normalize selected scores before applying the routing scale.
     renormalize: bool = True
-
-    # Optional: positive scale applied after normalizing selected weights.
+    # Optional: positive scale applied to selected routing weights.
     routed_scaling_factor: float = 1.0
-
+    # Optional: generated selected-expert ID dtype.
+    topk_ids_dtype: torch.dtype = torch.int32
+    # Optional: generated selected routing-weight dtype.
+    topk_weights_dtype: torch.dtype = torch.float32
     # Optional: generated tensor device override.
     device: DeviceLike = None
 
 
 @dataclass(init=False)
-class MoeAlignBlockSizeInputs(NumericsInputGenerator):
-    """Input generator for MoE expert block-alignment metadata."""
+class MoeRoutingInputs(NumericsInputGenerator):
+    """Generate consistent router operands, logits, and selected routes."""
 
-    config: MoeAlignBlockSizeInputConfig
-
-    def __init__(self, config: MoeAlignBlockSizeInputConfig) -> None:
-        self.config = config
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        self.config.total_tokens = int(self.config.total_tokens)
-        self.config.top_k = int(self.config.top_k)
-        self.config.num_experts = int(self.config.num_experts)
-        self.config.block_size = int(self.config.block_size)
-        if self.config.total_tokens < 0:
-            raise ValueError("total_tokens must be non-negative")
-        if self.config.top_k <= 0:
-            raise ValueError("top_k must be positive")
-        if self.config.num_experts <= 0:
-            raise ValueError("num_experts must be positive")
-        if self.config.top_k > self.config.num_experts:
-            raise ValueError("top_k must be <= num_experts")
-        if self.config.block_size <= 0:
-            raise ValueError("block_size must be positive")
-        if self.config.topk_ids_dtype not in _TOPK_ID_DTYPES:
-            raise ValueError("topk_ids_dtype must be an integer dtype")
-
-    def generate(
-        self,
-        *,
-        seed: int,
-        device: DeviceLike = None,
-    ) -> MoeAlignBlockSizeInputValues:
-        target_device = _resolve_device(self.config.device, device)
-        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
-        generator = torch.Generator(device=rng_device).manual_seed(seed)
-        topk_ids = torch.randint(
-            0,
-            self.config.num_experts,
-            (self.config.total_tokens, self.config.top_k),
-            dtype=self.config.topk_ids_dtype,
-            device=target_device,
-            generator=generator,
-        )
-        return MoeAlignBlockSizeInputValues(
-            topk_ids=topk_ids,
-            block_size=self.config.block_size,
-            num_experts=self.config.num_experts,
-        )
-
-
-@dataclass(init=False)
-class MoESoftmaxTopKRoutingInputs(NumericsInputGenerator):
-    """Input generator for softmax/bias top-k MoE routing."""
-
-    config: MoESoftmaxTopKRoutingInputConfig
-
-    def __init__(self, config: MoESoftmaxTopKRoutingInputConfig) -> None:
-        self.config = config
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        self.config.num_tokens = _check_nonnegative(
-            "num_tokens", self.config.num_tokens
-        )
-        self.config.num_experts = int(self.config.num_experts)
-        self.config.num_experts_real = int(self.config.num_experts_real)
-        self.config.top_k = int(self.config.top_k)
-        if self.config.num_experts <= 0:
-            raise ValueError("num_experts must be positive")
-        if self.config.num_experts_real <= 0:
-            raise ValueError("num_experts_real must be positive")
-        if self.config.num_experts_real >= self.config.num_experts:
-            raise ValueError("num_experts_real must be < num_experts")
-        if self.config.top_k <= 0:
-            raise ValueError("top_k must be positive")
-        if self.config.top_k > self.config.num_experts:
-            raise ValueError("top_k must be <= num_experts")
-        if self.config.topk_indices_dtype not in (torch.int32, torch.int64):
-            raise ValueError("topk_indices_dtype must be torch.int32 or torch.int64")
-        self.config.scaling_factor = _check_positive_finite_float(
-            "scaling_factor", self.config.scaling_factor
-        )
-
-    def generate(
-        self,
-        *,
-        seed: int,
-        device: DeviceLike = None,
-    ) -> MoESoftmaxTopKRoutingInputValues:
-        self.__post_init__()
-        target_device = _resolve_device(self.config.device, device)
-        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
-        generator = torch.Generator(device=rng_device).manual_seed(seed)
-        logits = (
-            torch.randn(
-                (self.config.num_tokens, self.config.num_experts),
-                dtype=torch.float32,
-                device=target_device,
-                generator=generator,
-            )
-            * 0.25
-        )
-        correction_bias = torch.zeros(
-            (self.config.num_experts,),
-            dtype=torch.float32,
-            device=target_device,
-        )
-        preferred = self._preferred_experts()
-        for rank, expert in enumerate(preferred):
-            correction_bias[expert] = float(len(preferred) - rank)
-        topk_indices = torch.full(
-            (self.config.num_tokens, self.config.top_k),
-            -1,
-            dtype=self.config.topk_indices_dtype,
-            device=target_device,
-        )
-        topk_weights = torch.zeros(
-            (self.config.num_tokens, self.config.top_k),
-            dtype=torch.float32,
-            device=target_device,
-        )
-        values = MoESoftmaxTopKRoutingInputValues(
-            logits=logits.contiguous(),
-            correction_bias=correction_bias.contiguous(),
-            topk_indices=topk_indices,
-            topk_weights=topk_weights,
-            num_experts_real=self.config.num_experts_real,
-            scaling_factor=self.config.scaling_factor,
-            renormalize=self.config.renormalize,
-        )
-        _validate_moe_softmax_topk_routing_values(values)
-        return values
-
-    def _preferred_experts(self) -> list[int]:
-        candidates: list[int] = []
-        if self.config.include_zero_expert_selection:
-            candidates.append(self.config.num_experts_real)
-        candidates.extend(range(self.config.num_experts_real))
-        candidates.extend(
-            range(self.config.num_experts_real + 1, self.config.num_experts)
-        )
-        return candidates[: self.config.top_k]
-
-
-@dataclass(init=False)
-class MoEBiasedGroupedTopKInputs(NumericsInputGenerator):
-    """Input generator for sigmoid/bias grouped top-k MoE routing."""
-
-    config: MoEBiasedGroupedTopKInputConfig
+    config: MoeRoutingInputConfig
     hidden_states_input: TensorInput | None
-    gating_output_input: TensorInput | None
+    router_weight_input: TensorInput | None
+    router_bias_input: TensorInput | None
+    correction_bias_input: TensorInput | None
 
-    def __init__(self, config: MoEBiasedGroupedTopKInputConfig) -> None:
+    def __init__(self, config: MoeRoutingInputConfig) -> None:
         self.config = config
         self.hidden_states_input = None
-        self.gating_output_input = None
+        self.router_weight_input = None
+        self.router_bias_input = None
+        self.correction_bias_input = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
         self.config.num_tokens = _check_nonnegative(
             "num_tokens", self.config.num_tokens
         )
-        self.config.hidden_size = int(self.config.hidden_size)
-        self.config.num_experts = int(self.config.num_experts)
-        self.config.top_k = int(self.config.top_k)
-        self.config.num_expert_groups = int(self.config.num_expert_groups)
-        self.config.top_k_groups = int(self.config.top_k_groups)
-        if self.config.hidden_size <= 0:
-            raise ValueError("hidden_size must be positive")
-        if self.config.num_experts <= 0:
-            raise ValueError("num_experts must be positive")
-        if self.config.top_k <= 0:
-            raise ValueError("top_k must be positive")
-        if self.config.num_expert_groups <= 0:
-            raise ValueError("num_expert_groups must be positive")
-        if self.config.num_experts % self.config.num_expert_groups != 0:
-            raise ValueError("num_experts must be divisible by num_expert_groups")
-        experts_per_group = self.config.num_experts // self.config.num_expert_groups
-        if experts_per_group < 2:
-            raise ValueError("each expert group must contain at least two experts")
-        if self.config.top_k_groups <= 0:
-            raise ValueError("top_k_groups must be positive")
-        if self.config.top_k_groups > self.config.num_expert_groups:
-            raise ValueError("top_k_groups must be <= num_expert_groups")
-        if self.config.top_k > self.config.top_k_groups * experts_per_group:
-            raise ValueError("top_k must fit within the experts in the selected groups")
-        self.config.hidden_dtype = _check_moe_float_dtype(
+        self.config.hidden_size = _check_positive(
+            "hidden_size", self.config.hidden_size
+        )
+        self.config.top_k, self.config.num_experts = _check_top_k(
+            top_k=self.config.top_k,
+            num_experts=self.config.num_experts,
+        )
+        self.config.hidden_dtype = _check_float_dtype(
             "hidden_dtype", self.config.hidden_dtype
         )
-        self.config.router_dtype = _check_moe_float_dtype(
+        self.config.router_dtype = _check_float_dtype(
             "router_dtype", self.config.router_dtype
         )
+        self.config.router_bias_dtype = _check_optional_float_dtype(
+            "router_bias_dtype", self.config.router_bias_dtype
+        )
+        self.config.correction_bias_dtype = _check_optional_float_dtype(
+            "correction_bias_dtype", self.config.correction_bias_dtype
+        )
+        if self.config.score_function not in _ROUTING_SCORE_FUNCTIONS:
+            raise ValueError(
+                "score_function must be 'softmax', 'sigmoid', or 'softplus_sqrt'"
+            )
+        self.config.num_expert_groups = _check_positive(
+            "num_expert_groups", self.config.num_expert_groups
+        )
+        self.config.top_k_groups = _check_positive(
+            "top_k_groups", self.config.top_k_groups
+        )
+        if self.config.num_experts % self.config.num_expert_groups != 0:
+            raise ValueError("num_experts must be divisible by num_expert_groups")
+        if self.config.top_k_groups > self.config.num_expert_groups:
+            raise ValueError("top_k_groups must be <= num_expert_groups")
+        experts_per_group = self.config.num_experts // self.config.num_expert_groups
+        if self.config.num_expert_groups > 1 and experts_per_group < 2:
+            raise ValueError("grouped routing requires at least two experts per group")
+        if self.config.top_k > self.config.top_k_groups * experts_per_group:
+            raise ValueError("selected expert groups do not contain top_k experts")
         self.config.routed_scaling_factor = _check_positive_finite_float(
             "routed_scaling_factor", self.config.routed_scaling_factor
         )
-        if self.config.num_token_non_padded is not None:
-            self.config.num_token_non_padded = int(self.config.num_token_non_padded)
-            if not 0 <= self.config.num_token_non_padded <= self.config.num_tokens:
-                raise ValueError(
-                    "num_token_non_padded must be in [0, num_tokens] when set"
-                )
-        if self.hidden_states_input is None:
-            self.hidden_states_input = TensorInput(
-                (self.config.num_tokens, self.config.hidden_size),
-                self.config.hidden_dtype,
+        self.config.topk_ids_dtype = _check_integer_dtype(
+            "topk_ids_dtype", self.config.topk_ids_dtype
+        )
+        self.config.topk_weights_dtype = _check_float_dtype(
+            "topk_weights_dtype", self.config.topk_weights_dtype
+        )
+
+        self.hidden_states_input = self.hidden_states_input or TensorInput(
+            (self.config.num_tokens, self.config.hidden_size),
+            self.config.hidden_dtype,
+            device=self.config.device,
+        )
+        self.router_weight_input = self.router_weight_input or TensorInput(
+            (self.config.num_experts, self.config.hidden_size),
+            self.config.router_dtype,
+            device=self.config.device,
+        )
+        if self.config.router_bias_dtype is None:
+            self.router_bias_input = None
+        else:
+            self.router_bias_input = self.router_bias_input or TensorInput(
+                (self.config.num_experts,),
+                self.config.router_bias_dtype,
                 device=self.config.device,
             )
-        if self.gating_output_input is None:
-            self.gating_output_input = TensorInput(
-                (self.config.num_tokens, self.config.num_experts),
-                self.config.router_dtype,
+        if self.config.correction_bias_dtype is None:
+            self.correction_bias_input = None
+        else:
+            self.correction_bias_input = self.correction_bias_input or TensorInput(
+                (self.config.num_experts,),
+                self.config.correction_bias_dtype,
                 device=self.config.device,
             )
 
@@ -659,75 +548,144 @@ class MoEBiasedGroupedTopKInputs(NumericsInputGenerator):
         *,
         seed: int,
         device: DeviceLike = None,
-    ) -> MoEBiasedGroupedTopKInputValues:
+    ) -> MoeRoutingInputValues:
         self.__post_init__()
         target_device = _resolve_device(self.config.device, device)
-        if self.hidden_states_input is None or self.gating_output_input is None:
-            raise ValueError("MoEBiasedGroupedTopKInputs child generators are missing")
-
+        if self.hidden_states_input is None or self.router_weight_input is None:
+            raise ValueError("routing tensor generators must be initialized")
         hidden_states = self.hidden_states_input.generate(
-            seed=_child_seed(seed, 1),
-            device=target_device,
+            seed=_child_seed(seed, 1), device=target_device
         ).values
-        gating_output = self.gating_output_input.generate(
-            seed=_child_seed(seed, 2),
-            device=target_device,
+        router_weight = self.router_weight_input.generate(
+            seed=_child_seed(seed, 2), device=target_device
         ).values
-        if hidden_states is None:
-            raise ValueError("hidden_states generation was skipped")
-        if gating_output is None:
-            raise ValueError("gating_output generation was skipped")
-
-        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
-        generator = torch.Generator(device=rng_device).manual_seed(_child_seed(seed, 3))
-        correction_bias = (
-            torch.randn(
-                (self.config.num_experts,),
-                dtype=torch.float32,
-                device=target_device,
-                generator=generator,
-            )
-            * 0.25
+        if hidden_states is None or router_weight is None:
+            raise ValueError("routing operands cannot skip tensor generation")
+        router_weight = (router_weight.float() / math.sqrt(self.config.hidden_size)).to(
+            self.config.router_dtype
         )
-        logical_to_physical_map = None
-        if self.config.use_logical_to_physical_map:
-            logical_to_physical_map = torch.randperm(
-                self.config.num_experts,
-                dtype=torch.int32,
-                device=target_device,
-                generator=generator,
-            )
-        num_token_non_padded = None
-        if self.config.num_token_non_padded is not None:
-            num_token_non_padded = torch.tensor(
-                self.config.num_token_non_padded,
-                dtype=torch.int32,
-                device=target_device,
-            )
-        values = MoEBiasedGroupedTopKInputValues(
-            hidden_states=hidden_states.contiguous(),
-            gating_output=gating_output.contiguous(),
-            correction_bias=correction_bias.contiguous(),
+        router_bias = (
+            None
+            if self.router_bias_input is None
+            else self.router_bias_input.generate(
+                seed=_child_seed(seed, 3), device=target_device
+            ).values
+        )
+        correction_bias = (
+            None
+            if self.correction_bias_input is None
+            else self.correction_bias_input.generate(
+                seed=_child_seed(seed, 4), device=target_device
+            ).values
+        )
+        if router_bias is not None:
+            router_bias = (router_bias.float() * 0.25).to(router_bias.dtype)
+        if correction_bias is not None:
+            correction_bias = (correction_bias.float() * 0.25).to(correction_bias.dtype)
+
+        router_logits = hidden_states.float() @ router_weight.float().transpose(0, 1)
+        if router_bias is not None:
+            router_logits += router_bias.float()
+        router_logits = router_logits.to(self.config.router_dtype).contiguous()
+        topk_ids, topk_weights = _select_routes(
+            logits=router_logits,
+            correction_bias=correction_bias,
+            score_function=self.config.score_function,
             top_k=self.config.top_k,
-            renormalize=self.config.renormalize,
             num_expert_groups=self.config.num_expert_groups,
             top_k_groups=self.config.top_k_groups,
+            renormalize=self.config.renormalize,
             routed_scaling_factor=self.config.routed_scaling_factor,
-            logical_to_physical_map=logical_to_physical_map,
-            num_token_non_padded=num_token_non_padded,
+            ids_dtype=self.config.topk_ids_dtype,
+            weights_dtype=self.config.topk_weights_dtype,
         )
-        _validate_moe_biased_grouped_topk_values(values)
+        values = MoeRoutingInputValues(
+            hidden_states=hidden_states.contiguous(),
+            router_weight=router_weight.contiguous(),
+            router_bias=None if router_bias is None else router_bias.contiguous(),
+            router_logits=router_logits,
+            correction_bias=(
+                None if correction_bias is None else correction_bias.contiguous()
+            ),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+        _validate_routing_values(values, self.config)
         return values
 
 
-@dataclass(init=False)
-class MoEDeepSeekV4MegaMoEStagingInputs(NumericsInputGenerator):
-    """Input generator for DeepSeek V4 MegaMoE input staging."""
+def _validate_routing_values(
+    values: MoeRoutingInputValues,
+    config: MoeRoutingInputConfig,
+) -> None:
+    if values.hidden_states.shape != (config.num_tokens, config.hidden_size):
+        raise ValueError("hidden_states shape does not match routing configuration")
+    if values.router_weight.shape != (config.num_experts, config.hidden_size):
+        raise ValueError("router_weight shape does not match routing configuration")
+    if values.router_logits.shape != (config.num_tokens, config.num_experts):
+        raise ValueError("router_logits shape does not match routing configuration")
+    if not torch.isfinite(values.router_logits).all():
+        raise ValueError("router_logits must be finite")
+    if values.router_bias is not None and values.router_bias.shape != (
+        config.num_experts,
+    ):
+        raise ValueError("router_bias shape does not match routing configuration")
+    if values.correction_bias is not None and values.correction_bias.shape != (
+        config.num_experts,
+    ):
+        raise ValueError("correction_bias shape does not match routing configuration")
+    _validate_topk_values(
+        topk_ids=values.topk_ids,
+        topk_weights=values.topk_weights,
+        num_tokens=config.num_tokens,
+        num_experts=config.num_experts,
+        top_k=config.top_k,
+        expected_weight_sum=(
+            config.routed_scaling_factor if config.renormalize else None
+        ),
+    )
 
-    config: MoEDeepSeekV4MegaMoEStagingInputConfig
+
+@dataclass
+class MoeDispatchInputValues:
+    """Generated values entering token-to-expert dispatch."""
+
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+
+
+@dataclass
+class MoeDispatchInputConfig:
+    """Initialization parameters for token-to-expert dispatch inputs."""
+
+    # Required: number of input token rows.
+    num_tokens: int
+    # Required: hidden-state width.
+    hidden_size: int
+    # Required: total number of routed experts.
+    num_experts: int
+    # Required: number of experts selected per token.
+    top_k: int
+    # Required: generated hidden-state dtype.
+    hidden_dtype: torch.dtype
+
+    # Optional: selected-expert ID dtype.
+    topk_ids_dtype: torch.dtype = torch.int32
+    # Optional: selected routing-weight dtype.
+    topk_weights_dtype: torch.dtype = torch.float32
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class MoeDispatchInputs(NumericsInputGenerator):
+    """Generate hidden states and consistent precomputed routing metadata."""
+
+    config: MoeDispatchInputConfig
     hidden_states_input: TensorInput | None
 
-    def __init__(self, config: MoEDeepSeekV4MegaMoEStagingInputConfig) -> None:
+    def __init__(self, config: MoeDispatchInputConfig) -> None:
         self.config = config
         self.hidden_states_input = None
         self.__post_init__()
@@ -736,101 +694,355 @@ class MoEDeepSeekV4MegaMoEStagingInputs(NumericsInputGenerator):
         self.config.num_tokens = _check_nonnegative(
             "num_tokens", self.config.num_tokens
         )
-        self.config.hidden_size = int(self.config.hidden_size)
-        self.config.num_experts = int(self.config.num_experts)
-        self.config.top_k = int(self.config.top_k)
-        if self.config.hidden_size <= 0:
-            raise ValueError("hidden_size must be positive")
-        if self.config.hidden_size % _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE != 0:
-            raise ValueError("hidden_size must be a multiple of 128")
-        if self.config.num_experts <= 0:
-            raise ValueError("num_experts must be positive")
-        if self.config.top_k <= 0:
-            raise ValueError("top_k must be positive")
-        if self.config.top_k > self.config.num_experts:
-            raise ValueError("top_k must be <= num_experts")
-        self.config.hidden_dtype = _check_moe_float_dtype(
+        self.config.hidden_size = _check_positive(
+            "hidden_size", self.config.hidden_size
+        )
+        self.config.top_k, self.config.num_experts = _check_top_k(
+            top_k=self.config.top_k,
+            num_experts=self.config.num_experts,
+        )
+        self.config.hidden_dtype = _check_float_dtype(
             "hidden_dtype", self.config.hidden_dtype
         )
-        if self.config.topk_ids_dtype not in _TOPK_ID_DTYPES:
-            raise ValueError("topk_ids_dtype must be an integer dtype")
-        if self.config.fp8_dtype != torch.float8_e4m3fn:
-            raise ValueError("fp8_dtype must be torch.float8_e4m3fn")
-        if self.hidden_states_input is None:
-            self.hidden_states_input = TensorInput(
-                (self.config.num_tokens, self.config.hidden_size),
-                self.config.hidden_dtype,
-                device=self.config.device,
-            )
+        self.config.topk_ids_dtype = _check_integer_dtype(
+            "topk_ids_dtype", self.config.topk_ids_dtype
+        )
+        self.config.topk_weights_dtype = _check_float_dtype(
+            "topk_weights_dtype", self.config.topk_weights_dtype
+        )
+        self.hidden_states_input = self.hidden_states_input or TensorInput(
+            (self.config.num_tokens, self.config.hidden_size),
+            self.config.hidden_dtype,
+            device=self.config.device,
+        )
 
     def generate(
         self,
         *,
         seed: int,
         device: DeviceLike = None,
-    ) -> MoEDeepSeekV4MegaMoEStagingInputValues:
+    ) -> MoeDispatchInputValues:
         self.__post_init__()
         target_device = _resolve_device(self.config.device, device)
         if self.hidden_states_input is None:
             raise ValueError("hidden_states_input must be initialized")
         hidden_states = self.hidden_states_input.generate(
-            seed=_child_seed(seed, 1),
-            device=target_device,
+            seed=_child_seed(seed, 1), device=target_device
         ).values
         if hidden_states is None:
-            raise ValueError("hidden_states generation was skipped")
-        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
-        generator = torch.Generator(device=rng_device).manual_seed(_child_seed(seed, 2))
-        raw_ids = torch.rand(
-            (self.config.num_tokens, self.config.num_experts),
-            dtype=torch.float32,
-            device=target_device,
-            generator=generator,
-        ).argsort(dim=-1)[:, : self.config.top_k]
-        topk_ids = raw_ids.to(self.config.topk_ids_dtype)
-        raw_weights = torch.rand(
-            (self.config.num_tokens, self.config.top_k),
-            dtype=torch.float32,
-            device=target_device,
-            generator=generator,
-        )
-        topk_weights = raw_weights / raw_weights.sum(dim=-1, keepdim=True).clamp_min(
-            1.0e-12
-        )
-        block_count = self.config.hidden_size // _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE
-        values = MoEDeepSeekV4MegaMoEStagingInputValues(
-            hidden_states=hidden_states.contiguous(),
-            topk_ids=topk_ids.contiguous(),
-            topk_weights=topk_weights.contiguous(),
-            x_fp8=torch.empty(
-                (self.config.num_tokens, self.config.hidden_size),
-                dtype=self.config.fp8_dtype,
-                device=target_device,
-            ),
-            x_sf=torch.empty(
-                (self.config.num_tokens, block_count),
-                dtype=torch.int32,
-                device=target_device,
-            ),
-            topk_idx_out=torch.empty_like(topk_ids),
-            topk_weights_out=torch.empty_like(topk_weights),
+            raise ValueError("dispatch cannot skip hidden-state generation")
+        topk_ids, topk_weights = _generate_routes(
+            num_tokens=self.config.num_tokens,
             num_experts=self.config.num_experts,
+            top_k=self.config.top_k,
+            ids_dtype=self.config.topk_ids_dtype,
+            weights_dtype=self.config.topk_weights_dtype,
+            seed=_child_seed(seed, 2),
+            device=target_device,
         )
-        _validate_moe_deepseek_v4_mega_moe_staging_values(values)
+        values = MoeDispatchInputValues(
+            hidden_states=hidden_states.contiguous(),
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+        _validate_dispatch_values(values, self.config)
         return values
 
 
-@dataclass(init=False)
-class MoEFinalizeFuseSharedInputs(NumericsInputGenerator):
-    """Input generator for MoE routed-output finalization."""
+def _validate_dispatch_values(
+    values: MoeDispatchInputValues,
+    config: MoeDispatchInputConfig,
+) -> None:
+    if values.hidden_states.shape != (config.num_tokens, config.hidden_size):
+        raise ValueError("hidden_states shape does not match dispatch configuration")
+    if values.hidden_states.dtype not in _FLOAT_DTYPES:
+        raise ValueError("hidden_states must use a regular floating dtype")
+    if not torch.isfinite(values.hidden_states).all():
+        raise ValueError("hidden_states must be finite")
+    _validate_topk_values(
+        topk_ids=values.topk_ids,
+        topk_weights=values.topk_weights,
+        num_tokens=config.num_tokens,
+        num_experts=config.num_experts,
+        top_k=config.top_k,
+        expected_weight_sum=1.0,
+    )
 
-    config: MoEFinalizeFuseSharedInputConfig
-    gemm2_out_input: TensorInput | None
+
+@dataclass
+class MoeGateUpInputValues:
+    """Generated operands entering the expert gate/up projection."""
+
+    routed_hidden_states: torch.Tensor
+    expert_ids: torch.Tensor
+    w13: GemmInputValues
+    w13_bias: torch.Tensor | None
+    activation_scale: torch.Tensor | None
+
+
+@dataclass
+class MoeGateUpInputConfig:
+    """Initialization parameters for expert gate/up projection inputs."""
+
+    # Required: number of routed token-expert rows.
+    num_routed_tokens: int
+    # Required: input hidden-state width.
+    hidden_size: int
+    # Required: width of each gate and up projection.
+    intermediate_size: int
+    # Required: total number of routed experts.
+    num_experts: int
+    # Required: routed activation dtype.
+    activation_dtype: torch.dtype
+
+    # Optional: expert weight dtype. None uses activation_dtype.
+    weight_dtype: InputDType = None
+    # Optional: expert weight scale dtype; custom dtypes infer their default.
+    weight_scale_dtype: InputDType = None
+    # Optional: scale block size for scaled regular torch weights.
+    weight_scale_block_size: int = 32
+    # Optional: generate one gate/up bias row per expert.
+    bias_dtype: torch.dtype | None = None
+    # Optional: generate one input scale per expert.
+    activation_scale_dtype: torch.dtype | None = None
+    # Optional: positive value used for each generated input scale.
+    activation_scale: float = 0.125
+    # Optional: routed expert ID dtype.
+    expert_ids_dtype: torch.dtype = torch.int32
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class MoeGateUpInputs(NumericsInputGenerator):
+    """Generate routed activations and expert W13 operands."""
+
+    config: MoeGateUpInputConfig
+    routed_hidden_states_input: TensorInput | None
+    w13: GemmInputs | None
+    w13_bias_input: TensorInput | None
+
+    def __init__(self, config: MoeGateUpInputConfig) -> None:
+        self.config = config
+        self.routed_hidden_states_input = None
+        self.w13 = None
+        self.w13_bias_input = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        self.config.num_routed_tokens = _check_nonnegative(
+            "num_routed_tokens", self.config.num_routed_tokens
+        )
+        self.config.hidden_size = _check_positive(
+            "hidden_size", self.config.hidden_size
+        )
+        self.config.intermediate_size = _check_positive(
+            "intermediate_size", self.config.intermediate_size
+        )
+        self.config.num_experts = _check_positive(
+            "num_experts", self.config.num_experts
+        )
+        self.config.activation_dtype = _check_float_dtype(
+            "activation_dtype", self.config.activation_dtype
+        )
+        self.config.bias_dtype = _check_optional_float_dtype(
+            "bias_dtype", self.config.bias_dtype
+        )
+        self.config.activation_scale_dtype = _check_optional_float_dtype(
+            "activation_scale_dtype", self.config.activation_scale_dtype
+        )
+        self.config.activation_scale = _check_positive_finite_float(
+            "activation_scale", self.config.activation_scale
+        )
+        self.config.expert_ids_dtype = _check_integer_dtype(
+            "expert_ids_dtype", self.config.expert_ids_dtype
+        )
+        self.routed_hidden_states_input = (
+            self.routed_hidden_states_input
+            or TensorInput(
+                (self.config.num_routed_tokens, self.config.hidden_size),
+                self.config.activation_dtype,
+                device=self.config.device,
+            )
+        )
+        self.w13 = self.w13 or _make_expert_weight_generator(
+            num_rows=self.config.num_routed_tokens,
+            output_size=2 * self.config.intermediate_size,
+            input_size=self.config.hidden_size,
+            num_experts=self.config.num_experts,
+            activation_dtype=self.config.activation_dtype,
+            weight_dtype=self.config.weight_dtype,
+            weight_scale_dtype=self.config.weight_scale_dtype,
+            weight_scale_block_size=self.config.weight_scale_block_size,
+            device=self.config.device,
+        )
+        if self.config.bias_dtype is None:
+            self.w13_bias_input = None
+        else:
+            self.w13_bias_input = self.w13_bias_input or TensorInput(
+                (self.config.num_experts, 2 * self.config.intermediate_size),
+                self.config.bias_dtype,
+                device=self.config.device,
+            )
+
+    def generate(
+        self,
+        *,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> MoeGateUpInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        if self.routed_hidden_states_input is None or self.w13 is None:
+            raise ValueError("gate/up child generators must be initialized")
+        routed_hidden_states = self.routed_hidden_states_input.generate(
+            seed=_child_seed(seed, 1), device=target_device
+        ).values
+        if routed_hidden_states is None:
+            raise ValueError("gate/up cannot skip routed activation generation")
+        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
+        generator = torch.Generator(device=rng_device).manual_seed(_child_seed(seed, 2))
+        expert_ids = torch.randint(
+            0,
+            self.config.num_experts,
+            (self.config.num_routed_tokens,),
+            dtype=self.config.expert_ids_dtype,
+            device=target_device,
+            generator=generator,
+        )
+        w13_bias = (
+            None
+            if self.w13_bias_input is None
+            else self.w13_bias_input.generate(
+                seed=_child_seed(seed, 4), device=target_device
+            ).values
+        )
+        values = MoeGateUpInputValues(
+            routed_hidden_states=routed_hidden_states.contiguous(),
+            expert_ids=expert_ids.contiguous(),
+            w13=self.w13.generate(seed=_child_seed(seed, 3), device=target_device),
+            w13_bias=None if w13_bias is None else w13_bias.contiguous(),
+            activation_scale=_make_activation_scale(
+                num_experts=self.config.num_experts,
+                dtype=self.config.activation_scale_dtype,
+                value=self.config.activation_scale,
+                device=target_device,
+            ),
+        )
+        _validate_gate_up_values(values, self)
+        return values
+
+
+def _validate_gate_up_values(
+    values: MoeGateUpInputValues,
+    generator: MoeGateUpInputs,
+) -> None:
+    config = generator.config
+    if values.routed_hidden_states.shape != (
+        config.num_routed_tokens,
+        config.hidden_size,
+    ):
+        raise ValueError(
+            "routed_hidden_states shape does not match gate/up configuration"
+        )
+    if values.routed_hidden_states.dtype not in _FLOAT_DTYPES:
+        raise ValueError("routed_hidden_states must use a regular floating dtype")
+    if not torch.isfinite(values.routed_hidden_states).all():
+        raise ValueError("routed_hidden_states must be finite")
+    if values.expert_ids.shape != (config.num_routed_tokens,):
+        raise ValueError("expert_ids shape does not match gate/up configuration")
+    if values.expert_ids.dtype not in _INTEGER_DTYPES:
+        raise ValueError("expert_ids must use an integer dtype")
+    if values.expert_ids.numel() and (
+        values.expert_ids.min().item() < 0
+        or values.expert_ids.max().item() >= config.num_experts
+    ):
+        raise ValueError("expert_ids must be in [0, num_experts)")
+    if generator.w13 is None:
+        raise ValueError("w13 generator must be initialized")
+    _validate_expert_weight_values(
+        name="w13",
+        values=values.w13,
+        generator=generator.w13,
+    )
+    if values.w13_bias is not None and values.w13_bias.shape != (
+        config.num_experts,
+        2 * config.intermediate_size,
+    ):
+        raise ValueError("w13_bias shape does not match gate/up configuration")
+    if values.activation_scale is not None and values.activation_scale.shape != (
+        config.num_experts,
+    ):
+        raise ValueError("activation_scale shape does not match expert count")
+
+
+@dataclass
+class MoeDownCombineInputValues:
+    """Generated operands entering expert down projection and route reduction."""
+
+    activations: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    w2: GemmInputValues
+    w2_bias: torch.Tensor | None
+    activation_scale: torch.Tensor | None
+    shared_output: torch.Tensor | None
+
+
+@dataclass
+class MoeDownCombineInputConfig:
+    """Initialization parameters for down projection and route combination."""
+
+    # Required: number of original token rows.
+    num_tokens: int
+    # Required: final hidden-state width.
+    hidden_size: int
+    # Required: activated expert intermediate width.
+    intermediate_size: int
+    # Required: total number of routed experts.
+    num_experts: int
+    # Required: selected experts per original token.
+    top_k: int
+    # Required: post-activation and output dtype.
+    activation_dtype: torch.dtype
+
+    # Optional: expert weight dtype. None uses activation_dtype.
+    weight_dtype: InputDType = None
+    # Optional: expert weight scale dtype; custom dtypes infer their default.
+    weight_scale_dtype: InputDType = None
+    # Optional: scale block size for scaled regular torch weights.
+    weight_scale_block_size: int = 32
+    # Optional: generate one down-projection bias row per expert.
+    bias_dtype: torch.dtype | None = None
+    # Optional: generate one down-projection input scale per expert.
+    activation_scale_dtype: torch.dtype | None = None
+    # Optional: positive value used for each generated input scale.
+    activation_scale: float = 0.125
+    # Optional: selected expert ID dtype.
+    topk_ids_dtype: torch.dtype = torch.int32
+    # Optional: selected route-weight dtype.
+    topk_weights_dtype: torch.dtype = torch.float32
+    # Optional: generate a dense shared-expert contribution for combination.
+    include_shared_output: bool = False
+    # Optional: generated tensor device override.
+    device: DeviceLike = None
+
+
+@dataclass(init=False)
+class MoeDownCombineInputs(NumericsInputGenerator):
+    """Generate activated expert rows, W2 operands, and combination metadata."""
+
+    config: MoeDownCombineInputConfig
+    activations_input: TensorInput | None
+    w2: GemmInputs | None
+    w2_bias_input: TensorInput | None
     shared_output_input: TensorInput | None
 
-    def __init__(self, config: MoEFinalizeFuseSharedInputConfig) -> None:
+    def __init__(self, config: MoeDownCombineInputConfig) -> None:
         self.config = config
-        self.gemm2_out_input = None
+        self.activations_input = None
+        self.w2 = None
+        self.w2_bias_input = None
         self.shared_output_input = None
         self.__post_init__()
 
@@ -838,640 +1050,176 @@ class MoEFinalizeFuseSharedInputs(NumericsInputGenerator):
         self.config.num_tokens = _check_nonnegative(
             "num_tokens", self.config.num_tokens
         )
-        self.config.hidden_size = int(self.config.hidden_size)
-        self.config.top_k = int(self.config.top_k)
-        self.config.num_dropped_slots = int(self.config.num_dropped_slots)
-        if self.config.hidden_size <= 0:
-            raise ValueError("hidden_size must be positive")
-        if self.config.top_k <= 0:
-            raise ValueError("top_k must be positive")
-        if self.config.top_k > _MOE_FINALIZE_MAX_TOPK:
-            raise ValueError(f"top_k must be <= {_MOE_FINALIZE_MAX_TOPK}")
-        total_slots = self.config.num_tokens * self.config.top_k
-        if not 0 <= self.config.num_dropped_slots <= total_slots:
-            raise ValueError("num_dropped_slots must be in [0, num_tokens * top_k]")
-        if self.config.hidden_size_padded is not None:
-            self.config.hidden_size_padded = int(self.config.hidden_size_padded)
-            if self.config.hidden_size_padded < self.config.hidden_size:
-                raise ValueError("hidden_size_padded must be >= hidden_size")
-        if self.config.total_num_padded_tokens is not None:
-            self.config.total_num_padded_tokens = int(
-                self.config.total_num_padded_tokens
-            )
-            if self.config.total_num_padded_tokens < self._active_slot_count():
-                raise ValueError(
-                    "total_num_padded_tokens must be at least the number of "
-                    "non-dropped token/top-k slots"
-                )
-        if self.config.expert_weights_dtype not in (torch.float32, torch.bfloat16):
-            raise ValueError(
-                "expert_weights_dtype must be torch.float32 or torch.bfloat16"
-            )
-        self.gemm2_out_input = self.gemm2_out_input or TensorInput(
-            (self._total_num_padded_tokens(), self._hidden_size_padded()),
-            torch.bfloat16,
+        self.config.hidden_size = _check_positive(
+            "hidden_size", self.config.hidden_size
+        )
+        self.config.intermediate_size = _check_positive(
+            "intermediate_size", self.config.intermediate_size
+        )
+        self.config.top_k, self.config.num_experts = _check_top_k(
+            top_k=self.config.top_k,
+            num_experts=self.config.num_experts,
+        )
+        self.config.activation_dtype = _check_float_dtype(
+            "activation_dtype", self.config.activation_dtype
+        )
+        self.config.bias_dtype = _check_optional_float_dtype(
+            "bias_dtype", self.config.bias_dtype
+        )
+        self.config.activation_scale_dtype = _check_optional_float_dtype(
+            "activation_scale_dtype", self.config.activation_scale_dtype
+        )
+        self.config.activation_scale = _check_positive_finite_float(
+            "activation_scale", self.config.activation_scale
+        )
+        self.config.topk_ids_dtype = _check_integer_dtype(
+            "topk_ids_dtype", self.config.topk_ids_dtype
+        )
+        self.config.topk_weights_dtype = _check_float_dtype(
+            "topk_weights_dtype", self.config.topk_weights_dtype
+        )
+        num_routes = self.config.num_tokens * self.config.top_k
+        self.activations_input = self.activations_input or TensorInput(
+            (num_routes, self.config.intermediate_size),
+            self.config.activation_dtype,
             device=self.config.device,
         )
-        self.gemm2_out_input.shape = (
-            self._total_num_padded_tokens(),
-            self._hidden_size_padded(),
+        self.w2 = self.w2 or _make_expert_weight_generator(
+            num_rows=num_routes,
+            output_size=self.config.hidden_size,
+            input_size=self.config.intermediate_size,
+            num_experts=self.config.num_experts,
+            activation_dtype=self.config.activation_dtype,
+            weight_dtype=self.config.weight_dtype,
+            weight_scale_dtype=self.config.weight_scale_dtype,
+            weight_scale_block_size=self.config.weight_scale_block_size,
+            device=self.config.device,
         )
-        self.gemm2_out_input.dtype = torch.bfloat16
-        self.gemm2_out_input.device = self.config.device
+        if self.config.bias_dtype is None:
+            self.w2_bias_input = None
+        else:
+            self.w2_bias_input = self.w2_bias_input or TensorInput(
+                (self.config.num_experts, self.config.hidden_size),
+                self.config.bias_dtype,
+                device=self.config.device,
+            )
         if self.config.include_shared_output:
             self.shared_output_input = self.shared_output_input or TensorInput(
                 (self.config.num_tokens, self.config.hidden_size),
-                torch.bfloat16,
+                self.config.activation_dtype,
                 device=self.config.device,
             )
-            self.shared_output_input.shape = (
-                self.config.num_tokens,
-                self.config.hidden_size,
-            )
-            self.shared_output_input.dtype = torch.bfloat16
-            self.shared_output_input.device = self.config.device
         else:
             self.shared_output_input = None
 
-    def _hidden_size_padded(self) -> int:
-        return self.config.hidden_size_padded or self.config.hidden_size
-
-    def _active_slot_count(self) -> int:
-        return (
-            self.config.num_tokens * self.config.top_k - self.config.num_dropped_slots
-        )
-
-    def _total_num_padded_tokens(self) -> int:
-        if self.config.total_num_padded_tokens is not None:
-            return self.config.total_num_padded_tokens
-        return self._active_slot_count()
-
     def generate(
         self,
         *,
         seed: int,
         device: DeviceLike = None,
-    ) -> MoEFinalizeFuseSharedInputValues:
+    ) -> MoeDownCombineInputValues:
         self.__post_init__()
         target_device = _resolve_device(self.config.device, device)
-        if self.gemm2_out_input is None:
-            raise ValueError("gemm2_out_input must be initialized")
-        gemm2_out = self.gemm2_out_input.generate(
-            seed=_child_seed(seed, 1),
-            device=target_device,
+        if self.activations_input is None or self.w2 is None:
+            raise ValueError("down/combine child generators must be initialized")
+        activations = self.activations_input.generate(
+            seed=_child_seed(seed, 1), device=target_device
         ).values
-        if gemm2_out is None:
-            raise ValueError("gemm2_out generation was skipped")
-
-        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
-        generator = torch.Generator(device=rng_device).manual_seed(_child_seed(seed, 2))
-        total_slots = self.config.num_tokens * self.config.top_k
-        expanded_idx_to_permuted_idx = torch.full(
-            (total_slots,),
-            -1,
-            dtype=torch.int32,
+        if activations is None:
+            raise ValueError("down/combine cannot skip activation generation")
+        topk_ids, topk_weights = _generate_routes(
+            num_tokens=self.config.num_tokens,
+            num_experts=self.config.num_experts,
+            top_k=self.config.top_k,
+            ids_dtype=self.config.topk_ids_dtype,
+            weights_dtype=self.config.topk_weights_dtype,
+            seed=_child_seed(seed, 2),
             device=target_device,
         )
-        if total_slots > 0 and self._active_slot_count() > 0:
-            slot_order = torch.randperm(
-                total_slots,
-                dtype=torch.int64,
-                device=target_device,
-                generator=generator,
-            )
-            active_slots = slot_order[self.config.num_dropped_slots :]
-            permuted_rows = torch.randperm(
-                self._total_num_padded_tokens(),
-                dtype=torch.int32,
-                device=target_device,
-                generator=generator,
-            )[: self._active_slot_count()]
-            expanded_idx_to_permuted_idx[active_slots] = permuted_rows
-
-        raw_weights = torch.rand(
-            (self.config.num_tokens, self.config.top_k),
-            dtype=torch.float32,
-            device=target_device,
-            generator=generator,
-        )
-        expert_weights = raw_weights / raw_weights.sum(dim=-1, keepdim=True).clamp_min(
-            1.0e-12
-        )
-        expert_weights = expert_weights.to(self.config.expert_weights_dtype)
-
-        shared_output = None
-        if self.shared_output_input is not None:
-            shared_output = self.shared_output_input.generate(
-                seed=_child_seed(seed, 3),
-                device=target_device,
+        w2_bias = (
+            None
+            if self.w2_bias_input is None
+            else self.w2_bias_input.generate(
+                seed=_child_seed(seed, 4), device=target_device
             ).values
-            if shared_output is None:
-                raise ValueError("shared_output generation was skipped")
-
-        values = MoEFinalizeFuseSharedInputValues(
-            gemm2_out=gemm2_out.contiguous(),
-            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx.contiguous(),
-            expert_weights=expert_weights.contiguous(),
-            shared_output=None if shared_output is None else shared_output.contiguous(),
         )
-        _validate_moe_finalize_fuse_shared_values(values)
-        return values
-
-
-@dataclass(init=False)
-class MoESoftplusSqrtTopKRoutingInputs(NumericsInputGenerator):
-    """Input generator for softplus-sqrt top-k MoE routing."""
-
-    config: MoESoftplusSqrtTopKRoutingInputConfig
-
-    def __init__(self, config: MoESoftplusSqrtTopKRoutingInputConfig) -> None:
-        self.config = config
-        self.__post_init__()
-
-    def __post_init__(self) -> None:
-        self.config.num_tokens = _check_nonnegative(
-            "num_tokens", self.config.num_tokens
+        shared_output = (
+            None
+            if self.shared_output_input is None
+            else self.shared_output_input.generate(
+                seed=_child_seed(seed, 5), device=target_device
+            ).values
         )
-        self.config.num_experts = int(self.config.num_experts)
-        self.config.top_k = int(self.config.top_k)
-        if self.config.num_experts <= 0:
-            raise ValueError("num_experts must be positive")
-        if self.config.top_k <= 0:
-            raise ValueError("top_k must be positive")
-        if self.config.top_k > self.config.num_experts:
-            raise ValueError("top_k must be <= num_experts")
-        if not self.config.renormalize:
-            raise ValueError("softplus-sqrt routing requires renormalize=True")
-        self.config.routed_scaling_factor = _check_positive_finite_float(
-            "routed_scaling_factor", self.config.routed_scaling_factor
-        )
-        if self.config.input_ids_dtype not in (torch.int32, torch.int64):
-            raise ValueError("input_ids_dtype must be torch.int32 or torch.int64")
-        if self.config.hash_table_size is not None:
-            self.config.hash_table_size = int(self.config.hash_table_size)
-            if self.config.hash_table_size <= 0:
-                raise ValueError("hash_table_size must be positive when set")
-
-    def generate(
-        self,
-        *,
-        seed: int,
-        device: DeviceLike = None,
-    ) -> MoESoftplusSqrtTopKRoutingInputValues:
-        self.__post_init__()
-        target_device = _resolve_device(self.config.device, device)
-        rng_device = "cuda" if target_device.type == "cuda" else "cpu"
-        generator = torch.Generator(device=rng_device).manual_seed(seed)
-        logits = (
-            torch.randn(
-                (self.config.num_tokens, self.config.num_experts),
-                dtype=torch.float32,
-                device=target_device,
-                generator=generator,
-            )
-            * 0.5
-        )
-        topk_indices = torch.empty(
-            (self.config.num_tokens, self.config.top_k),
-            dtype=torch.int32,
-            device=target_device,
-        )
-        topk_weights = torch.empty(
-            (self.config.num_tokens, self.config.top_k),
-            dtype=torch.float32,
-            device=target_device,
-        )
-        correction_bias = None
-        input_ids = None
-        hash_indices_table = None
-        if self.config.use_hash_table:
-            table_size = self.config.hash_table_size or max(self.config.num_tokens, 1)
-            input_ids = torch.randint(
-                0,
-                table_size,
-                (self.config.num_tokens,),
-                dtype=self.config.input_ids_dtype,
-                device=target_device,
-                generator=generator,
-            )
-            table_rows = [
-                torch.randperm(
-                    self.config.num_experts,
-                    dtype=torch.int32,
-                    device=target_device,
-                    generator=generator,
-                )[: self.config.top_k]
-                for _ in range(table_size)
-            ]
-            hash_indices_table = (
-                torch.stack(table_rows)
-                if table_rows
-                else torch.empty(
-                    (0, self.config.top_k),
-                    dtype=torch.int32,
-                    device=target_device,
-                )
-            )
-        else:
-            correction_bias = (
-                torch.randn(
-                    (self.config.num_experts,),
-                    dtype=torch.float32,
-                    device=target_device,
-                    generator=generator,
-                )
-                * 0.25
-            )
-        values = MoESoftplusSqrtTopKRoutingInputValues(
-            logits=logits.contiguous(),
-            correction_bias=(
-                None if correction_bias is None else correction_bias.contiguous()
-            ),
-            input_ids=None if input_ids is None else input_ids.contiguous(),
-            hash_indices_table=(
-                None if hash_indices_table is None else hash_indices_table.contiguous()
-            ),
-            topk_indices=topk_indices,
+        values = MoeDownCombineInputValues(
+            activations=activations.contiguous(),
+            topk_ids=topk_ids,
             topk_weights=topk_weights,
-            renormalize=self.config.renormalize,
-            routed_scaling_factor=self.config.routed_scaling_factor,
+            w2=self.w2.generate(seed=_child_seed(seed, 3), device=target_device),
+            w2_bias=None if w2_bias is None else w2_bias.contiguous(),
+            activation_scale=_make_activation_scale(
+                num_experts=self.config.num_experts,
+                dtype=self.config.activation_scale_dtype,
+                value=self.config.activation_scale,
+                device=target_device,
+            ),
+            shared_output=(
+                None if shared_output is None else shared_output.contiguous()
+            ),
         )
-        _validate_moe_softplus_sqrt_topk_routing_values(values)
+        _validate_down_combine_values(values, self)
         return values
 
 
-def _validate_moe_align_block_size_values(
-    values: MoeAlignBlockSizeInputValues,
+def _validate_down_combine_values(
+    values: MoeDownCombineInputValues,
+    generator: MoeDownCombineInputs,
 ) -> None:
-    if values.topk_ids.ndim != 2:
-        raise ValueError(f"topk_ids must be rank-2, got {tuple(values.topk_ids.shape)}")
-    if values.topk_ids.dtype not in _TOPK_ID_DTYPES:
-        raise ValueError("topk_ids must use an integer dtype")
-    if values.block_size <= 0:
-        raise ValueError("block_size must be positive")
-    if values.num_experts <= 0:
-        raise ValueError("num_experts must be positive")
-    if values.topk_ids.numel() == 0:
-        return
-    if values.topk_ids.min().item() < 0:
-        raise ValueError("topk_ids must be non-negative")
-    if values.topk_ids.max().item() >= values.num_experts:
-        raise ValueError("topk_ids must be less than num_experts")
-
-
-def _validate_moe_softmax_topk_routing_values(
-    values: MoESoftmaxTopKRoutingInputValues,
-) -> None:
-    if values.logits.ndim != 2:
-        raise ValueError("logits must be rank-2")
-    if values.correction_bias.ndim != 1:
-        raise ValueError("correction_bias must be rank-1")
-    if values.logits.dtype != torch.float32:
-        raise TypeError(f"logits must use torch.float32, got {values.logits.dtype}")
-    if values.correction_bias.dtype != torch.float32:
-        raise TypeError(
-            f"correction_bias must use torch.float32, got {values.correction_bias.dtype}"
-        )
-    num_tokens, num_experts = values.logits.shape
-    if values.correction_bias.shape != (num_experts,):
-        raise ValueError("correction_bias must have one value per expert")
-    if values.topk_indices.ndim != 2:
-        raise ValueError("topk_indices must be rank-2")
-    if values.topk_weights.ndim != 2:
-        raise ValueError("topk_weights must be rank-2")
-    if values.topk_indices.shape != values.topk_weights.shape:
-        raise ValueError("topk_indices and topk_weights must have matching shapes")
-    if values.topk_indices.shape[0] != num_tokens:
-        raise ValueError("topk output rows must match logits rows")
-    top_k = values.topk_indices.shape[1]
-    if top_k <= 0:
-        raise ValueError("top_k must be positive")
-    if top_k > num_experts:
-        raise ValueError("top_k must be <= num_experts")
-    if values.topk_indices.dtype not in (torch.int32, torch.int64):
-        raise TypeError("topk_indices must use torch.int32 or torch.int64")
-    if values.topk_weights.dtype != torch.float32:
-        raise TypeError("topk_weights must use torch.float32")
-    if values.logits.device != values.correction_bias.device:
-        raise ValueError("logits and correction_bias must share device")
-    if values.topk_indices.device != values.logits.device:
-        raise ValueError("topk_indices must share device with logits")
-    if values.topk_weights.device != values.logits.device:
-        raise ValueError("topk_weights must share device with logits")
-    if values.num_experts_real <= 0 or values.num_experts_real >= num_experts:
-        raise ValueError("num_experts_real must be in [1, num_experts)")
-    _check_positive_finite_float("scaling_factor", values.scaling_factor)
-    if not torch.isfinite(values.logits).all():
-        raise ValueError("logits must be finite")
-    if not torch.isfinite(values.correction_bias).all():
-        raise ValueError("correction_bias must be finite")
-
-
-def _validate_moe_softplus_sqrt_topk_routing_values(
-    values: MoESoftplusSqrtTopKRoutingInputValues,
-) -> None:
-    if values.logits.ndim != 2:
-        raise ValueError("logits must be rank-2")
-    if values.logits.dtype != torch.float32:
-        raise TypeError("logits must use torch.float32")
-    num_tokens, num_experts = values.logits.shape
-    if values.topk_indices.ndim != 2:
-        raise ValueError("topk_indices must be rank-2")
-    if values.topk_weights.ndim != 2:
-        raise ValueError("topk_weights must be rank-2")
-    if values.topk_indices.shape != values.topk_weights.shape:
-        raise ValueError("topk_indices and topk_weights must have matching shapes")
-    if values.topk_indices.shape[0] != num_tokens:
-        raise ValueError("topk output rows must match logits rows")
-    top_k = values.topk_indices.shape[1]
-    if top_k <= 0:
-        raise ValueError("top_k must be positive")
-    if top_k > num_experts:
-        raise ValueError("top_k must be <= num_experts")
-    if values.topk_indices.dtype != torch.int32:
-        raise TypeError("topk_indices must use torch.int32")
-    if values.topk_weights.dtype != torch.float32:
-        raise TypeError("topk_weights must use torch.float32")
-    if values.topk_indices.device != values.logits.device:
-        raise ValueError("topk_indices must share device with logits")
-    if values.topk_weights.device != values.logits.device:
-        raise ValueError("topk_weights must share device with logits")
-    if not values.renormalize:
-        raise ValueError("softplus-sqrt routing requires renormalize=True")
-    _check_positive_finite_float("routed_scaling_factor", values.routed_scaling_factor)
-
-    has_hash_inputs = (
-        values.input_ids is not None or values.hash_indices_table is not None
+    config = generator.config
+    num_routes = config.num_tokens * config.top_k
+    if values.activations.shape != (num_routes, config.intermediate_size):
+        raise ValueError("activations shape does not match down/combine configuration")
+    if values.activations.dtype not in _FLOAT_DTYPES:
+        raise ValueError("activations must use a regular floating dtype")
+    if not torch.isfinite(values.activations).all():
+        raise ValueError("activations must be finite")
+    _validate_topk_values(
+        topk_ids=values.topk_ids,
+        topk_weights=values.topk_weights,
+        num_tokens=config.num_tokens,
+        num_experts=config.num_experts,
+        top_k=config.top_k,
+        expected_weight_sum=1.0,
     )
-    if has_hash_inputs:
-        if values.correction_bias is not None:
-            raise ValueError("hash routing must not include correction_bias")
-        if values.input_ids is None or values.hash_indices_table is None:
-            raise ValueError("hash routing requires input_ids and hash_indices_table")
-        if values.input_ids.ndim != 1:
-            raise ValueError("input_ids must be rank-1")
-        if values.input_ids.shape[0] != num_tokens:
-            raise ValueError("input_ids length must match logits rows")
-        if values.input_ids.dtype not in (torch.int32, torch.int64):
-            raise TypeError("input_ids must use torch.int32 or torch.int64")
-        if values.input_ids.device != values.logits.device:
-            raise ValueError("input_ids must share device with logits")
-        table = values.hash_indices_table
-        if table.ndim != 2:
-            raise ValueError("hash_indices_table must be rank-2")
-        if table.shape[1] != top_k:
-            raise ValueError("hash_indices_table width must match top_k")
-        if table.dtype != torch.int32:
-            raise TypeError("hash_indices_table must use torch.int32")
-        if table.device != values.logits.device:
-            raise ValueError("hash_indices_table must share device with logits")
-        if table.shape[0] <= 0:
-            raise ValueError("hash_indices_table must contain at least one row")
-        if num_tokens > 0:
-            if values.input_ids.min().item() < 0:
-                raise ValueError("input_ids must be non-negative")
-            if values.input_ids.max().item() >= table.shape[0]:
-                raise ValueError("input_ids must index hash_indices_table rows")
-        if table.numel() > 0:
-            if table.min().item() < 0 or table.max().item() >= num_experts:
-                raise ValueError("hash_indices_table expert ids must be in range")
-            sorted_rows = table.to(torch.long).sort(dim=-1).values
-            if top_k > 1 and torch.any(sorted_rows[:, 1:] == sorted_rows[:, :-1]):
-                raise ValueError("hash_indices_table rows must not repeat experts")
-    else:
-        if values.correction_bias is None:
-            raise ValueError("non-hash routing requires correction_bias")
-        if values.correction_bias.ndim != 1:
-            raise ValueError("correction_bias must be rank-1")
-        if values.correction_bias.shape != (num_experts,):
-            raise ValueError("correction_bias must have one value per expert")
-        if values.correction_bias.dtype != torch.float32:
-            raise TypeError("correction_bias must use torch.float32")
-        if values.correction_bias.device != values.logits.device:
-            raise ValueError("correction_bias must share device with logits")
-        if not torch.isfinite(values.correction_bias).all():
-            raise ValueError("correction_bias must be finite")
-
-    if not torch.isfinite(values.logits).all():
-        raise ValueError("logits must be finite")
-
-
-def _validate_moe_deepseek_v4_mega_moe_staging_values(
-    values: MoEDeepSeekV4MegaMoEStagingInputValues,
-) -> None:
-    if values.hidden_states.ndim != 2:
-        raise ValueError("hidden_states must be rank-2")
-    if not torch.is_floating_point(values.hidden_states):
-        raise TypeError("hidden_states must use a floating dtype")
-    num_tokens, hidden_size = values.hidden_states.shape
-    if hidden_size <= 0 or hidden_size % _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE != 0:
-        raise ValueError("hidden_size must be a positive multiple of 128")
-    if values.num_experts <= 0:
-        raise ValueError("num_experts must be positive")
-    if values.topk_ids.ndim != 2:
-        raise ValueError("topk_ids must be rank-2")
-    if values.topk_weights.ndim != 2:
-        raise ValueError("topk_weights must be rank-2")
-    if values.topk_ids.shape != values.topk_weights.shape:
-        raise ValueError("topk_ids and topk_weights must have matching shapes")
-    if values.topk_ids.shape[0] != num_tokens:
-        raise ValueError("topk rows must match hidden_states rows")
-    if values.topk_ids.shape[1] <= 0:
-        raise ValueError("top_k must be positive")
-    if values.topk_ids.shape[1] > values.num_experts:
-        raise ValueError("top_k must be <= num_experts")
-    if values.topk_ids.dtype not in _TOPK_ID_DTYPES:
-        raise TypeError("topk_ids must use an integer dtype")
-    if values.topk_weights.dtype != torch.float32:
-        raise TypeError("topk_weights must use torch.float32")
-    if values.x_fp8.shape != values.hidden_states.shape:
-        raise ValueError("x_fp8 shape must match hidden_states")
-    if values.x_fp8.dtype != torch.float8_e4m3fn:
-        raise TypeError("x_fp8 must use torch.float8_e4m3fn")
-    if values.x_sf.shape != (
-        num_tokens,
-        hidden_size // _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE,
+    if generator.w2 is None:
+        raise ValueError("w2 generator must be initialized")
+    _validate_expert_weight_values(
+        name="w2",
+        values=values.w2,
+        generator=generator.w2,
+    )
+    if values.w2_bias is not None and values.w2_bias.shape != (
+        config.num_experts,
+        config.hidden_size,
     ):
-        raise ValueError("x_sf shape must be [num_tokens, hidden_size // 128]")
-    if values.x_sf.dtype != torch.int32:
-        raise TypeError("x_sf must use torch.int32")
-    if values.topk_idx_out.shape != values.topk_ids.shape:
-        raise ValueError("topk_idx_out shape must match topk_ids")
-    if values.topk_idx_out.dtype != values.topk_ids.dtype:
-        raise TypeError("topk_idx_out dtype must match topk_ids")
-    if values.topk_weights_out.shape != values.topk_weights.shape:
-        raise ValueError("topk_weights_out shape must match topk_weights")
-    if values.topk_weights_out.dtype != values.topk_weights.dtype:
-        raise TypeError("topk_weights_out dtype must match topk_weights")
-    tensors = (
-        values.topk_ids,
-        values.topk_weights,
-        values.x_fp8,
-        values.x_sf,
-        values.topk_idx_out,
-        values.topk_weights_out,
-    )
-    if any(tensor.device != values.hidden_states.device for tensor in tensors):
-        raise ValueError("all staging tensors must share device")
-    if values.topk_ids.numel() > 0:
-        if values.topk_ids.min().item() < 0:
-            raise ValueError("topk_ids must be non-negative")
-        if values.topk_ids.max().item() >= values.num_experts:
-            raise ValueError("topk_ids must be less than num_experts")
-    if not torch.isfinite(values.hidden_states).all():
-        raise ValueError("hidden_states must be finite")
-    if not torch.isfinite(values.topk_weights).all():
-        raise ValueError("topk_weights must be finite")
-    if torch.any(values.topk_weights < 0.0):
-        raise ValueError("topk_weights must be non-negative")
-
-
-def _validate_moe_finalize_fuse_shared_values(
-    values: MoEFinalizeFuseSharedInputValues,
-) -> None:
-    if values.gemm2_out.ndim != 2:
-        raise ValueError("gemm2_out must be rank-2")
-    if values.gemm2_out.dtype != torch.bfloat16:
-        raise TypeError("gemm2_out must use torch.bfloat16")
-    total_num_padded_tokens, hidden_size_padded = values.gemm2_out.shape
-    if hidden_size_padded <= 0:
-        raise ValueError("gemm2_out hidden dimension must be positive")
-    if values.expert_weights.ndim != 2:
-        raise ValueError("expert_weights must be rank-2")
-    if values.expert_weights.dtype not in (torch.float32, torch.bfloat16):
-        raise TypeError("expert_weights must use torch.float32 or torch.bfloat16")
-    num_tokens, top_k = values.expert_weights.shape
-    if top_k <= 0:
-        raise ValueError("top_k must be positive")
-    if top_k > _MOE_FINALIZE_MAX_TOPK:
-        raise ValueError(f"top_k must be <= {_MOE_FINALIZE_MAX_TOPK}")
-    if values.expanded_idx_to_permuted_idx.ndim != 1:
-        raise ValueError("expanded_idx_to_permuted_idx must be rank-1")
-    if values.expanded_idx_to_permuted_idx.dtype != torch.int32:
-        raise TypeError("expanded_idx_to_permuted_idx must use torch.int32")
-    if values.expanded_idx_to_permuted_idx.shape[0] != num_tokens * top_k:
+        raise ValueError("w2_bias shape does not match down/combine configuration")
+    if values.activation_scale is not None and values.activation_scale.shape != (
+        config.num_experts,
+    ):
+        raise ValueError("activation_scale shape does not match expert count")
+    if values.shared_output is not None and values.shared_output.shape != (
+        config.num_tokens,
+        config.hidden_size,
+    ):
         raise ValueError(
-            "expanded_idx_to_permuted_idx length must equal num_tokens * top_k"
+            "shared_output shape does not match down/combine configuration"
         )
-    if values.expert_weights.device != values.gemm2_out.device:
-        raise ValueError("expert_weights must share device with gemm2_out")
-    if values.expanded_idx_to_permuted_idx.device != values.gemm2_out.device:
-        raise ValueError(
-            "expanded_idx_to_permuted_idx must share device with gemm2_out"
-        )
-    if values.shared_output is not None:
-        if values.shared_output.ndim != 2:
-            raise ValueError("shared_output must be rank-2 when present")
-        if values.shared_output.dtype != torch.bfloat16:
-            raise TypeError("shared_output must use torch.bfloat16")
-        if values.shared_output.shape[0] != num_tokens:
-            raise ValueError("shared_output rows must match expert_weights rows")
-        if values.shared_output.shape[1] <= 0:
-            raise ValueError("shared_output hidden dimension must be positive")
-        if values.shared_output.shape[1] > hidden_size_padded:
-            raise ValueError("shared_output hidden dimension cannot exceed gemm2_out")
-        if values.shared_output.device != values.gemm2_out.device:
-            raise ValueError("shared_output must share device with gemm2_out")
-        if not torch.isfinite(values.shared_output.float()).all():
-            raise ValueError("shared_output must be finite")
-    indices = values.expanded_idx_to_permuted_idx
-    if indices.numel() > 0:
-        if indices.min().item() < -1:
-            raise ValueError("expanded indices must be -1 or non-negative")
-        if total_num_padded_tokens == 0:
-            if torch.any(indices >= 0):
-                raise ValueError("non-dropped indices require gemm2_out rows")
-        elif indices.max().item() >= total_num_padded_tokens:
-            raise ValueError("expanded indices must be less than gemm2_out rows")
-        active = indices[indices >= 0].detach().cpu().to(torch.long)
-        if active.numel() > 1:
-            if torch.unique(active).numel() != active.numel():
-                raise ValueError("non-dropped expanded indices must be unique")
-    if not torch.isfinite(values.gemm2_out.float()).all():
-        raise ValueError("gemm2_out must be finite")
-    if not torch.isfinite(values.expert_weights.float()).all():
-        raise ValueError("expert_weights must be finite")
-
-
-def _validate_moe_biased_grouped_topk_values(
-    values: MoEBiasedGroupedTopKInputValues,
-) -> None:
-    if values.hidden_states.ndim != 2:
-        raise ValueError("hidden_states must be rank-2")
-    if values.gating_output.ndim != 2:
-        raise ValueError("gating_output must be rank-2")
-    if values.correction_bias.ndim != 1:
-        raise ValueError("correction_bias must be rank-1")
-    if not torch.is_floating_point(values.hidden_states):
-        raise TypeError("hidden_states must use a floating dtype")
-    if not torch.is_floating_point(values.gating_output):
-        raise TypeError("gating_output must use a floating dtype")
-    if values.correction_bias.dtype != torch.float32:
-        raise TypeError("correction_bias must use torch.float32")
-    num_tokens, num_experts = values.gating_output.shape
-    if values.hidden_states.shape[0] != num_tokens:
-        raise ValueError("hidden_states rows must match gating_output rows")
-    if values.correction_bias.shape != (num_experts,):
-        raise ValueError("correction_bias must have one value per expert")
-    top_k = int(values.top_k)
-    num_expert_groups = int(values.num_expert_groups)
-    top_k_groups = int(values.top_k_groups)
-    if top_k <= 0:
-        raise ValueError("top_k must be positive")
-    if num_expert_groups <= 0:
-        raise ValueError("num_expert_groups must be positive")
-    if num_experts % num_expert_groups != 0:
-        raise ValueError("num_experts must be divisible by num_expert_groups")
-    experts_per_group = num_experts // num_expert_groups
-    if experts_per_group < 2:
-        raise ValueError("each expert group must contain at least two experts")
-    if top_k_groups <= 0 or top_k_groups > num_expert_groups:
-        raise ValueError("top_k_groups must be in [1, num_expert_groups]")
-    if top_k > top_k_groups * experts_per_group:
-        raise ValueError("top_k must fit within the experts in the selected groups")
-    if values.hidden_states.device != values.gating_output.device:
-        raise ValueError("hidden_states and gating_output must share device")
-    if values.correction_bias.device != values.gating_output.device:
-        raise ValueError("correction_bias must share device with gating_output")
-    if values.logical_to_physical_map is not None:
-        mapping = values.logical_to_physical_map
-        if mapping.shape != (num_experts,):
-            raise ValueError("logical_to_physical_map must have one entry per expert")
-        if mapping.dtype != torch.int32:
-            raise TypeError("logical_to_physical_map must use torch.int32")
-        if mapping.device != values.gating_output.device:
-            raise ValueError("logical_to_physical_map must share device")
-        sorted_mapping = mapping.detach().cpu().to(torch.long).sort().values
-        expected = torch.arange(num_experts, dtype=torch.long)
-        if not torch.equal(sorted_mapping, expected):
-            raise ValueError("logical_to_physical_map must be a permutation")
-    if values.num_token_non_padded is not None:
-        if values.num_token_non_padded.shape != ():
-            raise ValueError("num_token_non_padded must be a scalar tensor")
-        if values.num_token_non_padded.dtype != torch.int32:
-            raise TypeError("num_token_non_padded must use torch.int32")
-        if values.num_token_non_padded.device != values.gating_output.device:
-            raise ValueError("num_token_non_padded must share device")
-        value = int(values.num_token_non_padded.detach().cpu().item())
-        if not 0 <= value <= num_tokens:
-            raise ValueError("num_token_non_padded must be in [0, num_tokens]")
-    _check_positive_finite_float("routed_scaling_factor", values.routed_scaling_factor)
-    if not torch.isfinite(values.hidden_states).all():
-        raise ValueError("hidden_states must be finite")
-    if not torch.isfinite(values.gating_output).all():
-        raise ValueError("gating_output must be finite")
-    if not torch.isfinite(values.correction_bias).all():
-        raise ValueError("correction_bias must be finite")
 
 
 @dataclass
 class MoeInputValues:
-    """Generated values for ``MoeInputs``."""
+    """Generated external operands for a full fused routed MoE computation."""
 
-    hidden_states: torch.Tensor | None
-    router_logits: torch.Tensor | None
-    topk_ids: torch.Tensor
-    topk_weights: torch.Tensor
+    routing: MoeRoutingInputValues
     w13: GemmInputValues
     w2: GemmInputValues
     w13_bias: torch.Tensor | None
@@ -1482,115 +1230,46 @@ class MoeInputValues:
 
 @dataclass
 class MoeInputConfig:
-    """Initialization parameters for ``MoeInputs``."""
+    """Initialization parameters for full fused routed MoE inputs."""
 
-    # ------------------------------------------------------------------
-    # Required configuration fields.
-    # ------------------------------------------------------------------
-
-    # Required: total routed tokens.
-    num_tokens: int
-
-    # Required: hidden-state width.
-    hidden_size: int
-
-    # Required: expert intermediate width.
+    # Required: router projection and top-k configuration. This object is
+    # shared directly with the nested MoeRoutingInputs generator.
+    routing: MoeRoutingInputConfig
+    # Required: expert intermediate width after SwiGLU activation.
     intermediate_size: int
 
-    # Required: number of routed experts.
-    num_experts: int
-
-    # Required: number of selected experts per token.
-    top_k: int
-
-    # Required: generated hidden-state dtype.
-    hidden_dtype: torch.dtype
-
-    # ------------------------------------------------------------------
-    # Optional dtype, format, and layer configuration.
-    # ------------------------------------------------------------------
-
-    # Optional: generated router-logit dtype.
-    router_dtype: torch.dtype = torch.float32
-
-    # Optional: generated expert-weight dtype. Defaults to hidden_dtype for
-    # dense weights, MXFP4 for mxfp4 weights, and MXINT4 for mxint4 weights.
+    # Optional: W13 and W2 weight dtype. None uses routing.hidden_dtype.
     weight_dtype: InputDType = None
-
-    # Optional: expert-weight storage/scale format.
-    weight_format: str = "dense"
-
-    # Optional: expert-weight scale dtype for scaled formats. MXFP4 accepts
-    # ``None`` to infer raw UE8M0 scale storage; MXINT4 accepts ``None`` to
-    # infer BF16 group scales.
+    # Optional: W13 and W2 scale dtype; custom dtypes infer their default.
     weight_scale_dtype: InputDType = None
-
-    # Optional: output dtype metadata reserved for layer-level tests.
-    output_dtype: torch.dtype | None = None
-
-    # Optional: generated bias dtype. ``None`` skips biases.
+    # Optional: scale block size for scaled regular torch weights.
+    weight_scale_block_size: int = 32
+    # Optional: generate W13 and W2 expert biases with this dtype.
     bias_dtype: torch.dtype | None = None
-
-    # Optional: dtype for generated per-expert activation scales used by
-    # quantized expert projection paths. ``None`` skips these side inputs.
+    # Optional: generate one input scale per expert for both projections.
     activation_scale_dtype: torch.dtype | None = None
-
-    # Optional: positive scalar used to fill the W13 activation scale tensor.
+    # Optional: positive value used for each W13 input scale.
     w13_activation_scale: float = 0.125
-
-    # Optional: positive scalar used to fill the W2 activation scale tensor.
+    # Optional: positive value used for each W2 input scale.
     w2_activation_scale: float = 0.125
-
-    # Optional: default generation device.
+    # Optional: generated tensor device override.
     device: DeviceLike = None
-
-    # Optional: SwiGLU alpha metadata reserved for layer-level tests.
-    swiglu_alpha: float | None = None
-
-    # Optional: SwiGLU limit metadata reserved for layer-level tests.
-    swiglu_limit: float | None = None
-
-    # ------------------------------------------------------------------
-    # Optional child generator configuration.
-    # ------------------------------------------------------------------
-
-    # Optional: nested config for gate/up projection expert weights.
-    w13: GemmInputConfig | None = None
-
-    # Optional: nested config for down projection expert weights.
-    w2: GemmInputConfig | None = None
 
 
 @dataclass(init=False)
 class MoeInputs(NumericsInputGenerator):
-    """Typed input generator for routed MoE layer tests.
-
-    Defaults model a SwiGLU MoE layer with generated hidden states, router
-    logits, random top-k expert ids, and expert weight inputs for the gate/up
-    and down projections. Dense and quantized/scaled weights use ``GemmInputs``
-    and skip activation operands by default, because activations normally come
-    from the layer execution itself.
-
-    Leaf tensor generators and child GEMM generators are initialized at
-    construction time and reused by ``generate`` so callers can mutate child
-    generator fields before generating through this parent.
-    """
+    """Generate all external operands needed by a full fused routed MoE."""
 
     config: MoeInputConfig
-    hidden_states_input: TensorInput | None
-    router_logits_input: TensorInput | None
+    routing: MoeRoutingInputs | None
     w13: GemmInputs | None
     w2: GemmInputs | None
     w13_bias_input: TensorInput | None
     w2_bias_input: TensorInput | None
 
-    def __init__(
-        self,
-        config: MoeInputConfig,
-    ) -> None:
+    def __init__(self, config: MoeInputConfig) -> None:
         self.config = config
-        self.hidden_states_input = None
-        self.router_logits_input = None
+        self.routing = None
         self.w13 = None
         self.w2 = None
         self.w13_bias_input = None
@@ -1598,311 +1277,152 @@ class MoeInputs(NumericsInputGenerator):
         self.__post_init__()
 
     def __post_init__(self) -> None:
-        self.config.num_tokens = int(self.config.num_tokens)
-        self.config.hidden_size = int(self.config.hidden_size)
-        self.config.intermediate_size = int(self.config.intermediate_size)
-        self.config.num_experts = int(self.config.num_experts)
-        self.config.top_k = int(self.config.top_k)
-        if self.config.num_tokens < 0:
-            raise ValueError("num_tokens must be non-negative")
-        if self.config.hidden_size <= 0:
-            raise ValueError("hidden_size must be positive")
-        if self.config.intermediate_size <= 0:
-            raise ValueError("intermediate_size must be positive")
-        if self.config.num_experts <= 0:
-            raise ValueError("num_experts must be positive")
-        if self.config.top_k <= 0:
-            raise ValueError("top_k must be positive")
-        if self.config.top_k > self.config.num_experts:
-            raise ValueError("top_k must be <= num_experts")
-        if not isinstance(self.config.hidden_dtype, torch.dtype):
-            raise TypeError("hidden_dtype must be a torch.dtype")
-        if not isinstance(self.config.router_dtype, torch.dtype):
-            raise TypeError("router_dtype must be a torch.dtype")
-        if self.config.activation_scale_dtype is not None:
-            self.config.activation_scale_dtype = _check_moe_float_dtype(
-                "activation_scale_dtype", self.config.activation_scale_dtype
-            )
+        if not isinstance(self.config.routing, MoeRoutingInputConfig):
+            raise TypeError("routing must be a MoeRoutingInputConfig")
+        self.config.intermediate_size = _check_positive(
+            "intermediate_size", self.config.intermediate_size
+        )
+        self.config.bias_dtype = _check_optional_float_dtype(
+            "bias_dtype", self.config.bias_dtype
+        )
+        self.config.activation_scale_dtype = _check_optional_float_dtype(
+            "activation_scale_dtype", self.config.activation_scale_dtype
+        )
         self.config.w13_activation_scale = _check_positive_finite_float(
             "w13_activation_scale", self.config.w13_activation_scale
         )
         self.config.w2_activation_scale = _check_positive_finite_float(
             "w2_activation_scale", self.config.w2_activation_scale
         )
-        if self.config.weight_dtype is None:
-            self.config.weight_dtype = (
-                CustomDType.MXFP4
-                if self.config.weight_format == "mxfp4"
-                else (
-                    CustomDType.MXINT4
-                    if self.config.weight_format == "mxint4"
-                    else self.config.hidden_dtype
-                )
-            )
-        if self.config.weight_format == "mxint4":
-            if self.config.weight_dtype != CustomDType.MXINT4:
-                raise ValueError("mxint4 MoE weights require CustomDType.MXINT4")
-            if self.config.weight_scale_dtype not in (None, torch.bfloat16):
-                raise ValueError(
-                    "mxint4 MoE weight_scale_dtype must be torch.bfloat16 or None"
-                )
-        if (
-            self.config.weight_format not in {"dense", "mxfp4", "mxint4"}
-            and self.config.weight_scale_dtype is None
-        ):
-            self.config.weight_scale_dtype = torch.float8_e4m3fn
-        if self.hidden_states_input is None:
-            self.hidden_states_input = TensorInput(
-                (self.config.num_tokens, self.config.hidden_size),
-                self.config.hidden_dtype,
-                device=self.config.device,
-            )
-        if self.router_logits_input is None:
-            self.router_logits_input = TensorInput(
-                (self.config.num_tokens, self.config.num_experts),
-                self.config.router_dtype,
-                device=self.config.device,
-            )
-        if self.w13 is None:
-            self.w13 = self._make_weight_gemm(
-                self.config.w13
-                or self._make_weight_gemm_config(
-                    N=2 * self.config.intermediate_size,
-                    K=self.config.hidden_size,
-                )
-            )
-        if self.w2 is None:
-            self.w2 = self._make_weight_gemm(
-                self.config.w2
-                or self._make_weight_gemm_config(
-                    N=self.config.hidden_size,
-                    K=self.config.intermediate_size,
-                )
-            )
-        if self.w13_bias_input is None:
-            self.w13_bias_input = TensorInput(
-                (self.config.num_experts, 2 * self.config.intermediate_size),
+        if self.routing is None:
+            self.routing = MoeRoutingInputs(self.config.routing)
+        else:
+            self.routing.config = self.config.routing
+            self.routing.__post_init__()
+
+        self.w13 = self.w13 or _make_expert_weight_generator(
+            num_rows=self.config.routing.num_tokens,
+            output_size=2 * self.config.intermediate_size,
+            input_size=self.config.routing.hidden_size,
+            num_experts=self.config.routing.num_experts,
+            activation_dtype=self.config.routing.hidden_dtype,
+            weight_dtype=self.config.weight_dtype,
+            weight_scale_dtype=self.config.weight_scale_dtype,
+            weight_scale_block_size=self.config.weight_scale_block_size,
+            device=self.config.device,
+        )
+        self.w2 = self.w2 or _make_expert_weight_generator(
+            num_rows=self.config.routing.num_tokens,
+            output_size=self.config.routing.hidden_size,
+            input_size=self.config.intermediate_size,
+            num_experts=self.config.routing.num_experts,
+            activation_dtype=self.config.routing.hidden_dtype,
+            weight_dtype=self.config.weight_dtype,
+            weight_scale_dtype=self.config.weight_scale_dtype,
+            weight_scale_block_size=self.config.weight_scale_block_size,
+            device=self.config.device,
+        )
+        if self.config.bias_dtype is None:
+            self.w13_bias_input = None
+            self.w2_bias_input = None
+        else:
+            self.w13_bias_input = self.w13_bias_input or TensorInput(
+                (
+                    self.config.routing.num_experts,
+                    2 * self.config.intermediate_size,
+                ),
                 self.config.bias_dtype,
                 device=self.config.device,
             )
-        if self.w2_bias_input is None:
-            self.w2_bias_input = TensorInput(
-                (self.config.num_experts, self.config.hidden_size),
+            self.w2_bias_input = self.w2_bias_input or TensorInput(
+                (
+                    self.config.routing.num_experts,
+                    self.config.routing.hidden_size,
+                ),
                 self.config.bias_dtype,
                 device=self.config.device,
             )
-        self.config.w13 = self.w13.config
-        self.config.w2 = self.w2.config
-        self._verify_weight_gemm_config(
-            "w13",
-            self.config.w13,
-            N=2 * self.config.intermediate_size,
-            K=self.config.hidden_size,
-        )
-        self._verify_weight_gemm_config(
-            "w2",
-            self.config.w2,
-            N=self.config.hidden_size,
-            K=self.config.intermediate_size,
-        )
 
-    def _make_weight_gemm(
-        self,
-        config: GemmInputConfig,
-    ) -> GemmInputs:
-        return GemmInputs(config)
-
-    def _verify_weight_gemm_config(
-        self,
-        name: str,
-        config: GemmInputConfig,
-        *,
-        N: int,
-        K: int,
-    ) -> None:
-        if config.M != self.config.num_tokens or config.N != N or config.K != K:
-            raise ValueError(
-                f"{name} GEMM config must use M/N/K "
-                f"{(self.config.num_tokens, N, K)}, got "
-                f"{(config.M, config.N, config.K)}"
-            )
-        if config.batch_shape != (self.config.num_experts,):
-            raise ValueError(
-                f"{name} GEMM config batch_shape must be "
-                f"{(self.config.num_experts,)}, got {config.batch_shape}"
-            )
-        if config.a_dtype is not None:
-            raise ValueError(f"{name} GEMM config must use a_dtype=None")
-
-    def _make_weight_gemm_config(
+    def generate(
         self,
         *,
-        N: int,
-        K: int,
-    ) -> GemmInputConfig:
-        c_dtype = self.config.output_dtype or self.config.hidden_dtype
-        if self.config.weight_format == "dense":
-            if not isinstance(self.config.weight_dtype, torch.dtype):
-                raise ValueError("dense MoE weights require a torch dtype")
-            return GemmInputConfig(
-                M=self.config.num_tokens,
-                N=N,
-                K=K,
-                a_dtype=None,
-                b_dtype=self.config.weight_dtype,
-                c_dtype=c_dtype,
-                batch_shape=(self.config.num_experts,),
-            )
-
-        if self.config.weight_format == "mxfp4":
-            return GemmInputConfig(
-                M=self.config.num_tokens,
-                N=N,
-                K=K,
-                a_dtype=None,
-                b_dtype=self.config.weight_dtype,
-                c_dtype=c_dtype,
-                batch_shape=(self.config.num_experts,),
-                b_scale_shape=gemm_scale_shape(
-                    "block",
-                    "b",
-                    M=self.config.num_tokens,
-                    N=N,
-                    K=K,
-                    batch_shape=(self.config.num_experts,),
-                    block_shape=(32,),
-                ),
-                b_scale_dtype=self.config.weight_scale_dtype,
-            )
-
-        if self.config.weight_format == "mxint4":
-            return GemmInputConfig(
-                M=self.config.num_tokens,
-                N=N,
-                K=K,
-                a_dtype=None,
-                b_dtype=self.config.weight_dtype,
-                c_dtype=c_dtype,
-                batch_shape=(self.config.num_experts,),
-                b_scale_shape=gemm_scale_shape(
-                    "block",
-                    "b",
-                    M=self.config.num_tokens,
-                    N=N,
-                    K=K,
-                    batch_shape=(self.config.num_experts,),
-                    block_shape=(32,),
-                ),
-                b_scale_dtype=self.config.weight_scale_dtype,
-            )
-
-        return GemmInputConfig(
-            M=self.config.num_tokens,
-            N=N,
-            K=K,
-            a_dtype=None,
-            b_dtype=self.config.weight_dtype,
-            c_dtype=c_dtype,
-            batch_shape=(self.config.num_experts,),
-            b_scale_shape=(1,),
-            b_scale_dtype=self.config.weight_scale_dtype or torch.float32,
+        seed: int,
+        device: DeviceLike = None,
+    ) -> MoeInputValues:
+        self.__post_init__()
+        target_device = _resolve_device(self.config.device, device)
+        if self.routing is None or self.w13 is None or self.w2 is None:
+            raise ValueError("full MoE child generators must be initialized")
+        w13_bias = (
+            None
+            if self.w13_bias_input is None
+            else self.w13_bias_input.generate(
+                seed=_child_seed(seed, 4), device=target_device
+            ).values
         )
-
-    def generate(self, *, seed: int, device: DeviceLike = None) -> MoeInputValues:
-        default_device = _resolve_device(self.config.device, device)
-        if (
-            self.hidden_states_input is None
-            or self.router_logits_input is None
-            or self.w13 is None
-            or self.w2 is None
-            or self.w13_bias_input is None
-            or self.w2_bias_input is None
-        ):
-            raise ValueError("MoeInputs child generators must be initialized")
-
-        hidden_states = self.hidden_states_input.generate(
-            seed=_child_seed(seed, 1),
-            device=default_device,
-        ).values
-        router_logits = self.router_logits_input.generate(
-            seed=_child_seed(seed, 2),
-            device=default_device,
-        ).values
-        if hidden_states is None:
-            raise ValueError("hidden_states generation was skipped")
-        if router_logits is None:
-            raise ValueError("router_logits generation was skipped")
-        topk_weights, topk_ids = _moe_topk_from_router_logits(
-            router_logits,
-            self.config.top_k,
-            dtype=hidden_states.dtype,
+        w2_bias = (
+            None
+            if self.w2_bias_input is None
+            else self.w2_bias_input.generate(
+                seed=_child_seed(seed, 5), device=target_device
+            ).values
         )
-
-        w13 = self.w13.generate(seed=_child_seed(seed, 4), device=default_device)
-        w2 = self.w2.generate(seed=_child_seed(seed, 5), device=default_device)
-
-        w13_bias = self.w13_bias_input.generate(
-            seed=_child_seed(seed, 6),
-            device=default_device,
-        ).values
-        w2_bias = self.w2_bias_input.generate(
-            seed=_child_seed(seed, 7),
-            device=default_device,
-        ).values
-        w13_activation_scale = self._make_activation_scale(
-            self.config.w13_activation_scale,
-            device=default_device,
+        values = MoeInputValues(
+            routing=self.routing.generate(
+                seed=_child_seed(seed, 1), device=target_device
+            ),
+            w13=self.w13.generate(seed=_child_seed(seed, 2), device=target_device),
+            w2=self.w2.generate(seed=_child_seed(seed, 3), device=target_device),
+            w13_bias=None if w13_bias is None else w13_bias.contiguous(),
+            w2_bias=None if w2_bias is None else w2_bias.contiguous(),
+            w13_activation_scale=_make_activation_scale(
+                num_experts=self.config.routing.num_experts,
+                dtype=self.config.activation_scale_dtype,
+                value=self.config.w13_activation_scale,
+                device=target_device,
+            ),
+            w2_activation_scale=_make_activation_scale(
+                num_experts=self.config.routing.num_experts,
+                dtype=self.config.activation_scale_dtype,
+                value=self.config.w2_activation_scale,
+                device=target_device,
+            ),
         )
-        w2_activation_scale = self._make_activation_scale(
-            self.config.w2_activation_scale,
-            device=default_device,
-        )
-        return MoeInputValues(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            w13=w13,
-            w2=w2,
-            w13_bias=w13_bias,
-            w2_bias=w2_bias,
-            w13_activation_scale=w13_activation_scale,
-            w2_activation_scale=w2_activation_scale,
-        )
-
-    def _make_activation_scale(
-        self,
-        scale: float,
-        *,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        if self.config.activation_scale_dtype is None:
-            return None
-        return torch.full(
-            (self.config.num_experts,),
-            scale,
-            dtype=self.config.activation_scale_dtype,
-            device=device,
-        )
+        _validate_moe_values(values, self)
+        return values
 
 
-def _moe_topk_from_router_logits(
-    router_logits: torch.Tensor,
-    top_k: int,
-    *,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if router_logits.ndim != 2:
-        raise ValueError(
-            f"router_logits must be rank-2, got {tuple(router_logits.shape)}"
-        )
-    top_k = int(top_k)
-    num_experts = router_logits.shape[-1]
-    if top_k <= 0:
-        raise ValueError("top_k must be positive")
-    if top_k > num_experts:
-        raise ValueError("top_k must be <= router_logits.shape[-1]")
-    scores = torch.softmax(router_logits.float(), dim=-1)
-    topk_weights, topk_ids = torch.topk(scores, k=top_k, dim=-1, sorted=False)
-    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    return topk_weights.to(dtype), topk_ids.to(torch.int32)
+def _validate_moe_values(
+    values: MoeInputValues,
+    generator: MoeInputs,
+) -> None:
+    config = generator.config
+    if generator.routing is None or generator.w13 is None or generator.w2 is None:
+        raise ValueError("full MoE child generators must be initialized")
+    _validate_routing_values(values.routing, generator.routing.config)
+    _validate_expert_weight_values(
+        name="w13",
+        values=values.w13,
+        generator=generator.w13,
+    )
+    _validate_expert_weight_values(
+        name="w2",
+        values=values.w2,
+        generator=generator.w2,
+    )
+    if values.w13_bias is not None and values.w13_bias.shape != (
+        config.routing.num_experts,
+        2 * config.intermediate_size,
+    ):
+        raise ValueError("w13_bias shape does not match full MoE configuration")
+    if values.w2_bias is not None and values.w2_bias.shape != (
+        config.routing.num_experts,
+        config.routing.hidden_size,
+    ):
+        raise ValueError("w2_bias shape does not match full MoE configuration")
+    for name, scale in (
+        ("w13_activation_scale", values.w13_activation_scale),
+        ("w2_activation_scale", values.w2_activation_scale),
+    ):
+        if scale is not None and scale.shape != (config.routing.num_experts,):
+            raise ValueError(f"{name} shape does not match expert count")

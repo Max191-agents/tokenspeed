@@ -34,6 +34,7 @@ from tokenspeed_numerics_input_generators import (
     CustomDType,
     MoeInputConfig,
     MoeInputs,
+    MoeRoutingInputConfig,
     TensorInput,
 )
 from triton_kernels.matmul import FnSpecs, FusedActivation, matmul
@@ -305,15 +306,18 @@ class TritonReference:
 def _make_raw_mxfp4_weights() -> RawMxfp4Weights:
     values = MoeInputs(
         MoeInputConfig(
-            num_tokens=1,
-            hidden_size=HIDDEN_SIZE,
+            routing=MoeRoutingInputConfig(
+                num_tokens=1,
+                hidden_size=HIDDEN_SIZE,
+                num_experts=E,
+                top_k=TOPK,
+                hidden_dtype=torch.bfloat16,
+                router_dtype=torch.bfloat16,
+                topk_weights_dtype=torch.bfloat16,
+                device="cuda",
+            ),
             intermediate_size=INTERMEDIATE_SIZE,
-            num_experts=E,
-            top_k=TOPK,
-            hidden_dtype=torch.bfloat16,
-            router_dtype=torch.bfloat16,
             weight_dtype=CustomDType.MXFP4,
-            weight_format="mxfp4",
             weight_scale_dtype=None,
             bias_dtype=torch.float32,
             activation_scale_dtype=torch.float32,

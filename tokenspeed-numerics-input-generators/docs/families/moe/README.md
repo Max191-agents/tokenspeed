@@ -1,72 +1,30 @@
-# MoE Generators
+# MoE Family
 
-MoE generators describe routed mixture-of-experts layers and metadata
-preparation. A routed MoE layer maps each token to one or more experts, applies
-expert-local gate/up and down projections, and combines the expert outputs using
-route weights.
+The MoE family models the four fundamental stages of routed expert
+computation and the external operands of the complete fused operation.
 
 ## Generators
 
-- `MoeInputs`: generates hidden states, router logits, top-k routing ids and
-  weights, expert W13/W2 GEMM operands, optional biases, and optional
-  per-expert activation scales for quantized projection inputs.
-- `MoeAlignBlockSizeInputs`: generates top-k expert ids and block-size metadata
-  for expert-local token grouping and padding.
-- `MoESoftmaxTopKRoutingInputs`: generates FP32 router logits, correction bias,
-  and output buffers for softmax/correction-bias top-k routing with padded
-  zero-expert masking.
-- `MoEBiasedGroupedTopKInputs`: generates hidden-state rows, sigmoid router
-  logits, correction bias, optional expert-id maps, and optional padding
-  cutoffs for grouped top-k routing.
-- `MoESoftplusSqrtTopKRoutingInputs`: generates FP32 router logits and either
-  correction-bias routing metadata or token-id keyed hash routing metadata for
-  normalized `sqrt(softplus(x))` top-k routing.
-- `MoEDeepSeekV4MegaMoEStagingInputs`: generates hidden states, precomputed
-  top-k routing tensors, and staging buffers for FP8 hidden-state quantization
-  and packed scale output.
-- `MoEFinalizeFuseSharedInputs`: generates permuted expert outputs, flattened
-  token/top-k to permuted-row maps, route weights, and optional shared residuals
-  for routed-output finalization.
+- `MoeRoutingInputs`: router projection operands, router logits, and consistent
+  top-k expert IDs and weights.
+- `MoeDispatchInputs`: hidden states and precomputed top-k routing metadata
+  entering token-to-expert dispatch.
+- `MoeGateUpInputs`: routed hidden-state rows, selected expert IDs, W13 expert
+  weights, and optional gate/up bias and quantization scales.
+- `MoeDownCombineInputs`: activated expert rows, top-k routing metadata, W2
+  expert weights, and optional down bias, quantization scales, and shared
+  output.
+- `MoeInputs`: all external operands for a full fused routed MoE, composed from
+  `MoeRoutingInputs` and expert W13/W2 weight generation.
 
-`MoeInputs` composes the GEMM generator for expert weights. Dense, MXFP4, and
-MXINT4 expert weights are operation-level choices; backend preprocessing such
-as preshuffling, checkpoint repacking, or registry precision configs belongs in
-adapters.
+Routing supports softmax, sigmoid, and softplus-sqrt score transformations,
+optional correction bias, optional expert-group filtering, selected-weight
+normalization, and routing scales. Expert weights support regular torch dtypes
+and the quantized custom dtypes handled by core tensor generation.
 
-## Generated Values
+Kernel-specific staging buffers, block-alignment metadata, permutation
+layouts, and finalization buffers are adapter concerns. Tests for those kernels
+should derive them from the relevant core stage generator.
 
-Generated routing uses router logits to derive valid top-k ids and normalized
-route weights. References validate that selected experts are in range, route
-weights are finite and normalized, and expert weight shapes agree with hidden
-and intermediate dimensions. Optional activation scales are generated as
-positive per-expert tensors and are intended for adapters that quantize the
-projection activations before calling a backend kernel.
-
-MXINT4 MoE weights are generated as packed signed INT4 bytes with BF16 group
-scales. Backend adapters can repack those bytes into checkpoint or block-major
-layouts without changing the operation-level generator contract.
-
-Softmax top-k routing values describe the standalone router operation used to
-produce selected expert ids and scaled route weights. Expert ids greater than
-or equal to `num_experts_real` denote padded experts that the consuming
-operation maps to `-1` in the output ids.
-
-Biased grouped top-k routing values describe the MiniMax/DeepSeek-style router
-that scores experts with `sigmoid(gating_output) + correction_bias`, filters
-candidates by selected expert groups, and returns selected ids plus weights from
-the original sigmoid scores.
-
-Softplus-sqrt top-k routing values describe the DeepSeek-style router that
-uses `sqrt(softplus(logits))` as route weights. Expert selection can come from
-correction-biased top-k scores or from a generated hash table keyed by token id.
-
-DeepSeek V4 MegaMoE staging values describe the preparation step that converts
-hidden-state rows into FP8 E4M3 blocks with packed 32-channel scale exponents
-and copies precomputed routing tensors into GEMM staging buffers.
-
-Finalize-fuse-shared values describe the epilogue that gathers permuted expert
-down-projection outputs, weights them by the selected route weights, sums them
-per token, and optionally adds a shared-expert residual.
-
-These generators intentionally describe operation-level routed computations
-rather than any one fused MoE kernel signature.
+See the detailed MoE documentation and class docstrings for tensor shapes,
+configuration fields, and verification guarantees.

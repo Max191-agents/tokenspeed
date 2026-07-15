@@ -18,21 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Expected-value helpers for MoE kernel tests."""
+"""Expected-value helpers for MoE kernel compatibility tests."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_numerics_input_generators import (
-    MoeAlignBlockSizeInputValues,
-    MoEBiasedGroupedTopKInputValues,
-    MoEDeepSeekV4MegaMoEStagingInputValues,
-    MoEFinalizeFuseSharedInputValues,
-    MoESoftmaxTopKRoutingInputValues,
-    MoESoftplusSqrtTopKRoutingInputValues,
-)
 
 
 @dataclass
@@ -63,21 +55,22 @@ class MoEStagingReferenceValues:
 
 
 def moe_align_block_size_reference(
-    values: MoeAlignBlockSizeInputValues,
+    topk_ids: torch.Tensor,
+    *,
+    block_size: int,
+    num_experts: int,
 ) -> MoeAlignBlockSizeReferenceValues:
-    device = values.topk_ids.device
-    pad_id = values.topk_ids.numel()
+    device = topk_ids.device
+    pad_id = topk_ids.numel()
     sorted_chunks: list[torch.Tensor] = []
     expert_blocks: list[int] = []
-    flat_ids = values.topk_ids.reshape(-1)
+    flat_ids = topk_ids.reshape(-1)
     flat_positions = torch.arange(pad_id, dtype=torch.int32, device=device)
 
-    for expert in range(values.num_experts):
+    for expert in range(num_experts):
         selected = flat_positions[flat_ids == expert]
         count = int(selected.numel())
-        padded_count = (
-            (count + values.block_size - 1) // values.block_size * values.block_size
-        )
+        padded_count = (count + block_size - 1) // block_size * block_size
         if padded_count == 0:
             continue
         if padded_count > count:
@@ -95,7 +88,7 @@ def moe_align_block_size_reference(
         else:
             selected = selected.to(torch.int32)
         sorted_chunks.append(selected)
-        expert_blocks.extend([expert] * (padded_count // values.block_size))
+        expert_blocks.extend([expert] * (padded_count // block_size))
 
     sorted_token_ids = (
         torch.cat(sorted_chunks)
@@ -114,52 +107,52 @@ def moe_align_block_size_reference(
 
 
 def moe_softmax_topk_routing_reference(
-    values: MoESoftmaxTopKRoutingInputValues,
+    logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    *,
+    top_k: int,
+    num_experts_real: int,
+    scaling_factor: float,
+    renormalize: bool,
 ) -> MoERoutingReferenceValues:
-    probs = torch.softmax(values.logits.float(), dim=-1)
-    selection_scores = probs + values.correction_bias.reshape(1, -1)
-    top_k = values.topk_indices.shape[1]
-    out_indices = torch.empty_like(values.topk_indices)
-    out_weights = torch.empty_like(values.topk_weights)
-    scores_cpu = selection_scores.detach().cpu()
-    probs_cpu = probs.detach().cpu()
-    for row_idx in range(scores_cpu.shape[0]):
-        ordered = sorted(
-            range(scores_cpu.shape[1]),
-            key=lambda expert: (-float(scores_cpu[row_idx, expert]), expert),
-        )[:top_k]
-        selected_probs = torch.tensor(
-            [float(probs_cpu[row_idx, expert]) for expert in ordered],
-            dtype=torch.float32,
-            device=values.logits.device,
-        )
-        if values.renormalize:
-            selected_probs = selected_probs / (selected_probs.sum() + 1.0e-10)
-        out_indices[row_idx] = torch.tensor(
-            [-1 if expert >= values.num_experts_real else expert for expert in ordered],
-            dtype=values.topk_indices.dtype,
-            device=values.logits.device,
-        )
-        out_weights[row_idx] = selected_probs * float(values.scaling_factor)
-    return MoERoutingReferenceValues(out_indices, out_weights)
+    probs = torch.softmax(logits.float(), dim=-1)
+    selection_scores = probs + correction_bias.reshape(1, -1)
+    selected = selection_scores.topk(top_k, dim=-1, sorted=True).indices
+    selected_probs = probs.gather(1, selected)
+    if renormalize:
+        selected_probs /= selected_probs.sum(dim=-1, keepdim=True).clamp_min(1.0e-10)
+    selected = torch.where(selected >= num_experts_real, -1, selected)
+    return MoERoutingReferenceValues(
+        selected.to(torch.int32),
+        selected_probs.to(torch.float32) * float(scaling_factor),
+    )
 
 
 def moe_biased_grouped_topk_reference(
-    values: MoEBiasedGroupedTopKInputValues,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    *,
+    top_k: int,
+    renormalize: bool,
+    num_expert_groups: int,
+    top_k_groups: int,
+    routed_scaling_factor: float,
+    logical_to_physical_map: torch.Tensor | None,
+    num_token_non_padded: torch.Tensor | None,
 ) -> MoEGroupedRoutingReferenceValues:
-    scores = values.gating_output.float().sigmoid()
+    scores = gating_output.float().sigmoid()
     num_tokens, num_experts = scores.shape
-    experts_per_group = num_experts // values.num_expert_groups
-    selection_scores = scores + values.correction_bias.reshape(1, -1)
+    experts_per_group = num_experts // num_expert_groups
+    selection_scores = scores + correction_bias.reshape(1, -1)
     grouped_scores = selection_scores.reshape(
         num_tokens,
-        values.num_expert_groups,
+        num_expert_groups,
         experts_per_group,
     )
     group_scores = grouped_scores.topk(2, dim=-1).values.sum(dim=-1)
     selected_groups = torch.topk(
         group_scores,
-        k=values.top_k_groups,
+        k=top_k_groups,
         dim=-1,
         sorted=False,
     ).indices
@@ -167,28 +160,25 @@ def moe_biased_grouped_topk_reference(
     group_mask.scatter_(1, selected_groups, True)
     expert_mask = (
         group_mask.unsqueeze(-1)
-        .expand(num_tokens, values.num_expert_groups, experts_per_group)
+        .expand(num_tokens, num_expert_groups, experts_per_group)
         .reshape(num_tokens, num_experts)
     )
     candidate_scores = selection_scores.masked_fill(~expert_mask, float("-inf"))
     topk_ids = torch.topk(
         candidate_scores,
-        k=values.top_k,
+        k=top_k,
         dim=-1,
         sorted=False,
     ).indices.to(torch.int32)
     topk_weights = scores.gather(1, topk_ids.to(torch.long)).to(torch.float32)
 
-    if values.renormalize:
-        weight_sum = topk_weights.sum(dim=-1, keepdim=True)
-        denom = torch.where(weight_sum != 0.0, weight_sum, torch.ones_like(weight_sum))
-        topk_weights = topk_weights / denom * float(values.routed_scaling_factor)
-    if values.logical_to_physical_map is not None:
-        topk_ids = values.logical_to_physical_map[topk_ids.to(torch.long)].to(
-            torch.int32
-        )
-    if values.num_token_non_padded is not None:
-        valid_tokens = int(values.num_token_non_padded.detach().cpu().item())
+    if renormalize:
+        topk_weights /= topk_weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+        topk_weights *= float(routed_scaling_factor)
+    if logical_to_physical_map is not None:
+        topk_ids = logical_to_physical_map[topk_ids.to(torch.long)].to(torch.int32)
+    if num_token_non_padded is not None:
+        valid_tokens = int(num_token_non_padded.detach().cpu().item())
         if valid_tokens < num_tokens:
             topk_ids = topk_ids.clone()
             topk_ids[valid_tokens:, :] = -1
@@ -196,46 +186,42 @@ def moe_biased_grouped_topk_reference(
 
 
 def moe_softplus_sqrt_topk_routing_reference(
-    values: MoESoftplusSqrtTopKRoutingInputValues,
+    logits: torch.Tensor,
+    *,
+    top_k: int,
+    routed_scaling_factor: float,
+    correction_bias: torch.Tensor | None = None,
+    input_ids: torch.Tensor | None = None,
+    hash_indices_table: torch.Tensor | None = None,
 ) -> MoERoutingReferenceValues:
-    transformed = torch.sqrt(torch.nn.functional.softplus(values.logits.float()))
-    if values.input_ids is not None:
-        assert values.hash_indices_table is not None
-        topk_indices = values.hash_indices_table[values.input_ids.to(torch.long)].to(
-            torch.int32
-        )
+    transformed = torch.sqrt(torch.nn.functional.softplus(logits.float()))
+    if input_ids is not None:
+        assert hash_indices_table is not None
+        topk_indices = hash_indices_table[input_ids.to(torch.long)].to(torch.int32)
     else:
-        assert values.correction_bias is not None
-        selection_scores = transformed + values.correction_bias.reshape(1, -1)
-        scores_cpu = selection_scores.detach().cpu()
-        selected = [
-            torch.tensor(
-                sorted(
-                    range(scores_cpu.shape[1]),
-                    key=lambda expert: (-float(scores_cpu[row_idx, expert]), expert),
-                )[: values.topk_indices.shape[1]],
-                dtype=torch.int32,
-                device=values.logits.device,
-            )
-            for row_idx in range(scores_cpu.shape[0])
-        ]
+        assert correction_bias is not None
         topk_indices = (
-            torch.stack(selected) if selected else torch.empty_like(values.topk_indices)
+            (transformed + correction_bias.reshape(1, -1))
+            .topk(
+                top_k,
+                dim=-1,
+                sorted=True,
+            )
+            .indices.to(torch.int32)
         )
 
     topk_weights = transformed.gather(1, topk_indices.to(torch.long))
-    denom = topk_weights.sum(dim=-1, keepdim=True)
-    denom = torch.where(denom != 0.0, denom, torch.ones_like(denom))
-    topk_weights = (topk_weights / denom * float(values.routed_scaling_factor)).to(
-        torch.float32
-    )
-    return MoERoutingReferenceValues(topk_indices.to(torch.int32), topk_weights)
+    topk_weights /= topk_weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+    topk_weights = (topk_weights * float(routed_scaling_factor)).to(torch.float32)
+    return MoERoutingReferenceValues(topk_indices, topk_weights)
 
 
 def moe_deepseek_v4_mega_moe_staging_reference(
-    values: MoEDeepSeekV4MegaMoEStagingInputValues,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
 ) -> MoEStagingReferenceValues:
-    hidden = values.hidden_states.float()
+    hidden = hidden_states.float()
     num_tokens, hidden_size = hidden.shape
     grouped = hidden.reshape(num_tokens, hidden_size // 128, 128)
     grouped_abs = grouped.abs().reshape(num_tokens, hidden_size // 128, 4, 32)
@@ -252,44 +238,39 @@ def moe_deepseek_v4_mega_moe_staging_reference(
     scaled = grouped.reshape(num_tokens, hidden_size // 128, 4, 32) / (
         rounded_scale.unsqueeze(-1)
     )
-    shifts = torch.arange(
-        0,
-        32,
-        8,
-        dtype=torch.int32,
-        device=values.hidden_states.device,
-    )
+    shifts = torch.arange(0, 32, 8, dtype=torch.int32, device=hidden_states.device)
     return MoEStagingReferenceValues(
         x_fp8=scaled.reshape_as(hidden).to(torch.float8_e4m3fn),
         x_sf=((scale_exp.to(torch.int32) << shifts).sum(dim=-1)).to(torch.int32),
-        topk_idx_out=values.topk_ids.clone(),
-        topk_weights_out=values.topk_weights.clone(),
+        topk_idx_out=topk_ids.clone(),
+        topk_weights_out=topk_weights.clone(),
     )
 
 
 def moe_finalize_fuse_shared_reference(
-    values: MoEFinalizeFuseSharedInputValues,
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    shared_output: torch.Tensor | None,
 ) -> torch.Tensor:
-    num_tokens, top_k = values.expert_weights.shape
+    num_tokens, top_k = expert_weights.shape
     hidden_size = (
-        values.shared_output.shape[1]
-        if values.shared_output is not None
-        else values.gemm2_out.shape[1]
+        shared_output.shape[1] if shared_output is not None else gemm2_out.shape[1]
     )
     output = torch.zeros(
         (num_tokens, hidden_size),
         dtype=torch.float32,
-        device=values.gemm2_out.device,
+        device=gemm2_out.device,
     )
-    indices = values.expanded_idx_to_permuted_idx.reshape(num_tokens, top_k)
+    indices = expanded_idx_to_permuted_idx.reshape(num_tokens, top_k)
     for token_idx in range(num_tokens):
         for topk_idx in range(top_k):
             permuted_idx = int(indices[token_idx, topk_idx].item())
             if permuted_idx != -1:
                 output[token_idx] += (
-                    values.expert_weights[token_idx, topk_idx].float()
-                    * values.gemm2_out[permuted_idx, :hidden_size].float()
+                    expert_weights[token_idx, topk_idx].float()
+                    * gemm2_out[permuted_idx, :hidden_size].float()
                 )
-    if values.shared_output is not None:
-        output += values.shared_output.float()
+    if shared_output is not None:
+        output += shared_output.float()
     return output.to(torch.bfloat16)

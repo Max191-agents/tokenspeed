@@ -39,26 +39,19 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import load_builtin_kernels
 from tokenspeed_numerics_input_generators import (
     CustomDType,
-    MoeAlignBlockSizeInputValues,
-    MoEBiasedGroupedTopKInputConfig,
-    MoEBiasedGroupedTopKInputs,
-    MoEDeepSeekV4MegaMoEStagingInputConfig,
-    MoEDeepSeekV4MegaMoEStagingInputs,
-    MoEFinalizeFuseSharedInputConfig,
-    MoEFinalizeFuseSharedInputs,
+    MoeDispatchInputConfig,
+    MoeDispatchInputs,
+    MoeDownCombineInputConfig,
+    MoeDownCombineInputs,
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
-    MoESoftmaxTopKRoutingInputConfig,
-    MoESoftmaxTopKRoutingInputs,
-    MoESoftplusSqrtTopKRoutingInputConfig,
-    MoESoftplusSqrtTopKRoutingInputs,
+    MoeRoutingInputConfig,
+    MoeRoutingInputs,
 )
 
 
 def _make_mxfp4_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
-    if values.hidden_states is None or values.router_logits is None:
-        raise ValueError("MoE values must include hidden states and router logits")
     if values.w13.B is None or values.w13.B_scales is None:
         raise ValueError("MoE values must include W13 MXFP4 weights and scales")
     if values.w2.B is None or values.w2.B_scales is None:
@@ -70,7 +63,7 @@ def _make_mxfp4_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
     layer.num_local_experts = num_experts
     layer.ep_size = 1
     layer.ep_rank = 0
-    layer.top_k = values.topk_ids.shape[1]
+    layer.top_k = values.routing.topk_ids.shape[1]
     layer.activation = "silu"
     layer.swiglu_arg = None
     layer.w13_weight = torch.nn.Parameter(values.w13.B.clone(), requires_grad=False)
@@ -87,8 +80,6 @@ def _make_mxfp4_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
 
 
 def _make_dense_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
-    if values.hidden_states is None or values.router_logits is None:
-        raise ValueError("MoE values must include hidden states and router logits")
     if values.w13.B is None or values.w2.B is None:
         raise ValueError("MoE values must include dense W13 and W2 weights")
 
@@ -100,7 +91,7 @@ def _make_dense_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
     layer.ep_rank = 0
     layer.tp_size = 1
     layer.tp_rank = 0
-    layer.top_k = values.topk_ids.shape[1]
+    layer.top_k = values.routing.topk_ids.shape[1]
     layer.activation = "silu"
     layer.swiglu_arg = None
     layer.w13_weight = torch.nn.Parameter(values.w13.B.clone(), requires_grad=False)
@@ -133,24 +124,26 @@ def test_moe_align_block_size_numerics_adapter_uses_generator() -> None:
         seed=41,
     ).generate(total_tokens=7, top_k=2, num_experts=5, block_size=4)
 
-    values = MoeAlignBlockSizeInputValues(
-        topk_ids=generated["topk_ids"],
-        block_size=generated["block_size"],
-        num_experts=generated["num_experts"],
+    topk_ids = generated["topk_ids"]
+    block_size = generated["block_size"]
+    num_experts = generated["num_experts"]
+    ref = moe_align_block_size_reference(
+        topk_ids,
+        block_size=block_size,
+        num_experts=num_experts,
     )
-    ref = moe_align_block_size_reference(values)
 
-    assert values.topk_ids.shape == (7, 2)
-    assert values.topk_ids.dtype == torch.int32
-    assert torch.all(values.topk_ids >= 0)
-    assert torch.all(values.topk_ids < 5)
-    assert ref.sorted_token_ids.numel() % values.block_size == 0
-    assert ref.expert_ids.numel() * values.block_size == ref.sorted_token_ids.numel()
+    assert topk_ids.shape == (7, 2)
+    assert topk_ids.dtype == torch.int32
+    assert torch.all(topk_ids >= 0)
+    assert torch.all(topk_ids < 5)
+    assert ref.sorted_token_ids.numel() % block_size == 0
+    assert ref.expert_ids.numel() * block_size == ref.sorted_token_ids.numel()
     canonical = canonicalize_align_block_size(
         ref.sorted_token_ids,
         ref.expert_ids,
         ref.num_tokens_post_pad,
-        values.block_size,
+        block_size,
     )
     assert canonical.dtype == torch.int32
     assert (
@@ -165,33 +158,46 @@ def test_moe_softmax_topk_routing_generator_runs_cuda_helper() -> None:
 
     from tokenspeed_kernel.thirdparty.cuda import routing_flash
 
-    values = MoESoftmaxTopKRoutingInputs(
-        MoESoftmaxTopKRoutingInputConfig(
+    num_experts_real = 256
+    scaling_factor = 6.0
+    renormalize = False
+    values = MoeRoutingInputs(
+        MoeRoutingInputConfig(
             num_tokens=8,
+            hidden_size=16,
             num_experts=384,
-            num_experts_real=256,
             top_k=12,
-            scaling_factor=6.0,
-            renormalize=False,
+            hidden_dtype=torch.float32,
+            correction_bias_dtype=torch.float32,
+            renormalize=renormalize,
+            routed_scaling_factor=scaling_factor,
         )
     ).generate(seed=45, device="cuda")
-    expected = moe_softmax_topk_routing_reference(values)
+    assert values.correction_bias is not None
+    expected = moe_softmax_topk_routing_reference(
+        values.router_logits,
+        values.correction_bias,
+        top_k=12,
+        num_experts_real=num_experts_real,
+        scaling_factor=scaling_factor,
+        renormalize=renormalize,
+    )
 
     try:
         routing_flash(
-            values.logits,
+            values.router_logits,
             values.correction_bias,
-            values.topk_indices,
+            values.topk_ids,
             values.topk_weights,
-            values.num_experts_real,
-            values.scaling_factor,
-            values.renormalize,
+            num_experts_real,
+            scaling_factor,
+            renormalize,
         )
     except RuntimeError as exc:
         pytest.skip(f"routing_flash extension unavailable: {exc}")
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(values.topk_indices, expected.topk_indices)
+    torch.testing.assert_close(values.topk_ids, expected.topk_indices)
     torch.testing.assert_close(
         values.topk_weights,
         expected.topk_weights,
@@ -203,33 +209,47 @@ def test_moe_softmax_topk_routing_generator_runs_cuda_helper() -> None:
 def test_moe_biased_grouped_topk_generator_matches_triton_fallback() -> None:
     from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
 
-    values = MoEBiasedGroupedTopKInputs(
-        MoEBiasedGroupedTopKInputConfig(
+    values = MoeRoutingInputs(
+        MoeRoutingInputConfig(
             num_tokens=5,
             hidden_size=8,
             num_experts=8,
             top_k=3,
+            hidden_dtype=torch.float32,
+            score_function="sigmoid",
+            correction_bias_dtype=torch.float32,
             num_expert_groups=2,
             top_k_groups=1,
             renormalize=True,
             routed_scaling_factor=2.0,
-            use_logical_to_physical_map=True,
-            num_token_non_padded=4,
         )
     ).generate(seed=46, device="cpu")
-    expected = moe_biased_grouped_topk_reference(values)
+    assert values.correction_bias is not None
+    logical_to_physical_map = torch.randperm(8, dtype=torch.int32)
+    num_token_non_padded = torch.tensor(4, dtype=torch.int32)
+    expected = moe_biased_grouped_topk_reference(
+        values.router_logits,
+        values.correction_bias,
+        top_k=3,
+        renormalize=True,
+        num_expert_groups=2,
+        top_k_groups=1,
+        routed_scaling_factor=2.0,
+        logical_to_physical_map=logical_to_physical_map,
+        num_token_non_padded=num_token_non_padded,
+    )
 
     actual_weights, actual_ids = minimax_biased_grouped_topk(
         values.hidden_states,
-        values.gating_output,
+        values.router_logits,
         values.correction_bias,
-        topk=values.top_k,
-        renormalize=values.renormalize,
-        num_expert_group=values.num_expert_groups,
-        topk_group=values.top_k_groups,
-        routed_scaling_factor=values.routed_scaling_factor,
-        num_token_non_padded=values.num_token_non_padded,
-        logical_to_physical_map=values.logical_to_physical_map,
+        topk=3,
+        renormalize=True,
+        num_expert_group=2,
+        topk_group=1,
+        routed_scaling_factor=2.0,
+        num_token_non_padded=num_token_non_padded,
+        logical_to_physical_map=logical_to_physical_map,
     )
 
     torch.testing.assert_close(actual_ids, expected.topk_ids)
@@ -246,63 +266,94 @@ def test_moe_softplus_sqrt_topk_routing_generator_runs_cuda_helpers() -> None:
         softplus_sqrt_topk_flash,
     )
 
-    non_hash = MoESoftplusSqrtTopKRoutingInputs(
-        MoESoftplusSqrtTopKRoutingInputConfig(
+    non_hash = MoeRoutingInputs(
+        MoeRoutingInputConfig(
             num_tokens=8,
+            hidden_size=16,
             num_experts=256,
             top_k=6,
+            hidden_dtype=torch.float32,
+            score_function="softplus_sqrt",
+            correction_bias_dtype=torch.float32,
             routed_scaling_factor=1.75,
         )
     ).generate(seed=47, device="cuda")
-    non_hash_expected = moe_softplus_sqrt_topk_routing_reference(non_hash)
     assert non_hash.correction_bias is not None
+    non_hash_expected = moe_softplus_sqrt_topk_routing_reference(
+        non_hash.router_logits,
+        top_k=6,
+        routed_scaling_factor=1.75,
+        correction_bias=non_hash.correction_bias,
+    )
     try:
         softplus_sqrt_topk_flash(
-            non_hash.logits,
+            non_hash.router_logits,
             non_hash.correction_bias,
-            non_hash.topk_indices,
+            non_hash.topk_ids,
             non_hash.topk_weights,
-            non_hash.routed_scaling_factor,
-            non_hash.renormalize,
+            1.75,
+            True,
         )
     except RuntimeError as exc:
         pytest.skip(f"softplus_sqrt_topk_flash extension unavailable: {exc}")
 
-    hashed = MoESoftplusSqrtTopKRoutingInputs(
-        MoESoftplusSqrtTopKRoutingInputConfig(
+    hashed = MoeRoutingInputs(
+        MoeRoutingInputConfig(
             num_tokens=8,
+            hidden_size=16,
             num_experts=256,
             top_k=6,
-            use_hash_table=True,
-            hash_table_size=16,
+            hidden_dtype=torch.float32,
+            score_function="softplus_sqrt",
             routed_scaling_factor=2.25,
         )
     ).generate(seed=48, device="cuda")
-    hashed_expected = moe_softplus_sqrt_topk_routing_reference(hashed)
-    assert hashed.input_ids is not None
-    assert hashed.hash_indices_table is not None
+    generator = torch.Generator(device="cuda").manual_seed(48)
+    input_ids = torch.randint(
+        0,
+        16,
+        (8,),
+        dtype=torch.int64,
+        device="cuda",
+        generator=generator,
+    )
+    hash_indices_table = torch.stack(
+        [
+            torch.randperm(256, dtype=torch.int32, device="cuda", generator=generator)[
+                :6
+            ]
+            for _ in range(16)
+        ]
+    )
+    hashed_expected = moe_softplus_sqrt_topk_routing_reference(
+        hashed.router_logits,
+        top_k=6,
+        routed_scaling_factor=2.25,
+        input_ids=input_ids,
+        hash_indices_table=hash_indices_table,
+    )
     try:
         hash_softplus_sqrt_topk_flash(
-            hashed.logits,
-            hashed.input_ids,
-            hashed.hash_indices_table,
-            hashed.topk_indices,
+            hashed.router_logits,
+            input_ids,
+            hash_indices_table,
+            hashed.topk_ids,
             hashed.topk_weights,
-            hashed.routed_scaling_factor,
-            hashed.renormalize,
+            2.25,
+            True,
         )
     except RuntimeError as exc:
         pytest.skip(f"hash_softplus_sqrt_topk_flash extension unavailable: {exc}")
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(non_hash.topk_indices, non_hash_expected.topk_indices)
+    torch.testing.assert_close(non_hash.topk_ids, non_hash_expected.topk_indices)
     torch.testing.assert_close(
         non_hash.topk_weights,
         non_hash_expected.topk_weights,
         rtol=1.0e-4,
         atol=1.0e-4,
     )
-    torch.testing.assert_close(hashed.topk_indices, hashed_expected.topk_indices)
+    torch.testing.assert_close(hashed.topk_ids, hashed_expected.topk_indices)
     torch.testing.assert_close(
         hashed.topk_weights,
         hashed_expected.topk_weights,
@@ -317,8 +368,8 @@ def test_moe_deepseek_v4_mega_moe_staging_generator_runs_triton_helper() -> None
 
     from tokenspeed_kernel.thirdparty.triton import stage_deepseek_v4_mega_moe_inputs
 
-    values = MoEDeepSeekV4MegaMoEStagingInputs(
-        MoEDeepSeekV4MegaMoEStagingInputConfig(
+    values = MoeDispatchInputs(
+        MoeDispatchInputConfig(
             num_tokens=4,
             hidden_size=128,
             num_experts=8,
@@ -326,31 +377,39 @@ def test_moe_deepseek_v4_mega_moe_staging_generator_runs_triton_helper() -> None
             hidden_dtype=torch.bfloat16,
         )
     ).generate(seed=49, device="cuda")
-    expected = moe_deepseek_v4_mega_moe_staging_reference(values)
+    x_fp8 = torch.empty_like(values.hidden_states, dtype=torch.float8_e4m3fn)
+    x_sf = torch.empty((4, 1), dtype=torch.int32, device="cuda")
+    topk_idx_out = torch.empty_like(values.topk_ids)
+    topk_weights_out = torch.empty_like(values.topk_weights)
+    expected = moe_deepseek_v4_mega_moe_staging_reference(
+        values.hidden_states,
+        values.topk_ids,
+        values.topk_weights,
+    )
 
     try:
         stage_deepseek_v4_mega_moe_inputs(
             values.hidden_states,
             values.topk_weights,
             values.topk_ids,
-            values.x_fp8,
-            values.x_sf,
-            values.topk_idx_out,
-            values.topk_weights_out,
+            x_fp8,
+            x_sf,
+            topk_idx_out,
+            topk_weights_out,
         )
     except (RuntimeError, ValueError) as exc:
         pytest.skip(f"stage_deepseek_v4_mega_moe_inputs unavailable: {exc}")
     torch.cuda.synchronize()
 
     torch.testing.assert_close(
-        values.x_fp8.float(),
+        x_fp8.float(),
         expected.x_fp8.float(),
         rtol=0,
         atol=0,
     )
-    torch.testing.assert_close(values.x_sf, expected.x_sf)
-    torch.testing.assert_close(values.topk_idx_out, expected.topk_idx_out)
-    torch.testing.assert_close(values.topk_weights_out, expected.topk_weights_out)
+    torch.testing.assert_close(x_sf, expected.x_sf)
+    torch.testing.assert_close(topk_idx_out, expected.topk_idx_out)
+    torch.testing.assert_close(topk_weights_out, expected.topk_weights_out)
 
 
 def test_moe_finalize_fuse_shared_generator_runs_cuda_helper() -> None:
@@ -364,24 +423,47 @@ def test_moe_finalize_fuse_shared_generator_runs_cuda_helper() -> None:
 
     from tokenspeed_kernel.thirdparty.cuda import moe_finalize_fuse_shared
 
-    values = MoEFinalizeFuseSharedInputs(
-        MoEFinalizeFuseSharedInputConfig(
+    values = MoeDownCombineInputs(
+        MoeDownCombineInputConfig(
             num_tokens=4,
             hidden_size=64,
+            intermediate_size=32,
+            num_experts=4,
             top_k=2,
+            activation_dtype=torch.bfloat16,
             include_shared_output=True,
-            expert_weights_dtype=torch.float32,
         )
     ).generate(seed=50, device="cuda")
-    expected = moe_finalize_fuse_shared_reference(values)
+    assert values.w2.B is not None
+    expert_ids = values.topk_ids.reshape(-1).to(torch.long)
+    selected_weights = values.w2.B[expert_ids].float()
+    gemm2_out = (
+        torch.bmm(
+            selected_weights,
+            values.activations.float().unsqueeze(-1),
+        )
+        .squeeze(-1)
+        .to(torch.bfloat16)
+    )
+    expanded_idx_to_permuted_idx = torch.arange(
+        gemm2_out.shape[0],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    expected = moe_finalize_fuse_shared_reference(
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        values.topk_weights,
+        values.shared_output,
+    )
 
     try:
         actual = moe_finalize_fuse_shared(
-            values.gemm2_out,
-            values.expanded_idx_to_permuted_idx,
-            values.expert_weights,
+            gemm2_out,
+            expanded_idx_to_permuted_idx,
+            values.topk_weights,
             values.shared_output,
-            values.expert_weights.shape[1],
+            values.topk_weights.shape[1],
         )
     except (RuntimeError, ModuleNotFoundError) as exc:
         pytest.skip(f"moe_finalize_fuse_shared extension unavailable: {exc}")
@@ -399,14 +481,16 @@ def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None
 
     load_builtin_kernels()
     config = MoeInputConfig(
-        num_tokens=4,
-        hidden_size=64,
+        routing=MoeRoutingInputConfig(
+            num_tokens=4,
+            hidden_size=64,
+            num_experts=4,
+            top_k=2,
+            hidden_dtype=torch.bfloat16,
+            router_dtype=torch.bfloat16,
+            topk_weights_dtype=torch.bfloat16,
+        ),
         intermediate_size=64,
-        num_experts=4,
-        top_k=2,
-        hidden_dtype=torch.bfloat16,
-        router_dtype=torch.bfloat16,
-        weight_format="mxfp4",
         weight_dtype=CustomDType.MXFP4,
         weight_scale_dtype=None,
         bias_dtype=None,
@@ -425,13 +509,14 @@ def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None
     assert plan["process_weights_kernel_name"] == "triton_mxfp4_moe_process_weights"
 
     moe_process_weights(plan, layer)
+    routing = values.routing
     actual = moe_apply(
         plan,
-        values.hidden_states,
+        routing.hidden_states,
         layer,
-        values.router_logits,
-        topk_weights=values.topk_weights,
-        topk_ids=values.topk_ids,
+        routing.router_logits,
+        topk_weights=routing.topk_weights,
+        topk_ids=routing.topk_ids,
     )
     torch.cuda.synchronize()
 
@@ -441,14 +526,16 @@ def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None
 
 def test_mxint4_moe_generator_matches_flashinfer_trtllm_contract() -> None:
     config = MoeInputConfig(
-        num_tokens=4,
-        hidden_size=64,
+        routing=MoeRoutingInputConfig(
+            num_tokens=4,
+            hidden_size=64,
+            num_experts=4,
+            top_k=2,
+            hidden_dtype=torch.bfloat16,
+            router_dtype=torch.float32,
+            topk_weights_dtype=torch.bfloat16,
+        ),
         intermediate_size=64,
-        num_experts=4,
-        top_k=2,
-        hidden_dtype=torch.bfloat16,
-        router_dtype=torch.float32,
-        weight_format="mxint4",
         weight_dtype=CustomDType.MXINT4,
         weight_scale_dtype=None,
         bias_dtype=None,
@@ -462,12 +549,12 @@ def test_mxint4_moe_generator_matches_flashinfer_trtllm_contract() -> None:
     w13_weight_packed = _mxint4_checkpoint_words_from_generator(values.w13.B)
     w2_weight_packed = _mxint4_checkpoint_words_from_generator(values.w2.B)
     layer = torch.nn.Module()
-    layer.num_experts = config.num_experts
-    layer.num_local_experts = config.num_experts
+    layer.num_experts = config.routing.num_experts
+    layer.num_local_experts = config.routing.num_experts
     layer.ep_size = 1
     layer.ep_rank = 0
     layer.tp_size = 1
-    layer.top_k = config.top_k
+    layer.top_k = config.routing.top_k
     layer.intermediate_size = config.intermediate_size
     layer.w13_weight_packed = torch.nn.Parameter(
         w13_weight_packed,
@@ -494,13 +581,11 @@ def test_mxint4_moe_generator_matches_flashinfer_trtllm_contract() -> None:
     assert layer.w2_weight_scale.shape == (4, 64, 2)
     assert layer.w13_weight_scale.dtype == torch.bfloat16
     assert layer.w2_weight_scale.dtype == torch.bfloat16
-    assert values.hidden_states is not None
-    assert values.hidden_states.shape == (4, 64)
-    assert values.hidden_states.dtype == torch.bfloat16
-    assert values.router_logits is not None
-    assert values.router_logits.shape == (4, 4)
-    assert values.topk_ids.shape == (4, 2)
-    assert values.topk_ids.dtype == torch.int32
+    assert values.routing.hidden_states.shape == (4, 64)
+    assert values.routing.hidden_states.dtype == torch.bfloat16
+    assert values.routing.router_logits.shape == (4, 4)
+    assert values.routing.topk_ids.shape == (4, 2)
+    assert values.routing.topk_ids.dtype == torch.int32
     assert moe_reference(values, output_dtype=torch.bfloat16).shape == (4, 64)
 
 
@@ -511,14 +596,16 @@ def test_dense_moe_generator_runs_flashinfer_cutlass_kernel(device: str) -> None
 
     load_builtin_kernels()
     config = MoeInputConfig(
-        num_tokens=4,
-        hidden_size=64,
+        routing=MoeRoutingInputConfig(
+            num_tokens=4,
+            hidden_size=64,
+            num_experts=4,
+            top_k=2,
+            hidden_dtype=torch.bfloat16,
+            router_dtype=torch.bfloat16,
+            topk_weights_dtype=torch.bfloat16,
+        ),
         intermediate_size=64,
-        num_experts=4,
-        top_k=2,
-        hidden_dtype=torch.bfloat16,
-        router_dtype=torch.bfloat16,
-        weight_format="dense",
         weight_dtype=torch.bfloat16,
         bias_dtype=None,
     )
@@ -538,13 +625,14 @@ def test_dense_moe_generator_runs_flashinfer_cutlass_kernel(device: str) -> None
     )
 
     moe_process_weights(plan, layer)
+    routing = values.routing
     actual = moe_apply(
         plan,
-        values.hidden_states,
+        routing.hidden_states,
         layer,
-        values.router_logits,
-        topk_weights=values.topk_weights,
-        topk_ids=values.topk_ids,
+        routing.router_logits,
+        topk_weights=routing.topk_weights,
+        topk_ids=routing.topk_ids,
     )
     torch.cuda.synchronize()
 
