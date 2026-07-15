@@ -18,8 +18,6 @@ on the config and values classes in code.
   dtype semantics.
 - [embedding](embedding/README.md): rotary embedding inputs and references.
 - [gemm](gemm/README.md): dense, scaled, and quantized GEMM inputs.
-- [kvcache](kvcache/README.md): cache stores, page-table gathers, and cache-row
-  transfers.
 - [layernorm](layernorm/README.md): RMSNorm, QK RMSNorm, fused RoPE/gate, and
   parallel RMSNorm inputs.
 - [moe](moe/README.md): routed MoE layers and expert block-alignment metadata.
@@ -27,5 +25,3 @@ on the config and values classes in code.
   quantization inputs.
 - [sampling](sampling/README.md): argmax, scalar gather, min-p, and top-k/top-p
   sampling inputs.
-- [transforms](transforms/README.md): standalone deterministic tensor
-  transforms such as Walsh-Hadamard.

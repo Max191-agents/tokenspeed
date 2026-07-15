@@ -247,7 +247,6 @@ tokenspeed_numerics_input_generators/
     cache.py                # reusable cache/page-table generators
     metadata.py             # request metadata and slot mappings
   moe.py                    # MoE-family generators
-  transforms.py             # standalone deterministic tensor transforms
 
 docs/families/
   README.md                 # operation-family navigation
@@ -255,7 +254,6 @@ docs/families/
   gemm/README.md
   attention/README.md
   moe/README.md
-  transforms/README.md
 ```
 
 The exact names and module boundaries can evolve, but the conceptual split

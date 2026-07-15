@@ -32,13 +32,11 @@ _PUBLIC_MODULES = (
     "core",
     "embedding",
     "gemm",
-    "kvcache",
     "layernorm",
     "moe",
     "quantization",
     "rotary",
     "sampling",
-    "transforms",
 )
 
 _REMOVED_MODULES = (
@@ -46,6 +44,8 @@ _REMOVED_MODULES = (
     "attention_cache",
     "attention_metadata",
     "communication",
+    "kvcache",
+    "transforms",
 )
 
 

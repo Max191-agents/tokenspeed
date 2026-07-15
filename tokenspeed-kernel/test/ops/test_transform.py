@@ -22,33 +22,48 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_numerics_input_generators import (
-    HadamardTransformInputConfig,
-    HadamardTransformInputs,
-    hadamard_transform_reference,
-)
 
 
-def test_hadamard_transform_generator_runs_fast_hadamard_extension(device: str) -> None:
+def _hadamard_reference(x: torch.Tensor, scale: float) -> torch.Tensor:
+    transform_dim = x.shape[-1]
+    out = x.float().reshape(-1, transform_dim).clone()
+    stride = 1
+    while stride < transform_dim:
+        view = out.reshape(-1, transform_dim // (2 * stride), 2, stride)
+        left = view[:, :, 0, :].clone()
+        right = view[:, :, 1, :].clone()
+        view[:, :, 0, :] = left + right
+        view[:, :, 1, :] = left - right
+        stride *= 2
+    return (out * scale).reshape_as(x).to(x.dtype)
+
+
+def test_fast_hadamard_transform(device: str) -> None:
     pytest.importorskip("fast_hadamard_transform")
     from tokenspeed_kernel.thirdparty.fast_hadamard_transform import hadamard_transform
 
-    values = HadamardTransformInputs(
-        HadamardTransformInputConfig(
-            batch_shape=(5,),
-            transform_dim=64,
-            dtype=torch.bfloat16,
+    transform_dim = 64
+    scale = transform_dim**-0.5
+    x = (
+        torch.linspace(
+            -1,
+            1,
+            steps=5 * transform_dim,
+            device=device,
+            dtype=torch.float32,
         )
-    ).generate(seed=171, device=device)
-    expected = hadamard_transform_reference(values.x, scale=values.scale)
+        .reshape(5, transform_dim)
+        .to(torch.bfloat16)
+    )
+    expected = _hadamard_reference(x, scale)
 
     try:
-        actual = hadamard_transform(values.x, scale=values.scale)
+        actual = hadamard_transform(x, scale=scale)
     except RuntimeError as exc:
         pytest.skip(f"fast_hadamard_transform unavailable for this device: {exc}")
     if actual.is_cuda:
         torch.cuda.synchronize()
 
-    assert actual.shape == values.x.shape
-    assert actual.dtype == values.x.dtype
+    assert actual.shape == x.shape
+    assert actual.dtype == x.dtype
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
