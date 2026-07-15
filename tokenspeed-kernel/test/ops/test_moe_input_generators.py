@@ -23,9 +23,18 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel.numerics.moe  # noqa: F401
 import torch
+from moe_references import (
+    moe_align_block_size_reference,
+    moe_biased_grouped_topk_reference,
+    moe_deepseek_v4_mega_moe_staging_reference,
+    moe_finalize_fuse_shared_reference,
+    moe_softmax_topk_routing_reference,
+    moe_softplus_sqrt_topk_routing_reference,
+)
 from tokenspeed_kernel import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.numerics.inputs import get_input_generator
 from tokenspeed_kernel.numerics.moe import canonicalize_align_block_size
+from tokenspeed_kernel.numerics.reference.moe import moe_reference
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import load_builtin_kernels
 from tokenspeed_numerics_input_generators import (
@@ -44,14 +53,6 @@ from tokenspeed_numerics_input_generators import (
     MoESoftmaxTopKRoutingInputs,
     MoESoftplusSqrtTopKRoutingInputConfig,
     MoESoftplusSqrtTopKRoutingInputs,
-    canonicalize_moe_align_block_size,
-    moe_align_block_size_reference,
-    moe_biased_grouped_topk_reference,
-    moe_deepseek_v4_mega_moe_staging_reference,
-    moe_finalize_fuse_shared_reference,
-    moe_reference,
-    moe_softmax_topk_routing_reference,
-    moe_softplus_sqrt_topk_routing_reference,
 )
 
 
@@ -145,16 +146,15 @@ def test_moe_align_block_size_numerics_adapter_uses_generator() -> None:
     assert torch.all(values.topk_ids < 5)
     assert ref.sorted_token_ids.numel() % values.block_size == 0
     assert ref.expert_ids.numel() * values.block_size == ref.sorted_token_ids.numel()
-    torch.testing.assert_close(
-        canonicalize_align_block_size(
-            ref.sorted_token_ids,
-            ref.expert_ids,
-            ref.num_tokens_post_pad,
-            values.block_size,
-        ),
-        canonicalize_moe_align_block_size(ref, block_size=values.block_size),
-        atol=0,
-        rtol=0,
+    canonical = canonicalize_align_block_size(
+        ref.sorted_token_ids,
+        ref.expert_ids,
+        ref.num_tokens_post_pad,
+        values.block_size,
+    )
+    assert canonical.dtype == torch.int32
+    assert (
+        canonical.numel() == 1 + ref.expert_ids.numel() + ref.sorted_token_ids.numel()
     )
 
 

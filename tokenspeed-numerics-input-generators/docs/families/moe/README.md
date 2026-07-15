@@ -48,8 +48,8 @@ layouts without changing the operation-level generator contract.
 
 Softmax top-k routing values describe the standalone router operation used to
 produce selected expert ids and scaled route weights. Expert ids greater than
-or equal to `num_experts_real` are generated and referenced as padded experts
-that map to `-1` in the output ids.
+or equal to `num_experts_real` denote padded experts that the consuming
+operation maps to `-1` in the output ids.
 
 Biased grouped top-k routing values describe the MiniMax/DeepSeek-style router
 that scores experts with `sigmoid(gating_output) + correction_bias`, filters

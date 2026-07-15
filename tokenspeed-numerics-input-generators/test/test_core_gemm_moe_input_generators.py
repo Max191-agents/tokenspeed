@@ -34,34 +34,20 @@ from tokenspeed_numerics_input_generators import (
     MoeAlignBlockSizeInputValues,
     MoEBiasedGroupedTopKInputConfig,
     MoEBiasedGroupedTopKInputs,
-    MoEBiasedGroupedTopKInputValues,
     MoEDeepSeekV4MegaMoEStagingInputConfig,
     MoEDeepSeekV4MegaMoEStagingInputs,
-    MoEDeepSeekV4MegaMoEStagingInputValues,
     MoEFinalizeFuseSharedInputConfig,
     MoEFinalizeFuseSharedInputs,
-    MoEFinalizeFuseSharedInputValues,
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
     MoESoftmaxTopKRoutingInputConfig,
     MoESoftmaxTopKRoutingInputs,
-    MoESoftmaxTopKRoutingInputValues,
     MoESoftplusSqrtTopKRoutingInputConfig,
     MoESoftplusSqrtTopKRoutingInputs,
-    MoESoftplusSqrtTopKRoutingInputValues,
     TensorInput,
-    canonicalize_moe_align_block_size,
     gemm_reference,
     gemm_scale_shape,
-    moe_align_block_size_buffer_dims,
-    moe_align_block_size_reference,
-    moe_biased_grouped_topk_reference,
-    moe_deepseek_v4_mega_moe_staging_reference,
-    moe_finalize_fuse_shared_reference,
-    moe_reference,
-    moe_softmax_topk_routing_reference,
-    moe_softplus_sqrt_topk_routing_reference,
     nvfp4_dequantization_reference,
     nvfp4_quantization_reference,
 )
@@ -1298,109 +1284,6 @@ def test_moe_inputs_generate_optional_activation_scales() -> None:
     )
 
 
-def test_moe_reference_matches_manual_dense_silu() -> None:
-    values = MoeInputs(
-        MoeInputConfig(
-            num_tokens=4,
-            hidden_size=8,
-            intermediate_size=12,
-            num_experts=3,
-            top_k=2,
-            hidden_dtype=torch.float32,
-            bias_dtype=torch.float32,
-        )
-    ).generate(seed=30, device="cpu")
-
-    ref = moe_reference(values)
-    assert values.hidden_states is not None
-    assert values.w13.B is not None
-    assert values.w2.B is not None
-    assert values.w13_bias is not None
-    assert values.w2_bias is not None
-    manual = torch.zeros(4, 8, dtype=torch.float32)
-    for token in range(values.hidden_states.shape[0]):
-        hidden = values.hidden_states[token].float()
-        for slot in range(values.topk_ids.shape[1]):
-            expert = int(values.topk_ids[token, slot])
-            route_weight = values.topk_weights[token, slot].float()
-            gate_up = hidden @ values.w13.B[expert].float().T
-            gate_up = gate_up + values.w13_bias[expert].float()
-            gate, up = gate_up.chunk(2, dim=-1)
-            activated = torch.nn.functional.silu(gate) * up
-            expert_output = activated @ values.w2.B[expert].float().T
-            expert_output = expert_output + values.w2_bias[expert].float()
-            manual[token] += route_weight * expert_output
-
-    torch.testing.assert_close(ref, manual, atol=1.0e-5, rtol=1.0e-5)
-
-
-def test_moe_reference_handles_mxfp4_weight_values() -> None:
-    values = MoeInputs(
-        MoeInputConfig(
-            num_tokens=5,
-            hidden_size=64,
-            intermediate_size=32,
-            num_experts=4,
-            top_k=2,
-            hidden_dtype=torch.float16,
-            weight_format="mxfp4",
-        )
-    ).generate(seed=32, device="cpu")
-
-    ref = moe_reference(values)
-
-    assert ref.shape == (5, 64)
-    assert ref.dtype == torch.float16
-
-
-def test_moe_reference_handles_mxint4_weight_values() -> None:
-    values = MoeInputs(
-        MoeInputConfig(
-            num_tokens=5,
-            hidden_size=64,
-            intermediate_size=32,
-            num_experts=4,
-            top_k=2,
-            hidden_dtype=torch.float16,
-            weight_format="mxint4",
-        )
-    ).generate(seed=35, device="cpu")
-
-    ref = moe_reference(values)
-
-    assert ref.shape == (5, 64)
-    assert ref.dtype == torch.float16
-    assert torch.isfinite(ref).all()
-
-
-def test_moe_reference_rejects_invalid_topk_weights() -> None:
-    values = MoeInputs(
-        MoeInputConfig(
-            num_tokens=4,
-            hidden_size=8,
-            intermediate_size=12,
-            num_experts=3,
-            top_k=2,
-            hidden_dtype=torch.float32,
-        )
-    ).generate(seed=33, device="cpu")
-    bad_values = MoeInputValues(
-        hidden_states=values.hidden_states,
-        router_logits=values.router_logits,
-        topk_ids=values.topk_ids,
-        topk_weights=values.topk_weights * 0.5,
-        w13=values.w13,
-        w2=values.w2,
-        w13_bias=values.w13_bias,
-        w2_bias=values.w2_bias,
-        w13_activation_scale=values.w13_activation_scale,
-        w2_activation_scale=values.w2_activation_scale,
-    )
-
-    with pytest.raises(ValueError, match="topk_weights rows must sum to 1"):
-        moe_reference(bad_values)
-
-
 def test_moe_inputs_verify_topk_config() -> None:
     with pytest.raises(ValueError, match="top_k must be <= num_experts"):
         MoeInputs(
@@ -1496,7 +1379,7 @@ def test_moe_inputs_verify_child_gemm_shapes() -> None:
         )
 
 
-def test_moe_softmax_topk_routing_inputs_generate_values_and_reference() -> None:
+def test_moe_softmax_topk_routing_inputs_generate_values() -> None:
     values = MoESoftmaxTopKRoutingInputs(
         MoESoftmaxTopKRoutingInputConfig(
             num_tokens=3,
@@ -1507,8 +1390,6 @@ def test_moe_softmax_topk_routing_inputs_generate_values_and_reference() -> None
         )
     ).generate(seed=51, device="cpu")
 
-    ref = moe_softmax_topk_routing_reference(values)
-
     assert values.logits.shape == (3, 8)
     assert values.logits.dtype == torch.float32
     assert values.correction_bias.shape == (8,)
@@ -1516,37 +1397,9 @@ def test_moe_softmax_topk_routing_inputs_generate_values_and_reference() -> None
     assert values.topk_indices.dtype == torch.int32
     assert values.topk_weights.shape == (3, 4)
     assert values.topk_weights.dtype == torch.float32
-    assert ref.topk_indices.shape == (3, 4)
-    assert ref.topk_weights.shape == (3, 4)
-    assert torch.all(ref.topk_indices[:, 0] == -1)
-    assert torch.all(ref.topk_weights >= 0.0)
-    assert torch.isfinite(ref.topk_weights).all()
 
 
-def test_moe_softmax_topk_routing_reference_handles_renormalization() -> None:
-    values = MoESoftmaxTopKRoutingInputValues(
-        logits=torch.tensor([[0.0, 1.0, -1.0, 0.5]], dtype=torch.float32),
-        correction_bias=torch.tensor([0.0, 1.0, 0.0, 3.0], dtype=torch.float32),
-        topk_indices=torch.empty((1, 2), dtype=torch.int64),
-        topk_weights=torch.empty((1, 2), dtype=torch.float32),
-        num_experts_real=3,
-        scaling_factor=6.0,
-        renormalize=True,
-    )
-
-    ref = moe_softmax_topk_routing_reference(values)
-    probs = torch.softmax(values.logits, dim=-1)
-    selected = probs[:, [3, 1]]
-    expected_weights = selected / selected.sum(dim=-1, keepdim=True) * 6.0
-
-    torch.testing.assert_close(
-        ref.topk_indices,
-        torch.tensor([[-1, 1]], dtype=torch.int64),
-    )
-    torch.testing.assert_close(ref.topk_weights, expected_weights)
-
-
-def test_moe_softmax_topk_routing_verifies_config_and_values() -> None:
+def test_moe_softmax_topk_routing_verifies_config() -> None:
     with pytest.raises(ValueError, match="num_experts_real must be < num_experts"):
         MoESoftmaxTopKRoutingInputs(
             MoESoftmaxTopKRoutingInputConfig(
@@ -1568,20 +1421,8 @@ def test_moe_softmax_topk_routing_verifies_config_and_values() -> None:
             )
         )
 
-    values = MoESoftmaxTopKRoutingInputValues(
-        logits=torch.zeros((2, 4), dtype=torch.float32),
-        correction_bias=torch.zeros((3,), dtype=torch.float32),
-        topk_indices=torch.empty((2, 2), dtype=torch.int32),
-        topk_weights=torch.empty((2, 2), dtype=torch.float32),
-        num_experts_real=3,
-        scaling_factor=1.0,
-        renormalize=False,
-    )
-    with pytest.raises(ValueError, match="one value per expert"):
-        moe_softmax_topk_routing_reference(values)
 
-
-def test_moe_biased_grouped_topk_inputs_generate_values_and_reference() -> None:
+def test_moe_biased_grouped_topk_inputs_generate_values() -> None:
     values = MoEBiasedGroupedTopKInputs(
         MoEBiasedGroupedTopKInputConfig(
             num_tokens=4,
@@ -1597,8 +1438,6 @@ def test_moe_biased_grouped_topk_inputs_generate_values_and_reference() -> None:
         )
     ).generate(seed=52, device="cpu")
 
-    ref = moe_biased_grouped_topk_reference(values)
-
     assert values.hidden_states.shape == (4, 6)
     assert values.gating_output.shape == (4, 8)
     assert values.correction_bias.shape == (8,)
@@ -1609,61 +1448,9 @@ def test_moe_biased_grouped_topk_inputs_generate_values_and_reference() -> None:
     )
     assert values.num_token_non_padded is not None
     assert int(values.num_token_non_padded.item()) == 3
-    assert ref.topk_weights.shape == (4, 3)
-    assert ref.topk_ids.shape == (4, 3)
-    assert ref.topk_ids.dtype == torch.int32
-    assert torch.all(ref.topk_ids[:3] >= 0)
-    assert torch.all(ref.topk_ids[:3] < 8)
-    assert torch.all(ref.topk_ids[3] == -1)
-    torch.testing.assert_close(
-        ref.topk_weights[:3].sum(dim=-1),
-        torch.full((3,), 2.5),
-        rtol=1.0e-5,
-        atol=1.0e-5,
-    )
 
 
-def test_moe_biased_grouped_topk_reference_matches_manual_group_filter() -> None:
-    values = MoEBiasedGroupedTopKInputValues(
-        hidden_states=torch.zeros((1, 4), dtype=torch.float32),
-        gating_output=torch.tensor(
-            [[0.0, 1.0, 3.0, -1.0, 2.0, -2.0]],
-            dtype=torch.float32,
-        ),
-        correction_bias=torch.tensor(
-            [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            dtype=torch.float32,
-        ),
-        top_k=3,
-        renormalize=False,
-        num_expert_groups=3,
-        top_k_groups=2,
-        routed_scaling_factor=1.0,
-        logical_to_physical_map=None,
-        num_token_non_padded=None,
-    )
-
-    ref = moe_biased_grouped_topk_reference(values)
-    scores = values.gating_output.sigmoid()
-    selection_scores = scores + values.correction_bias.reshape(1, -1)
-    group_scores = selection_scores.reshape(1, 3, 2).topk(2, dim=-1).values.sum(dim=-1)
-    selected_groups = torch.topk(group_scores, k=2, dim=-1, sorted=False).indices
-    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
-    group_mask.scatter_(1, selected_groups, True)
-    expert_mask = group_mask.unsqueeze(-1).expand(1, 3, 2).reshape(1, 6)
-    expected_ids = torch.topk(
-        selection_scores.masked_fill(~expert_mask, float("-inf")),
-        k=3,
-        dim=-1,
-        sorted=False,
-    ).indices.to(torch.int32)
-    expected_weights = scores.gather(1, expected_ids.to(torch.long)).to(torch.float32)
-
-    torch.testing.assert_close(ref.topk_ids, expected_ids)
-    torch.testing.assert_close(ref.topk_weights, expected_weights)
-
-
-def test_moe_biased_grouped_topk_verifies_config_and_values() -> None:
+def test_moe_biased_grouped_topk_verifies_config() -> None:
     with pytest.raises(ValueError, match="divisible by num_expert_groups"):
         MoEBiasedGroupedTopKInputs(
             MoEBiasedGroupedTopKInputConfig(
@@ -1687,21 +1474,6 @@ def test_moe_biased_grouped_topk_verifies_config_and_values() -> None:
             )
         )
 
-    values = MoEBiasedGroupedTopKInputs(
-        MoEBiasedGroupedTopKInputConfig(
-            num_tokens=2,
-            hidden_size=4,
-            num_experts=4,
-            top_k=2,
-            use_logical_to_physical_map=True,
-        )
-    ).generate(seed=53, device="cpu")
-    assert values.logical_to_physical_map is not None
-    values.logical_to_physical_map[0] = values.logical_to_physical_map[1]
-
-    with pytest.raises(ValueError, match="must be a permutation"):
-        moe_biased_grouped_topk_reference(values)
-
 
 def test_moe_softplus_sqrt_topk_routing_inputs_generate_non_hash_values() -> None:
     values = MoESoftplusSqrtTopKRoutingInputs(
@@ -1713,8 +1485,6 @@ def test_moe_softplus_sqrt_topk_routing_inputs_generate_non_hash_values() -> Non
         )
     ).generate(seed=54, device="cpu")
 
-    ref = moe_softplus_sqrt_topk_routing_reference(values)
-
     assert values.logits.shape == (3, 8)
     assert values.logits.dtype == torch.float32
     assert values.correction_bias is not None
@@ -1724,52 +1494,9 @@ def test_moe_softplus_sqrt_topk_routing_inputs_generate_non_hash_values() -> Non
     assert values.topk_indices.shape == (3, 4)
     assert values.topk_indices.dtype == torch.int32
     assert values.topk_weights.shape == (3, 4)
-    assert ref.topk_indices.shape == (3, 4)
-    assert ref.topk_weights.shape == (3, 4)
-    torch.testing.assert_close(
-        ref.topk_weights.sum(dim=-1),
-        torch.full((3,), 2.0),
-        rtol=1.0e-5,
-        atol=1.0e-5,
-    )
 
 
-def test_moe_softplus_sqrt_topk_routing_reference_handles_hash_table() -> None:
-    values = MoESoftplusSqrtTopKRoutingInputValues(
-        logits=torch.tensor(
-            [
-                [0.0, 1.0, -1.0, 0.5],
-                [2.0, -2.0, 0.25, 1.5],
-            ],
-            dtype=torch.float32,
-        ),
-        correction_bias=None,
-        input_ids=torch.tensor([1, 0], dtype=torch.int64),
-        hash_indices_table=torch.tensor(
-            [
-                [3, 1],
-                [0, 2],
-            ],
-            dtype=torch.int32,
-        ),
-        topk_indices=torch.empty((2, 2), dtype=torch.int32),
-        topk_weights=torch.empty((2, 2), dtype=torch.float32),
-        renormalize=True,
-        routed_scaling_factor=3.0,
-    )
-
-    ref = moe_softplus_sqrt_topk_routing_reference(values)
-    transformed = torch.sqrt(torch.nn.functional.softplus(values.logits))
-    expected_ids = torch.tensor([[0, 2], [3, 1]], dtype=torch.int32)
-    expected_weights = transformed.gather(1, expected_ids.to(torch.long))
-    expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
-    expected_weights = expected_weights * 3.0
-
-    torch.testing.assert_close(ref.topk_indices, expected_ids)
-    torch.testing.assert_close(ref.topk_weights, expected_weights)
-
-
-def test_moe_softplus_sqrt_topk_routing_verifies_config_and_values() -> None:
+def test_moe_softplus_sqrt_topk_routing_verifies_config() -> None:
     with pytest.raises(ValueError, match="renormalize=True"):
         MoESoftplusSqrtTopKRoutingInputs(
             MoESoftplusSqrtTopKRoutingInputConfig(
@@ -1778,20 +1505,6 @@ def test_moe_softplus_sqrt_topk_routing_verifies_config_and_values() -> None:
                 renormalize=False,
             )
         )
-
-    values = MoESoftplusSqrtTopKRoutingInputValues(
-        logits=torch.zeros((1, 4), dtype=torch.float32),
-        correction_bias=None,
-        input_ids=torch.tensor([0], dtype=torch.int32),
-        hash_indices_table=torch.tensor([[1, 1]], dtype=torch.int32),
-        topk_indices=torch.empty((1, 2), dtype=torch.int32),
-        topk_weights=torch.empty((1, 2), dtype=torch.float32),
-        renormalize=True,
-        routed_scaling_factor=1.0,
-    )
-
-    with pytest.raises(ValueError, match="must not repeat experts"):
-        moe_softplus_sqrt_topk_routing_reference(values)
 
 
 def test_moe_deepseek_v4_mega_moe_staging_inputs_generate_values() -> None:
@@ -1804,8 +1517,6 @@ def test_moe_deepseek_v4_mega_moe_staging_inputs_generate_values() -> None:
             hidden_dtype=torch.bfloat16,
         )
     ).generate(seed=55, device="cpu")
-
-    ref = moe_deepseek_v4_mega_moe_staging_reference(values)
 
     assert values.hidden_states.shape == (3, 256)
     assert values.hidden_states.dtype == torch.bfloat16
@@ -1824,35 +1535,9 @@ def test_moe_deepseek_v4_mega_moe_staging_inputs_generate_values() -> None:
     assert values.x_fp8.dtype == torch.float8_e4m3fn
     assert values.x_sf.shape == (3, 2)
     assert values.x_sf.dtype == torch.int32
-    assert ref.x_fp8.shape == values.x_fp8.shape
-    assert ref.x_sf.shape == values.x_sf.shape
-    torch.testing.assert_close(ref.topk_idx_out, values.topk_ids)
-    torch.testing.assert_close(ref.topk_weights_out, values.topk_weights)
 
 
-def test_moe_deepseek_v4_mega_moe_staging_reference_packs_scale_exponents() -> None:
-    values = MoEDeepSeekV4MegaMoEStagingInputValues(
-        hidden_states=torch.ones((1, 128), dtype=torch.float32),
-        topk_ids=torch.tensor([[2, 0]], dtype=torch.int32),
-        topk_weights=torch.tensor([[0.25, 0.75]], dtype=torch.float32),
-        x_fp8=torch.empty((1, 128), dtype=torch.float8_e4m3fn),
-        x_sf=torch.empty((1, 1), dtype=torch.int32),
-        topk_idx_out=torch.empty((1, 2), dtype=torch.int32),
-        topk_weights_out=torch.empty((1, 2), dtype=torch.float32),
-        num_experts=4,
-    )
-
-    ref = moe_deepseek_v4_mega_moe_staging_reference(values)
-
-    # For amax=1, the exact scale is 1/448. The staging op rounds that up to
-    # the next power of two, 2^-8, whose biased exponent byte is 119.
-    assert int(ref.x_sf[0, 0].item()) == 0x77777777
-    torch.testing.assert_close(ref.topk_idx_out, values.topk_ids)
-    torch.testing.assert_close(ref.topk_weights_out, values.topk_weights)
-    assert torch.isfinite(ref.x_fp8.float()).all()
-
-
-def test_moe_deepseek_v4_mega_moe_staging_verifies_config_and_values() -> None:
+def test_moe_deepseek_v4_mega_moe_staging_verifies_config() -> None:
     with pytest.raises(ValueError, match="multiple of 128"):
         MoEDeepSeekV4MegaMoEStagingInputs(
             MoEDeepSeekV4MegaMoEStagingInputConfig(
@@ -1863,21 +1548,8 @@ def test_moe_deepseek_v4_mega_moe_staging_verifies_config_and_values() -> None:
             )
         )
 
-    values = MoEDeepSeekV4MegaMoEStagingInputs(
-        MoEDeepSeekV4MegaMoEStagingInputConfig(
-            num_tokens=2,
-            hidden_size=128,
-            num_experts=4,
-            top_k=2,
-        )
-    ).generate(seed=56, device="cpu")
-    values.topk_ids[0, 0] = 4
 
-    with pytest.raises(ValueError, match="less than num_experts"):
-        moe_deepseek_v4_mega_moe_staging_reference(values)
-
-
-def test_moe_finalize_fuse_shared_inputs_generate_values_and_reference() -> None:
+def test_moe_finalize_fuse_shared_inputs_generate_values() -> None:
     values = MoEFinalizeFuseSharedInputs(
         MoEFinalizeFuseSharedInputConfig(
             num_tokens=3,
@@ -1890,8 +1562,6 @@ def test_moe_finalize_fuse_shared_inputs_generate_values_and_reference() -> None
             expert_weights_dtype=torch.float32,
         )
     ).generate(seed=57, device="cpu")
-
-    ref = moe_finalize_fuse_shared_reference(values)
 
     assert values.gemm2_out.shape == (8, 12)
     assert values.gemm2_out.dtype == torch.bfloat16
@@ -1909,43 +1579,6 @@ def test_moe_finalize_fuse_shared_inputs_generate_values_and_reference() -> None
     assert values.shared_output is not None
     assert values.shared_output.shape == (3, 8)
     assert values.shared_output.dtype == torch.bfloat16
-    assert ref.shape == (3, 8)
-    assert ref.dtype == torch.bfloat16
-    assert torch.isfinite(ref.float()).all()
-
-
-def test_moe_finalize_fuse_shared_reference_matches_manual_sum() -> None:
-    values = MoEFinalizeFuseSharedInputValues(
-        gemm2_out=torch.tensor(
-            [
-                [1.0, 2.0, 3.0],
-                [4.0, 5.0, 6.0],
-                [7.0, 8.0, 9.0],
-            ],
-            dtype=torch.bfloat16,
-        ),
-        expanded_idx_to_permuted_idx=torch.tensor([0, 2, -1, 1], dtype=torch.int32),
-        expert_weights=torch.tensor(
-            [[0.25, 0.75], [0.5, 0.5]],
-            dtype=torch.float32,
-        ),
-        shared_output=torch.tensor(
-            [[1.0, -1.0], [0.5, 0.25]],
-            dtype=torch.bfloat16,
-        ),
-    )
-
-    ref = moe_finalize_fuse_shared_reference(values)
-    expected = torch.stack(
-        [
-            0.25 * values.gemm2_out[0, :2].float()
-            + 0.75 * values.gemm2_out[2, :2].float()
-            + values.shared_output[0].float(),
-            0.5 * values.gemm2_out[1, :2].float() + values.shared_output[1].float(),
-        ]
-    ).to(torch.bfloat16)
-
-    torch.testing.assert_close(ref, expected)
 
 
 def test_moe_finalize_fuse_shared_inputs_support_no_shared_output() -> None:
@@ -1959,16 +1592,12 @@ def test_moe_finalize_fuse_shared_inputs_support_no_shared_output() -> None:
         )
     ).generate(seed=58, device="cpu")
 
-    ref = moe_finalize_fuse_shared_reference(values)
-
     assert values.shared_output is None
     assert values.gemm2_out.shape == (4, 8)
     assert values.expert_weights.dtype == torch.bfloat16
-    assert ref.shape == (2, 8)
-    assert ref.dtype == torch.bfloat16
 
 
-def test_moe_finalize_fuse_shared_verifies_config_and_values() -> None:
+def test_moe_finalize_fuse_shared_verifies_config() -> None:
     with pytest.raises(ValueError, match="top_k"):
         MoEFinalizeFuseSharedInputs(
             MoEFinalizeFuseSharedInputConfig(
@@ -1986,18 +1615,6 @@ def test_moe_finalize_fuse_shared_verifies_config_and_values() -> None:
                 total_num_padded_tokens=3,
             )
         )
-
-    values = MoEFinalizeFuseSharedInputs(
-        MoEFinalizeFuseSharedInputConfig(
-            num_tokens=2,
-            hidden_size=8,
-            top_k=2,
-        )
-    ).generate(seed=59, device="cpu")
-    values.expanded_idx_to_permuted_idx[0] = values.gemm2_out.shape[0]
-
-    with pytest.raises(ValueError, match="less than gemm2_out rows"):
-        moe_finalize_fuse_shared_reference(values)
 
 
 def test_moe_align_block_size_inputs_generate_topk_ids() -> None:
@@ -2049,66 +1666,3 @@ def test_moe_align_block_size_inputs_verify_config() -> None:
                 topk_ids_dtype=torch.float32,
             )
         )
-
-
-def test_moe_align_block_size_reference_pads_each_expert() -> None:
-    values = MoeAlignBlockSizeInputValues(
-        topk_ids=torch.tensor(
-            [
-                [1, 2, 3],
-                [0, 1, 3],
-                [0, 2, 3],
-                [0, 1, 2],
-            ],
-            dtype=torch.int32,
-        ),
-        block_size=4,
-        num_experts=4,
-    )
-
-    assert moe_align_block_size_buffer_dims(values) == (4, 16)
-    ref = moe_align_block_size_reference(values)
-
-    torch.testing.assert_close(
-        ref.sorted_token_ids,
-        torch.tensor(
-            [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12],
-            dtype=torch.int32,
-        ),
-        atol=0,
-        rtol=0,
-    )
-    torch.testing.assert_close(
-        ref.expert_ids,
-        torch.tensor([0, 1, 2, 3], dtype=torch.int32),
-        atol=0,
-        rtol=0,
-    )
-    torch.testing.assert_close(
-        ref.num_tokens_post_pad,
-        torch.tensor([16], dtype=torch.int32),
-        atol=0,
-        rtol=0,
-    )
-
-    canonical = canonicalize_moe_align_block_size(ref, block_size=4)
-    torch.testing.assert_close(
-        canonical,
-        torch.tensor(
-            [16, 0, 1, 2, 3, 3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12],
-            dtype=torch.int32,
-        ),
-        atol=0,
-        rtol=0,
-    )
-
-
-def test_moe_align_block_size_reference_rejects_invalid_ids() -> None:
-    values = MoeAlignBlockSizeInputValues(
-        topk_ids=torch.tensor([[0, 4]], dtype=torch.int32),
-        block_size=4,
-        num_experts=4,
-    )
-
-    with pytest.raises(ValueError, match="less than num_experts"):
-        moe_align_block_size_reference(values)

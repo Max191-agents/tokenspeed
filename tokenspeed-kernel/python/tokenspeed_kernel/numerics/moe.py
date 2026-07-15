@@ -47,11 +47,9 @@ from tokenspeed_numerics_input_generators import (
     CustomDType,
     MoeAlignBlockSizeInputConfig,
     MoeAlignBlockSizeInputs,
-    MoeAlignBlockSizeReferenceValues,
     MoeInputConfig,
     MoeInputs,
     MoeInputValues,
-    canonicalize_moe_align_block_size,
 )
 
 
@@ -532,11 +530,17 @@ def canonicalize_align_block_size(
 
     Caller must size ``sorted_ids`` to ``expert_ids.numel() * block_size``.
     """
-    return canonicalize_moe_align_block_size(
-        MoeAlignBlockSizeReferenceValues(
-            sorted_token_ids=sorted_ids,
-            expert_ids=expert_ids,
-            num_tokens_post_pad=num_tokens_post_pad,
-        ),
-        block_size=block_size,
+    block_size = int(block_size)
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if sorted_ids.numel() != expert_ids.numel() * block_size:
+        raise ValueError("sorted_ids size must equal expert_ids.numel() * block_size")
+    blocks = sorted_ids.reshape(expert_ids.numel(), block_size)
+    blocks_sorted, _ = blocks.sort(dim=-1)
+    return torch.cat(
+        (
+            num_tokens_post_pad.flatten().to(torch.int32),
+            expert_ids.flatten().to(torch.int32),
+            blocks_sorted.flatten().to(torch.int32),
+        )
     )

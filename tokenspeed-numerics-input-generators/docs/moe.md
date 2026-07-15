@@ -134,53 +134,6 @@ Dropped token/top-k slots use permute index `-1` and do not contribute to the
 sum. `gemm2_out` may use a padded hidden width; when `shared_output` is
 present, the logical output width is the shared-output width.
 
-## References
-
-`moe_reference` implements the routed layer computation for generated MoE
-values. For each token and selected expert it applies the expert gate/up
-projection, computes the gated activation, applies the expert down projection,
-scales the result by the selected routing weight, and sums across selected
-experts. Dense weights and generated scaled, MXFP4, or MXINT4 weight values are
-normalized through the GEMM operand semantics before the reference matmuls.
-
-`moe_align_block_size_reference` implements the block-alignment metadata
-semantics directly:
-
-1. Flatten `topk_ids` so each selected token-expert pair has one slot id.
-2. Collect slot ids for each expert.
-3. Pad each expert's slot list with the sentinel id `topk_ids.numel()` until the
-   expert's slot count is divisible by `block_size`.
-4. Emit concatenated `sorted_token_ids`, one `expert_id` per block, and the
-   total padded token count.
-
-`canonicalize_moe_align_block_size` packs those outputs into a deterministic
-comparison tensor while ignoring intra-block ordering differences that can arise
-from parallel implementations.
-
-`moe_softmax_topk_routing_reference` implements the softmax, correction-bias
-selection, optional selected-weight renormalization, scaling, and padded-expert
-masking semantics described above. Ties are resolved by selecting the smaller
-expert id first so reference output is deterministic.
-
-`moe_biased_grouped_topk_reference` implements sigmoid scoring, grouped
-candidate filtering, top-k expert selection, optional renormalization/scaling,
-logical-to-physical expert id mapping, and padded-token output id masking.
-
-`moe_softplus_sqrt_topk_routing_reference` implements both correction-bias and
-hash-table softplus-sqrt routing. Non-hash ties are resolved by smaller expert
-id first for deterministic references. Hash-table routing preserves the expert
-order stored in the selected table row.
-
-`moe_deepseek_v4_mega_moe_staging_reference` implements the 128-wide FP8 hidden
-quantization, packed exponent-scale output, and top-k tensor copy semantics
-described above.
-
-`moe_finalize_fuse_shared_reference` implements routed-output finalization by
-gathering active `gemm2_out` rows through the flattened permute map, applying
-the per-slot expert weights, summing across `top_k`, and optionally adding the
-shared residual. The reference returns BF16 output to match the TokenSpeed CUDA
-helper.
-
 ## TokenSpeed API Mapping
 
 TokenSpeed fused MoE kernels consume a runtime weight module plus a plan created
@@ -202,8 +155,9 @@ Dense TokenSpeed MoE adapters follow the same pattern with ordinary torch
 weight tensors. `MoeInputs` provides the semantic expert weights in
 `w13.B` and `w2.B`; the adapter attaches them to a small module, calls
 `moe_process_weights` for the selected backend, and then compares `moe_apply`
-against `moe_reference(values)`. Backend-specific gate/up reordering is owned
-by `moe_process_weights`, not by the generator.
+against a reference owned by TokenSpeed's numerical-testing layer.
+Backend-specific gate/up reordering is owned by `moe_process_weights`, not by
+the generator.
 
 The FlashInfer TRT-LLM MXINT4 path is a weight-only INT4 variant with BF16
 group scales. `MoeInputs(weight_format="mxint4")` generates the operation-level
@@ -257,12 +211,11 @@ MoE configs verify token counts, hidden/intermediate widths, expert counts,
 top-k constraints, block sizes, integer routing dtypes, and generated id
 ranges. Optional activation scales must use regular floating dtypes and
 positive finite scalar fill values. MXINT4 weights require BF16 group scales
-with shapes derived from the expert projection widths. The layer reference
-checks that selected expert ids and weights are rank-2, shape-consistent,
-finite, non-negative, duplicate-free per token, and normalized across each
-token's selected experts. The align-block-size reference also checks that
-provided top-k ids are rank-2 and within `[0, num_experts)`, so invalid routing
-metadata fails before reaching a kernel adapter.
+with shapes derived from the expert projection widths. Generated selected
+expert ids and weights are rank-2, shape-consistent, finite, non-negative,
+duplicate-free per token, and normalized across each token's selected experts.
+The align-block-size generator checks that top-k ids are rank-2 and within
+`[0, num_experts)` before returning them.
 
 Softmax top-k routing verifies that logits and correction bias are finite FP32
 tensors with matching expert width, output buffers are rank-2 with matching
