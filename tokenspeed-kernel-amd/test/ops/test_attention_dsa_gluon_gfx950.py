@@ -913,8 +913,9 @@ def _make_grouped_radix_logits(
     *,
     cols: int,
     topk: int,
+    seed: int = 1907,
 ) -> torch.Tensor:
-    generator = _generator("cuda", 1907)
+    generator = _generator("cuda", seed)
     logits = torch.empty(
         (row_starts.numel(), cols),
         device="cuda",
@@ -1050,6 +1051,128 @@ def test_dsa_decode_radix_topk_groups_tiles_for_batched_queries() -> None:
         logits,
         out,
         lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+
+
+def test_dsa_prefill_grouped_radix_topk_is_graph_capturable() -> None:
+    rows = 64
+    cols = 90000
+    topk = 2048
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = row_ids * 11
+    row_ends = cols - (rows - 1 - row_ids) * 19
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        dsa_topk_gfx950._dsa_prefill_radix_topk(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+    torch.cuda.current_stream().wait_stream(side_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dsa_topk_gfx950._dsa_prefill_radix_topk(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+    out.fill_(-7)
+    graph.replay()
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+
+
+def test_dsa_prefill_grouped_radix_topk_is_stream_local() -> None:
+    rows = 64
+    cols = 90000
+    topk = 2048
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = row_ids * 13
+    row_ends = cols - (rows - 1 - row_ids) * 23
+    logits_a = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=2907,
+    )
+    logits_b = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=3907,
+    )
+    out_a = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    out_b = torch.empty_like(out_a)
+    lens_a = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    lens_b = torch.empty_like(lens_a)
+
+    current_stream = torch.cuda.current_stream()
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    stream_a.wait_stream(current_stream)
+    stream_b.wait_stream(current_stream)
+    with torch.cuda.stream(stream_a):
+        dsa_topk_gfx950._dsa_prefill_radix_topk(
+            logits_a,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out_a,
+            lens_out=lens_a,
+        )
+    with torch.cuda.stream(stream_b):
+        dsa_topk_gfx950._dsa_prefill_radix_topk(
+            logits_b,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out_b,
+            lens_out=lens_b,
+        )
+    current_stream.wait_stream(stream_a)
+    current_stream.wait_stream(stream_b)
+
+    _assert_grouped_radix_topk(
+        logits_a,
+        out_a,
+        lens_a,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    _assert_grouped_radix_topk(
+        logits_b,
+        out_b,
+        lens_b,
         row_starts,
         row_ends,
         topk=topk,
