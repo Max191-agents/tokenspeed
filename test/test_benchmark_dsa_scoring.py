@@ -210,16 +210,13 @@ def test_combine_preserves_graph_measurement_provenance(
     assert measurement["capture_launches_per_cell"] == 1
     assert measurement["host_submission_in_timing"] is False
     assert measurement["measured_execution"] == "captured_production_graph_replay"
-    assert measurement["event_timing"] == (
-        "torch.cuda.Event_batched_until_cell_end"
-    )
+    assert measurement["event_timing"] == ("torch.cuda.Event_batched_until_cell_end")
     assert all(
         Path(item["path"]).is_absolute()
         for item in combined["provenance"]["round_inputs"]
     )
     assert all(
-        len(item["sha256"]) == 64
-        for item in combined["provenance"]["round_inputs"]
+        len(item["sha256"]) == 64 for item in combined["provenance"]["round_inputs"]
     )
 
 

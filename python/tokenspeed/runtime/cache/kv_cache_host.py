@@ -29,6 +29,7 @@ from pathlib import Path
 
 import psutil
 import torch
+from tokenspeed_kernel.ops.kvcache.cuda import transfer_kv_direct
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
@@ -45,7 +46,6 @@ if _platform.is_nvidia:
         transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,

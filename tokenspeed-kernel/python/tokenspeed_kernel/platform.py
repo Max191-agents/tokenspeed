@@ -666,27 +666,30 @@ def _check_nvlink_available() -> bool:
 @lru_cache(maxsize=1)
 def _get_hip_runtime():
     lib_name = "libamdhip64.so"
-    candidates = []
-    torch_hip_path = Path(torch.__file__).resolve().parent / "lib" / lib_name
-    if torch_hip_path.exists():
-        candidates.append(str(torch_hip_path))
-    candidates.append(lib_name)
+    candidates: list[str | None] = []
+    torch_extension_path = getattr(torch._C, "__file__", None)
+    if torch_extension_path:
+        # Resolve through Torch's dependency scope so host registration and
+        # pointer lookup use the same HIP runtime instance.
+        candidates.append(str(Path(torch_extension_path).resolve()))
+    candidates.append(None)
 
     last_error = None
     for candidate in candidates:
         try:
             lib = ctypes.CDLL(candidate)
-            lib.hipHostGetDevicePointer.argtypes = [
+            get_device_pointer = lib.hipHostGetDevicePointer
+            get_device_pointer.argtypes = [
                 ctypes.POINTER(ctypes.c_void_p),
                 ctypes.c_void_p,
                 ctypes.c_uint,
             ]
-            lib.hipHostGetDevicePointer.restype = ctypes.c_int
+            get_device_pointer.restype = ctypes.c_int
             if hasattr(lib, "hipGetErrorString"):
                 lib.hipGetErrorString.argtypes = [ctypes.c_int]
                 lib.hipGetErrorString.restype = ctypes.c_char_p
             return lib
-        except OSError as exc:
+        except (AttributeError, OSError) as exc:
             last_error = exc
 
     raise RuntimeError(f"Failed to load {lib_name}") from last_error
