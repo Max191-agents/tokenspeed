@@ -1082,6 +1082,38 @@ def _assert_decode_topk_slots(
         assert bool((actual[row, count:] == -1).all())
 
 
+def _assert_persistent_workspace_layout(
+    workspace: tuple[torch.Tensor, ...],
+    rows: int,
+) -> None:
+    row_bucket = dsa_topk_gfx950._next_power_of_two(rows)
+    num_passes = dsa_topk_gfx950._PERSISTENT_PREFILL_NUM_PASSES.value
+    num_buckets = dsa_topk_gfx950._PERSISTENT_PREFILL_NUM_BUCKETS.value
+    counter_stride = dsa_topk_gfx950._PERSISTENT_PREFILL_COUNTER_STRIDE.value
+    histograms, pass_arrivals, pass_done, reset_arrivals, output_counters = workspace
+
+    assert histograms.shape == (row_bucket, num_passes, num_buckets)
+    assert pass_arrivals.shape == (row_bucket, counter_stride)
+    assert pass_done.shape == (row_bucket, counter_stride)
+    assert reset_arrivals.shape == (row_bucket, counter_stride)
+    assert output_counters.shape == (row_bucket, 2, counter_stride)
+
+
+def _assert_persistent_workspace_reset(workspace: tuple[torch.Tensor, ...]) -> None:
+    assert all(int(torch.count_nonzero(tensor).item()) == 0 for tensor in workspace)
+
+
+def test_dsa_persistent_workspace_uses_one_cyclic_pass_arrival_per_row() -> None:
+    rows = 33
+    workspace = dsa_topk_gfx950._persistent_topk_workspace(
+        rows,
+        torch.device("cuda"),
+    )
+
+    _assert_persistent_workspace_layout(workspace, rows)
+    _assert_persistent_workspace_reset(workspace)
+
+
 @pytest.mark.parametrize(
     ("rows", "cols", "expected_groups"),
     (
@@ -1136,7 +1168,8 @@ def test_dsa_prefill_topk_dispatches_persistent_groups_across_rows(
         topk=topk,
     )
     workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
-    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace)
+    _assert_persistent_workspace_layout(workspace, rows)
+    _assert_persistent_workspace_reset(workspace)
 
 
 def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
@@ -1158,6 +1191,9 @@ def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
     tiles = dsa_topk_gfx950.triton.cdiv(cols, dsa_topk_gfx950._RADIX_TOPK_BLOCK_N)
     groups = dsa_topk_gfx950._radix_groups_per_row(rows, tiles, logits.device)
     assert groups < tiles
+    workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+    _assert_persistent_workspace_layout(workspace, rows)
+    _assert_persistent_workspace_reset(workspace)
     dsa_topk_gfx950._dsa_prefill_topk_indices(
         logits,
         row_starts,
@@ -1174,6 +1210,7 @@ def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
         row_ends,
         topk=topk,
     )
+    _assert_persistent_workspace_reset(workspace)
     out.fill_(-1)
     lens_out.fill_(-1)
     dsa_topk_gfx950._dsa_prefill_topk_indices(
@@ -1193,6 +1230,7 @@ def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
         row_ends,
         topk=topk,
     )
+    _assert_persistent_workspace_reset(workspace)
 
 
 def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
@@ -2748,7 +2786,8 @@ def test_dsa_persistent_decode_handles_tail_ties_and_infinities() -> None:
         topk=topk,
     )
     workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
-    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace)
+    _assert_persistent_workspace_layout(workspace, rows)
+    _assert_persistent_workspace_reset(workspace)
 
 
 @pytest.mark.parametrize("warm_workspace", (False, True), ids=("cold-key", "warm-key"))
@@ -2826,6 +2865,9 @@ def test_dsa_persistent_decode_is_graph_capturable(warm_workspace: bool) -> None
             lens_out=lens_out,
         )
     capture_stream.synchronize()
+    graph_workspace = dsa_topk_gfx950._persistent_topk_workspace_cache[workspace_key]
+    _assert_persistent_workspace_layout(graph_workspace, rows)
+    _assert_persistent_workspace_reset(graph_workspace)
     out.fill_(-7)
     graph.replay()
     torch.cuda.synchronize()
@@ -2840,6 +2882,7 @@ def test_dsa_persistent_decode_is_graph_capturable(warm_workspace: bool) -> None
         q_len_per_req=q_len_per_req,
         topk=topk,
     )
+    _assert_persistent_workspace_reset(graph_workspace)
 
 
 def test_dsa_persistent_decode_is_stream_local() -> None:
@@ -2943,8 +2986,10 @@ def test_dsa_persistent_decode_is_stream_local() -> None:
         q_len_per_req=q_len_per_req,
         topk=topk,
     )
-    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace_a)
-    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace_b)
+    _assert_persistent_workspace_layout(workspace_a, rows)
+    _assert_persistent_workspace_layout(workspace_b, rows)
+    _assert_persistent_workspace_reset(workspace_a)
+    _assert_persistent_workspace_reset(workspace_b)
 
 
 def test_dsa_prefill_topk_hist_derived_handles_shifted_and_inf_rows() -> None:
@@ -3179,10 +3224,10 @@ def test_dsa_persistent_prefill_topk_is_graph_capturable(
         )
     capture_stream.synchronize()
     assert workspace_key in dsa_topk_gfx950._persistent_topk_workspace_cache
+    graph_workspace = dsa_topk_gfx950._persistent_topk_workspace_cache[workspace_key]
+    _assert_persistent_workspace_layout(graph_workspace, rows)
+    _assert_persistent_workspace_reset(graph_workspace)
     if warm_workspace:
-        graph_workspace = dsa_topk_gfx950._persistent_topk_workspace_cache[
-            workspace_key
-        ]
         graph_workspace_ptrs = tuple(t.data_ptr() for t in graph_workspace)
         pressure_streams = [torch.cuda.Stream() for _ in range(17)]
         for pressure_stream in pressure_streams:
@@ -3215,6 +3260,7 @@ def test_dsa_persistent_prefill_topk_is_graph_capturable(
         row_ends,
         topk=topk,
     )
+    _assert_persistent_workspace_reset(graph_workspace)
 
 
 def test_dsa_persistent_prefill_topk_is_stream_local() -> None:
@@ -3299,8 +3345,10 @@ def test_dsa_persistent_prefill_topk_is_stream_local() -> None:
         row_ends,
         topk=topk,
     )
-    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace_a)
-    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace_b)
+    _assert_persistent_workspace_layout(workspace_a, rows)
+    _assert_persistent_workspace_layout(workspace_b, rows)
+    _assert_persistent_workspace_reset(workspace_a)
+    _assert_persistent_workspace_reset(workspace_b)
 
 
 def _pack_sparse_kv(
