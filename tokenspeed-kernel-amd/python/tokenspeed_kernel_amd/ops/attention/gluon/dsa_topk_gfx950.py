@@ -397,15 +397,9 @@ def _emit_oneblock_topk_tile(
     remaining,
     selected_count,
     shared_output_counters,
-    block_table,
     out,
     row,
-    req,
-    block_table_stride: gl.constexpr,
     out_stride: gl.constexpr,
-    block_table_cols: gl.constexpr,
-    page_size: gl.constexpr,
-    IS_DECODE: gl.constexpr,
     value_layout: gl.constexpr,
     BLOCK_N: gl.constexpr,
     IS_TAIL: gl.constexpr,
@@ -435,29 +429,16 @@ def _emit_oneblock_topk_tile(
     equal_position = count_greater + equal_rank
     greater_write = greater_mask & (greater_position < selected_count)
     equal_write = equal_mask & (equal_rank < remaining)
-    write_mask = greater_write | equal_write
     logical_offsets = candidate_start + offsets.to(gl.int32)
-
-    if IS_DECODE:
-        block_idx = logical_offsets // page_size
-        block_offset = logical_offsets - block_idx * page_size
-        page = gl.load(
-            block_table + req * block_table_stride + block_idx,
-            mask=write_mask & (block_idx < block_table_cols),
-            other=0,
-        ).to(gl.int32)
-        indices = page * page_size + block_offset
-    else:
-        indices = logical_offsets
 
     gl.store(
         out + row * out_stride + greater_position,
-        indices,
+        logical_offsets,
         mask=greater_write,
     )
     gl.store(
         out + row * out_stride + equal_position,
-        indices,
+        logical_offsets,
         mask=equal_write,
     )
 
@@ -968,15 +949,9 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             remaining,
             selected_count,
             shared_output_counters,
-            block_table,
             out,
             row,
-            req,
-            block_table_stride,
             out_stride,
-            block_table_cols,
-            page_size,
-            IS_DECODE,
             value_layout,
             BLOCK_N,
             False,
@@ -993,18 +968,33 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             remaining,
             selected_count,
             shared_output_counters,
-            block_table,
             out,
             row,
-            req,
-            block_table_stride,
             out_stride,
-            block_table_cols,
-            page_size,
-            IS_DECODE,
             value_layout,
             BLOCK_N,
             True,
+        )
+
+    if IS_DECODE:
+        gl.barrier()
+        valid_output = output_offsets < selected_count
+        logical_offsets = gl.load(
+            out + row * out_stride + output_offsets,
+            mask=valid_output,
+            other=0,
+        ).to(gl.int32)
+        block_idx = logical_offsets // page_size
+        block_offset = logical_offsets - block_idx * page_size
+        page = gl.load(
+            block_table + req * block_table_stride + block_idx,
+            mask=valid_output & (block_idx < block_table_cols),
+            other=0,
+        ).to(gl.int32)
+        gl.store(
+            out + row * out_stride + output_offsets,
+            page * page_size + block_offset,
+            mask=valid_output,
         )
 
 
