@@ -1348,6 +1348,271 @@ def test_dsa_prefill_topk_90k_boundary_keeps_exact_values() -> None:
     )
 
 
+def _make_oneblock_scan_logits(
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    cols: int,
+    seed: int,
+) -> torch.Tensor:
+    logits = torch.full(
+        (row_starts.numel(), cols),
+        float("inf"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    generator = _generator("cuda", seed)
+    starts = row_starts.cpu().tolist()
+    ends = row_ends.cpu().tolist()
+    for row, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        logits[row, start:end].uniform_(-1.0, 1.0, generator=generator)
+
+    logits[0, starts[0] : ends[0]] = float("inf")
+    logits[1, starts[1] : ends[1]] = -float("inf")
+    logits[2, starts[2] : starts[2] + 37] = float("inf")
+    logits[2, starts[2] + 37 : ends[2] : 257] = -float("inf")
+    tie_start = starts[3] + 4096
+    logits[3, tie_start : tie_start + 4096] = 2.0
+    return logits
+
+
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+def test_dsa_oneblock_hierarchical_scan_matches_reference_and_repeats(
+    mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+) -> None:
+    rows = 4
+    cols = 90000
+    topk = 2048
+    page_size = 64
+    if mode == "decode":
+        row_starts = torch.zeros((rows,), device="cuda", dtype=torch.int32)
+        row_ends = torch.tensor(
+            [32768, 65537, 89971, cols], device="cuda", dtype=torch.int32
+        )
+    else:
+        row_starts = torch.tensor([17, 31, 47, 63], device="cuda", dtype=torch.int32)
+        row_ends = torch.tensor(
+            [32785, 65568, 89971, cols], device="cuda", dtype=torch.int32
+        )
+    logits = _make_oneblock_scan_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        seed=8907,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_USE_HIERARCHICAL_SCAN",
+        True,
+    )
+
+    if mode == "decode":
+        block_table = _make_reversed_decode_block_table(rows, cols, page_size)
+        for _ in range(2):
+            dsa_topk_gfx950._dsa_decode_topk_slots(
+                logits,
+                block_table,
+                row_ends,
+                page_size=page_size,
+                topk=topk,
+                q_len_per_req=1,
+                out=out,
+                lens_out=lens_out,
+            )
+            _assert_decode_topk_slots(
+                logits,
+                out,
+                lens_out,
+                row_ends,
+                block_table,
+                page_size=page_size,
+                q_len_per_req=1,
+                topk=topk,
+            )
+    else:
+        for _ in range(2):
+            dsa_topk_gfx950._dsa_prefill_topk_indices(
+                logits,
+                row_starts,
+                row_ends,
+                topk=topk,
+                out=out,
+                lens_out=lens_out,
+            )
+            _assert_grouped_radix_topk(
+                logits,
+                out,
+                lens_out,
+                row_starts,
+                row_ends,
+                topk=topk,
+            )
+
+
+def test_dsa_oneblock_hierarchical_scan_is_graph_capturable(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+) -> None:
+    rows = 4
+    cols = 90000
+    topk = 2048
+    row_starts = torch.tensor([17, 31, 47, 63], device="cuda", dtype=torch.int32)
+    row_ends = torch.tensor(
+        [32785, 65568, 89971, cols], device="cuda", dtype=torch.int32
+    )
+    logits = _make_oneblock_scan_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        seed=9907,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_USE_HIERARCHICAL_SCAN",
+        True,
+    )
+
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+    torch.cuda.current_stream().wait_stream(side_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+    out.fill_(-7)
+    graph.replay()
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+
+
+def test_dsa_oneblock_hierarchical_scan_is_stream_local(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+) -> None:
+    rows = 4
+    cols = 90000
+    topk = 2048
+    page_size = 64
+    row_starts = torch.zeros((rows,), device="cuda", dtype=torch.int32)
+    seq_lens = torch.tensor(
+        [32768, 65537, 89971, cols], device="cuda", dtype=torch.int32
+    )
+    logits_a = _make_oneblock_scan_logits(
+        row_starts,
+        seq_lens,
+        cols=cols,
+        seed=10907,
+    )
+    logits_b = _make_oneblock_scan_logits(
+        row_starts,
+        seq_lens,
+        cols=cols,
+        seed=11907,
+    )
+    block_table = _make_reversed_decode_block_table(rows, cols, page_size)
+    out_a = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    out_b = torch.empty_like(out_a)
+    lens_a = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    lens_b = torch.empty_like(lens_a)
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_USE_HIERARCHICAL_SCAN",
+        True,
+    )
+
+    dsa_topk_gfx950._dsa_decode_topk_slots(
+        logits_a,
+        block_table,
+        seq_lens,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=1,
+        out=out_a,
+        lens_out=lens_a,
+    )
+    current_stream = torch.cuda.current_stream()
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    stream_a.wait_stream(current_stream)
+    stream_b.wait_stream(current_stream)
+    with torch.cuda.stream(stream_a):
+        for _ in range(3):
+            dsa_topk_gfx950._dsa_decode_topk_slots(
+                logits_a,
+                block_table,
+                seq_lens,
+                page_size=page_size,
+                topk=topk,
+                q_len_per_req=1,
+                out=out_a,
+                lens_out=lens_a,
+            )
+    with torch.cuda.stream(stream_b):
+        for _ in range(3):
+            dsa_topk_gfx950._dsa_decode_topk_slots(
+                logits_b,
+                block_table,
+                seq_lens,
+                page_size=page_size,
+                topk=topk,
+                q_len_per_req=1,
+                out=out_b,
+                lens_out=lens_b,
+            )
+    current_stream.wait_stream(stream_a)
+    current_stream.wait_stream(stream_b)
+
+    _assert_decode_topk_slots(
+        logits_a,
+        out_a,
+        lens_a,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        q_len_per_req=1,
+        topk=topk,
+    )
+    _assert_decode_topk_slots(
+        logits_b,
+        out_b,
+        lens_b,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        q_len_per_req=1,
+        topk=topk,
+    )
+
+
 def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
     device = torch.device("cuda")
     compute_units = torch.cuda.get_device_properties(device).multi_processor_count
