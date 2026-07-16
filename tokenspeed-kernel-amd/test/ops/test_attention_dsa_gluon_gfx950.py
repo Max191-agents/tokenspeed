@@ -968,7 +968,7 @@ def _assert_grouped_radix_topk(
         assert bool((actual[row, count:] == -1).all())
 
 
-def test_dsa_prefill_radix_topk_groups_tiles_across_rows() -> None:
+def test_dsa_prefill_topk_dispatches_staged_groups_across_rows() -> None:
     rows = 64
     cols = 131072
     topk = 2048
@@ -987,7 +987,7 @@ def test_dsa_prefill_radix_topk_groups_tiles_across_rows() -> None:
     tiles = dsa_topk_gfx950.triton.cdiv(cols, dsa_topk_gfx950._RADIX_TOPK_BLOCK_N)
     groups = dsa_topk_gfx950._radix_groups_per_row(rows, tiles, logits.device)
     assert groups < tiles
-    dsa_topk_gfx950._dsa_prefill_radix_topk(
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1006,7 +1006,7 @@ def test_dsa_prefill_radix_topk_groups_tiles_across_rows() -> None:
     )
 
 
-def test_dsa_decode_radix_topk_groups_tiles_for_batched_queries() -> None:
+def test_dsa_decode_topk_dispatches_staged_groups_for_batched_queries() -> None:
     page_size = 64
     q_len_per_req = 4
     requests = 16
@@ -1036,13 +1036,118 @@ def test_dsa_decode_radix_topk_groups_tiles_for_batched_queries() -> None:
     tiles = dsa_topk_gfx950.triton.cdiv(cols, dsa_topk_gfx950._RADIX_TOPK_BLOCK_N)
     groups = dsa_topk_gfx950._radix_groups_per_row(rows, tiles, logits.device)
     assert groups < tiles
-    dsa_topk_gfx950._dsa_decode_radix_topk_slots(
+    dsa_topk_gfx950._dsa_decode_topk_slots(
         logits,
         block_table,
         seq_lens,
         page_size=page_size,
         topk=topk,
         q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+
+
+def test_dsa_decode_topk_oneblock_maps_grouped_queries_to_physical_slots() -> None:
+    page_size = 64
+    q_len_per_req = 4
+    requests = 3
+    rows = requests * q_len_per_req
+    cols = 8192
+    topk = 2048
+    seq_lens = cols - torch.arange(requests, device="cuda", dtype=torch.int32) * 53
+    q_offsets = torch.arange(q_len_per_req, device="cuda", dtype=torch.int32)
+    row_ends = (seq_lens[:, None] - (q_len_per_req - 1) + q_offsets[None, :]).reshape(
+        -1
+    )
+    row_starts = torch.zeros((rows,), device="cuda", dtype=torch.int32)
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+    )
+    pages = math.ceil(cols / page_size)
+    block_table = torch.arange(
+        pages - 1,
+        -1,
+        -1,
+        device="cuda",
+        dtype=torch.int32,
+    ).repeat(requests, 1)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    dsa_topk_gfx950._dsa_decode_topk_slots(
+        logits,
+        block_table,
+        seq_lens,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    logical = torch.empty_like(out)
+    inverse_pages = torch.empty((pages,), device="cuda", dtype=torch.int64)
+    inverse_pages[block_table[0].long()] = torch.arange(pages, device="cuda")
+    for row in range(rows):
+        slots = out[row].long()
+        logical[row] = (
+            inverse_pages[slots // page_size] * page_size + slots % page_size
+        ).to(torch.int32)
+    _assert_grouped_radix_topk(
+        logits,
+        logical,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+
+
+def test_dsa_prefill_topk_hist_derived_handles_shifted_and_inf_rows() -> None:
+    rows = 4
+    cols = 524288
+    topk = 2048
+    row_starts = torch.tensor([17, 31, 47, 63], device="cuda", dtype=torch.int32)
+    row_ends = torch.tensor(
+        [1017, cols - 91, cols - 61, cols - 31],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    generator = _generator("cuda", 4907)
+    logits = torch.randn(
+        (rows, cols),
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    )
+    columns = torch.arange(cols, device="cuda")
+    valid = (columns[None, :] >= row_starts[:, None]) & (
+        columns[None, :] < row_ends[:, None]
+    )
+    logits.masked_fill_(~valid, -float("inf"))
+    logits[1, row_starts[1] + 1000 : row_ends[1]] = -float("inf")
+    logits[2, row_starts[2] : row_starts[2] + 37] = float("inf")
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
         out=out,
         lens_out=lens_out,
     )
@@ -1076,7 +1181,7 @@ def test_dsa_prefill_grouped_radix_topk_is_graph_capturable() -> None:
     side_stream = torch.cuda.Stream()
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
-        dsa_topk_gfx950._dsa_prefill_radix_topk(
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
             logits,
             row_starts,
             row_ends,
@@ -1088,7 +1193,7 @@ def test_dsa_prefill_grouped_radix_topk_is_graph_capturable() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        dsa_topk_gfx950._dsa_prefill_radix_topk(
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
             logits,
             row_starts,
             row_ends,
@@ -1141,7 +1246,7 @@ def test_dsa_prefill_grouped_radix_topk_is_stream_local() -> None:
     stream_a.wait_stream(current_stream)
     stream_b.wait_stream(current_stream)
     with torch.cuda.stream(stream_a):
-        dsa_topk_gfx950._dsa_prefill_radix_topk(
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
             logits_a,
             row_starts,
             row_ends,
@@ -1150,7 +1255,7 @@ def test_dsa_prefill_grouped_radix_topk_is_stream_local() -> None:
             lens_out=lens_a,
         )
     with torch.cuda.stream(stream_b):
-        dsa_topk_gfx950._dsa_prefill_radix_topk(
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
             logits_b,
             row_starts,
             row_ends,
