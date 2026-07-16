@@ -1134,14 +1134,10 @@ def _dsa_persistent_radix_topk_kernel(
             sem="acq_rel",
             scope="gpu",
         )
-        if old == GROUPS_PER_ROW - 1:
-            # Cycle the shared arrival counter before publishing this generation.
-            gl.atomic_xchg(
-                row_pass_arrival,
-                0,
-                sem="relaxed",
-                scope="gpu",
-            )
+        generation_last_arrival = (pass_index + 1) * GROUPS_PER_ROW - 1
+        if old == generation_last_arrival:
+            # pass_done gates each generation; the counter cannot exceed
+            # NUM_PASSES * GROUPS_PER_ROW before the final reset.
             gl.atomic_add(
                 pass_done + row * COUNTER_STRIDE,
                 1,
@@ -1326,6 +1322,7 @@ def _dsa_persistent_radix_topk_kernel(
                 + bucket_offsets,
                 histogram_zeros,
             )
+        # This is the only reset of the monotonic pass-arrival counter.
         gl.store(
             pass_arrivals + row * COUNTER_STRIDE,
             0,
