@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import inspect
 import math
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -1080,6 +1081,236 @@ def _assert_decode_topk_slots(
         ).values
         torch.testing.assert_close(actual_values.cpu(), expected_values.cpu())
         assert bool((actual[row, count:] == -1).all())
+
+
+_MANUAL_DECODE_QUALIFICATION_CONFIGS = (
+    pytest.param((8192, 8), id="8192x8-production"),
+    pytest.param((10240, 4), id="10240x4"),
+    pytest.param((12288, 4), id="12288x4"),
+    pytest.param((14336, 4), id="14336x4"),
+)
+
+
+def _make_dispatch_tensor(*shape: int) -> SimpleNamespace:
+    strides = []
+    stride = 1
+    for extent in reversed(shape):
+        strides.append(stride)
+        stride *= extent
+    strides.reverse()
+    return SimpleNamespace(
+        shape=shape,
+        device=SimpleNamespace(type="cuda", index=0),
+        stride=lambda dim: strides[dim],
+    )
+
+
+def _record_decode_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    cols: int,
+) -> tuple[object, tuple[object, ...], tuple[object, ...], dict[str, object]]:
+    launches: list[
+        tuple[object, tuple[object, ...], tuple[object, ...], dict[str, object]]
+    ] = []
+
+    def record_launch(
+        kernel,
+        grid,
+        args,
+        pointer_dtypes,
+        specialization_key,
+        **kwargs,
+    ) -> None:
+        del pointer_dtypes
+        launches.append((kernel, args, specialization_key, kwargs | {"grid": grid}))
+
+    monkeypatch.setattr(dsa_topk_gfx950, "_persistent_decode_groups", lambda *_: None)
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_get_cached_compiled_runner_plan",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_launch_warmed_compiled_kernel",
+        record_launch,
+    )
+    rows = 2
+    dsa_topk_gfx950._dsa_decode_topk_slots(
+        _make_dispatch_tensor(rows, cols),
+        _make_dispatch_tensor(rows, math.ceil(cols / 64)),
+        _make_dispatch_tensor(rows),
+        page_size=64,
+        topk=2048,
+        q_len_per_req=1,
+        out=_make_dispatch_tensor(rows, 2048),
+        lens_out=_make_dispatch_tensor(rows),
+    )
+    assert len(launches) == 1
+    return launches[0]
+
+
+def _record_prefill_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    cols: int,
+) -> tuple[object, tuple[object, ...], tuple[object, ...], dict[str, object]]:
+    launches: list[
+        tuple[object, tuple[object, ...], tuple[object, ...], dict[str, object]]
+    ] = []
+
+    def record_launch(
+        kernel,
+        grid,
+        args,
+        pointer_dtypes,
+        specialization_key,
+        **kwargs,
+    ) -> None:
+        del pointer_dtypes
+        launches.append((kernel, args, specialization_key, kwargs | {"grid": grid}))
+
+    monkeypatch.setattr(dsa_topk_gfx950, "_persistent_prefill_groups", lambda *_: None)
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_launch_warmed_compiled_kernel",
+        record_launch,
+    )
+    rows = 2
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        _make_dispatch_tensor(rows, cols),
+        _make_dispatch_tensor(rows),
+        _make_dispatch_tensor(rows),
+        topk=2048,
+        out=_make_dispatch_tensor(rows, 2048),
+        lens_out=_make_dispatch_tensor(rows),
+    )
+    assert len(launches) == 1
+    return launches[0]
+
+
+def test_dsa_manual_decode_config_source_contract() -> None:
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_RUNTIME_CONFIG == (8192, 4)
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG == (8192, 8)
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_MANUAL_CONFIG == (8192, 8)
+    assert dsa_topk_gfx950._ONEBLOCK_PREFILL_RADIX_BLOCK_N == 4096
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS == 65536
+    assert dsa_topk_gfx950._ONEBLOCK_RADIX_MAX_COLS == 90000
+
+    params = {
+        param.name: param
+        for param in dsa_topk_gfx950._dsa_oneblock_manual_radix_topk_kernel.params
+    }
+    constexpr_tail = (
+        "MAX_BUCKETS",
+        "BLOCK_N",
+        "LOAD_ELEMS",
+        "COMPACT_FINAL_BLOCK_N",
+        "USE_COMPACT_FINAL",
+        "USE_RADIX_EARLY_STOP",
+    )
+    assert tuple(params)[-len(constexpr_tail) :] == constexpr_tail
+    assert all(params[name].is_constexpr for name in constexpr_tail)
+
+    kernel_source = inspect.getsource(
+        dsa_topk_gfx950._dsa_oneblock_manual_radix_topk_kernel.fn
+    )
+    assert "LOAD_ELEMS: gl.constexpr" in kernel_source
+    assert (
+        "_vector_layout(\n        BLOCK_N,\n        gl.num_warps(),\n        LOAD_ELEMS"
+        in kernel_source
+    )
+
+
+@pytest.mark.parametrize("config", _MANUAL_DECODE_QUALIFICATION_CONFIGS)
+@pytest.mark.parametrize("cols", (65536, 90000))
+def test_dsa_manual_decode_config_dispatches_only_broad_region(
+    monkeypatch: pytest.MonkeyPatch,
+    config: tuple[int, int],
+    cols: int,
+) -> None:
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_DECODE_MANUAL_CONFIG",
+        config,
+    )
+
+    kernel, args, specialization_key, kwargs = _record_decode_dispatch(
+        monkeypatch,
+        cols,
+    )
+
+    assert kernel is dsa_topk_gfx950._dsa_oneblock_manual_radix_topk_kernel
+    assert args[19:21] == config
+    assert specialization_key == args[11:]
+    assert specialization_key[-5:-3] == config
+    assert kwargs["dispatch_cache"] is dsa_topk_gfx950._manual_decode_runner_plans
+    assert kwargs["dispatch_key"] == (2, specialization_key)
+    assert kwargs["native_scalar_count"] == 4
+    assert kwargs["num_warps"] == 16
+    assert kwargs["grid"] == (2, 1, 1)
+
+
+@pytest.mark.parametrize(
+    ("cols", "expected_config"),
+    ((65535, (8192, 4)), (90001, (8192, 8))),
+)
+def test_dsa_manual_decode_config_does_not_change_runtime_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    cols: int,
+    expected_config: tuple[int, int],
+) -> None:
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_DECODE_MANUAL_CONFIG",
+        (14336, 4),
+    )
+
+    kernel, args, specialization_key, kwargs = _record_decode_dispatch(
+        monkeypatch,
+        cols,
+    )
+
+    assert kernel is dsa_topk_gfx950._dsa_runtime_radix_topk_kernel
+    assert args[16:18] == expected_config
+    assert specialization_key == args[10:]
+    assert kwargs["dispatch_cache"] is dsa_topk_gfx950._runtime_decode_runner_plans
+
+
+def test_dsa_manual_decode_config_does_not_change_prefill_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_DECODE_MANUAL_CONFIG",
+        (14336, 4),
+    )
+
+    kernel, args, specialization_key, kwargs = _record_prefill_dispatch(
+        monkeypatch,
+        65536,
+    )
+
+    assert kernel is dsa_topk_gfx950._dsa_oneblock_manual_radix_topk_kernel
+    assert args[20:22] == (4096, 4)
+    assert specialization_key == args[11:]
+    assert kwargs["dispatch_cache"] is dsa_topk_gfx950._manual_prefill_runner_plans
+
+
+def test_dsa_manual_decode_block_and_load_are_distinct_specializations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specialization_keys = []
+    for config in ((10240, 4), (12288, 4), (12288, 8), (14336, 4)):
+        monkeypatch.setattr(
+            dsa_topk_gfx950,
+            "_ONEBLOCK_DECODE_MANUAL_CONFIG",
+            config,
+        )
+        _, _, specialization_key, _ = _record_decode_dispatch(monkeypatch, 65536)
+        assert specialization_key[-5:-3] == config
+        specialization_keys.append(specialization_key)
+
+    assert len(set(specialization_keys)) == len(specialization_keys)
 
 
 @pytest.mark.parametrize(
