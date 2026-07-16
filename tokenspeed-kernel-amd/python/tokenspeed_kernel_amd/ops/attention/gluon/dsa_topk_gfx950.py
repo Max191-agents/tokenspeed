@@ -45,6 +45,8 @@ _ONEBLOCK_RADIX_SCHEDULE = (11, 11, 10)
 _ONEBLOCK_RADIX_BUCKETS = 1 << max(_ONEBLOCK_RADIX_SCHEDULE)
 _ONEBLOCK_DECODE_RADIX_BLOCK_N = 8192
 _ONEBLOCK_PREFILL_RADIX_BLOCK_N = 4096
+_ONEBLOCK_COMPACT_FINAL_BLOCK_N = 4096
+_ONEBLOCK_COMPACT_FINAL_MIN_COLS = 65536
 _ONEBLOCK_RADIX_MAX_COLS = 90000
 _PREFILL_HIST_DERIVED_MIN_COLS = 524288
 
@@ -461,6 +463,159 @@ def _emit_oneblock_topk_tile(
 
 
 @gluon.jit
+def _accumulate_compact_final_histogram_tile(
+    candidate_logits,
+    tile_start,
+    candidate_len,
+    vector_end,
+    candidate_start,
+    prefix,
+    shared_histogram,
+    shared_output_counters,
+    shared_compact_keys,
+    shared_compact_offsets,
+    block_table,
+    out,
+    row,
+    req,
+    block_table_stride: gl.constexpr,
+    out_stride: gl.constexpr,
+    block_table_cols: gl.constexpr,
+    page_size: gl.constexpr,
+    IS_DECODE: gl.constexpr,
+    value_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    RADIX_BITS: gl.constexpr,
+    IS_TAIL: gl.constexpr,
+):
+    offsets, values, valid = _load_oneblock_tile(
+        candidate_logits,
+        tile_start,
+        candidate_len,
+        vector_end,
+        value_layout,
+        BLOCK_N,
+        IS_TAIL,
+    )
+    keys = _fp32_to_ordered_key(values)
+    high_prefix = keys >> RADIX_BITS
+    prefix_match = valid & (high_prefix == prefix)
+    buckets = keys & ((1 << RADIX_BITS) - 1)
+    shared_histogram.atomic_scatter_add(
+        gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+        buckets.to(gl.int32),
+        axis=0,
+        mask=prefix_match,
+    )
+
+    definite_winner = valid & (high_prefix > prefix)
+    reservation_mask = definite_winner | prefix_match
+    reservation_counter = gl.where(definite_winner, 0, 2).to(gl.int32)
+    reservation = shared_output_counters.atomic_scatter_add(
+        gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+        reservation_counter,
+        axis=0,
+        mask=reservation_mask,
+    )
+    logical_offsets = candidate_start + offsets.to(gl.int32)
+    shared_compact_keys.atomic_scatter_xchg(
+        keys,
+        reservation,
+        axis=0,
+        mask=prefix_match,
+    )
+    shared_compact_offsets.atomic_scatter_xchg(
+        logical_offsets,
+        reservation,
+        axis=0,
+        mask=prefix_match,
+    )
+
+    if IS_DECODE:
+        block_idx = logical_offsets // page_size
+        block_offset = logical_offsets - block_idx * page_size
+        page = gl.load(
+            block_table + req * block_table_stride + block_idx,
+            mask=definite_winner & (block_idx < block_table_cols),
+            other=0,
+        ).to(gl.int32)
+        indices = page * page_size + block_offset
+    else:
+        indices = logical_offsets
+    gl.store(
+        out + row * out_stride + reservation,
+        indices,
+        mask=definite_winner,
+    )
+
+
+@gluon.jit
+def _emit_compact_final_topk(
+    shared_compact_keys,
+    shared_compact_offsets,
+    compact_count,
+    prefix,
+    count_greater,
+    remaining,
+    selected_count,
+    shared_output_counters,
+    block_table,
+    out,
+    row,
+    req,
+    block_table_stride: gl.constexpr,
+    out_stride: gl.constexpr,
+    block_table_cols: gl.constexpr,
+    page_size: gl.constexpr,
+    topk: gl.constexpr,
+    IS_DECODE: gl.constexpr,
+    output_layout: gl.constexpr,
+):
+    compact_positions = gl.arange(0, topk, layout=output_layout)
+    valid = compact_positions < compact_count
+    keys = shared_compact_keys.load(output_layout)
+    logical_offsets = shared_compact_offsets.load(output_layout)
+    greater_mask = valid & (keys > prefix)
+    equal_mask = valid & (keys == prefix)
+    reservation_mask = greater_mask | equal_mask
+    reservation_counter = gl.where(greater_mask, 0, 1).to(gl.int32)
+    reservation = shared_output_counters.atomic_scatter_add(
+        gl.full([topk], 1, gl.int32, layout=output_layout),
+        reservation_counter,
+        axis=0,
+        mask=reservation_mask,
+    )
+    greater_position = reservation
+    equal_rank = reservation
+    equal_position = count_greater + equal_rank
+    greater_write = greater_mask & (greater_position < selected_count)
+    equal_write = equal_mask & (equal_rank < remaining)
+    write_mask = greater_write | equal_write
+
+    if IS_DECODE:
+        block_idx = logical_offsets // page_size
+        block_offset = logical_offsets - block_idx * page_size
+        page = gl.load(
+            block_table + req * block_table_stride + block_idx,
+            mask=write_mask & (block_idx < block_table_cols),
+            other=0,
+        ).to(gl.int32)
+        indices = page * page_size + block_offset
+    else:
+        indices = logical_offsets
+    gl.store(
+        out + row * out_stride + greater_position,
+        indices,
+        mask=greater_write,
+    )
+    gl.store(
+        out + row * out_stride + equal_position,
+        indices,
+        mask=equal_write,
+    )
+
+
+@gluon.jit
 def _dsa_oneblock_manual_radix_topk_kernel(
     logits,
     block_table,
@@ -482,6 +637,8 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     RADIX2_BITS: gl.constexpr,
     MAX_BUCKETS: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    COMPACT_FINAL_BLOCK_N: gl.constexpr,
+    USE_COMPACT_FINAL: gl.constexpr,
 ):
     row = gl.program_id(0)
     value_layout: gl.constexpr = _vector_layout(
@@ -504,6 +661,12 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         gl.num_warps(),
         triton.cdiv(topk, 64 * gl.num_warps()),
     )
+    if USE_COMPACT_FINAL:
+        compact_final_layout: gl.constexpr = _vector_layout(
+            COMPACT_FINAL_BLOCK_N,
+            gl.num_warps(),
+            triton.cdiv(COMPACT_FINAL_BLOCK_N, 64 * gl.num_warps()),
+        )
     shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[MAX_BUCKETS, 1]],
         [MAX_BUCKETS],
@@ -516,17 +679,40 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         shared_layout,
         value=histogram_zeros,
     )
-    output_counter_layout: gl.constexpr = _vector_layout(2, gl.num_warps(), 1)
-    output_counter_shared_layout: gl.constexpr = (
-        gl.PaddedSharedLayout.with_identity_for([[2, 1]], [2], [0])
+    output_counter_count: gl.constexpr = 4 if USE_COMPACT_FINAL else 2
+    output_counter_layout: gl.constexpr = _vector_layout(
+        output_counter_count, gl.num_warps(), 1
     )
-    output_counter_zeros = gl.zeros([2], gl.int32, layout=output_counter_layout)
+    output_counter_shared_layout: gl.constexpr = (
+        gl.PaddedSharedLayout.with_identity_for(
+            [[output_counter_count, 1]], [output_counter_count], [0]
+        )
+    )
+    output_counter_zeros = gl.zeros(
+        [output_counter_count], gl.int32, layout=output_counter_layout
+    )
     shared_output_counters = gl.allocate_shared_memory(
         gl.int32,
-        [2],
+        [output_counter_count],
         output_counter_shared_layout,
         value=output_counter_zeros,
     )
+    if USE_COMPACT_FINAL:
+        compact_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[topk, 1]],
+            [topk],
+            [0],
+        )
+        shared_compact_keys = gl.allocate_shared_memory(
+            gl.uint32,
+            [topk],
+            compact_shared_layout,
+        )
+        shared_compact_offsets = gl.allocate_shared_memory(
+            gl.int32,
+            [topk],
+            compact_shared_layout,
+        )
     gl.barrier()
 
     if IS_DECODE:
@@ -571,6 +757,8 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     vector_end = candidate_len & -4
     prefix = gl.full([], 0, gl.uint32)
     remaining = selected_count
+    if USE_COMPACT_FINAL:
+        compact_count = candidate_len
     bucket_offsets = gl.arange(0, MAX_BUCKETS, layout=histogram_layout)
 
     for pass_index in gl.static_range(3):
@@ -589,36 +777,123 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             gl.barrier()
 
         full_end = candidate_len & -BLOCK_N
-        for tile_start in range(0, full_end, BLOCK_N):
-            _accumulate_oneblock_histogram_tile(
-                candidate_logits,
-                tile_start,
-                candidate_len,
-                vector_end,
-                prefix,
-                shared_histogram,
-                shift,
-                radix_bits,
-                value_layout,
-                BLOCK_N,
-                pass_index == 0,
-                False,
-            )
-        if full_end < candidate_len:
-            _accumulate_oneblock_histogram_tile(
-                candidate_logits,
-                full_end,
-                candidate_len,
-                vector_end,
-                prefix,
-                shared_histogram,
-                shift,
-                radix_bits,
-                value_layout,
-                BLOCK_N,
-                pass_index == 0,
-                True,
-            )
+        if USE_COMPACT_FINAL and pass_index == 2:
+            if compact_count <= topk:
+                compact_full_end = candidate_len & -COMPACT_FINAL_BLOCK_N
+                for tile_start in range(0, compact_full_end, COMPACT_FINAL_BLOCK_N):
+                    _accumulate_compact_final_histogram_tile(
+                        candidate_logits,
+                        tile_start,
+                        candidate_len,
+                        vector_end,
+                        candidate_start,
+                        prefix,
+                        shared_histogram,
+                        shared_output_counters,
+                        shared_compact_keys,
+                        shared_compact_offsets,
+                        block_table,
+                        out,
+                        row,
+                        req,
+                        block_table_stride,
+                        out_stride,
+                        block_table_cols,
+                        page_size,
+                        IS_DECODE,
+                        compact_final_layout,
+                        COMPACT_FINAL_BLOCK_N,
+                        radix_bits,
+                        False,
+                    )
+                if compact_full_end < candidate_len:
+                    _accumulate_compact_final_histogram_tile(
+                        candidate_logits,
+                        compact_full_end,
+                        candidate_len,
+                        vector_end,
+                        candidate_start,
+                        prefix,
+                        shared_histogram,
+                        shared_output_counters,
+                        shared_compact_keys,
+                        shared_compact_offsets,
+                        block_table,
+                        out,
+                        row,
+                        req,
+                        block_table_stride,
+                        out_stride,
+                        block_table_cols,
+                        page_size,
+                        IS_DECODE,
+                        compact_final_layout,
+                        COMPACT_FINAL_BLOCK_N,
+                        radix_bits,
+                        True,
+                    )
+            else:
+                for tile_start in range(0, full_end, BLOCK_N):
+                    _accumulate_oneblock_histogram_tile(
+                        candidate_logits,
+                        tile_start,
+                        candidate_len,
+                        vector_end,
+                        prefix,
+                        shared_histogram,
+                        shift,
+                        radix_bits,
+                        value_layout,
+                        BLOCK_N,
+                        False,
+                        False,
+                    )
+                if full_end < candidate_len:
+                    _accumulate_oneblock_histogram_tile(
+                        candidate_logits,
+                        full_end,
+                        candidate_len,
+                        vector_end,
+                        prefix,
+                        shared_histogram,
+                        shift,
+                        radix_bits,
+                        value_layout,
+                        BLOCK_N,
+                        False,
+                        True,
+                    )
+        else:
+            for tile_start in range(0, full_end, BLOCK_N):
+                _accumulate_oneblock_histogram_tile(
+                    candidate_logits,
+                    tile_start,
+                    candidate_len,
+                    vector_end,
+                    prefix,
+                    shared_histogram,
+                    shift,
+                    radix_bits,
+                    value_layout,
+                    BLOCK_N,
+                    pass_index == 0,
+                    False,
+                )
+            if full_end < candidate_len:
+                _accumulate_oneblock_histogram_tile(
+                    candidate_logits,
+                    full_end,
+                    candidate_len,
+                    vector_end,
+                    prefix,
+                    shared_histogram,
+                    shift,
+                    radix_bits,
+                    value_layout,
+                    BLOCK_N,
+                    pass_index == 0,
+                    True,
+                )
 
         gl.barrier()
         counts = shared_histogram.load(histogram_layout)
@@ -637,16 +912,49 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         select_high = group_greater + count_high >= remaining
         group_bucket = gl.where(select_high, bucket_high, bucket_low)
         group_selected_greater = group_greater + gl.where(select_high, 0, count_high)
+        if USE_COMPACT_FINAL:
+            group_selected_count = gl.where(select_high, count_high, count_low)
         selected_bucket = gl.sum(gl.where(selected_group, group_bucket, 0), axis=0).to(
             gl.int32
         )
         selected_greater = gl.sum(
             gl.where(selected_group, group_selected_greater, 0), axis=0
         ).to(gl.int32)
+        if USE_COMPACT_FINAL:
+            selected_bucket_count = gl.sum(
+                gl.where(selected_group, group_selected_count, 0), axis=0
+            ).to(gl.int32)
         prefix = (prefix << radix_bits) | selected_bucket.to(gl.uint32)
         remaining -= selected_greater
+        if USE_COMPACT_FINAL and pass_index == 1:
+            compact_count = selected_bucket_count
 
     count_greater = selected_count - remaining
+    if USE_COMPACT_FINAL:
+        if compact_count <= topk:
+            _emit_compact_final_topk(
+                shared_compact_keys,
+                shared_compact_offsets,
+                compact_count,
+                prefix,
+                count_greater,
+                remaining,
+                selected_count,
+                shared_output_counters,
+                block_table,
+                out,
+                row,
+                req,
+                block_table_stride,
+                out_stride,
+                block_table_cols,
+                page_size,
+                topk,
+                IS_DECODE,
+                output_layout,
+            )
+            return
+
     full_end = candidate_len & -BLOCK_N
     for tile_start in range(0, full_end, BLOCK_N):
         _emit_oneblock_topk_tile(
@@ -2099,8 +2407,8 @@ def _dsa_decode_topk_slots(
             topk=topk,
             q_len_per_req=q_len_per_req,
             IS_DECODE=True,
-            TOPK_LOAD_ELEMS=_load_elems(topk, 16),
-            num_warps=16,
+            TOPK_LOAD_ELEMS=_load_elems(topk, 8),
+            num_warps=8,
         )
         return out, lens_out
 
@@ -2126,6 +2434,8 @@ def _dsa_decode_topk_slots(
             RADIX2_BITS=_ONEBLOCK_RADIX_SCHEDULE[2],
             MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
             BLOCK_N=_ONEBLOCK_DECODE_RADIX_BLOCK_N,
+            COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
+            USE_COMPACT_FINAL=False,
             num_warps=16,
         )
         return out, lens_out
@@ -2167,8 +2477,8 @@ def _dsa_prefill_topk_indices(
             topk=topk,
             q_len_per_req=1,
             IS_DECODE=False,
-            TOPK_LOAD_ELEMS=_load_elems(topk, 16),
-            num_warps=16,
+            TOPK_LOAD_ELEMS=_load_elems(topk, 8),
+            num_warps=8,
         )
         return out, lens_out
 
@@ -2194,6 +2504,8 @@ def _dsa_prefill_topk_indices(
             RADIX2_BITS=_ONEBLOCK_RADIX_SCHEDULE[2],
             MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
             BLOCK_N=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
+            COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
+            USE_COMPACT_FINAL=cols >= _ONEBLOCK_COMPACT_FINAL_MIN_COLS,
             num_warps=16,
         )
         return out, lens_out

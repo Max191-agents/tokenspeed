@@ -907,6 +907,30 @@ def test_dsa_prefill_topk_gluon_long_row_uses_radix_path() -> None:
     )
 
 
+def test_dsa_prefill_topk_oneblock_falls_back_for_large_tie_bucket() -> None:
+    cols = 65536
+    topk = 2048
+    logits = torch.zeros((1, cols), device="cuda", dtype=torch.float32)
+    row_starts = torch.zeros((1,), device="cuda", dtype=torch.int32)
+    row_ends = torch.full((1,), cols, device="cuda", dtype=torch.int32)
+    out = torch.empty((1, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
+
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    selected = out[0]
+    torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
+    assert ((selected >= 0) & (selected < cols)).all()
+    assert torch.unique(selected).numel() == topk
+
+
 def _make_grouped_radix_logits(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
