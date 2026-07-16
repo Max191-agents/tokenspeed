@@ -1294,6 +1294,7 @@ def test_dsa_decode_topk_boundary_keeps_trivial_dispatch(
     assert kernel is dsa_topk_gfx950._dsa_trivial_decode_topk2048_kernel
     assert specialization_key == args[7:]
     assert kwargs["dispatch_cache"] is dsa_topk_gfx950._trivial_decode_runner_plans
+    assert kwargs["num_warps"] == 16
 
 
 @pytest.mark.parametrize("cols", (90001, 256 * 1024))
@@ -2326,7 +2327,7 @@ def test_compiled_runner_graph_replay_and_capture_miss_fallback(
     )
     dsa_topk_gfx950._dsa_trivial_decode_topk2048_kernel[(1, 1, 1)](
         *kernel_args,
-        num_warps=8,
+        num_warps=16,
     )
     _clear_compiled_runner_caches()
 

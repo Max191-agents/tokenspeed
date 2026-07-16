@@ -4630,7 +4630,7 @@ def _dsa_decode_topk_slots(
                     dispatch_cache=_trivial_decode_runner_plans,
                     dispatch_key=dispatch_key,
                     native_scalar_count=3,
-                    num_warps=8,
+                    num_warps=16,
                 )
         else:
             _dsa_trivial_topk_kernel[(rows,)](
