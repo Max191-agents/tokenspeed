@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import math
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -33,6 +35,31 @@ from tokenspeed_kernel_amd.ops.attention.gluon.dsa_topk_gfx950 import (  # noqa:
 )
 
 torch.manual_seed(42)
+
+
+_COMPILED_RUNNER_CACHES = (
+    dsa_topk_gfx950._compiled_runner_cache,
+    dsa_topk_gfx950._trivial_decode_runner_plans,
+    dsa_topk_gfx950._runtime_decode_runner_plans,
+    dsa_topk_gfx950._manual_decode_runner_plans,
+    dsa_topk_gfx950._trivial_prefill_runner_plans,
+    dsa_topk_gfx950._runtime_prefill_runner_plans,
+    dsa_topk_gfx950._manual_prefill_runner_plans,
+)
+
+
+def _clear_compiled_runner_caches() -> None:
+    with dsa_topk_gfx950._compiled_runner_cache_lock:
+        for cache in _COMPILED_RUNNER_CACHES:
+            cache.clear()
+        dsa_topk_gfx950._compiled_runner_environments.clear()
+
+
+@pytest.fixture
+def isolated_compiled_runner_caches():
+    _clear_compiled_runner_caches()
+    yield
+    _clear_compiled_runner_caches()
 
 
 @pytest.mark.parametrize(
@@ -1455,6 +1482,369 @@ def test_dsa_decode_topk_trivial_2048_maps_grouped_queries_to_physical_slots(
 
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
     torch.testing.assert_close(lens_out, expected_lens, rtol=0, atol=0)
+
+
+def _make_trivial_decode_inputs(
+    cols: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    pages = math.ceil(cols / 64)
+    logits = torch.empty((1, cols), device="cuda", dtype=torch.float32)
+    block_table = torch.arange(pages, device="cuda", dtype=torch.int32)[None, :]
+    seq_lens = torch.tensor([cols], device="cuda", dtype=torch.int32)
+    out = torch.empty((1, 2048), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
+    return logits, block_table, seq_lens, out, lens_out
+
+
+def _run_trivial_decode(
+    inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+) -> None:
+    logits, block_table, seq_lens, out, lens_out = inputs
+    dsa_topk_gfx950._dsa_decode_topk_slots(
+        logits,
+        block_table,
+        seq_lens,
+        page_size=64,
+        topk=2048,
+        q_len_per_req=1,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def _assert_trivial_decode(
+    inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+) -> None:
+    logits, _, _, out, lens_out = inputs
+    cols = logits.shape[1]
+    torch.testing.assert_close(
+        out[0, :cols],
+        torch.arange(cols, device="cuda", dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    assert (out[0, cols:] == -1).all()
+    assert lens_out.item() == cols
+
+
+def test_compiled_runner_abi_gate_matches_installed_distribution() -> None:
+    assert dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED == (
+        importlib.metadata.version("tokenspeed-triton") == "3.8.10.post20260709"
+    )
+
+
+@pytest.mark.skipif(
+    not dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED,
+    reason="requires the supported CompiledKernel runner ABI",
+)
+def test_compiled_runner_reuses_trivial_plan_for_native_scalars(
+    isolated_compiled_runner_caches,
+) -> None:
+    short_inputs = _make_trivial_decode_inputs(512)
+    _run_trivial_decode(short_inputs)
+    assert len(dsa_topk_gfx950._trivial_decode_runner_plans) == 1
+    plan = next(iter(dsa_topk_gfx950._trivial_decode_runner_plans.values()))
+
+    long_inputs = _make_trivial_decode_inputs(2048)
+    _run_trivial_decode(long_inputs)
+
+    assert len(dsa_topk_gfx950._trivial_decode_runner_plans) == 1
+    assert next(iter(dsa_topk_gfx950._trivial_decode_runner_plans.values())) is plan
+    _assert_trivial_decode(short_inputs)
+    _assert_trivial_decode(long_inputs)
+
+
+@pytest.mark.skipif(
+    not dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED,
+    reason="requires the supported CompiledKernel runner ABI",
+)
+def test_compiled_runner_uses_current_stream_and_launch_hooks(
+    isolated_compiled_runner_caches,
+) -> None:
+    inputs = _make_trivial_decode_inputs(2048)
+    _run_trivial_decode(inputs)
+    assert dsa_topk_gfx950._trivial_decode_runner_plans
+
+    streams: list[int] = []
+
+    def record_stream(metadata) -> None:
+        streams.append(metadata.get()["stream"])
+
+    hook = dsa_topk_gfx950.triton.knobs.runtime.launch_enter_hook
+    current_stream = torch.cuda.current_stream()
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    hook.add(record_stream)
+    try:
+        _run_trivial_decode(inputs)
+        stream_a.wait_stream(current_stream)
+        with torch.cuda.stream(stream_a):
+            _run_trivial_decode(inputs)
+        event = stream_a.record_event()
+        stream_b.wait_event(event)
+        with torch.cuda.stream(stream_b):
+            _run_trivial_decode(inputs)
+        current_stream.wait_stream(stream_b)
+    finally:
+        hook.remove(record_stream)
+
+    assert streams == [
+        current_stream.cuda_stream,
+        stream_a.cuda_stream,
+        stream_b.cuda_stream,
+    ]
+    _assert_trivial_decode(inputs)
+
+
+@pytest.mark.skipif(
+    not dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED,
+    reason="requires the supported CompiledKernel runner ABI",
+)
+def test_compiled_runner_graph_replay_and_capture_miss_fallback(
+    isolated_compiled_runner_caches,
+) -> None:
+    inputs = _make_trivial_decode_inputs(2048)
+    _run_trivial_decode(inputs)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_trivial_decode(inputs)
+    inputs[3].fill_(-7)
+    graph.replay()
+    _assert_trivial_decode(inputs)
+
+    kernel_args = (
+        inputs[1],
+        inputs[2],
+        inputs[3],
+        inputs[4],
+        inputs[1].stride(0),
+        inputs[3].stride(0),
+        inputs[1].shape[1],
+        64,
+        1,
+    )
+    dsa_topk_gfx950._dsa_trivial_decode_topk2048_kernel[(1, 1, 1)](
+        *kernel_args,
+        num_warps=8,
+    )
+    _clear_compiled_runner_caches()
+
+    miss_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(miss_graph):
+        _run_trivial_decode(inputs)
+    assert not dsa_topk_gfx950._compiled_runner_cache
+    assert not dsa_topk_gfx950._trivial_decode_runner_plans
+    inputs[3].fill_(-7)
+    miss_graph.replay()
+    _assert_trivial_decode(inputs)
+
+
+class _FakeCompiledRunnerKernel:
+    def __init__(self) -> None:
+        self.debug = False
+        self.pre_run_hooks: list = []
+        self.used_global_vals: dict = {}
+        self.normal_launches = 0
+
+    def __getitem__(self, grid):
+        del grid
+
+        def launch(*args, **kwargs) -> None:
+            self.normal_launches += 1
+            for hook in self.pre_run_hooks:
+                hook(*args, **kwargs)
+
+        return launch
+
+
+def _make_fake_compiled_plan(
+    kernel: _FakeCompiledRunnerKernel,
+    pointer_args: tuple[torch.Tensor, ...],
+    runner,
+) -> dsa_topk_gfx950._CompiledRunnerPlan:
+    driver = dsa_topk_gfx950.triton.runtime.driver.active
+    return dsa_topk_gfx950._CompiledRunnerPlan(
+        runner,
+        driver,
+        driver.get_current_device(),
+        dsa_topk_gfx950._compiled_runner_mutable_state(kernel),
+        dsa_topk_gfx950._compiled_runner_target_getter(driver),
+        dsa_topk_gfx950._compiled_runner_target_key(driver),
+        dsa_topk_gfx950._compiled_runner_knob_key(),
+        pointer_args,
+    )
+
+
+def _launch_fake_compiled_plan(
+    kernel: _FakeCompiledRunnerKernel,
+    pointer_args: tuple[torch.Tensor, ...],
+    plan: dsa_topk_gfx950._CompiledRunnerPlan,
+) -> None:
+    dispatch_key = ("test",)
+    dispatch_cache = OrderedDict(((dispatch_key, plan),))
+    dsa_topk_gfx950._launch_warmed_compiled_kernel(
+        kernel,
+        (1, 1, 1),
+        pointer_args,
+        (torch.int32,) * len(pointer_args),
+        (),
+        dispatch_cache=dispatch_cache,
+        dispatch_key=dispatch_key,
+        num_warps=1,
+    )
+
+
+@pytest.mark.skipif(
+    not dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED,
+    reason="requires the supported CompiledKernel runner ABI",
+)
+@pytest.mark.parametrize(
+    "unsupported_state",
+    [
+        "pre_run_hook",
+        "used_global",
+        "debug",
+        "inspection_hook",
+        "instrumentation",
+        "compile_knob",
+    ],
+)
+def test_compiled_runner_falls_back_for_unsupported_mutable_state(
+    unsupported_state: str,
+) -> None:
+    kernel = _FakeCompiledRunnerKernel()
+    original_args = tuple(
+        torch.zeros((4,), device="cuda", dtype=torch.int32) for _ in range(4)
+    )
+    direct_launches: list[bool] = []
+    plan = _make_fake_compiled_plan(
+        kernel,
+        original_args,
+        lambda *args: direct_launches.append(True),
+    )
+    changed_args = tuple(
+        torch.ones((4,), device="cuda", dtype=torch.int32) for _ in range(4)
+    )
+    knobs = dsa_topk_gfx950.triton.knobs
+
+    if unsupported_state == "pre_run_hook":
+        kernel.pre_run_hooks.append(lambda *args, **kwargs: None)
+        _launch_fake_compiled_plan(kernel, changed_args, plan)
+    elif unsupported_state == "used_global":
+        kernel.used_global_vals["test"] = 1
+        _launch_fake_compiled_plan(kernel, changed_args, plan)
+    elif unsupported_state == "debug":
+        kernel.debug = True
+        _launch_fake_compiled_plan(kernel, changed_args, plan)
+    elif unsupported_state == "inspection_hook":
+        with knobs.runtime.scope():
+            knobs.runtime.add_stages_inspection_hook = lambda *args: None
+            _launch_fake_compiled_plan(kernel, changed_args, plan)
+    elif unsupported_state == "instrumentation":
+        with knobs.compilation.scope():
+            knobs.compilation.instrumentation_mode = "test"
+            _launch_fake_compiled_plan(kernel, changed_args, plan)
+    else:
+        with knobs.amd.scope():
+            knobs.amd.use_buffer_ops = False
+            _launch_fake_compiled_plan(kernel, changed_args, plan)
+
+    assert kernel.normal_launches == 1
+    assert not direct_launches
+
+
+@pytest.mark.skipif(
+    not dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED,
+    reason="requires the supported CompiledKernel runner ABI",
+)
+@pytest.mark.parametrize("unsupported_pointer", ["dtype", "alignment"])
+def test_compiled_runner_falls_back_for_unsupported_pointer(
+    unsupported_pointer: str,
+) -> None:
+    kernel = _FakeCompiledRunnerKernel()
+    original_args = tuple(
+        torch.zeros((4,), device="cuda", dtype=torch.int32) for _ in range(4)
+    )
+    direct_launches: list[bool] = []
+    plan = _make_fake_compiled_plan(
+        kernel,
+        original_args,
+        lambda *args: direct_launches.append(True),
+    )
+    changed_args = list(
+        torch.ones((4,), device="cuda", dtype=torch.int32) for _ in range(4)
+    )
+    if unsupported_pointer == "dtype":
+        changed_args[0] = torch.ones((4,), device="cuda", dtype=torch.int64)
+    else:
+        backing = torch.ones((5,), device="cuda", dtype=torch.int32)
+        changed_args[0] = backing[1:]
+
+    _launch_fake_compiled_plan(kernel, tuple(changed_args), plan)
+
+    assert kernel.normal_launches == 1
+    assert not direct_launches
+
+
+@pytest.mark.skipif(
+    not dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED,
+    reason="requires the supported CompiledKernel runner ABI",
+)
+def test_runtime_decode_plan_reuses_native_strides(
+    isolated_compiled_runner_caches,
+) -> None:
+    plan = None
+    for cols in (8192, 16384):
+        row_starts = torch.zeros((1,), device="cuda", dtype=torch.int32)
+        row_ends = torch.full((1,), cols, device="cuda", dtype=torch.int32)
+        logits = _make_grouped_radix_logits(
+            row_starts,
+            row_ends,
+            cols=cols,
+            topk=2048,
+        )
+        block_table = torch.arange(
+            math.ceil(cols / 64), device="cuda", dtype=torch.int32
+        )[None, :]
+        out = torch.empty((1, 2048), device="cuda", dtype=torch.int32)
+        lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
+        dsa_topk_gfx950._dsa_decode_topk_slots(
+            logits,
+            block_table,
+            row_ends,
+            page_size=64,
+            topk=2048,
+            q_len_per_req=1,
+            out=out,
+            lens_out=lens_out,
+        )
+        _assert_grouped_radix_topk(
+            logits,
+            out,
+            lens_out,
+            row_starts,
+            row_ends,
+            topk=2048,
+        )
+        assert len(dsa_topk_gfx950._runtime_decode_runner_plans) == 1
+        current_plan = next(iter(dsa_topk_gfx950._runtime_decode_runner_plans.values()))
+        if plan is None:
+            plan = current_plan
+        else:
+            assert current_plan is plan
 
 
 @pytest.mark.parametrize("cols", [8192, 131072, 524288])
