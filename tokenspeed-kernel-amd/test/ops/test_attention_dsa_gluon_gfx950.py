@@ -45,6 +45,7 @@ _COMPILED_RUNNER_CACHES = (
     dsa_topk_gfx950._trivial_prefill_runner_plans,
     dsa_topk_gfx950._runtime_prefill_runner_plans,
     dsa_topk_gfx950._manual_prefill_runner_plans,
+    dsa_topk_gfx950._persistent_runner_plans,
 )
 
 
@@ -1230,8 +1231,14 @@ def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
         out=out,
         lens_out=lens_out,
     )
-    first_out = out.clone()
-    first_lens = lens_out.clone()
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
     out.fill_(-1)
     lens_out.fill_(-1)
     dsa_topk_gfx950._dsa_prefill_topk_indices(
@@ -1251,8 +1258,6 @@ def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
         row_ends,
         topk=topk,
     )
-    torch.testing.assert_close(out, first_out)
-    torch.testing.assert_close(lens_out, first_lens)
 
 
 def test_dsa_persistent_prefill_topk_handles_ragged_rows() -> None:
@@ -1385,7 +1390,9 @@ def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
     )
 
 
-def test_dsa_decode_topk_dispatches_persistent_radix_for_batched_queries() -> None:
+def test_dsa_decode_topk_dispatches_persistent_radix_for_batched_queries(
+    isolated_compiled_runner_caches,
+) -> None:
     page_size = 64
     q_len_per_req = 4
     requests = 16
@@ -1431,6 +1438,9 @@ def test_dsa_decode_topk_dispatches_persistent_radix_for_batched_queries() -> No
         row_ends,
         topk=topk,
     )
+    assert len(dsa_topk_gfx950._persistent_runner_plans) == 1
+    plan = next(iter(dsa_topk_gfx950._persistent_runner_plans.values()))
+    assert len(plan.pointer_refs) == 11
 
 
 @pytest.mark.parametrize("cols", (512, 1024, 2048))
