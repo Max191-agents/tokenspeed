@@ -56,13 +56,11 @@ _PREFILL_RADIX_SCATTER_TARGET_GROUPS_PER_CU = 2
 _PREFILL_LOCAL_GROUP_PREFIX_MIN_COLS = 262144
 _ONEBLOCK_RADIX_SCHEDULE = (12, 12, 8)
 _ONEBLOCK_RADIX_BUCKETS = 1 << max(_ONEBLOCK_RADIX_SCHEDULE)
-_ONEBLOCK_DECODE_RADIX_BLOCK_N = 8192
-_ONEBLOCK_DECODE_SHORT_LOAD_ELEMS = 4
-_ONEBLOCK_DECODE_LONG_LOAD_ELEMS = 8
+_ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG = (8192, 8)
+_ONEBLOCK_DECODE_MANUAL_CONFIG = (8192, 4)
 _ONEBLOCK_PREFILL_RADIX_BLOCK_N = 4096
 _ONEBLOCK_COMPACT_FINAL_BLOCK_N = 4096
 _ONEBLOCK_COMPACT_FINAL_MIN_COLS = 65536
-_ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS = 65536
 _ONEBLOCK_DECODE_RUNTIME_MAX_COLS = 256 * 1024
 _ONEBLOCK_RADIX_MAX_COLS = 90000
 _PREFILL_RUNTIME_RADIX_MIN_COLS = 98304
@@ -2136,6 +2134,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     RADIX2_BITS: gl.constexpr,
     MAX_BUCKETS: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
     COMPACT_FINAL_BLOCK_N: gl.constexpr,
     USE_COMPACT_FINAL: gl.constexpr,
     USE_RADIX_EARLY_STOP: gl.constexpr,
@@ -2144,7 +2143,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     value_layout: gl.constexpr = _vector_layout(
         BLOCK_N,
         gl.num_warps(),
-        triton.cdiv(BLOCK_N, 64 * gl.num_warps()),
+        LOAD_ELEMS,
     )
     histogram_layout: gl.constexpr = _vector_layout(
         MAX_BUCKETS,
@@ -4671,15 +4670,8 @@ def _dsa_decode_topk_slots(
         )
 
     if cols <= _ONEBLOCK_DECODE_RUNTIME_MAX_COLS:
-        if (
-            cols < _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS
-            or cols > _ONEBLOCK_RADIX_MAX_COLS
-        ):
-            load_elems = (
-                _ONEBLOCK_DECODE_SHORT_LOAD_ELEMS
-                if cols < _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS
-                else _ONEBLOCK_DECODE_LONG_LOAD_ELEMS
-            )
+        if cols > _ONEBLOCK_RADIX_MAX_COLS:
+            block_n, load_elems = _ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG
             kernel_args = (
                 logits,
                 block_table,
@@ -4697,7 +4689,7 @@ def _dsa_decode_topk_slots(
                 True,
                 False,
                 _ONEBLOCK_RADIX_BUCKETS,
-                _ONEBLOCK_DECODE_RADIX_BLOCK_N,
+                block_n,
                 load_elems,
             )
             specialization_key = kernel_args[10:]
@@ -4730,6 +4722,7 @@ def _dsa_decode_topk_slots(
                     num_warps=16,
                 )
         else:
+            block_n, load_elems = _ONEBLOCK_DECODE_MANUAL_CONFIG
             kernel_args = (
                 logits,
                 block_table,
@@ -4750,7 +4743,8 @@ def _dsa_decode_topk_slots(
                 _ONEBLOCK_RADIX_SCHEDULE[1],
                 _ONEBLOCK_RADIX_SCHEDULE[2],
                 _ONEBLOCK_RADIX_BUCKETS,
-                _ONEBLOCK_DECODE_RADIX_BLOCK_N,
+                block_n,
+                load_elems,
                 _ONEBLOCK_COMPACT_FINAL_BLOCK_N,
                 False,
                 True,
@@ -4927,6 +4921,7 @@ def _dsa_prefill_topk_indices(
                 _ONEBLOCK_RADIX_SCHEDULE[2],
                 _ONEBLOCK_RADIX_BUCKETS,
                 _ONEBLOCK_PREFILL_RADIX_BLOCK_N,
+                _load_elems(_ONEBLOCK_PREFILL_RADIX_BLOCK_N, 16),
                 _ONEBLOCK_COMPACT_FINAL_BLOCK_N,
                 True,
                 False,

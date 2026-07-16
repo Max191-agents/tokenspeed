@@ -1083,6 +1083,232 @@ def _assert_decode_topk_slots(
         assert bool((actual[row, count:] == -1).all())
 
 
+def _make_dispatch_tensor(*shape: int) -> SimpleNamespace:
+    strides = []
+    stride = 1
+    for extent in reversed(shape):
+        strides.append(stride)
+        stride *= extent
+    strides.reverse()
+    return SimpleNamespace(
+        shape=shape,
+        device=SimpleNamespace(type="cuda", index=0),
+        stride=lambda dim: strides[dim],
+    )
+
+
+def _record_decode_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    cols: int,
+) -> tuple[object, tuple[object, ...], tuple[object, ...], dict[str, object]]:
+    launches: list[
+        tuple[object, tuple[object, ...], tuple[object, ...], dict[str, object]]
+    ] = []
+
+    def record_launch(
+        kernel,
+        grid,
+        args,
+        pointer_dtypes,
+        specialization_key,
+        **kwargs,
+    ) -> None:
+        del pointer_dtypes
+        launches.append((kernel, args, specialization_key, kwargs | {"grid": grid}))
+
+    monkeypatch.setattr(dsa_topk_gfx950, "_persistent_decode_groups", lambda *_: None)
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_get_cached_compiled_runner_plan",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_launch_warmed_compiled_kernel",
+        record_launch,
+    )
+    rows = 2
+    dsa_topk_gfx950._dsa_decode_topk_slots(
+        _make_dispatch_tensor(rows, cols),
+        _make_dispatch_tensor(rows, math.ceil(cols / 64)),
+        _make_dispatch_tensor(rows),
+        page_size=64,
+        topk=2048,
+        q_len_per_req=1,
+        out=_make_dispatch_tensor(rows, 2048),
+        lens_out=_make_dispatch_tensor(rows),
+    )
+    assert len(launches) == 1
+    return launches[0]
+
+
+def _record_prefill_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    cols: int,
+) -> tuple[object, tuple[object, ...], tuple[object, ...], dict[str, object]]:
+    launches: list[
+        tuple[object, tuple[object, ...], tuple[object, ...], dict[str, object]]
+    ] = []
+
+    def record_launch(
+        kernel,
+        grid,
+        args,
+        pointer_dtypes,
+        specialization_key,
+        **kwargs,
+    ) -> None:
+        del pointer_dtypes
+        launches.append((kernel, args, specialization_key, kwargs | {"grid": grid}))
+
+    monkeypatch.setattr(dsa_topk_gfx950, "_persistent_prefill_groups", lambda *_: None)
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_launch_warmed_compiled_kernel",
+        record_launch,
+    )
+    rows = 2
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        _make_dispatch_tensor(rows, cols),
+        _make_dispatch_tensor(rows),
+        _make_dispatch_tensor(rows),
+        topk=2048,
+        out=_make_dispatch_tensor(rows, 2048),
+        lens_out=_make_dispatch_tensor(rows),
+    )
+    assert len(launches) == 1
+    return launches[0]
+
+
+def test_dsa_manual_decode_config_source_contract() -> None:
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_MANUAL_CONFIG == (8192, 4)
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG == (8192, 8)
+    assert dsa_topk_gfx950._ONEBLOCK_RADIX_SCHEDULE == (12, 12, 8)
+    assert dsa_topk_gfx950._ONEBLOCK_PREFILL_RADIX_BLOCK_N == 4096
+    assert dsa_topk_gfx950._ONEBLOCK_RADIX_MAX_COLS == 90000
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_RUNTIME_MAX_COLS == 256 * 1024
+
+    params = {
+        param.name: param
+        for param in dsa_topk_gfx950._dsa_oneblock_manual_radix_topk_kernel.params
+    }
+    constexpr_tail = (
+        "MAX_BUCKETS",
+        "BLOCK_N",
+        "LOAD_ELEMS",
+        "COMPACT_FINAL_BLOCK_N",
+        "USE_COMPACT_FINAL",
+        "USE_RADIX_EARLY_STOP",
+    )
+    assert tuple(params)[-len(constexpr_tail) :] == constexpr_tail
+    assert all(params[name].is_constexpr for name in constexpr_tail)
+
+    kernel_source = inspect.getsource(
+        dsa_topk_gfx950._dsa_oneblock_manual_radix_topk_kernel.fn
+    )
+    assert "LOAD_ELEMS: gl.constexpr" in kernel_source
+    assert (
+        "_vector_layout(\n        BLOCK_N,\n        gl.num_warps(),\n        LOAD_ELEMS"
+        in kernel_source
+    )
+
+
+@pytest.mark.parametrize("cols", (2049, 8192, 16384, 32768, 65536, 90000))
+def test_dsa_manual_decode_dispatches_whole_oneblock_region(
+    monkeypatch: pytest.MonkeyPatch,
+    cols: int,
+) -> None:
+    kernel, args, specialization_key, kwargs = _record_decode_dispatch(
+        monkeypatch,
+        cols,
+    )
+
+    assert kernel is dsa_topk_gfx950._dsa_oneblock_manual_radix_topk_kernel
+    assert args[15:18] == (12, 12, 8)
+    assert args[19:21] == (8192, 4)
+    assert args[-3:] == (4096, False, True)
+    assert specialization_key == args[11:]
+    assert specialization_key[-5:-3] == (8192, 4)
+    assert kwargs["dispatch_cache"] is dsa_topk_gfx950._manual_decode_runner_plans
+    assert kwargs["dispatch_key"] == (2, specialization_key)
+    assert kwargs["native_scalar_count"] == 4
+    assert kwargs["num_warps"] == 16
+    assert kwargs["grid"] == (2, 1, 1)
+
+
+def test_dsa_manual_decode_region_uses_one_specialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specialization_keys = [
+        _record_decode_dispatch(monkeypatch, cols)[2]
+        for cols in (2049, 8192, 16384, 32768, 65536, 90000)
+    ]
+
+    assert len(set(specialization_keys)) == 1
+
+
+def test_dsa_manual_decode_block_and_load_are_distinct_specializations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specialization_keys = []
+    for config in ((8192, 4), (8192, 8), (10240, 4)):
+        monkeypatch.setattr(
+            dsa_topk_gfx950,
+            "_ONEBLOCK_DECODE_MANUAL_CONFIG",
+            config,
+        )
+        _, _, specialization_key, _ = _record_decode_dispatch(monkeypatch, 8192)
+        assert specialization_key[-5:-3] == config
+        specialization_keys.append(specialization_key)
+
+    assert len(set(specialization_keys)) == len(specialization_keys)
+
+
+def test_dsa_decode_topk_boundary_keeps_trivial_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel, args, specialization_key, kwargs = _record_decode_dispatch(
+        monkeypatch,
+        2048,
+    )
+
+    assert kernel is dsa_topk_gfx950._dsa_trivial_decode_topk2048_kernel
+    assert specialization_key == args[7:]
+    assert kwargs["dispatch_cache"] is dsa_topk_gfx950._trivial_decode_runner_plans
+
+
+@pytest.mark.parametrize("cols", (90001, 256 * 1024))
+def test_dsa_decode_above_90k_keeps_long_runtime_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    cols: int,
+) -> None:
+    kernel, args, specialization_key, kwargs = _record_decode_dispatch(
+        monkeypatch,
+        cols,
+    )
+
+    assert kernel is dsa_topk_gfx950._dsa_runtime_radix_topk_kernel
+    assert args[16:18] == (8192, 8)
+    assert specialization_key == args[10:]
+    assert kwargs["dispatch_cache"] is dsa_topk_gfx950._runtime_decode_runner_plans
+
+
+def test_dsa_manual_decode_config_keeps_prefill_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel, args, specialization_key, kwargs = _record_prefill_dispatch(
+        monkeypatch,
+        65536,
+    )
+
+    assert kernel is dsa_topk_gfx950._dsa_oneblock_manual_radix_topk_kernel
+    assert args[15:18] == (12, 12, 8)
+    assert args[19:21] == (4096, 4)
+    assert args[-3:] == (4096, True, False)
+    assert specialization_key == args[11:]
+    assert kwargs["dispatch_cache"] is dsa_topk_gfx950._manual_prefill_runner_plans
+
+
 def _assert_persistent_workspace_layout(
     workspace: tuple[torch.Tensor, ...],
     rows: int,
@@ -2156,25 +2382,29 @@ def _make_real_compiled_wrapper_case(name: str) -> Callable[[], None]:
         return lambda: _run_trivial_decode(inputs)
 
     if name == "runtime_decode":
-        logits = torch.empty((1, 8192), device="cuda", dtype=torch.float32)
-        block_table = torch.arange(128, device="cuda", dtype=torch.int32)[None, :]
-        seq_lens = torch.tensor([8192], device="cuda", dtype=torch.int32)
-        out = torch.empty((1, 2048), device="cuda", dtype=torch.int32)
+        cols = 90001
+        topk = 1024
+        logits = torch.empty((1, cols), device="cuda", dtype=torch.float32)
+        block_table = torch.arange(
+            math.ceil(cols / 64), device="cuda", dtype=torch.int32
+        )[None, :]
+        seq_lens = torch.tensor([cols], device="cuda", dtype=torch.int32)
+        out = torch.empty((1, topk), device="cuda", dtype=torch.int32)
         lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
 
-        def run_runtime_decode() -> None:
+        def run_decode() -> None:
             dsa_topk_gfx950._dsa_decode_topk_slots(
                 logits,
                 block_table,
                 seq_lens,
                 page_size=64,
-                topk=2048,
+                topk=topk,
                 q_len_per_req=1,
                 out=out,
                 lens_out=lens_out,
             )
 
-        return run_runtime_decode
+        return run_decode
 
     if name == "persistent":
         logits = torch.empty((1, 131072), device="cuda", dtype=torch.float32)
@@ -2265,7 +2495,12 @@ def _install_recording_wrapper_plan(
 )
 @pytest.mark.parametrize(
     "wrapper_name",
-    ("persistent", "trivial_decode", "runtime_decode", "trivial_prefill"),
+    (
+        "persistent",
+        "trivial_decode",
+        "runtime_decode",
+        "trivial_prefill",
+    ),
 )
 def test_real_wrapper_same_pointer_plan_uses_direct_runner(
     wrapper_name: str,
@@ -2290,7 +2525,12 @@ def test_real_wrapper_same_pointer_plan_uses_direct_runner(
 )
 @pytest.mark.parametrize(
     "wrapper_name",
-    ("persistent", "trivial_decode", "runtime_decode", "trivial_prefill"),
+    (
+        "persistent",
+        "trivial_decode",
+        "runtime_decode",
+        "trivial_prefill",
+    ),
 )
 @pytest.mark.parametrize(
     "unsupported_state",
@@ -2603,30 +2843,51 @@ def test_compiled_runner_falls_back_for_unsupported_pointer(
     not dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED,
     reason="requires the supported CompiledKernel runner ABI",
 )
-def test_runtime_decode_plan_reuses_native_strides(
+@pytest.mark.parametrize(
+    ("cols_values", "topk", "cache_name"),
+    (
+        pytest.param(
+            (8192, 16384),
+            2048,
+            "_manual_decode_runner_plans",
+            id="manual",
+        ),
+        pytest.param(
+            (90001, 98304),
+            1024,
+            "_runtime_decode_runner_plans",
+            id="runtime",
+        ),
+    ),
+)
+def test_decode_plan_reuses_native_strides(
+    cols_values: tuple[int, int],
+    topk: int,
+    cache_name: str,
     isolated_compiled_runner_caches,
 ) -> None:
     plan = None
-    for cols in (8192, 16384):
+    dispatch_cache = getattr(dsa_topk_gfx950, cache_name)
+    for cols in cols_values:
         row_starts = torch.zeros((1,), device="cuda", dtype=torch.int32)
         row_ends = torch.full((1,), cols, device="cuda", dtype=torch.int32)
         logits = _make_grouped_radix_logits(
             row_starts,
             row_ends,
             cols=cols,
-            topk=2048,
+            topk=topk,
         )
         block_table = torch.arange(
             math.ceil(cols / 64), device="cuda", dtype=torch.int32
         )[None, :]
-        out = torch.empty((1, 2048), device="cuda", dtype=torch.int32)
+        out = torch.empty((1, topk), device="cuda", dtype=torch.int32)
         lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
         dsa_topk_gfx950._dsa_decode_topk_slots(
             logits,
             block_table,
             row_ends,
             page_size=64,
-            topk=2048,
+            topk=topk,
             q_len_per_req=1,
             out=out,
             lens_out=lens_out,
@@ -2637,17 +2898,20 @@ def test_runtime_decode_plan_reuses_native_strides(
             lens_out,
             row_starts,
             row_ends,
-            topk=2048,
+            topk=topk,
         )
-        assert len(dsa_topk_gfx950._runtime_decode_runner_plans) == 1
-        current_plan = next(iter(dsa_topk_gfx950._runtime_decode_runner_plans.values()))
+        assert len(dispatch_cache) == 1
+        current_plan = next(iter(dispatch_cache.values()))
         if plan is None:
             plan = current_plan
         else:
             assert current_plan is plan
 
 
-@pytest.mark.parametrize("cols", [8192, 131072, 524288])
+@pytest.mark.parametrize(
+    "cols",
+    [8192, 16384, 32768, 65536, 90000, 131072, 524288],
+)
 def test_dsa_decode_topk_maps_grouped_queries_to_physical_slots(
     cols: int,
 ) -> None:
