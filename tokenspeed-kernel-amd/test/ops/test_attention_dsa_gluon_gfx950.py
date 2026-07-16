@@ -1082,6 +1082,360 @@ def _assert_decode_topk_slots(
         assert bool((actual[row, count:] == -1).all())
 
 
+_RUNTIME_RADIX_TILE_CONFIGS = (
+    pytest.param((8192, 4), id="8192x4"),
+    pytest.param((16384, 4), id="16384x4"),
+    pytest.param((16384, 8), id="16384x8"),
+)
+
+
+@dataclass(frozen=True)
+class _RuntimeRadixTileCase:
+    mode: str
+    logits: torch.Tensor
+    row_starts: torch.Tensor
+    row_ends: torch.Tensor
+    block_table: torch.Tensor | None
+    seq_lens: torch.Tensor | None
+    q_len_per_req: int
+
+
+def _make_runtime_radix_tile_logits(
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    cols: int,
+    topk: int,
+    seed: int,
+    oversized_ties: bool = False,
+) -> torch.Tensor:
+    if oversized_ties:
+        logits = torch.full(
+            (row_starts.numel(), cols),
+            -17.0,
+            device="cuda",
+            dtype=torch.float32,
+        )
+    else:
+        logits = torch.empty(
+            (row_starts.numel(), cols),
+            device="cuda",
+            dtype=torch.float32,
+        ).uniform_(-1.0, 1.0, generator=_generator("cuda", seed))
+
+    for row, (start, end) in enumerate(
+        zip(row_starts.cpu().tolist(), row_ends.cpu().tolist(), strict=True)
+    ):
+        if oversized_ties:
+            if row % 3 == 0:
+                logits[row, start:end] = float("inf")
+            elif row % 3 == 1:
+                logits[row, start:end] = -float("inf")
+            else:
+                logits[row, start:end] = -float("inf")
+                logits[row, start : start + 37] = float("inf")
+                logits[row, start + 37 : start + 37 + topk + 257] = 1.0
+            continue
+
+        if end - start >= topk + 64:
+            high_count = topk - 32
+            logits[row, start : start + high_count] = torch.linspace(
+                4.0,
+                3.0,
+                high_count,
+                device="cuda",
+            )
+            logits[row, start + high_count : start + high_count + 64] = 2.0
+            logits[row, start + high_count + 64 : end : 257] = -float("inf")
+        logits[row, start] = float("inf")
+        logits[row, end - 1] = -float("inf")
+    return logits
+
+
+def _make_runtime_radix_tile_case(
+    mode: str,
+    cols: int,
+    *,
+    seed: int,
+    oversized_ties: bool = False,
+) -> _RuntimeRadixTileCase:
+    topk = 2048
+    if mode == "decode":
+        q_len_per_req = 4
+        seq_lens = torch.tensor(
+            (cols - 11, cols, 1537),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        q_offsets = torch.arange(q_len_per_req, device="cuda", dtype=torch.int32)
+        row_ends = (
+            seq_lens[:, None] - (q_len_per_req - 1) + q_offsets[None, :]
+        ).reshape(-1)
+        row_starts = torch.zeros_like(row_ends)
+        block_table = _make_reversed_decode_block_table(
+            seq_lens.numel(),
+            cols,
+            64,
+        )
+    elif mode == "prefill":
+        q_len_per_req = 1
+        row_starts = torch.tensor(
+            (0, 13, 257, cols // 4 + 3, cols - 1537),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        row_ends = torch.tensor(
+            (cols, cols - 7, cols - 31, cols - 3, cols),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        block_table = None
+        seq_lens = None
+    else:
+        raise AssertionError(f"unknown runtime radix mode: {mode}")
+
+    logits = _make_runtime_radix_tile_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=seed,
+        oversized_ties=oversized_ties,
+    )
+    return _RuntimeRadixTileCase(
+        mode=mode,
+        logits=logits,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        block_table=block_table,
+        seq_lens=seq_lens,
+        q_len_per_req=q_len_per_req,
+    )
+
+
+def _select_runtime_radix_tile_config(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    config: tuple[int, int],
+) -> None:
+    config_name = (
+        "_ONEBLOCK_DECODE_RUNTIME_CONFIG"
+        if mode == "decode"
+        else "_ONEBLOCK_PREFILL_RUNTIME_CONFIG"
+    )
+    monkeypatch.setattr(dsa_topk_gfx950, config_name, config)
+
+
+def _run_runtime_radix_tile_case(
+    case: _RuntimeRadixTileCase,
+    *,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = case.logits.shape[0]
+    if out is None:
+        out = torch.empty((rows, 2048), device="cuda", dtype=torch.int32)
+    if lens_out is None:
+        lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    if case.mode == "decode":
+        assert case.block_table is not None
+        assert case.seq_lens is not None
+        return dsa_topk_gfx950._dsa_decode_topk_slots(
+            case.logits,
+            case.block_table,
+            case.seq_lens,
+            page_size=64,
+            topk=2048,
+            q_len_per_req=case.q_len_per_req,
+            out=out,
+            lens_out=lens_out,
+        )
+    return dsa_topk_gfx950._dsa_prefill_topk_indices(
+        case.logits,
+        case.row_starts,
+        case.row_ends,
+        topk=2048,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def _assert_runtime_radix_tile_case(
+    case: _RuntimeRadixTileCase,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> None:
+    if case.mode == "decode":
+        assert case.block_table is not None
+        assert case.seq_lens is not None
+        _assert_decode_topk_slots(
+            case.logits,
+            out,
+            lens_out,
+            case.seq_lens,
+            case.block_table,
+            page_size=64,
+            q_len_per_req=case.q_len_per_req,
+            topk=2048,
+        )
+    else:
+        _assert_grouped_radix_topk(
+            case.logits,
+            out,
+            lens_out,
+            case.row_starts,
+            case.row_ends,
+            topk=2048,
+        )
+
+
+def test_dsa_runtime_radix_tile_config_contract() -> None:
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_RUNTIME_CONFIG == (8192, 4)
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG == (8192, 8)
+    assert dsa_topk_gfx950._ONEBLOCK_PREFILL_RUNTIME_CONFIG == (4096, 4)
+    assert dsa_topk_gfx950._ONEBLOCK_RADIX_SCHEDULE == (12, 12, 8)
+
+    params = {
+        param.name: param
+        for param in dsa_topk_gfx950._dsa_runtime_radix_topk_kernel.params
+    }
+    assert tuple(params)[-3:] == ("MAX_BUCKETS", "BLOCK_N", "LOAD_ELEMS")
+    assert all(params[name].is_constexpr for name in tuple(params)[-3:])
+
+
+@pytest.mark.parametrize("mode", ("decode", "prefill"))
+@pytest.mark.parametrize("config", _RUNTIME_RADIX_TILE_CONFIGS)
+def test_dsa_runtime_radix_tile_configs_match_exact_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+    mode: str,
+    config: tuple[int, int],
+) -> None:
+    _select_runtime_radix_tile_config(monkeypatch, mode, config)
+    plan = None
+    for cols in (8192, 16384, 32768, 32771):
+        case = _make_runtime_radix_tile_case(
+            mode,
+            cols,
+            seed=1907 + cols + config[0] + config[1],
+        )
+
+        out, lens_out = _run_runtime_radix_tile_case(case)
+
+        _assert_runtime_radix_tile_case(case, out, lens_out)
+        if dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED:
+            cache = (
+                dsa_topk_gfx950._runtime_decode_runner_plans
+                if mode == "decode"
+                else dsa_topk_gfx950._runtime_prefill_runner_plans
+            )
+            assert len(cache) == 1
+            current_plan = next(iter(cache.values()))
+            if plan is None:
+                plan = current_plan
+            else:
+                assert current_plan is plan
+
+
+@pytest.mark.parametrize("mode", ("decode", "prefill"))
+@pytest.mark.parametrize("config", _RUNTIME_RADIX_TILE_CONFIGS)
+def test_dsa_runtime_radix_tile_configs_repeat_ties_and_infinities(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+    mode: str,
+    config: tuple[int, int],
+) -> None:
+    _select_runtime_radix_tile_config(monkeypatch, mode, config)
+    case = _make_runtime_radix_tile_case(
+        mode,
+        32771,
+        seed=2907 + config[0] + config[1],
+        oversized_ties=True,
+    )
+    out = torch.empty((case.logits.shape[0], 2048), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((case.logits.shape[0],), device="cuda", dtype=torch.int32)
+
+    for _ in range(2):
+        out.fill_(123456)
+        lens_out.fill_(-7)
+        _run_runtime_radix_tile_case(case, out=out, lens_out=lens_out)
+        _assert_runtime_radix_tile_case(case, out, lens_out)
+
+
+@pytest.mark.parametrize("mode", ("decode", "prefill"))
+@pytest.mark.parametrize("config", _RUNTIME_RADIX_TILE_CONFIGS)
+def test_dsa_runtime_radix_tile_configs_are_graph_capturable(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+    mode: str,
+    config: tuple[int, int],
+) -> None:
+    _select_runtime_radix_tile_config(monkeypatch, mode, config)
+    case = _make_runtime_radix_tile_case(
+        mode,
+        32771,
+        seed=3907 + config[0] + config[1],
+    )
+    out = torch.empty((case.logits.shape[0], 2048), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((case.logits.shape[0],), device="cuda", dtype=torch.int32)
+    _run_runtime_radix_tile_case(case, out=out, lens_out=lens_out)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_runtime_radix_tile_case(case, out=out, lens_out=lens_out)
+    out.fill_(-7)
+    lens_out.fill_(-7)
+    graph.replay()
+
+    _assert_runtime_radix_tile_case(case, out, lens_out)
+
+
+@pytest.mark.parametrize("mode", ("decode", "prefill"))
+@pytest.mark.parametrize("config", _RUNTIME_RADIX_TILE_CONFIGS)
+def test_dsa_runtime_radix_tile_configs_use_two_streams(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+    mode: str,
+    config: tuple[int, int],
+) -> None:
+    _select_runtime_radix_tile_config(monkeypatch, mode, config)
+    case_a = _make_runtime_radix_tile_case(
+        mode,
+        32771,
+        seed=4907 + config[0] + config[1],
+    )
+    case_b = _make_runtime_radix_tile_case(
+        mode,
+        32771,
+        seed=5907 + config[0] + config[1],
+    )
+    out_a = torch.empty(
+        (case_a.logits.shape[0], 2048),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    out_b = torch.empty_like(out_a)
+    lens_a = torch.empty((case_a.logits.shape[0],), device="cuda", dtype=torch.int32)
+    lens_b = torch.empty_like(lens_a)
+    _run_runtime_radix_tile_case(case_a, out=out_a, lens_out=lens_a)
+
+    current_stream = torch.cuda.current_stream()
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    stream_a.wait_stream(current_stream)
+    stream_b.wait_stream(current_stream)
+    with torch.cuda.stream(stream_a):
+        _run_runtime_radix_tile_case(case_a, out=out_a, lens_out=lens_a)
+    with torch.cuda.stream(stream_b):
+        _run_runtime_radix_tile_case(case_b, out=out_b, lens_out=lens_b)
+    current_stream.wait_stream(stream_a)
+    current_stream.wait_stream(stream_b)
+
+    _assert_runtime_radix_tile_case(case_a, out_a, lens_a)
+    _assert_runtime_radix_tile_case(case_b, out_b, lens_b)
+
+
 @pytest.mark.parametrize(
     ("rows", "cols", "expected_groups"),
     (

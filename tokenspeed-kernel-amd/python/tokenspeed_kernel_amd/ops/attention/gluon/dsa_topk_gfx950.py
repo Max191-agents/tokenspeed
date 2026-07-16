@@ -57,9 +57,10 @@ _PREFILL_LOCAL_GROUP_PREFIX_MIN_COLS = 262144
 _ONEBLOCK_RADIX_SCHEDULE = (12, 12, 8)
 _ONEBLOCK_RADIX_BUCKETS = 1 << max(_ONEBLOCK_RADIX_SCHEDULE)
 _ONEBLOCK_DECODE_RADIX_BLOCK_N = 8192
-_ONEBLOCK_DECODE_SHORT_LOAD_ELEMS = 4
-_ONEBLOCK_DECODE_LONG_LOAD_ELEMS = 8
+_ONEBLOCK_DECODE_RUNTIME_CONFIG = (8192, 4)
+_ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG = (8192, 8)
 _ONEBLOCK_PREFILL_RADIX_BLOCK_N = 4096
+_ONEBLOCK_PREFILL_RUNTIME_CONFIG = (4096, 4)
 _ONEBLOCK_COMPACT_FINAL_BLOCK_N = 4096
 _ONEBLOCK_COMPACT_FINAL_MIN_COLS = 65536
 _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS = 65536
@@ -4674,10 +4675,10 @@ def _dsa_decode_topk_slots(
             cols < _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS
             or cols > _ONEBLOCK_RADIX_MAX_COLS
         ):
-            load_elems = (
-                _ONEBLOCK_DECODE_SHORT_LOAD_ELEMS
+            block_n, load_elems = (
+                _ONEBLOCK_DECODE_RUNTIME_CONFIG
                 if cols < _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS
-                else _ONEBLOCK_DECODE_LONG_LOAD_ELEMS
+                else _ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG
             )
             kernel_args = (
                 logits,
@@ -4696,7 +4697,7 @@ def _dsa_decode_topk_slots(
                 True,
                 False,
                 _ONEBLOCK_RADIX_BUCKETS,
-                _ONEBLOCK_DECODE_RADIX_BLOCK_N,
+                block_n,
                 load_elems,
             )
             specialization_key = kernel_args[10:]
@@ -4872,6 +4873,7 @@ def _dsa_prefill_topk_indices(
 
     if cols <= _ONEBLOCK_RADIX_MAX_COLS:
         if cols < _ONEBLOCK_COMPACT_FINAL_MIN_COLS:
+            block_n, load_elems = _ONEBLOCK_PREFILL_RUNTIME_CONFIG
             kernel_args = (
                 logits,
                 row_starts,
@@ -4889,8 +4891,8 @@ def _dsa_prefill_topk_indices(
                 False,
                 False,
                 _ONEBLOCK_RADIX_BUCKETS,
-                _ONEBLOCK_PREFILL_RADIX_BLOCK_N,
-                _load_elems(_ONEBLOCK_PREFILL_RADIX_BLOCK_N, 16),
+                block_n,
+                load_elems,
             )
             specialization_key = kernel_args[10:]
             _launch_warmed_compiled_kernel(
@@ -4945,6 +4947,7 @@ def _dsa_prefill_topk_indices(
         return out, lens_out
 
     if _PREFILL_RUNTIME_RADIX_MIN_COLS <= cols <= _PREFILL_RUNTIME_RADIX_MAX_COLS:
+        block_n, load_elems = _ONEBLOCK_PREFILL_RUNTIME_CONFIG
         kernel_args = (
             logits,
             row_starts,
@@ -4962,8 +4965,8 @@ def _dsa_prefill_topk_indices(
             False,
             True,
             _ONEBLOCK_RADIX_BUCKETS,
-            _ONEBLOCK_PREFILL_RADIX_BLOCK_N,
-            _load_elems(_ONEBLOCK_PREFILL_RADIX_BLOCK_N, 16),
+            block_n,
+            load_elems,
         )
         specialization_key = kernel_args[10:]
         _launch_warmed_compiled_kernel(
