@@ -319,6 +319,81 @@ def _dsa_trivial_topk_kernel(
 
 
 @gluon.jit
+def _dsa_trivial_decode_topk2048_kernel(
+    block_table,
+    seq_lens,
+    out,
+    lens_out,
+    block_table_stride: gl.constexpr,
+    out_stride: gl.constexpr,
+    block_table_cols: gl.constexpr,
+    page_size: gl.constexpr,
+    q_len_per_req: gl.constexpr,
+):
+    row = gl.program_id(0)
+    layout: gl.constexpr = gl.BlockedLayout(
+        [32 // gl.num_warps(), 1],
+        [1, 64],
+        [gl.num_warps(), 1],
+        [1, 0],
+    )
+    page_indices = gl.expand_dims(
+        gl.arange(0, 32, layout=gl.SliceLayout(1, layout)),
+        1,
+    )
+    page_offsets = gl.expand_dims(
+        gl.arange(0, 64, layout=gl.SliceLayout(0, layout)),
+        0,
+    )
+    offsets = page_indices * 64 + page_offsets
+
+    if q_len_per_req == 1:
+        req = row
+        candidate_len = gl.load(seq_lens + row).to(gl.int32)
+    else:
+        req = row // q_len_per_req
+        q_offset = row - req * q_len_per_req
+        candidate_len = gl.load(seq_lens + req).to(gl.int32)
+        candidate_len = candidate_len - (q_len_per_req - 1) + q_offset
+
+    valid = offsets < candidate_len
+    page = gl.load(
+        block_table + req * block_table_stride + page_indices,
+        mask=(page_indices * 64 < candidate_len) & (page_indices < block_table_cols),
+        other=0,
+    ).to(gl.int32)
+    indices = page * 64 + page_offsets
+    gl.store(
+        out + row * out_stride + offsets,
+        gl.where(valid, indices, -1),
+    )
+    gl.store(lens_out + row, gl.minimum(candidate_len, 2048).to(gl.int32))
+
+
+@gluon.jit
+def _dsa_trivial_prefill_topk2048_kernel(
+    row_starts,
+    row_ends,
+    out,
+    lens_out,
+    out_stride: gl.constexpr,
+):
+    row = gl.program_id(0)
+    layout: gl.constexpr = _vector_layout(2048, gl.num_warps(), 4)
+    offsets = gl.arange(0, 2048, layout=layout)
+    row_start = gl.load(row_starts + row).to(gl.int32)
+    row_end = gl.load(row_ends + row).to(gl.int32)
+    candidate_len = gl.maximum(row_end - row_start, 0)
+    valid = offsets < candidate_len
+    indices = row_start + offsets.to(gl.int32)
+    gl.store(
+        out + row * out_stride + offsets,
+        gl.where(valid, indices, -1),
+    )
+    gl.store(lens_out + row, gl.minimum(candidate_len, 2048).to(gl.int32))
+
+
+@gluon.jit
 def _load_oneblock_tile(
     candidate_logits,
     tile_start,
@@ -2787,23 +2862,37 @@ def _dsa_decode_topk_slots(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows, cols = logits.shape
     if cols <= topk:
-        _dsa_trivial_topk_kernel[(rows,)](
-            block_table,
-            seq_lens,
-            seq_lens,
-            seq_lens,
-            out,
-            lens_out,
-            block_table.stride(0),
-            out.stride(0),
-            block_table.shape[1],
-            page_size=int(page_size),
-            topk=topk,
-            q_len_per_req=q_len_per_req,
-            IS_DECODE=True,
-            TOPK_LOAD_ELEMS=_load_elems(topk, 8),
-            num_warps=8,
-        )
+        if topk == 2048 and page_size == 64:
+            _dsa_trivial_decode_topk2048_kernel[(rows,)](
+                block_table,
+                seq_lens,
+                out,
+                lens_out,
+                block_table.stride(0),
+                out.stride(0),
+                block_table.shape[1],
+                page_size=int(page_size),
+                q_len_per_req=q_len_per_req,
+                num_warps=8,
+            )
+        else:
+            _dsa_trivial_topk_kernel[(rows,)](
+                block_table,
+                seq_lens,
+                seq_lens,
+                seq_lens,
+                out,
+                lens_out,
+                block_table.stride(0),
+                out.stride(0),
+                block_table.shape[1],
+                page_size=int(page_size),
+                topk=topk,
+                q_len_per_req=q_len_per_req,
+                IS_DECODE=True,
+                TOPK_LOAD_ELEMS=_load_elems(topk, 8),
+                num_warps=8,
+            )
         return out, lens_out
 
     if cols <= _ONEBLOCK_RADIX_MAX_COLS:
@@ -2877,23 +2966,33 @@ def _dsa_prefill_topk_indices(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows, cols = logits.shape
     if cols <= topk:
-        _dsa_trivial_topk_kernel[(rows,)](
-            row_starts,
-            row_starts,
-            row_starts,
-            row_ends,
-            out,
-            lens_out,
-            0,
-            out.stride(0),
-            0,
-            page_size=1,
-            topk=topk,
-            q_len_per_req=1,
-            IS_DECODE=False,
-            TOPK_LOAD_ELEMS=_load_elems(topk, 8),
-            num_warps=8,
-        )
+        if topk == 2048:
+            _dsa_trivial_prefill_topk2048_kernel[(rows,)](
+                row_starts,
+                row_ends,
+                out,
+                lens_out,
+                out.stride(0),
+                num_warps=8,
+            )
+        else:
+            _dsa_trivial_topk_kernel[(rows,)](
+                row_starts,
+                row_starts,
+                row_starts,
+                row_ends,
+                out,
+                lens_out,
+                0,
+                out.stride(0),
+                0,
+                page_size=1,
+                topk=topk,
+                q_len_per_req=1,
+                IS_DECODE=False,
+                TOPK_LOAD_ELEMS=_load_elems(topk, 8),
+                num_warps=8,
+            )
         return out, lens_out
 
     if cols <= _ONEBLOCK_RADIX_MAX_COLS:
