@@ -27,12 +27,10 @@ from tokenspeed_numerics_input_generators import (
     MLARopeQuantizeFP8Inputs,
     RopeInputConfig,
     RopeInputs,
-    mla_rope_quantize_fp8_reference,
-    rope_reference,
 )
 
 
-def test_rope_inputs_generate_neox_full_head_values_and_reference() -> None:
+def test_rope_inputs_generate_neox_full_head_values() -> None:
     config = RopeInputConfig(
         num_tokens=5,
         num_q_heads=4,
@@ -48,53 +46,11 @@ def test_rope_inputs_generate_neox_full_head_values_and_reference() -> None:
     assert values.positions.dtype == torch.int64
     assert values.cos_sin_cache.shape == (1024, 16)
     assert values.fused_kv is None
-
-    q_ref, k_ref = rope_reference(
-        values.query,
-        values.key,
-        values.positions,
-        head_size=config.head_size,
-        cos_sin_cache=values.cos_sin_cache,
-        is_neox=config.is_neox,
-        rotary_dim=config.rotary_dim,
-    )
-    assert q_ref.shape == values.query.shape
-    assert k_ref.shape == values.key.shape
-    assert q_ref.dtype == values.query.dtype
-    assert k_ref.dtype == values.key.dtype
+    assert values.query.dtype == torch.bfloat16
+    assert values.key.dtype == torch.bfloat16
 
 
-def test_rope_reference_preserves_partial_rotary_tail() -> None:
-    config = RopeInputConfig(
-        num_tokens=3,
-        num_q_heads=2,
-        num_kv_heads=1,
-        head_size=16,
-        rotary_dim=8,
-        dtype=torch.float32,
-        is_neox=True,
-    )
-    values = RopeInputs(config).generate(seed=23, metadata_seed=24, device="cpu")
-
-    q_ref, k_ref = rope_reference(
-        values.query,
-        values.key,
-        values.positions,
-        head_size=config.head_size,
-        cos_sin_cache=values.cos_sin_cache,
-        is_neox=True,
-        rotary_dim=config.rotary_dim,
-    )
-
-    q_tail = q_ref.view(3, 2, 16)[..., 8:]
-    q_orig_tail = values.query.view(3, 2, 16)[..., 8:]
-    k_tail = k_ref.view(3, 1, 16)[..., 8:]
-    k_orig_tail = values.key.view(3, 1, 16)[..., 8:]
-    torch.testing.assert_close(q_tail, q_orig_tail)
-    torch.testing.assert_close(k_tail, k_orig_tail)
-
-
-def test_rope_inputs_generate_gptj_layout_reference() -> None:
+def test_rope_inputs_generate_gptj_layout_values() -> None:
     config = RopeInputConfig(
         num_tokens=4,
         num_q_heads=2,
@@ -104,20 +60,10 @@ def test_rope_inputs_generate_gptj_layout_reference() -> None:
         is_neox=False,
     )
     values = RopeInputs(config).generate(seed=25, metadata_seed=26, device="cpu")
-    q_ref, k_ref = rope_reference(
-        values.query,
-        values.key,
-        values.positions,
-        head_size=config.head_size,
-        cos_sin_cache=values.cos_sin_cache,
-        is_neox=False,
-        rotary_dim=config.rotary_dim,
-    )
 
-    assert q_ref.shape == values.query.shape
-    assert k_ref.shape == values.key.shape
-    assert not torch.equal(q_ref, values.query)
-    assert not torch.equal(k_ref, values.key)
+    assert values.query.shape == (4, 16)
+    assert values.key.shape == (4, 8)
+    assert values.cos_sin_cache.shape == (1024, 8)
 
 
 def test_rope_inputs_generate_fused_kv_and_output_buffers() -> None:
@@ -218,7 +164,7 @@ def test_rope_rejects_too_small_cache_for_fused_kv() -> None:
         )
 
 
-def test_mla_rope_quantize_fp8_inputs_generate_rank2_reference() -> None:
+def test_mla_rope_quantize_fp8_inputs_generate_rank2_values() -> None:
     config = MLARopeQuantizeFP8InputConfig(
         num_tokens=4,
         num_q_heads=3,
@@ -241,23 +187,15 @@ def test_mla_rope_quantize_fp8_inputs_generate_rank2_reference() -> None:
     assert values.k_nope.shape == (4, 5)
     assert values.q_rope_out.dtype == torch.float8_e4m3fn
     assert values.k_nope_out.dtype == torch.float8_e4m3fn
-
-    ref = mla_rope_quantize_fp8_reference(values)
-    assert ref.query.shape == (4, 3, 13)
-    assert ref.key.shape == (4, 13)
-    assert ref.query.dtype == torch.float8_e4m3fn
-    assert ref.key.dtype == torch.float8_e4m3fn
-    torch.testing.assert_close(
-        ref.q_nope.view(torch.uint8),
-        (values.q_nope.float() * values.quant_scale_q)
-        .to(torch.float8_e4m3fn)
-        .view(torch.uint8),
-        atol=0,
-        rtol=0,
-    )
+    assert values.q_rope_out.shape == values.q_rope.shape
+    assert values.k_rope_out.shape == values.k_rope.shape
+    assert values.q_nope_out.shape == values.q_nope.shape
+    assert values.k_nope_out.shape == values.k_nope.shape
+    assert values.quant_scale_q == 0.75
+    assert values.quant_scale_kv == 1.25
 
 
-def test_mla_rope_quantize_fp8_inputs_generate_rank3_reference() -> None:
+def test_mla_rope_quantize_fp8_inputs_generate_rank3_values() -> None:
     config = MLARopeQuantizeFP8InputConfig(
         num_tokens=3,
         num_q_heads=4,
@@ -279,12 +217,10 @@ def test_mla_rope_quantize_fp8_inputs_generate_rank3_reference() -> None:
     assert values.k_rope.shape == (3, 2, 10)
     assert values.k_nope.shape == (3, 2, 6)
     assert values.k_rope_out.dtype == torch.float8_e5m2
-
-    ref = mla_rope_quantize_fp8_reference(values)
-    assert ref.query.shape == (3, 4, 16)
-    assert ref.key.shape == (3, 2, 16)
-    assert ref.q_rope.dtype == torch.float8_e5m2
-    assert ref.k_rope.dtype == torch.float8_e5m2
+    assert values.q_rope_out.shape == (3, 4, 10)
+    assert values.q_nope_out.shape == (3, 4, 6)
+    assert values.k_rope_out.shape == (3, 2, 10)
+    assert values.k_nope_out.shape == (3, 2, 6)
 
 
 def test_mla_rope_quantize_fp8_metadata_seed_controls_positions_only() -> None:

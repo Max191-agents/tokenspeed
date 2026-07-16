@@ -90,6 +90,23 @@ def test_package_all_names_are_bound() -> None:
     assert missing == []
 
 
+def test_embedding_family_does_not_export_reference_implementations() -> None:
+    embedding = importlib.import_module(
+        "tokenspeed_numerics_input_generators.embedding"
+    )
+    reference_names = {
+        "MLARopeQuantizeFP8ReferenceValues",
+        "mla_rope_quantize_fp8_reference",
+        "rope_reference",
+    }
+
+    assert reference_names.isdisjoint(embedding.__all__)
+    assert reference_names.isdisjoint(public.__all__)
+    for name in reference_names:
+        assert not hasattr(embedding, name)
+        assert not hasattr(public, name)
+
+
 def test_removed_family_modules_are_not_importable() -> None:
     for module_name in _REMOVED_MODULES:
         with pytest.raises(ModuleNotFoundError):

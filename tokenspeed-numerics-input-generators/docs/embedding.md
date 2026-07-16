@@ -57,8 +57,9 @@ Rank-3 key tensors model explicit GQA/MHA KV heads:
 - `k_rope[num_tokens, num_kv_heads, qk_rope_head_dim]`
 
 The generated output buffers have the same shapes as their corresponding input
-slices and FP8 dtype. The reference returns both the slice outputs and the
-concatenated query/key tensors.
+slices and FP8 dtype. Executing the represented operation produces the rotated,
+quantized slices; concatenating each NOPE/RoPE pair produces the full query or
+key tensor.
 
 ## Fused KV Writes
 
@@ -114,3 +115,7 @@ RoPE FP8 values directly: the generated input slices, `cos_sin_cache`,
 `positions`, FP8 output buffers, layout flag, and quantization scales. The
 generator does not depend on FlashInfer; tests can adapt the values into that
 wrapper when the backend is available.
+
+Reference implementations are consumer concerns and are intentionally not
+part of the input-generator package. TokenSpeed keeps its RoPE references in
+its numerical validation layer.

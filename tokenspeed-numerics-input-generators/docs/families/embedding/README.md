@@ -21,9 +21,9 @@ tables for a requested context length and rotary dimension.
 ## Generated Values
 
 Generated values include input tensors, position metadata, precomputed
-cosine/sine caches, and optional output buffers. The references apply rotary
-math directly over the generated values, while backend adapters can translate
-those values into kernel-specific layouts.
+cosine/sine caches, and optional output buffers. Consumers execute the
+operation or translate those values into implementation-specific layouts;
+reference implementations are not part of this package.
 
 Verification keeps position ids within the generated cache range and enforces
 compatible rotary dimensions. For fused RoPE quantization, verification also

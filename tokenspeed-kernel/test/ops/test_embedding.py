@@ -22,12 +22,12 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.reference.embedding import rope_reference
 from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
 from tokenspeed_numerics_input_generators import (
     RopeInputConfig,
     RopeInputs,
     RopeInputValues,
-    rope_reference,
 )
 
 

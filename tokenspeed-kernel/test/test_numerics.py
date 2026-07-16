@@ -25,6 +25,7 @@ import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
 from tokenspeed_kernel.numerics.inputs import get_input_generator, get_standard_shapes
 from tokenspeed_kernel.numerics.outputs import get_output_extractor
+from tokenspeed_kernel.numerics.reference.embedding import rope_reference
 from tokenspeed_kernel.numerics.reference.moe import moe_reference
 from tokenspeed_kernel.numerics.tolerance import Tolerance
 from tokenspeed_kernel.numerics.verify import (
@@ -45,7 +46,6 @@ from tokenspeed_numerics_input_generators import (
     argmax_reference,
     attention_merge_state_reference,
     mxfp4_quantization_reference,
-    rope_reference,
 )
 
 _fp8_dtype = Platform.get().fp8e4m3fn.dtype

@@ -22,6 +22,10 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.reference.embedding import (
+    mla_rope_quantize_fp8_reference,
+    rope_reference,
+)
 from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
 from tokenspeed_kernel.ops.embedding.flashinfer import mla_rope_quantize_fp8
 from tokenspeed_kernel.platform import current_platform
@@ -30,11 +34,81 @@ from tokenspeed_numerics_input_generators import (
     MLARopeQuantizeFP8Inputs,
     RopeInputConfig,
     RopeInputs,
-    mla_rope_quantize_fp8_reference,
-    rope_reference,
 )
 
 platform = current_platform()
+
+
+def test_rope_reference_preserves_partial_rotary_tail() -> None:
+    config = RopeInputConfig(
+        num_tokens=3,
+        num_q_heads=2,
+        num_kv_heads=1,
+        head_size=16,
+        rotary_dim=8,
+        dtype=torch.float32,
+        is_neox=True,
+    )
+    values = RopeInputs(config).generate(seed=23, metadata_seed=24, device="cpu")
+
+    q_ref, k_ref = rope_reference(
+        values.query,
+        values.key,
+        values.positions,
+        head_size=config.head_size,
+        cos_sin_cache=values.cos_sin_cache,
+        is_neox=config.is_neox,
+        rotary_dim=config.rotary_dim,
+    )
+
+    torch.testing.assert_close(
+        q_ref.view(3, 2, 16)[..., 8:],
+        values.query.view(3, 2, 16)[..., 8:],
+    )
+    torch.testing.assert_close(
+        k_ref.view(3, 1, 16)[..., 8:],
+        values.key.view(3, 1, 16)[..., 8:],
+    )
+
+
+@pytest.mark.parametrize(
+    ("k_rank", "num_kv_heads", "expected_key_shape"),
+    [(2, 1, (4, 13)), (3, 2, (4, 2, 13))],
+)
+def test_mla_rope_quantize_fp8_reference(
+    k_rank: int,
+    num_kv_heads: int,
+    expected_key_shape: tuple[int, ...],
+) -> None:
+    values = MLARopeQuantizeFP8Inputs(
+        MLARopeQuantizeFP8InputConfig(
+            num_tokens=4,
+            num_q_heads=3,
+            qk_nope_head_dim=5,
+            qk_rope_head_dim=8,
+            input_dtype=torch.bfloat16,
+            k_rank=k_rank,
+            num_kv_heads=num_kv_heads,
+            quant_scale_q=0.75,
+            quant_scale_kv=1.25,
+            max_position=32,
+        )
+    ).generate(seed=31, metadata_seed=32, device="cpu")
+
+    ref = mla_rope_quantize_fp8_reference(values)
+
+    assert ref.query.shape == (4, 3, 13)
+    assert ref.key.shape == expected_key_shape
+    assert ref.query.dtype == torch.float8_e4m3fn
+    assert ref.key.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(
+        ref.q_nope.view(torch.uint8),
+        (values.q_nope.float() * values.quant_scale_q)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8),
+        atol=0,
+        rtol=0,
+    )
 
 
 @pytest.mark.parametrize("is_neox", [True, False])
