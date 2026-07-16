@@ -940,11 +940,13 @@ def _make_grouped_radix_logits(
     seed: int = 1907,
 ) -> torch.Tensor:
     generator = _generator("cuda", seed)
-    logits = torch.empty(
-        (row_starts.numel(), cols),
+    base_cols = min(cols, 65536)
+    base = torch.empty(
+        (row_starts.numel(), base_cols),
         device="cuda",
         dtype=torch.float32,
     ).uniform_(-1.0, 1.0, generator=generator)
+    logits = base.repeat(1, math.ceil(cols / base_cols))[:, :cols].contiguous()
     high_count = topk - 32
     starts = row_starts.cpu().tolist()
     ends = row_ends.cpu().tolist()
@@ -992,6 +994,121 @@ def _assert_grouped_radix_topk(
         assert bool((actual[row, count:] == -1).all())
 
 
+def _make_reversed_decode_block_table(
+    requests: int,
+    cols: int,
+    page_size: int,
+) -> torch.Tensor:
+    pages = math.ceil(cols / page_size)
+    logical_to_physical = torch.arange(
+        pages - 1,
+        -1,
+        -1,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    return torch.stack(
+        [logical_to_physical + request * pages for request in range(requests)]
+    )
+
+
+def _assert_decode_topk_slots(
+    logits: torch.Tensor,
+    actual: torch.Tensor,
+    actual_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    q_len_per_req: int,
+    topk: int,
+) -> None:
+    rows = logits.shape[0]
+    for row in range(rows):
+        req, q_offset = divmod(row, q_len_per_req)
+        row_end = int(seq_lens[req].item()) - (q_len_per_req - 1) + q_offset
+        count = min(max(row_end, 0), topk)
+        assert int(actual_lens[row].item()) == count
+        selected = actual[row, :count].long()
+        inverse_pages = torch.empty(
+            (int(block_table.max().item()) + 1,),
+            device="cuda",
+            dtype=torch.int64,
+        )
+        inverse_pages[block_table[req].long()] = torch.arange(
+            block_table.shape[1],
+            device="cuda",
+        )
+        logical = (
+            inverse_pages[selected // page_size] * page_size + selected % page_size
+        )
+        assert bool(((logical >= 0) & (logical < row_end)).all())
+        assert int(torch.unique(logical).numel()) == count
+        actual_values = torch.sort(logits[row].index_select(0, logical)).values
+        expected_values = torch.sort(
+            torch.topk(logits[row, :row_end], count).values
+        ).values
+        torch.testing.assert_close(actual_values.cpu(), expected_values.cpu())
+        assert bool((actual[row, count:] == -1).all())
+
+
+@pytest.mark.parametrize(
+    ("rows", "cols", "expected_groups"),
+    (
+        (32, 131072, 2),
+        (64, 131072, 2),
+        (64, 147493, 2),
+        (64, 262144, 4),
+        (64, 524288, 4),
+        (64, 1048576, 4),
+    ),
+)
+def test_dsa_prefill_topk_dispatches_persistent_groups_across_rows(
+    rows: int,
+    cols: int,
+    expected_groups: int,
+) -> None:
+    topk = 2048
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = row_ids * 17
+    row_ends = cols - (rows - 1 - row_ids) * 31
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    groups = dsa_topk_gfx950._persistent_prefill_groups(
+        rows,
+        cols,
+        topk,
+        logits.device,
+    )
+    assert groups == expected_groups
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace)
+
+
 def test_dsa_prefill_topk_local_prefix_is_deterministic_across_rows() -> None:
     rows = 64
     cols = 262144
@@ -1011,6 +1128,69 @@ def test_dsa_prefill_topk_local_prefix_is_deterministic_across_rows() -> None:
     tiles = dsa_topk_gfx950.triton.cdiv(cols, dsa_topk_gfx950._RADIX_TOPK_BLOCK_N)
     groups = dsa_topk_gfx950._radix_groups_per_row(rows, tiles, logits.device)
     assert groups < tiles
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+    first_out = out.clone()
+    first_lens = lens_out.clone()
+    out.fill_(-1)
+    lens_out.fill_(-1)
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    torch.testing.assert_close(out, first_out)
+    torch.testing.assert_close(lens_out, first_lens)
+
+
+def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
+    rows = 32
+    cols = 131072
+    topk = 2048
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = row_ids * 7
+    row_ends = cols - (rows - 1 - row_ids) * 11
+    logits = torch.zeros((rows, cols), device="cuda", dtype=torch.float32)
+    starts = row_starts.cpu().tolist()
+    ends = row_ends.cpu().tolist()
+    for row, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        if row == 0:
+            logits[row, start:end] = float("inf")
+        elif row == 1:
+            logits[row, start:end] = -float("inf")
+        else:
+            logits[row, start : start + 37] = float("inf")
+            logits[row, start + 37 : end : 257] = -float("inf")
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        == 2
+    )
     dsa_topk_gfx950._dsa_prefill_topk_indices(
         logits,
         row_starts,
@@ -1126,7 +1306,51 @@ def test_dsa_prefill_topk_90k_boundary_keeps_exact_values() -> None:
     )
 
 
-def test_dsa_decode_topk_dispatches_runtime_radix_for_batched_queries() -> None:
+def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
+    device = torch.device("cuda")
+    compute_units = torch.cuda.get_device_properties(device).multi_processor_count
+    topk = 2048
+    four_group_rows = compute_units // 4
+
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            four_group_rows,
+            262144,
+            topk,
+            device,
+        )
+        == 4
+    )
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            four_group_rows + 1,
+            262144,
+            topk,
+            device,
+        )
+        == 2
+    )
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            compute_units // 2 + 1,
+            262144,
+            topk,
+            device,
+        )
+        is None
+    )
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            dsa_topk_gfx950._PERSISTENT_PREFILL_MIN_ROWS - 1,
+            131072,
+            topk,
+            device,
+        )
+        is None
+    )
+
+
+def test_dsa_decode_topk_dispatches_persistent_radix_for_batched_queries() -> None:
     page_size = 64
     q_len_per_req = 4
     requests = 16
@@ -1246,14 +1470,11 @@ def test_dsa_decode_topk_maps_grouped_queries_to_physical_slots(
         cols=cols,
         topk=topk,
     )
-    pages = math.ceil(cols / page_size)
-    block_table = torch.arange(
-        pages - 1,
-        -1,
-        -1,
-        device="cuda",
-        dtype=torch.int32,
-    ).repeat(requests, 1)
+    block_table = _make_reversed_decode_block_table(
+        requests,
+        cols,
+        page_size,
+    )
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
@@ -1268,22 +1489,311 @@ def test_dsa_decode_topk_maps_grouped_queries_to_physical_slots(
         lens_out=lens_out,
     )
 
-    logical = torch.empty_like(out)
-    inverse_pages = torch.empty((pages,), device="cuda", dtype=torch.int64)
-    inverse_pages[block_table[0].long()] = torch.arange(pages, device="cuda")
-    for row in range(rows):
-        slots = out[row].long()
-        logical[row] = (
-            inverse_pages[slots // page_size] * page_size + slots % page_size
-        ).to(torch.int32)
-    _assert_grouped_radix_topk(
+    _assert_decode_topk_slots(
         logits,
-        logical,
+        out,
         lens_out,
-        row_starts,
-        row_ends,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        q_len_per_req=q_len_per_req,
         topk=topk,
     )
+
+
+def test_dsa_persistent_decode_groups_obey_residency_bound() -> None:
+    device = torch.device("cuda")
+    compute_units = torch.cuda.get_device_properties(device).multi_processor_count
+    topk = 2048
+
+    assert dsa_topk_gfx950._persistent_decode_groups(1, 131072, topk, device) == 8
+    assert (
+        dsa_topk_gfx950._persistent_decode_groups(
+            compute_units // 2,
+            131072,
+            topk,
+            device,
+        )
+        == 2
+    )
+    assert (
+        dsa_topk_gfx950._persistent_decode_groups(
+            compute_units // 2 + 1,
+            131072,
+            topk,
+            device,
+        )
+        is None
+    )
+    assert dsa_topk_gfx950._persistent_decode_groups(1, 90000, topk, device) is None
+    assert (
+        dsa_topk_gfx950._persistent_decode_groups(
+            1,
+            256 * 1024 + 1,
+            topk,
+            device,
+        )
+        is None
+    )
+
+
+def test_dsa_persistent_decode_handles_tail_ties_and_infinities() -> None:
+    page_size = 64
+    q_len_per_req = 4
+    requests = 2
+    rows = requests * q_len_per_req
+    cols = 147493
+    topk = 2048
+    seq_lens = torch.tensor(
+        [cols - 17, cols - 113],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    q_offsets = torch.arange(q_len_per_req, device="cuda", dtype=torch.int32)
+    row_ends = (seq_lens[:, None] - (q_len_per_req - 1) + q_offsets[None, :]).reshape(
+        -1
+    )
+    logits = torch.zeros((rows, cols), device="cuda", dtype=torch.float32)
+    for row, row_end in enumerate(row_ends.cpu().tolist()):
+        if row == 0:
+            logits[row, :row_end] = float("inf")
+        elif row == 1:
+            logits[row, :row_end] = -float("inf")
+        else:
+            logits[row, :37] = float("inf")
+            logits[row, 37:row_end:257] = -float("inf")
+    block_table = _make_reversed_decode_block_table(requests, cols, page_size)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    assert (
+        dsa_topk_gfx950._persistent_decode_groups(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        == 8
+    )
+    dsa_topk_gfx950._dsa_decode_topk_slots(
+        logits,
+        block_table,
+        seq_lens,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_decode_topk_slots(
+        logits,
+        out,
+        lens_out,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        q_len_per_req=q_len_per_req,
+        topk=topk,
+    )
+    workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace)
+
+
+@pytest.mark.parametrize("warm_workspace", (False, True), ids=("cold-key", "warm-key"))
+def test_dsa_persistent_decode_is_graph_capturable(warm_workspace: bool) -> None:
+    page_size = 64
+    q_len_per_req = 4
+    requests = 2
+    rows = requests * q_len_per_req
+    cols = 131072
+    topk = 2048
+    seq_lens = torch.tensor(
+        [cols - 17, cols - 71],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    q_offsets = torch.arange(q_len_per_req, device="cuda", dtype=torch.int32)
+    row_ends = (seq_lens[:, None] - (q_len_per_req - 1) + q_offsets[None, :]).reshape(
+        -1
+    )
+    logits = _make_grouped_radix_logits(
+        torch.zeros_like(row_ends),
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=5907,
+    )
+    block_table = _make_reversed_decode_block_table(requests, cols, page_size)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    dsa_topk_gfx950._dsa_decode_topk_slots(
+        logits,
+        block_table,
+        seq_lens,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    device_index = logits.device.index
+    assert device_index is not None
+    workspace_key = (
+        device_index,
+        int(capture_stream.cuda_stream),
+        dsa_topk_gfx950._next_power_of_two(rows),
+    )
+    assert workspace_key not in dsa_topk_gfx950._persistent_topk_workspace_cache
+    if warm_workspace:
+        with torch.cuda.stream(capture_stream):
+            dsa_topk_gfx950._dsa_decode_topk_slots(
+                logits,
+                block_table,
+                seq_lens,
+                page_size=page_size,
+                topk=topk,
+                q_len_per_req=q_len_per_req,
+                out=out,
+                lens_out=lens_out,
+            )
+        capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        dsa_topk_gfx950._dsa_decode_topk_slots(
+            logits,
+            block_table,
+            seq_lens,
+            page_size=page_size,
+            topk=topk,
+            q_len_per_req=q_len_per_req,
+            out=out,
+            lens_out=lens_out,
+        )
+    capture_stream.synchronize()
+    out.fill_(-7)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    _assert_decode_topk_slots(
+        logits,
+        out,
+        lens_out,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        q_len_per_req=q_len_per_req,
+        topk=topk,
+    )
+
+
+def test_dsa_persistent_decode_is_stream_local() -> None:
+    page_size = 64
+    q_len_per_req = 4
+    requests = 2
+    rows = requests * q_len_per_req
+    cols = 131072
+    topk = 2048
+    seq_lens = torch.tensor(
+        [cols - 17, cols - 71],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    q_offsets = torch.arange(q_len_per_req, device="cuda", dtype=torch.int32)
+    row_ends = (seq_lens[:, None] - (q_len_per_req - 1) + q_offsets[None, :]).reshape(
+        -1
+    )
+    row_starts = torch.zeros_like(row_ends)
+    logits_a = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=6907,
+    )
+    logits_b = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=7907,
+    )
+    block_table = _make_reversed_decode_block_table(requests, cols, page_size)
+    out_a = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    out_b = torch.empty_like(out_a)
+    lens_a = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    lens_b = torch.empty_like(lens_a)
+
+    current_stream = torch.cuda.current_stream()
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    stream_a.wait_stream(current_stream)
+    stream_b.wait_stream(current_stream)
+    with torch.cuda.stream(stream_a):
+        workspace_a = dsa_topk_gfx950._persistent_topk_workspace(
+            rows,
+            logits_a.device,
+        )
+        for _ in range(3):
+            dsa_topk_gfx950._dsa_decode_topk_slots(
+                logits_a,
+                block_table,
+                seq_lens,
+                page_size=page_size,
+                topk=topk,
+                q_len_per_req=q_len_per_req,
+                out=out_a,
+                lens_out=lens_a,
+            )
+    with torch.cuda.stream(stream_b):
+        workspace_b = dsa_topk_gfx950._persistent_topk_workspace(
+            rows,
+            logits_b.device,
+        )
+        for _ in range(3):
+            dsa_topk_gfx950._dsa_decode_topk_slots(
+                logits_b,
+                block_table,
+                seq_lens,
+                page_size=page_size,
+                topk=topk,
+                q_len_per_req=q_len_per_req,
+                out=out_b,
+                lens_out=lens_b,
+            )
+    assert all(
+        tensor_a.data_ptr() != tensor_b.data_ptr()
+        for tensor_a, tensor_b in zip(workspace_a, workspace_b, strict=True)
+    )
+    current_stream.wait_stream(stream_a)
+    current_stream.wait_stream(stream_b)
+
+    _assert_decode_topk_slots(
+        logits_a,
+        out_a,
+        lens_a,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        q_len_per_req=q_len_per_req,
+        topk=topk,
+    )
+    _assert_decode_topk_slots(
+        logits_b,
+        out_b,
+        lens_b,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        q_len_per_req=q_len_per_req,
+        topk=topk,
+    )
+    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace_a)
+    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace_b)
 
 
 def test_dsa_prefill_topk_hist_derived_handles_shifted_and_inf_rows() -> None:
@@ -1452,6 +1962,194 @@ def test_dsa_prefill_grouped_radix_topk_is_stream_local(cols: int) -> None:
         row_ends,
         topk=topk,
     )
+
+
+@pytest.mark.parametrize("warm_workspace", (False, True), ids=("cold-key", "warm-key"))
+def test_dsa_persistent_prefill_topk_is_graph_capturable(
+    warm_workspace: bool,
+) -> None:
+    rows = 64 if warm_workspace else 96
+    cols = 131072
+    topk = 2048
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = row_ids * 11
+    row_ends = cols - (rows - 1 - row_ids) * 19
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    # Compile before capture without populating the capture stream's cache key.
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    device_index = logits.device.index
+    assert device_index is not None
+    workspace_key = (
+        device_index,
+        int(capture_stream.cuda_stream),
+        dsa_topk_gfx950._next_power_of_two(rows),
+    )
+    assert workspace_key not in dsa_topk_gfx950._persistent_topk_workspace_cache
+    if warm_workspace:
+        with torch.cuda.stream(capture_stream):
+            dsa_topk_gfx950._dsa_prefill_topk_indices(
+                logits,
+                row_starts,
+                row_ends,
+                topk=topk,
+                out=out,
+                lens_out=lens_out,
+            )
+        capture_stream.synchronize()
+        assert workspace_key in dsa_topk_gfx950._persistent_topk_workspace_cache
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+    capture_stream.synchronize()
+    assert workspace_key in dsa_topk_gfx950._persistent_topk_workspace_cache
+    if warm_workspace:
+        graph_workspace = dsa_topk_gfx950._persistent_topk_workspace_cache[
+            workspace_key
+        ]
+        graph_workspace_ptrs = tuple(t.data_ptr() for t in graph_workspace)
+        pressure_streams = [torch.cuda.Stream() for _ in range(17)]
+        for pressure_stream in pressure_streams:
+            with torch.cuda.stream(pressure_stream):
+                dsa_topk_gfx950._persistent_topk_workspace(
+                    rows,
+                    logits.device,
+                )
+        torch.cuda.synchronize()
+        assert len(dsa_topk_gfx950._persistent_topk_workspace_cache) <= (
+            dsa_topk_gfx950._PERSISTENT_PREFILL_WORKSPACE_CACHE_MAXSIZE
+        )
+        assert workspace_key in dsa_topk_gfx950._persistent_topk_workspace_cache
+        assert (
+            tuple(
+                t.data_ptr()
+                for t in dsa_topk_gfx950._persistent_topk_workspace_cache[workspace_key]
+            )
+            == graph_workspace_ptrs
+        )
+    out.fill_(-7)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+
+
+def test_dsa_persistent_prefill_topk_is_stream_local() -> None:
+    rows = 64
+    cols = 131072
+    topk = 2048
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = row_ids * 13
+    row_ends = cols - (rows - 1 - row_ids) * 23
+    logits_a = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=2907,
+    )
+    logits_b = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=3907,
+    )
+    out_a = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    out_b = torch.empty_like(out_a)
+    lens_a = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    lens_b = torch.empty_like(lens_a)
+
+    current_stream = torch.cuda.current_stream()
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    stream_a.wait_stream(current_stream)
+    stream_b.wait_stream(current_stream)
+    with torch.cuda.stream(stream_a):
+        workspace_a = dsa_topk_gfx950._persistent_topk_workspace(
+            rows,
+            logits_a.device,
+        )
+        for _ in range(3):
+            dsa_topk_gfx950._dsa_prefill_topk_indices(
+                logits_a,
+                row_starts,
+                row_ends,
+                topk=topk,
+                out=out_a,
+                lens_out=lens_a,
+            )
+    with torch.cuda.stream(stream_b):
+        workspace_b = dsa_topk_gfx950._persistent_topk_workspace(
+            rows,
+            logits_b.device,
+        )
+        for _ in range(3):
+            dsa_topk_gfx950._dsa_prefill_topk_indices(
+                logits_b,
+                row_starts,
+                row_ends,
+                topk=topk,
+                out=out_b,
+                lens_out=lens_b,
+            )
+    assert all(
+        tensor_a.data_ptr() != tensor_b.data_ptr()
+        for tensor_a, tensor_b in zip(workspace_a, workspace_b, strict=True)
+    )
+    current_stream.wait_stream(stream_a)
+    current_stream.wait_stream(stream_b)
+
+    _assert_grouped_radix_topk(
+        logits_a,
+        out_a,
+        lens_a,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    _assert_grouped_radix_topk(
+        logits_b,
+        out_b,
+        lens_b,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace_a)
+    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace_b)
 
 
 def _pack_sparse_kv(
