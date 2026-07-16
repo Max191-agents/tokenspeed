@@ -5,8 +5,8 @@ computation and the external operands of the complete fused operation.
 
 ## Generators
 
-- `MoeRoutingInputs`: router projection operands, router logits, and consistent
-  top-k expert IDs and weights.
+- `MoeRoutingInputs`: hidden states, router projection weights, and optional
+  router and correction biases. It does not execute routing.
 - `MoeDispatchInputs`: hidden states and precomputed top-k routing metadata
   entering token-to-expert dispatch.
 - `MoeGateUpInputs`: routed hidden-state rows, selected expert IDs, W13 expert
@@ -17,10 +17,10 @@ computation and the external operands of the complete fused operation.
 - `MoeInputs`: all external operands for a full fused routed MoE, composed from
   `MoeRoutingInputs` and expert W13/W2 weight generation.
 
-Routing supports softmax, sigmoid, and softplus-sqrt score transformations,
-optional correction bias, optional expert-group filtering, selected-weight
-normalization, and routing scales. Expert weights support regular torch dtypes
-and the quantized custom dtypes handled by core tensor generation.
+Router logits and top-k selections are derived results and are intentionally not
+returned by `MoeRoutingInputs` or `MoeInputs`. Consumers execute their routing
+strategy after generation. Expert weights support regular torch dtypes and the
+quantized custom dtypes handled by core tensor generation.
 
 Kernel-specific staging buffers, block-alignment metadata, permutation
 layouts, and finalization buffers are adapter concerns. Tests for those kernels

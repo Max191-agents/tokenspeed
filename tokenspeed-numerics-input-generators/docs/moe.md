@@ -20,17 +20,13 @@ for the external operands of the full fused operation.
 - `hidden_states`: `[T, H]`.
 - `router_weight`: `[E, H]`.
 - Optional `router_bias`: `[E]`.
-- `router_logits`: `[T, E]`, derived from the generated hidden states and
-  router projection parameters.
 - Optional `correction_bias`: `[E]`, used for selection but not route weights.
-- `topk_ids`: `[T, K]` unique selected expert IDs.
-- `topk_weights`: `[T, K]` finite non-negative route weights.
 
-Router weights are scaled by `1 / sqrt(H)` before computing logits so the
-generated score distribution remains useful as hidden size grows. Routing can
-use softmax, sigmoid, or softplus-sqrt scores. Optional equal-size expert-group
-filtering restricts candidates before top-k selection. Selected weights can be
-renormalized and multiplied by a positive routing scale.
+Router weights are generated with a `1 / sqrt(H)` scale so executing the router
+projection produces a useful score distribution as hidden size grows. The
+generator does not execute that projection or top-k selection. Router logits,
+selected expert IDs, and route weights are derived results owned by the caller's
+reference or implementation.
 
 ## Dispatch
 
@@ -39,6 +35,10 @@ renormalized and multiplied by a positive routing scale.
 - `hidden_states`: `[T, H]`.
 - `topk_ids`: `[T, K]` unique IDs in `[0, E)`.
 - `topk_weights`: `[T, K]` normalized route weights.
+
+The top-k tensors are valid generated inputs here because routing has already
+happened at the dispatch boundary. They are generated independently rather than
+being computed from `hidden_states`.
 
 The generator does not choose a physical dispatch representation. Flattened
 slot IDs, expert offsets, block padding, permutations, inverse permutations,
@@ -84,14 +84,15 @@ when present, is added after the routed reduction.
 `MoeInputs` generates the external operands for the complete fused routed MoE:
 
 - Nested `routing` values containing hidden states, router projection tensors,
-  logits, and selected routes.
+  and optional routing biases.
 - `w13` and `w2` expert weight operands with optional scale sidecars.
 - Optional W13 and W2 expert biases.
 - Optional per-expert W13 and W2 activation scales.
 
 The full generator calls `MoeRoutingInputs` and reuses GEMM generation for the
-expert weights. It does not generate routed hidden states or post-gate/up
-activations because those are internal results of full execution.
+expert weights. It does not generate router logits, selected routes, routed
+hidden states, or post-gate/up activations because those are results produced
+during full execution.
 
 ## Dtypes And Quantization
 
@@ -113,9 +114,9 @@ block size so generated storage cannot represent a partial quantization group.
 
 TokenSpeed's fused MoE API begins after the router projection: it consumes
 hidden states, router logits or precomputed top-k values, and a runtime expert
-weight module. Its numerics adapter therefore extracts those tensors from
-`MoeInputs.routing` and builds the runtime module from `w13`, `w2`, biases, and
-scales.
+weight module. Its numerics adapter therefore executes router projection and
+top-k selection from `MoeInputs.routing`, then builds the runtime module from
+`w13`, `w2`, biases, and scales.
 
 Standalone helper kernels use the nearest core stage:
 
@@ -133,9 +134,9 @@ layouts out of the standalone input-generation package.
 ## Verification
 
 All generators reject invalid token, hidden, intermediate, expert, and top-k
-sizes. They verify floating and integer dtypes, finite positive routing and
-scale factors, expert-group divisibility and capacity, selected ID ranges,
-weight scale block divisibility, and the required shapes of every generated
-tensor. Generated top-k rows contain unique expert IDs and finite non-negative
-weights. Quantized weight configuration is also validated by the shared tensor
-and GEMM generators before values are returned.
+sizes. They verify floating and integer dtypes, selected ID ranges, weight scale
+block divisibility, and the required shapes and finite values of every generated
+tensor. Stage generators that accept top-k routing inputs ensure that each row
+contains unique expert IDs and finite non-negative weights. Quantized weight
+configuration is also validated by the shared tensor and GEMM generators before
+values are returned.

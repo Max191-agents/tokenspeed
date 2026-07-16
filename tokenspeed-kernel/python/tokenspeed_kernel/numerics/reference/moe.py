@@ -22,14 +22,70 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
-from tokenspeed_numerics_input_generators import GemmInputValues, MoeInputValues
+from tokenspeed_numerics_input_generators import (
+    GemmInputValues,
+    MoeInputValues,
+    MoeRoutingInputValues,
+)
 from tokenspeed_numerics_input_generators.gemm import (
     _check_gemm_layout,
     _logical_operand,
 )
+
+
+@dataclass
+class MoeRoutingResult:
+    """Results produced by executing router projection and top-k selection."""
+
+    router_logits: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+
+
+def moe_router_logits_reference(values: MoeRoutingInputValues) -> torch.Tensor:
+    """Execute the router projection from generated routing inputs."""
+
+    logits = values.hidden_states.float() @ values.router_weight.float().transpose(0, 1)
+    if values.router_bias is not None:
+        logits = logits + values.router_bias.float()
+    return logits.to(values.router_weight.dtype).contiguous()
+
+
+def moe_routing_reference(
+    values: MoeRoutingInputValues,
+    *,
+    top_k: int,
+    topk_ids_dtype: torch.dtype = torch.int32,
+    topk_weights_dtype: torch.dtype = torch.float32,
+) -> MoeRoutingResult:
+    """Execute standard softmax top-k routing from generated inputs."""
+
+    num_experts = values.router_weight.shape[0]
+    if top_k <= 0 or top_k > num_experts:
+        raise ValueError("top_k must be in [1, num_experts]")
+    logits = moe_router_logits_reference(values)
+    scores = torch.softmax(logits.float(), dim=-1)
+    selection_scores = scores
+    if values.correction_bias is not None:
+        selection_scores = selection_scores + values.correction_bias.float().reshape(
+            1, -1
+        )
+    topk_ids = selection_scores.topk(top_k, dim=-1, sorted=False).indices
+    topk_weights = scores.gather(1, topk_ids)
+    if topk_weights.shape[0]:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+            1.0e-12
+        )
+    return MoeRoutingResult(
+        router_logits=logits,
+        topk_ids=topk_ids.to(topk_ids_dtype).contiguous(),
+        topk_weights=topk_weights.to(topk_weights_dtype).contiguous(),
+    )
 
 
 def _moe_weight_operand(
@@ -134,6 +190,8 @@ def _moe_gate_up_activation(
 def moe_reference(
     values: MoeInputValues,
     *,
+    routing: MoeRoutingResult | None = None,
+    top_k: int | None = None,
     activation: str = "silu",
     swiglu_alpha: float | None = None,
     swiglu_limit: float | None = None,
@@ -141,14 +199,23 @@ def moe_reference(
     w2_b_layout: str = "NK",
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Return the semantic routed MoE layer output for generated values."""
+    """Execute the semantic routed MoE layer from generated input values."""
 
-    routing = values.routing
-    if routing.hidden_states.ndim != 2:
+    routing_inputs = values.routing
+    if routing_inputs.hidden_states.ndim != 2:
         raise ValueError(
-            "hidden_states must be rank-2, got " f"{tuple(routing.hidden_states.shape)}"
+            "hidden_states must be rank-2, got "
+            f"{tuple(routing_inputs.hidden_states.shape)}"
         )
-    num_tokens, hidden_size = routing.hidden_states.shape
+    num_tokens, hidden_size = routing_inputs.hidden_states.shape
+    if routing is None:
+        if top_k is None:
+            raise ValueError("top_k is required when routing results are not provided")
+        routing = moe_routing_reference(
+            routing_inputs,
+            top_k=top_k,
+            topk_weights_dtype=routing_inputs.hidden_states.dtype,
+        )
     if routing.router_logits.ndim != 2:
         raise ValueError(
             "router_logits must be rank-2, got " f"{tuple(routing.router_logits.shape)}"
@@ -206,7 +273,7 @@ def moe_reference(
     if not isinstance(output_dtype, torch.dtype):
         raise TypeError("output_dtype must be a torch.dtype")
 
-    hidden = routing.hidden_states.float()
+    hidden = routing_inputs.hidden_states.float()
     output = torch.zeros(
         (num_tokens, hidden_size),
         dtype=torch.float32,
@@ -262,9 +329,6 @@ def torch_moe_apply(
 
     del plan
     del x
-    del router_logits
-    del topk_weights
-    del topk_ids
     del num_tokens_global
     del max_num_tokens_per_gpu
     del do_finalize
@@ -272,7 +336,25 @@ def torch_moe_apply(
     values = getattr(w, "_tokenspeed_numerics_values", None)
     if values is None:
         raise ValueError("MoE reference requires generated values on weight module")
-    return moe_reference(values, output_dtype=values.routing.hidden_states.dtype)
+    if (topk_ids is None) != (topk_weights is None):
+        raise ValueError("topk_ids and topk_weights must be provided together")
+    if topk_ids is None or topk_weights is None:
+        routing = moe_routing_reference(
+            values.routing,
+            top_k=int(w.top_k),
+            topk_weights_dtype=values.routing.hidden_states.dtype,
+        )
+    else:
+        routing = MoeRoutingResult(
+            router_logits=router_logits,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+    return moe_reference(
+        values,
+        routing=routing,
+        output_dtype=values.routing.hidden_states.dtype,
+    )
 
 
 @register_kernel(
@@ -295,4 +377,8 @@ def torch_moe_process_weights(
     values = getattr(w, "_tokenspeed_numerics_values", None)
     if values is None:
         raise ValueError("MoE reference requires generated values on weight module")
-    return moe_reference(values, output_dtype=values.routing.hidden_states.dtype)
+    return moe_reference(
+        values,
+        top_k=int(w.top_k),
+        output_dtype=values.routing.hidden_states.dtype,
+    )

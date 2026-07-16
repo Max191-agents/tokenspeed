@@ -1095,103 +1095,64 @@ def test_composes_nvfp4_gemm_with_swiglu_quant_reference() -> None:
     assert torch.isfinite(dequant).all()
 
 
-def test_moe_routing_inputs_generate_consistent_projection_and_routes() -> None:
-    values = MoeRoutingInputs(
-        MoeRoutingInputConfig(
-            num_tokens=5,
-            hidden_size=16,
-            num_experts=4,
-            top_k=2,
-            hidden_dtype=torch.float16,
-            router_dtype=torch.float32,
-            router_bias_dtype=torch.float32,
-        )
-    ).generate(seed=23, device="cpu")
-
-    assert isinstance(values, MoeRoutingInputValues)
-    assert values.hidden_states.shape == (5, 16)
-    assert values.router_weight.shape == (4, 16)
-    assert values.router_bias is not None
-    expected_logits = (
-        values.hidden_states.float() @ values.router_weight.float().transpose(0, 1)
-        + values.router_bias.float()
+def test_moe_routing_inputs_generate_only_router_operands() -> None:
+    config = MoeRoutingInputConfig(
+        num_tokens=5,
+        hidden_size=16,
+        num_experts=4,
+        hidden_dtype=torch.float16,
+        router_dtype=torch.float32,
+        router_bias_dtype=torch.float32,
+        correction_bias_dtype=torch.float32,
     )
-    torch.testing.assert_close(values.router_logits, expected_logits)
-    expected_scores = torch.softmax(values.router_logits, dim=-1)
-    expected_weights, expected_ids = expected_scores.topk(2, dim=-1, sorted=False)
-    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
-    torch.testing.assert_close(values.topk_ids, expected_ids.to(torch.int32))
-    torch.testing.assert_close(values.topk_weights, expected_weights)
-    torch.testing.assert_close(values.topk_weights.sum(dim=-1), torch.ones(5))
+    first = MoeRoutingInputs(config).generate(seed=23, device="cpu")
+    second = MoeRoutingInputs(config).generate(seed=23, device="cpu")
 
+    assert isinstance(first, MoeRoutingInputValues)
+    assert set(vars(first)) == {
+        "hidden_states",
+        "router_weight",
+        "router_bias",
+        "correction_bias",
+    }
+    assert first.hidden_states.shape == (5, 16)
+    assert first.router_weight.shape == (4, 16)
+    assert first.router_bias is not None
+    assert first.router_bias.shape == (4,)
+    assert first.correction_bias is not None
+    assert first.correction_bias.shape == (4,)
+    assert torch.equal(first.hidden_states, second.hidden_states)
+    assert torch.equal(first.router_weight, second.router_weight)
+    assert torch.equal(first.router_bias, second.router_bias)
+    assert torch.equal(first.correction_bias, second.correction_bias)
 
-@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "softplus_sqrt"])
-def test_moe_routing_inputs_support_score_functions(score_function: str) -> None:
-    values = MoeRoutingInputs(
-        MoeRoutingInputConfig(
-            num_tokens=3,
-            hidden_size=8,
-            num_experts=8,
-            top_k=3,
-            hidden_dtype=torch.float32,
-            score_function=score_function,
-            correction_bias_dtype=torch.float32,
-            routed_scaling_factor=2.5,
-        )
-    ).generate(seed=24, device="cpu")
-
-    assert values.correction_bias is not None
-    assert values.topk_ids.shape == (3, 3)
-    assert values.topk_weights.shape == (3, 3)
-    torch.testing.assert_close(
-        values.topk_weights.sum(dim=-1),
-        torch.full((3,), 2.5),
-        rtol=1.0e-5,
-        atol=1.0e-5,
+    router_logits = (
+        first.hidden_states.float() @ first.router_weight.float().transpose(0, 1)
+        + first.router_bias.float()
     )
+    assert router_logits.shape == (5, 4)
+    assert torch.isfinite(router_logits).all()
 
 
-def test_moe_routing_inputs_support_group_filtering() -> None:
-    values = MoeRoutingInputs(
-        MoeRoutingInputConfig(
-            num_tokens=4,
-            hidden_size=8,
-            num_experts=8,
-            top_k=3,
-            hidden_dtype=torch.float32,
-            score_function="sigmoid",
-            correction_bias_dtype=torch.float32,
-            num_expert_groups=2,
-            top_k_groups=1,
-        )
-    ).generate(seed=25, device="cpu")
-
-    group_ids = values.topk_ids // 4
-    assert torch.all(group_ids == group_ids[:, :1])
-
-
-def test_moe_routing_inputs_verify_group_and_dtype_config() -> None:
-    with pytest.raises(ValueError, match="divisible by num_expert_groups"):
+def test_moe_routing_inputs_verify_shape_and_dtype_config() -> None:
+    with pytest.raises(ValueError, match="num_experts must be positive"):
         MoeRoutingInputs(
             MoeRoutingInputConfig(
                 num_tokens=3,
                 hidden_size=8,
-                num_experts=7,
-                top_k=2,
+                num_experts=0,
                 hidden_dtype=torch.float32,
-                num_expert_groups=2,
             )
         )
 
-    with pytest.raises(ValueError, match="topk_ids_dtype"):
+    with pytest.raises(ValueError, match="router_dtype"):
         MoeRoutingInputs(
             MoeRoutingInputConfig(
                 num_tokens=3,
                 hidden_size=8,
                 num_experts=4,
-                top_k=2,
                 hidden_dtype=torch.float32,
-                topk_ids_dtype=torch.float32,
+                router_dtype=torch.int32,
             )
         )
 
@@ -1305,10 +1266,8 @@ def test_moe_inputs_compose_full_fused_operands() -> None:
                 num_tokens=5,
                 hidden_size=16,
                 num_experts=4,
-                top_k=2,
                 hidden_dtype=torch.float16,
                 router_bias_dtype=torch.float32,
-                topk_weights_dtype=torch.float16,
             ),
             intermediate_size=32,
             bias_dtype=torch.float32,
@@ -1317,11 +1276,14 @@ def test_moe_inputs_compose_full_fused_operands() -> None:
 
     assert isinstance(values, MoeInputValues)
     assert isinstance(values.routing, MoeRoutingInputValues)
+    assert set(vars(values.routing)) == {
+        "hidden_states",
+        "router_weight",
+        "router_bias",
+        "correction_bias",
+    }
     assert values.routing.hidden_states.shape == (5, 16)
     assert values.routing.router_weight.shape == (4, 16)
-    assert values.routing.router_logits.shape == (5, 4)
-    assert values.routing.topk_ids.shape == (5, 2)
-    assert values.routing.topk_weights.dtype == torch.float16
     assert isinstance(values.w13, GemmInputValues)
     assert isinstance(values.w2, GemmInputValues)
     assert values.w13.A is None
@@ -1351,7 +1313,6 @@ def test_moe_inputs_infer_quantized_weight_scales(
                 num_tokens=5,
                 hidden_size=64,
                 num_experts=4,
-                top_k=2,
                 hidden_dtype=torch.float16,
             ),
             intermediate_size=32,
@@ -1378,7 +1339,6 @@ def test_moe_inputs_reuse_mutable_children() -> None:
                 num_tokens=4,
                 hidden_size=16,
                 num_experts=4,
-                top_k=2,
                 hidden_dtype=torch.float16,
             ),
             intermediate_size=32,
@@ -1397,18 +1357,17 @@ def test_moe_inputs_reuse_mutable_children() -> None:
     assert values.w13.B.dtype == torch.float64
 
 
-def test_moe_inputs_verify_projection_and_routing_config() -> None:
-    with pytest.raises(ValueError, match="top_k must be <= num_experts"):
+def test_moe_inputs_verify_projection_config() -> None:
+    with pytest.raises(ValueError, match="intermediate_size must be positive"):
         MoeInputs(
             MoeInputConfig(
                 routing=MoeRoutingInputConfig(
                     num_tokens=4,
                     hidden_size=64,
-                    num_experts=3,
-                    top_k=4,
+                    num_experts=4,
                     hidden_dtype=torch.float32,
                 ),
-                intermediate_size=32,
+                intermediate_size=0,
             )
         )
 
@@ -1419,7 +1378,6 @@ def test_moe_inputs_verify_projection_and_routing_config() -> None:
                     num_tokens=4,
                     hidden_size=48,
                     num_experts=4,
-                    top_k=2,
                     hidden_dtype=torch.float32,
                 ),
                 intermediate_size=32,
@@ -1434,7 +1392,6 @@ def test_moe_inputs_verify_projection_and_routing_config() -> None:
                     num_tokens=4,
                     hidden_size=64,
                     num_experts=4,
-                    top_k=2,
                     hidden_dtype=torch.float32,
                 ),
                 intermediate_size=32,

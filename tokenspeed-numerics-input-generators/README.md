@@ -63,6 +63,9 @@ The exact class names may vary by family, but the concepts should remain stable:
 - `generate(...)` returns a values object containing generated tensors and
   metadata. Generation should not rely on callers reading mutated generator
   fields to get output values.
+- The values object contains inputs at the documented operation boundary, not
+  results computed from those inputs. References, executors, and adapters own
+  operation execution and derived results.
 - Seeds are explicit. Structured metadata and numerical values should be able to
   use distinct seeds so tests can compare different value draws with identical
   request layouts or page mappings.
@@ -74,6 +77,13 @@ The values object should be as simple as possible. Plain tensors should be
 stored directly. Composite generated values, such as scaled tensors with values
 and scales or attention caches with page tables, should use small typed value
 objects.
+
+Operation boundaries matter when composing families. A top-k expert selection
+is a result of routing, but it is an input to token dispatch or expert-output
+combination. A routing generator must not return top-k results derived from its
+generated router operands. A standalone dispatch generator may generate valid
+top-k tensors because those tensors are inputs to the dispatch operation it
+represents.
 
 ## Verification
 

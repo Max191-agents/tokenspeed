@@ -22,6 +22,9 @@ if not _is_gfx950():
     )
 
 
+from tokenspeed_kernel.numerics.reference.moe import (  # noqa: E402
+    moe_router_logits_reference,
+)
 from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (  # noqa: E402
     _gluon_mxfp4_fp8_warp_decode_moe,
 )
@@ -122,7 +125,7 @@ def _build_case_from_values(
         "use_bias": use_bias,
         "values": values,
         "hidden": values.routing.hidden_states,
-        "router": values.routing.router_logits,
+        "router": moe_router_logits_reference(values.routing),
         "w13": values.w13.B,
         "w2": values.w2.B,
         "w13_scales": values.w13.B_scales,
@@ -156,9 +159,7 @@ def _build_case(
                 num_tokens=M,
                 hidden_size=D,
                 num_experts=E,
-                top_k=topk,
                 hidden_dtype=torch.bfloat16,
-                topk_weights_dtype=torch.bfloat16,
             ),
             intermediate_size=I,
             weight_dtype=CustomDType.MXFP4,

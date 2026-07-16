@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal
 
 import torch
 from tokenspeed_numerics_input_generators.core import (
@@ -61,8 +60,6 @@ __all__ = [
     "MoeRoutingInputValues",
 ]
 
-MoeRoutingScoreFunction = Literal["softmax", "sigmoid", "softplus_sqrt"]
-
 _FLOAT_DTYPES = {
     torch.float16,
     torch.bfloat16,
@@ -70,7 +67,6 @@ _FLOAT_DTYPES = {
     torch.float64,
 }
 _INTEGER_DTYPES = {torch.int16, torch.int32, torch.int64}
-_ROUTING_SCORE_FUNCTIONS = {"softmax", "sigmoid", "softplus_sqrt"}
 _DEFAULT_BLOCK_SIZE = {
     CustomDType.MXFP4: 32,
     CustomDType.MXINT4: 32,
@@ -237,74 +233,6 @@ def _generate_routes(
     return topk_ids.contiguous(), topk_weights.to(weights_dtype).contiguous()
 
 
-def _routing_scores(
-    logits: torch.Tensor,
-    score_function: MoeRoutingScoreFunction,
-) -> torch.Tensor:
-    logits = logits.float()
-    if score_function == "softmax":
-        return torch.softmax(logits, dim=-1)
-    if score_function == "sigmoid":
-        return torch.sigmoid(logits)
-    if score_function == "softplus_sqrt":
-        return torch.sqrt(torch.nn.functional.softplus(logits))
-    raise ValueError(f"unsupported score_function={score_function!r}")
-
-
-def _select_routes(
-    *,
-    logits: torch.Tensor,
-    correction_bias: torch.Tensor | None,
-    score_function: MoeRoutingScoreFunction,
-    top_k: int,
-    num_expert_groups: int,
-    top_k_groups: int,
-    renormalize: bool,
-    routed_scaling_factor: float,
-    ids_dtype: torch.dtype,
-    weights_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    scores = _routing_scores(logits, score_function)
-    selection_scores = scores
-    if correction_bias is not None:
-        selection_scores = selection_scores + correction_bias.float().reshape(1, -1)
-
-    if num_expert_groups > 1:
-        num_tokens, num_experts = selection_scores.shape
-        experts_per_group = num_experts // num_expert_groups
-        grouped = selection_scores.reshape(
-            num_tokens,
-            num_expert_groups,
-            experts_per_group,
-        )
-        group_scores = grouped.topk(2, dim=-1).values.sum(dim=-1)
-        selected_groups = group_scores.topk(
-            top_k_groups,
-            dim=-1,
-            sorted=False,
-        ).indices
-        group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
-        group_mask.scatter_(1, selected_groups, True)
-        expert_mask = (
-            group_mask.unsqueeze(-1)
-            .expand(num_tokens, num_expert_groups, experts_per_group)
-            .reshape(num_tokens, num_experts)
-        )
-        selection_scores = selection_scores.masked_fill(~expert_mask, float("-inf"))
-
-    topk_ids = selection_scores.topk(top_k, dim=-1, sorted=False).indices
-    topk_weights = scores.gather(1, topk_ids)
-    if renormalize and topk_weights.shape[0]:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
-            1.0e-12
-        )
-    topk_weights = topk_weights * routed_scaling_factor
-    return (
-        topk_ids.to(ids_dtype).contiguous(),
-        topk_weights.to(weights_dtype).contiguous(),
-    )
-
-
 def _make_activation_scale(
     *,
     num_experts: int,
@@ -396,20 +324,17 @@ def _validate_expert_weight_values(
 
 @dataclass
 class MoeRoutingInputValues:
-    """Generated values spanning router projection and top-k selection."""
+    """Generated tensor inputs for router projection and expert selection."""
 
     hidden_states: torch.Tensor
     router_weight: torch.Tensor
     router_bias: torch.Tensor | None
-    router_logits: torch.Tensor
     correction_bias: torch.Tensor | None
-    topk_ids: torch.Tensor
-    topk_weights: torch.Tensor
 
 
 @dataclass
 class MoeRoutingInputConfig:
-    """Initialization parameters for router projection and top-k selection."""
+    """Initialization parameters for router input tensors."""
 
     # Required: number of input token rows.
     num_tokens: int
@@ -417,38 +342,22 @@ class MoeRoutingInputConfig:
     hidden_size: int
     # Required: number of routed experts and router output columns.
     num_experts: int
-    # Required: number of experts selected per token.
-    top_k: int
     # Required: generated hidden-state dtype.
     hidden_dtype: torch.dtype
 
-    # Optional: router weight, bias, and logits dtype.
+    # Optional: router projection weight dtype.
     router_dtype: torch.dtype = torch.float32
     # Optional: generate a router projection bias with this dtype.
     router_bias_dtype: torch.dtype | None = None
-    # Optional: transformation applied to router logits before selection.
-    score_function: MoeRoutingScoreFunction = "softmax"
     # Optional: generate a correction bias used only for expert selection.
     correction_bias_dtype: torch.dtype | None = None
-    # Optional: number of equal-size expert groups used for candidate filtering.
-    num_expert_groups: int = 1
-    # Optional: number of groups retained before expert-level top-k selection.
-    top_k_groups: int = 1
-    # Optional: normalize selected scores before applying the routing scale.
-    renormalize: bool = True
-    # Optional: positive scale applied to selected routing weights.
-    routed_scaling_factor: float = 1.0
-    # Optional: generated selected-expert ID dtype.
-    topk_ids_dtype: torch.dtype = torch.int32
-    # Optional: generated selected routing-weight dtype.
-    topk_weights_dtype: torch.dtype = torch.float32
     # Optional: generated tensor device override.
     device: DeviceLike = None
 
 
 @dataclass(init=False)
 class MoeRoutingInputs(NumericsInputGenerator):
-    """Generate consistent router operands, logits, and selected routes."""
+    """Generate router operands without executing projection or selection."""
 
     config: MoeRoutingInputConfig
     hidden_states_input: TensorInput | None
@@ -471,9 +380,8 @@ class MoeRoutingInputs(NumericsInputGenerator):
         self.config.hidden_size = _check_positive(
             "hidden_size", self.config.hidden_size
         )
-        self.config.top_k, self.config.num_experts = _check_top_k(
-            top_k=self.config.top_k,
-            num_experts=self.config.num_experts,
+        self.config.num_experts = _check_positive(
+            "num_experts", self.config.num_experts
         )
         self.config.hidden_dtype = _check_float_dtype(
             "hidden_dtype", self.config.hidden_dtype
@@ -487,35 +395,6 @@ class MoeRoutingInputs(NumericsInputGenerator):
         self.config.correction_bias_dtype = _check_optional_float_dtype(
             "correction_bias_dtype", self.config.correction_bias_dtype
         )
-        if self.config.score_function not in _ROUTING_SCORE_FUNCTIONS:
-            raise ValueError(
-                "score_function must be 'softmax', 'sigmoid', or 'softplus_sqrt'"
-            )
-        self.config.num_expert_groups = _check_positive(
-            "num_expert_groups", self.config.num_expert_groups
-        )
-        self.config.top_k_groups = _check_positive(
-            "top_k_groups", self.config.top_k_groups
-        )
-        if self.config.num_experts % self.config.num_expert_groups != 0:
-            raise ValueError("num_experts must be divisible by num_expert_groups")
-        if self.config.top_k_groups > self.config.num_expert_groups:
-            raise ValueError("top_k_groups must be <= num_expert_groups")
-        experts_per_group = self.config.num_experts // self.config.num_expert_groups
-        if self.config.num_expert_groups > 1 and experts_per_group < 2:
-            raise ValueError("grouped routing requires at least two experts per group")
-        if self.config.top_k > self.config.top_k_groups * experts_per_group:
-            raise ValueError("selected expert groups do not contain top_k experts")
-        self.config.routed_scaling_factor = _check_positive_finite_float(
-            "routed_scaling_factor", self.config.routed_scaling_factor
-        )
-        self.config.topk_ids_dtype = _check_integer_dtype(
-            "topk_ids_dtype", self.config.topk_ids_dtype
-        )
-        self.config.topk_weights_dtype = _check_float_dtype(
-            "topk_weights_dtype", self.config.topk_weights_dtype
-        )
-
         self.hidden_states_input = self.hidden_states_input or TensorInput(
             (self.config.num_tokens, self.config.hidden_size),
             self.config.hidden_dtype,
@@ -583,32 +462,13 @@ class MoeRoutingInputs(NumericsInputGenerator):
         if correction_bias is not None:
             correction_bias = (correction_bias.float() * 0.25).to(correction_bias.dtype)
 
-        router_logits = hidden_states.float() @ router_weight.float().transpose(0, 1)
-        if router_bias is not None:
-            router_logits += router_bias.float()
-        router_logits = router_logits.to(self.config.router_dtype).contiguous()
-        topk_ids, topk_weights = _select_routes(
-            logits=router_logits,
-            correction_bias=correction_bias,
-            score_function=self.config.score_function,
-            top_k=self.config.top_k,
-            num_expert_groups=self.config.num_expert_groups,
-            top_k_groups=self.config.top_k_groups,
-            renormalize=self.config.renormalize,
-            routed_scaling_factor=self.config.routed_scaling_factor,
-            ids_dtype=self.config.topk_ids_dtype,
-            weights_dtype=self.config.topk_weights_dtype,
-        )
         values = MoeRoutingInputValues(
             hidden_states=hidden_states.contiguous(),
             router_weight=router_weight.contiguous(),
             router_bias=None if router_bias is None else router_bias.contiguous(),
-            router_logits=router_logits,
             correction_bias=(
                 None if correction_bias is None else correction_bias.contiguous()
             ),
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
         )
         _validate_routing_values(values, self.config)
         return values
@@ -622,28 +482,25 @@ def _validate_routing_values(
         raise ValueError("hidden_states shape does not match routing configuration")
     if values.router_weight.shape != (config.num_experts, config.hidden_size):
         raise ValueError("router_weight shape does not match routing configuration")
-    if values.router_logits.shape != (config.num_tokens, config.num_experts):
-        raise ValueError("router_logits shape does not match routing configuration")
-    if not torch.isfinite(values.router_logits).all():
-        raise ValueError("router_logits must be finite")
+    if not torch.isfinite(values.hidden_states).all():
+        raise ValueError("hidden_states must be finite")
+    if not torch.isfinite(values.router_weight).all():
+        raise ValueError("router_weight must be finite")
     if values.router_bias is not None and values.router_bias.shape != (
         config.num_experts,
     ):
         raise ValueError("router_bias shape does not match routing configuration")
+    if values.router_bias is not None and not torch.isfinite(values.router_bias).all():
+        raise ValueError("router_bias must be finite")
     if values.correction_bias is not None and values.correction_bias.shape != (
         config.num_experts,
     ):
         raise ValueError("correction_bias shape does not match routing configuration")
-    _validate_topk_values(
-        topk_ids=values.topk_ids,
-        topk_weights=values.topk_weights,
-        num_tokens=config.num_tokens,
-        num_experts=config.num_experts,
-        top_k=config.top_k,
-        expected_weight_sum=(
-            config.routed_scaling_factor if config.renormalize else None
-        ),
-    )
+    if (
+        values.correction_bias is not None
+        and not torch.isfinite(values.correction_bias).all()
+    ):
+        raise ValueError("correction_bias must be finite")
 
 
 @dataclass
@@ -1232,8 +1089,8 @@ class MoeInputValues:
 class MoeInputConfig:
     """Initialization parameters for full fused routed MoE inputs."""
 
-    # Required: router projection and top-k configuration. This object is
-    # shared directly with the nested MoeRoutingInputs generator.
+    # Required: router tensor configuration. This object is shared directly
+    # with the nested MoeRoutingInputs generator.
     routing: MoeRoutingInputConfig
     # Required: expert intermediate width after SwiGLU activation.
     intermediate_size: int

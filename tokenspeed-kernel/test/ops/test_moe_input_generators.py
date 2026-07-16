@@ -34,7 +34,11 @@ from moe_references import (
 from tokenspeed_kernel import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.numerics.inputs import get_input_generator
 from tokenspeed_kernel.numerics.moe import canonicalize_align_block_size
-from tokenspeed_kernel.numerics.reference.moe import moe_reference
+from tokenspeed_kernel.numerics.reference.moe import (
+    moe_reference,
+    moe_router_logits_reference,
+    moe_routing_reference,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import load_builtin_kernels
 from tokenspeed_numerics_input_generators import (
@@ -51,7 +55,11 @@ from tokenspeed_numerics_input_generators import (
 )
 
 
-def _make_mxfp4_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
+def _make_mxfp4_moe_weight_module(
+    values: MoeInputValues,
+    *,
+    top_k: int,
+) -> torch.nn.Module:
     if values.w13.B is None or values.w13.B_scales is None:
         raise ValueError("MoE values must include W13 MXFP4 weights and scales")
     if values.w2.B is None or values.w2.B_scales is None:
@@ -63,7 +71,7 @@ def _make_mxfp4_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
     layer.num_local_experts = num_experts
     layer.ep_size = 1
     layer.ep_rank = 0
-    layer.top_k = values.routing.topk_ids.shape[1]
+    layer.top_k = top_k
     layer.activation = "silu"
     layer.swiglu_arg = None
     layer.w13_weight = torch.nn.Parameter(values.w13.B.clone(), requires_grad=False)
@@ -79,7 +87,11 @@ def _make_mxfp4_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
     return layer
 
 
-def _make_dense_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
+def _make_dense_moe_weight_module(
+    values: MoeInputValues,
+    *,
+    top_k: int,
+) -> torch.nn.Module:
     if values.w13.B is None or values.w2.B is None:
         raise ValueError("MoE values must include dense W13 and W2 weights")
 
@@ -91,7 +103,7 @@ def _make_dense_moe_weight_module(values: MoeInputValues) -> torch.nn.Module:
     layer.ep_rank = 0
     layer.tp_size = 1
     layer.tp_rank = 0
-    layer.top_k = values.routing.topk_ids.shape[1]
+    layer.top_k = top_k
     layer.activation = "silu"
     layer.swiglu_arg = None
     layer.w13_weight = torch.nn.Parameter(values.w13.B.clone(), requires_grad=False)
@@ -166,16 +178,16 @@ def test_moe_softmax_topk_routing_generator_runs_cuda_helper() -> None:
             num_tokens=8,
             hidden_size=16,
             num_experts=384,
-            top_k=12,
             hidden_dtype=torch.float32,
             correction_bias_dtype=torch.float32,
-            renormalize=renormalize,
-            routed_scaling_factor=scaling_factor,
         )
     ).generate(seed=45, device="cuda")
     assert values.correction_bias is not None
+    router_logits = moe_router_logits_reference(values)
+    topk_ids = torch.empty((8, 12), dtype=torch.int32, device="cuda")
+    topk_weights = torch.empty((8, 12), dtype=torch.float32, device="cuda")
     expected = moe_softmax_topk_routing_reference(
-        values.router_logits,
+        router_logits,
         values.correction_bias,
         top_k=12,
         num_experts_real=num_experts_real,
@@ -185,10 +197,10 @@ def test_moe_softmax_topk_routing_generator_runs_cuda_helper() -> None:
 
     try:
         routing_flash(
-            values.router_logits,
+            router_logits,
             values.correction_bias,
-            values.topk_ids,
-            values.topk_weights,
+            topk_ids,
+            topk_weights,
             num_experts_real,
             scaling_factor,
             renormalize,
@@ -197,9 +209,9 @@ def test_moe_softmax_topk_routing_generator_runs_cuda_helper() -> None:
         pytest.skip(f"routing_flash extension unavailable: {exc}")
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(values.topk_ids, expected.topk_indices)
+    torch.testing.assert_close(topk_ids, expected.topk_indices)
     torch.testing.assert_close(
-        values.topk_weights,
+        topk_weights,
         expected.topk_weights,
         rtol=1.0e-3,
         atol=8.0e-2,
@@ -214,21 +226,16 @@ def test_moe_biased_grouped_topk_generator_matches_triton_fallback() -> None:
             num_tokens=5,
             hidden_size=8,
             num_experts=8,
-            top_k=3,
             hidden_dtype=torch.float32,
-            score_function="sigmoid",
             correction_bias_dtype=torch.float32,
-            num_expert_groups=2,
-            top_k_groups=1,
-            renormalize=True,
-            routed_scaling_factor=2.0,
         )
     ).generate(seed=46, device="cpu")
     assert values.correction_bias is not None
+    router_logits = moe_router_logits_reference(values)
     logical_to_physical_map = torch.randperm(8, dtype=torch.int32)
     num_token_non_padded = torch.tensor(4, dtype=torch.int32)
     expected = moe_biased_grouped_topk_reference(
-        values.router_logits,
+        router_logits,
         values.correction_bias,
         top_k=3,
         renormalize=True,
@@ -241,7 +248,7 @@ def test_moe_biased_grouped_topk_generator_matches_triton_fallback() -> None:
 
     actual_weights, actual_ids = minimax_biased_grouped_topk(
         values.hidden_states,
-        values.router_logits,
+        router_logits,
         values.correction_bias,
         topk=3,
         renormalize=True,
@@ -271,26 +278,26 @@ def test_moe_softplus_sqrt_topk_routing_generator_runs_cuda_helpers() -> None:
             num_tokens=8,
             hidden_size=16,
             num_experts=256,
-            top_k=6,
             hidden_dtype=torch.float32,
-            score_function="softplus_sqrt",
             correction_bias_dtype=torch.float32,
-            routed_scaling_factor=1.75,
         )
     ).generate(seed=47, device="cuda")
     assert non_hash.correction_bias is not None
+    non_hash_logits = moe_router_logits_reference(non_hash)
+    non_hash_topk_ids = torch.empty((8, 6), dtype=torch.int32, device="cuda")
+    non_hash_topk_weights = torch.empty((8, 6), dtype=torch.float32, device="cuda")
     non_hash_expected = moe_softplus_sqrt_topk_routing_reference(
-        non_hash.router_logits,
+        non_hash_logits,
         top_k=6,
         routed_scaling_factor=1.75,
         correction_bias=non_hash.correction_bias,
     )
     try:
         softplus_sqrt_topk_flash(
-            non_hash.router_logits,
+            non_hash_logits,
             non_hash.correction_bias,
-            non_hash.topk_ids,
-            non_hash.topk_weights,
+            non_hash_topk_ids,
+            non_hash_topk_weights,
             1.75,
             True,
         )
@@ -302,12 +309,12 @@ def test_moe_softplus_sqrt_topk_routing_generator_runs_cuda_helpers() -> None:
             num_tokens=8,
             hidden_size=16,
             num_experts=256,
-            top_k=6,
             hidden_dtype=torch.float32,
-            score_function="softplus_sqrt",
-            routed_scaling_factor=2.25,
         )
     ).generate(seed=48, device="cuda")
+    hashed_logits = moe_router_logits_reference(hashed)
+    hashed_topk_ids = torch.empty((8, 6), dtype=torch.int32, device="cuda")
+    hashed_topk_weights = torch.empty((8, 6), dtype=torch.float32, device="cuda")
     generator = torch.Generator(device="cuda").manual_seed(48)
     input_ids = torch.randint(
         0,
@@ -326,7 +333,7 @@ def test_moe_softplus_sqrt_topk_routing_generator_runs_cuda_helpers() -> None:
         ]
     )
     hashed_expected = moe_softplus_sqrt_topk_routing_reference(
-        hashed.router_logits,
+        hashed_logits,
         top_k=6,
         routed_scaling_factor=2.25,
         input_ids=input_ids,
@@ -334,11 +341,11 @@ def test_moe_softplus_sqrt_topk_routing_generator_runs_cuda_helpers() -> None:
     )
     try:
         hash_softplus_sqrt_topk_flash(
-            hashed.router_logits,
+            hashed_logits,
             input_ids,
             hash_indices_table,
-            hashed.topk_ids,
-            hashed.topk_weights,
+            hashed_topk_ids,
+            hashed_topk_weights,
             2.25,
             True,
         )
@@ -346,16 +353,16 @@ def test_moe_softplus_sqrt_topk_routing_generator_runs_cuda_helpers() -> None:
         pytest.skip(f"hash_softplus_sqrt_topk_flash extension unavailable: {exc}")
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(non_hash.topk_ids, non_hash_expected.topk_indices)
+    torch.testing.assert_close(non_hash_topk_ids, non_hash_expected.topk_indices)
     torch.testing.assert_close(
-        non_hash.topk_weights,
+        non_hash_topk_weights,
         non_hash_expected.topk_weights,
         rtol=1.0e-4,
         atol=1.0e-4,
     )
-    torch.testing.assert_close(hashed.topk_ids, hashed_expected.topk_indices)
+    torch.testing.assert_close(hashed_topk_ids, hashed_expected.topk_indices)
     torch.testing.assert_close(
-        hashed.topk_weights,
+        hashed_topk_weights,
         hashed_expected.topk_weights,
         rtol=1.0e-4,
         atol=1.0e-4,
@@ -485,10 +492,8 @@ def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None
             num_tokens=4,
             hidden_size=64,
             num_experts=4,
-            top_k=2,
             hidden_dtype=torch.bfloat16,
             router_dtype=torch.bfloat16,
-            topk_weights_dtype=torch.bfloat16,
         ),
         intermediate_size=64,
         weight_dtype=CustomDType.MXFP4,
@@ -496,7 +501,12 @@ def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None
         bias_dtype=None,
     )
     values = MoeInputs(config).generate(seed=42, device=device)
-    layer = _make_mxfp4_moe_weight_module(values)
+    layer = _make_mxfp4_moe_weight_module(values, top_k=2)
+    routing = moe_routing_reference(
+        values.routing,
+        top_k=2,
+        topk_weights_dtype=torch.bfloat16,
+    )
     plan = moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
@@ -509,10 +519,9 @@ def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None
     assert plan["process_weights_kernel_name"] == "triton_mxfp4_moe_process_weights"
 
     moe_process_weights(plan, layer)
-    routing = values.routing
     actual = moe_apply(
         plan,
-        routing.hidden_states,
+        values.routing.hidden_states,
         layer,
         routing.router_logits,
         topk_weights=routing.topk_weights,
@@ -520,7 +529,11 @@ def test_mxfp4_moe_generator_runs_triton_precomputed_kernel(device: str) -> None
     )
     torch.cuda.synchronize()
 
-    expected = moe_reference(values, output_dtype=torch.bfloat16).to(device=device)
+    expected = moe_reference(
+        values,
+        routing=routing,
+        output_dtype=torch.bfloat16,
+    ).to(device=device)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=5.0e-2, atol=0.1)
 
 
@@ -530,10 +543,8 @@ def test_mxint4_moe_generator_matches_flashinfer_trtllm_contract() -> None:
             num_tokens=4,
             hidden_size=64,
             num_experts=4,
-            top_k=2,
             hidden_dtype=torch.bfloat16,
             router_dtype=torch.float32,
-            topk_weights_dtype=torch.bfloat16,
         ),
         intermediate_size=64,
         weight_dtype=CustomDType.MXINT4,
@@ -554,7 +565,7 @@ def test_mxint4_moe_generator_matches_flashinfer_trtllm_contract() -> None:
     layer.ep_size = 1
     layer.ep_rank = 0
     layer.tp_size = 1
-    layer.top_k = config.routing.top_k
+    layer.top_k = 2
     layer.intermediate_size = config.intermediate_size
     layer.w13_weight_packed = torch.nn.Parameter(
         w13_weight_packed,
@@ -583,10 +594,11 @@ def test_mxint4_moe_generator_matches_flashinfer_trtllm_contract() -> None:
     assert layer.w2_weight_scale.dtype == torch.bfloat16
     assert values.routing.hidden_states.shape == (4, 64)
     assert values.routing.hidden_states.dtype == torch.bfloat16
-    assert values.routing.router_logits.shape == (4, 4)
-    assert values.routing.topk_ids.shape == (4, 2)
-    assert values.routing.topk_ids.dtype == torch.int32
-    assert moe_reference(values, output_dtype=torch.bfloat16).shape == (4, 64)
+    assert values.routing.router_weight.shape == (4, 64)
+    assert moe_reference(values, top_k=2, output_dtype=torch.bfloat16).shape == (
+        4,
+        64,
+    )
 
 
 def test_dense_moe_generator_runs_flashinfer_cutlass_kernel(device: str) -> None:
@@ -600,17 +612,20 @@ def test_dense_moe_generator_runs_flashinfer_cutlass_kernel(device: str) -> None
             num_tokens=4,
             hidden_size=64,
             num_experts=4,
-            top_k=2,
             hidden_dtype=torch.bfloat16,
             router_dtype=torch.bfloat16,
-            topk_weights_dtype=torch.bfloat16,
         ),
         intermediate_size=64,
         weight_dtype=torch.bfloat16,
         bias_dtype=None,
     )
     values = MoeInputs(config).generate(seed=43, device=device)
-    layer = _make_dense_moe_weight_module(values)
+    layer = _make_dense_moe_weight_module(values, top_k=2)
+    routing = moe_routing_reference(
+        values.routing,
+        top_k=2,
+        topk_weights_dtype=torch.bfloat16,
+    )
     plan = moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
@@ -625,10 +640,9 @@ def test_dense_moe_generator_runs_flashinfer_cutlass_kernel(device: str) -> None
     )
 
     moe_process_weights(plan, layer)
-    routing = values.routing
     actual = moe_apply(
         plan,
-        routing.hidden_states,
+        values.routing.hidden_states,
         layer,
         routing.router_logits,
         topk_weights=routing.topk_weights,
@@ -636,5 +650,9 @@ def test_dense_moe_generator_runs_flashinfer_cutlass_kernel(device: str) -> None
     )
     torch.cuda.synchronize()
 
-    expected = moe_reference(values, output_dtype=torch.bfloat16).to(device=device)
+    expected = moe_reference(
+        values,
+        routing=routing,
+        output_dtype=torch.bfloat16,
+    ).to(device=device)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=5.0e-2, atol=0.1)

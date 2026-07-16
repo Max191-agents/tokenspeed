@@ -1056,7 +1056,11 @@ def test_moe_apply_generator_uses_package_inputs() -> None:
     assert inputs["topk_weights"].shape == (3, 2)
     assert values.w13.B.shape == (4, 128, 32)
     assert values.w2.B.shape == (4, 64, 32)
-    expected = moe_reference(values, output_dtype=torch.bfloat16)
+    expected = moe_reference(
+        values,
+        routing=inputs["w"]._tokenspeed_numerics_routing,
+        output_dtype=torch.bfloat16,
+    )
     assert expected.shape == (3, 64)
 
     from tokenspeed_kernel.numerics.reference.moe import torch_moe_apply
@@ -1103,7 +1107,11 @@ def test_moe_process_weights_generator_observes_moe_reference() -> None:
     from tokenspeed_kernel.numerics.reference.moe import torch_moe_process_weights
 
     actual = torch_moe_process_weights(**inputs)
-    expected = moe_reference(values, output_dtype=torch.bfloat16)
+    expected = moe_reference(
+        values,
+        routing=inputs["w"]._tokenspeed_numerics_routing,
+        output_dtype=torch.bfloat16,
+    )
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 

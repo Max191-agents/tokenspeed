@@ -39,6 +39,10 @@ from tokenspeed_kernel.numerics.inputs import (
     set_standard_shapes,
 )
 from tokenspeed_kernel.numerics.outputs import set_output_extractor
+from tokenspeed_kernel.numerics.reference.moe import (
+    MoeRoutingResult,
+    moe_routing_reference,
+)
 from tokenspeed_kernel.numerics.tolerance import Tolerance, set_family_tolerance
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
@@ -121,6 +125,7 @@ def _single_trait(
 def _make_moe_weight_module(
     values: MoeInputValues,
     *,
+    top_k: int,
     weight_dtype: str,
     activation: str,
 ) -> torch.nn.Module:
@@ -135,7 +140,7 @@ def _make_moe_weight_module(
     layer.ep_rank = 0
     layer.tp_size = 1
     layer.tp_rank = 0
-    layer.top_k = int(values.routing.topk_ids.shape[1])
+    layer.top_k = top_k
     layer.activation = activation
     layer.swiglu_arg = None
     layer._tokenspeed_numerics_values = values
@@ -281,10 +286,8 @@ class MoeApplyInputGenerator(InputGenerator):
                     num_tokens=num_tokens,
                     hidden_size=hidden_size,
                     num_experts=num_experts,
-                    top_k=top_k,
                     hidden_dtype=self.dtype,
                     router_dtype=self.dtype,
-                    topk_weights_dtype=self.dtype,
                 ),
                 intermediate_size=intermediate_size,
                 weight_dtype=generated_weight_dtype,
@@ -299,12 +302,19 @@ class MoeApplyInputGenerator(InputGenerator):
                 ),
             )
         ).generate(seed=self.seed, device=self.device)
+        routing = moe_routing_reference(
+            values.routing,
+            top_k=top_k,
+            topk_weights_dtype=self.dtype,
+        )
 
         layer = _make_moe_weight_module(
             values,
+            top_k=top_k,
             weight_dtype=resolved_weight_dtype,
             activation=resolved_activation,
         )
+        layer._tokenspeed_numerics_routing = routing
         plan = {
             "weight_dtype": resolved_weight_dtype,
             "apply_kernel_name": (
@@ -350,16 +360,16 @@ class MoeApplyInputGenerator(InputGenerator):
             layer,
             weight_dtype=resolved_weight_dtype,
         )
-        routing = values.routing
+        routing = layer._tokenspeed_numerics_routing
         return {
             "plan": plan,
-            "x": routing.hidden_states,
+            "x": values.routing.hidden_states,
             "w": layer,
             "router_logits": routing.router_logits,
             "topk_weights": routing.topk_weights,
             "topk_ids": routing.topk_ids,
-            "num_tokens_global": routing.hidden_states.shape[0],
-            "max_num_tokens_per_gpu": routing.hidden_states.shape[0],
+            "num_tokens_global": values.routing.hidden_states.shape[0],
+            "max_num_tokens_per_gpu": values.routing.hidden_states.shape[0],
             "do_finalize": True,
             "enable_pdl": False,
         }
@@ -435,7 +445,9 @@ def _process_weights_output(
     values = getattr(w, "_tokenspeed_numerics_values", None)
     if values is None:
         raise ValueError("processed MoE module must carry generated MoE values")
-    routing = values.routing
+    routing = getattr(w, "_tokenspeed_numerics_routing", None)
+    if not isinstance(routing, MoeRoutingResult):
+        raise ValueError("processed MoE module must carry executed routing results")
 
     apply_kernel_name = plan.get("apply_kernel_name")
     apply_kernel = KernelRegistry.get().get_impl(apply_kernel_name)
@@ -443,13 +455,13 @@ def _process_weights_output(
         raise ValueError(f"MoE apply kernel {apply_kernel_name!r} is not registered")
     return apply_kernel(
         plan=plan,
-        x=routing.hidden_states,
+        x=values.routing.hidden_states,
         w=w,
         router_logits=routing.router_logits,
         topk_weights=routing.topk_weights,
         topk_ids=routing.topk_ids,
-        num_tokens_global=routing.hidden_states.shape[0],
-        max_num_tokens_per_gpu=routing.hidden_states.shape[0],
+        num_tokens_global=values.routing.hidden_states.shape[0],
+        max_num_tokens_per_gpu=values.routing.hidden_states.shape[0],
         do_finalize=True,
         enable_pdl=False,
     )
