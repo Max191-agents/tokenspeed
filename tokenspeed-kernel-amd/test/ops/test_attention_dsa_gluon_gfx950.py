@@ -992,9 +992,9 @@ def _assert_grouped_radix_topk(
         assert bool((actual[row, count:] == -1).all())
 
 
-def test_dsa_prefill_topk_dispatches_staged_groups_across_rows() -> None:
+def test_dsa_prefill_topk_local_prefix_is_deterministic_across_rows() -> None:
     rows = 64
-    cols = 131072
+    cols = 262144
     topk = 2048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 17
@@ -1011,6 +1011,102 @@ def test_dsa_prefill_topk_dispatches_staged_groups_across_rows() -> None:
     tiles = dsa_topk_gfx950.triton.cdiv(cols, dsa_topk_gfx950._RADIX_TOPK_BLOCK_N)
     groups = dsa_topk_gfx950._radix_groups_per_row(rows, tiles, logits.device)
     assert groups < tiles
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+    first_out = out.clone()
+    first_lens = lens_out.clone()
+    out.fill_(-1)
+    lens_out.fill_(-1)
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    torch.testing.assert_close(out, first_out)
+    torch.testing.assert_close(lens_out, first_lens)
+
+
+def test_dsa_prefill_topk_runtime_path_handles_ragged_rows() -> None:
+    rows = 64
+    cols = 131072
+    topk = 2048
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = row_ids * 17
+    row_ends = cols - (rows - 1 - row_ids) * 31
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+    first_out = out.clone()
+    first_lens = lens_out.clone()
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    torch.testing.assert_close(out, first_out)
+    torch.testing.assert_close(lens_out, first_lens)
+
+
+def test_dsa_prefill_topk_90k_boundary_keeps_exact_values() -> None:
+    rows = 4
+    cols = 90000
+    topk = 2048
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = row_ids * 19
+    row_ends = cols - (rows - 1 - row_ids) * 29
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
     dsa_topk_gfx950._dsa_prefill_topk_indices(
         logits,
         row_starts,
@@ -1186,9 +1282,9 @@ def test_dsa_prefill_topk_hist_derived_handles_shifted_and_inf_rows() -> None:
     )
 
 
-def test_dsa_prefill_grouped_radix_topk_is_graph_capturable() -> None:
+@pytest.mark.parametrize("cols", [131072, 262144], ids=["runtime", "staged"])
+def test_dsa_prefill_grouped_radix_topk_is_graph_capturable(cols: int) -> None:
     rows = 64
-    cols = 90000
     topk = 2048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 11
@@ -1238,9 +1334,9 @@ def test_dsa_prefill_grouped_radix_topk_is_graph_capturable() -> None:
     )
 
 
-def test_dsa_prefill_grouped_radix_topk_is_stream_local() -> None:
+@pytest.mark.parametrize("cols", [131072, 262144], ids=["runtime", "staged"])
+def test_dsa_prefill_grouped_radix_topk_is_stream_local(cols: int) -> None:
     rows = 64
-    cols = 90000
     topk = 2048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 13
