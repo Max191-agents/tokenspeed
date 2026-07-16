@@ -1615,6 +1615,7 @@ def _make_fake_raw_compiled_plan(
     global_scratch_size: int = 0,
     profile_scratch_size: int = 0,
     descriptor_wrapper: bool = False,
+    jit_kernel: object | None = None,
 ) -> tuple[
     dsa_topk_gfx950._CompiledRunnerPlan,
     object,
@@ -1654,10 +1655,13 @@ def _make_fake_raw_compiled_plan(
         arg_annotations=object(),
         kernel_signature=b"fake-signature",
     )
+    if jit_kernel is None:
+        jit_kernel = SimpleNamespace(launch_metadata=None)
     compiled = SimpleNamespace(
         run=launcher,
         function=object(),
         packed_metadata=(8, 1, 0),
+        src=SimpleNamespace(fn=jit_kernel),
     )
 
     def ordinary_runner(*args: object) -> None:
@@ -1723,7 +1727,14 @@ def test_compiled_runner_raw_plan_calls_generated_launcher() -> None:
 )
 @pytest.mark.parametrize(
     "unsupported_gate",
-    ("distribution_version", "global_scratch", "profile_scratch", "descriptor"),
+    (
+        "distribution_version",
+        "global_scratch",
+        "profile_scratch",
+        "descriptor",
+        "launch_metadata",
+        "missing_launch_metadata",
+    ),
 )
 def test_compiled_runner_raw_plan_falls_back_for_unsupported_launcher(
     unsupported_gate: str,
@@ -1740,11 +1751,47 @@ def test_compiled_runner_raw_plan_falls_back_for_unsupported_launcher(
         options["global_scratch_size"] = 16
     elif unsupported_gate == "profile_scratch":
         options["profile_scratch_size"] = 16
+    elif unsupported_gate == "launch_metadata":
+        options["jit_kernel"] = SimpleNamespace(launch_metadata=lambda *_args: None)
+    elif unsupported_gate == "missing_launch_metadata":
+        options["jit_kernel"] = object()
     else:
         options["descriptor_wrapper"] = True
 
     plan, _, direct_launches, ordinary_launches, _, _ = _make_fake_raw_compiled_plan(
         **options
+    )
+    plan.runner("pointer")
+
+    assert plan.raw_launch is None
+    assert plan.runner is plan.ordinary_runner
+    assert not direct_launches
+    assert ordinary_launches == [("pointer",)]
+
+
+@pytest.mark.skipif(
+    not dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED,
+    reason="requires the supported CompiledKernel runner ABI",
+)
+def test_compiled_runner_real_jit_launch_metadata_forces_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kernel = dsa_topk_gfx950._dsa_trivial_decode_topk2048_kernel
+    assert kernel.launch_metadata is None
+
+    raw_plan, _, direct_launches, ordinary_launches, _, direct_launch = (
+        _make_fake_raw_compiled_plan(jit_kernel=kernel)
+    )
+    raw_plan.runner("pointer")
+
+    assert raw_plan.raw_launch is direct_launch
+    assert len(direct_launches) == 1
+    assert not ordinary_launches
+
+    monkeypatch.setattr(kernel, "launch_metadata", lambda *_args: None)
+
+    plan, _, direct_launches, ordinary_launches, _, _ = _make_fake_raw_compiled_plan(
+        jit_kernel=kernel
     )
     plan.runner("pointer")
 

@@ -176,11 +176,17 @@ class _CompiledRunnerPlan:
         if compiled is None or grid is None or not _COMPILED_RUNNER_ABI_SUPPORTED:
             return
         launcher = compiled.run
+        # The raw launcher bypasses CompiledKernel's lazy launch metadata callback.
+        source = getattr(compiled, "src", None)
+        jit_kernel = getattr(source, "fn", None)
         runtime = triton.knobs.runtime
         enter_hook_chain = runtime.launch_enter_hook
         exit_hook_chain = runtime.launch_exit_hook
         if (
-            launcher.global_scratch_size != 0
+            jit_kernel is None
+            or not hasattr(jit_kernel, "launch_metadata")
+            or jit_kernel.launch_metadata is not None
+            or launcher.global_scratch_size != 0
             or launcher.profile_scratch_size != 0
             or launcher.launch is not driver.utils.launch
             or not isinstance(getattr(enter_hook_chain, "calls", None), list)
@@ -205,6 +211,8 @@ class _CompiledRunnerPlan:
         runtime = triton.knobs.runtime
         enter_hook_chain = self.enter_hook_chain
         exit_hook_chain = self.exit_hook_chain
+        # HookChain mutation is unsynchronized. Sequential add/remove falls back;
+        # concurrent mutation is not an atomic launch protocol supported by Triton.
         if (
             runtime.launch_enter_hook is not enter_hook_chain
             or runtime.launch_exit_hook is not exit_hook_chain
