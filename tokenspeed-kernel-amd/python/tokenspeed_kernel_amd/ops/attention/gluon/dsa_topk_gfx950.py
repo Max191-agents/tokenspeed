@@ -22,7 +22,9 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from functools import cache
+from threading import Lock
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
@@ -54,6 +56,26 @@ _ONEBLOCK_RADIX_MAX_COLS = 90000
 _PREFILL_RUNTIME_RADIX_MIN_COLS = 98304
 _PREFILL_RUNTIME_RADIX_MAX_COLS = 196608
 _PREFILL_HIST_DERIVED_MIN_COLS = 524288
+_PERSISTENT_PREFILL_MIN_COLS = 128 * 1024
+_PERSISTENT_PREFILL_FOUR_GROUP_MIN_COLS = 256 * 1024
+_PERSISTENT_PREFILL_MAX_COLS = 1024 * 1024
+_PERSISTENT_PREFILL_MIN_ROWS = 32
+_PERSISTENT_DECODE_MIN_COLS = 90000
+_PERSISTENT_DECODE_MAX_COLS = 256 * 1024
+_PERSISTENT_DECODE_MAX_GROUPS = 8
+_PERSISTENT_PREFILL_TOPK = 2048
+_PERSISTENT_PREFILL_BLOCK_N = 16384
+_PERSISTENT_PREFILL_NUM_WARPS = 16
+_PERSISTENT_PREFILL_NUM_BUCKETS = gl.constexpr(1 << 11)
+_PERSISTENT_PREFILL_NUM_PASSES = gl.constexpr(3)
+_PERSISTENT_PREFILL_COUNTER_STRIDE = gl.constexpr(32)
+_PERSISTENT_PREFILL_WORKSPACE_CACHE_MAXSIZE = 16
+
+_persistent_topk_workspace_cache: OrderedDict[
+    tuple[int, int, int], tuple[torch.Tensor, ...]
+] = OrderedDict()
+_persistent_topk_graph_workspace_keys: set[tuple[int, int, int]] = set()
+_persistent_topk_workspace_lock = Lock()
 
 __all__ = [
     "gluon_dsa_decode_topk_fp8_gfx950",
@@ -120,6 +142,587 @@ def _rank_four_items_per_thread(
         gl.int32
     )
 
+@gluon.jit
+def _persistent_wait_until_at_least(address, target, thread_offset):
+    return gl.inline_asm_elementwise(
+        asm="""
+            v_cmp_eq_u32_e32 vcc, 0, $4
+            s_and_saveexec_b64 $0, vcc
+            s_cbranch_execz 2f
+        1:
+            flat_load_dword $1, $2 sc0 sc1
+            s_waitcnt vmcnt(0) lgkmcnt(0)
+            buffer_inv sc0 sc1
+            v_cmp_ge_u32_e32 vcc, $1, $3
+            s_cbranch_vccnz 2f
+            s_sleep 1
+            s_branch 1b
+        2:
+            s_or_b64 exec, exec, $0
+        """,
+        constraints="=&s,=&v,v,v,v",
+        args=[address, target, thread_offset],
+        dtype=(gl.int64, gl.int32),
+        is_pure=False,
+        pack=1,
+    )
+
+
+@gluon.jit(noinline=True)
+def _persistent_histogram_tail(
+    row_logits,
+    shared_histogram,
+    row_start,
+    row_end,
+    n_cols,
+    full_tiles,
+    pass_index,
+    threshold_shift,
+    threshold,
+    shift,
+    bucket_mask,
+    BLOCK_N: gl.constexpr,
+    value_layout: gl.constexpr,
+):
+    offsets = full_tiles * BLOCK_N + gl.arange(
+        0,
+        BLOCK_N,
+        layout=value_layout,
+    )
+    offsets = gl.max_contiguous(
+        gl.multiple_of(offsets.to(gl.int32), 4),
+        4,
+    )
+    values = gl.amd.cdna4.buffer_load(
+        ptr=row_logits,
+        offsets=offsets,
+        mask=offsets < n_cols,
+        other=-float("inf"),
+    )
+    valid = (offsets >= row_start) & (offsets < row_end) & (offsets < n_cols)
+    keys = _fp32_to_topk_key(values)
+    if pass_index == 0:
+        prefix_match = valid
+    else:
+        prefix_match = valid & (
+            ((keys >> threshold_shift) << threshold_shift) == threshold
+        )
+    buckets = (keys >> shift) & bucket_mask
+    shared_histogram.atomic_scatter_add(
+        gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+        buckets.to(gl.int32),
+        axis=0,
+        mask=prefix_match,
+    )
+
+
+@gluon.jit(noinline=True)
+def _persistent_emit_tail(
+    row_logits,
+    shared_output_counters,
+    shared_greater_offsets,
+    shared_equal_offsets,
+    row_start,
+    row_end,
+    n_cols,
+    full_tiles,
+    threshold_shift,
+    threshold,
+    TOPK: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    value_layout: gl.constexpr,
+):
+    offsets = full_tiles * BLOCK_N + gl.arange(
+        0,
+        BLOCK_N,
+        layout=value_layout,
+    )
+    offsets = gl.max_contiguous(
+        gl.multiple_of(offsets.to(gl.int32), 4),
+        4,
+    )
+    values = gl.amd.cdna4.buffer_load(
+        ptr=row_logits,
+        offsets=offsets,
+        mask=offsets < n_cols,
+        other=-float("inf"),
+    )
+    valid = (offsets >= row_start) & (offsets < row_end) & (offsets < n_cols)
+    keys = _fp32_to_topk_key(values)
+    truncated_keys = (keys >> threshold_shift) << threshold_shift
+    greater = valid & (truncated_keys < threshold)
+    equal = valid & (truncated_keys == threshold)
+    reservation_mask = greater | equal
+    reservation_counter = gl.where(greater, 0, 1).to(gl.int32)
+    reservation = shared_output_counters.atomic_scatter_add(
+        gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+        reservation_counter,
+        axis=0,
+        mask=reservation_mask,
+    )
+    shared_greater_offsets.atomic_scatter_xchg(
+        offsets.to(gl.int32),
+        reservation,
+        axis=0,
+        mask=greater & (reservation < TOPK),
+    )
+    shared_equal_offsets.atomic_scatter_xchg(
+        offsets.to(gl.int32),
+        reservation,
+        axis=0,
+        mask=equal & (reservation < TOPK),
+    )
+
+
+@gluon.jit(
+    do_not_specialize=(
+        "logits_stride",
+        "block_table_stride",
+        "block_table_cols",
+        "n_cols",
+    ),
+)
+def _dsa_persistent_radix_topk_kernel(
+    logits,
+    histograms,
+    arrivals,
+    pass_done,
+    reset_arrivals,
+    output_counters,
+    block_table,
+    row_starts,
+    row_ends,
+    out,
+    lens_out,
+    logits_stride,
+    block_table_stride,
+    out_stride: gl.constexpr,
+    block_table_cols,
+    n_cols,
+    page_size: gl.constexpr,
+    q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
+    GROUPS_PER_ROW: gl.constexpr,
+    TOPK: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    row = gl.program_id(0)
+    group = gl.program_id(1)
+    value_layout: gl.constexpr = _vector_layout(
+        BLOCK_N,
+        gl.num_warps(),
+        BLOCK_N // (64 * gl.num_warps()),
+    )
+    output_layout: gl.constexpr = _vector_layout(
+        TOPK,
+        gl.num_warps(),
+        TOPK // (64 * gl.num_warps()),
+    )
+    if IS_DECODE:
+        req = row // q_len_per_req
+        q_offset = row - req * q_len_per_req
+        row_start = gl.full([], 0, gl.int32)
+        row_end = gl.load(row_ends + req).to(gl.int32) - (q_len_per_req - 1) + q_offset
+    else:
+        req = gl.full([], 0, gl.int32)
+        row_start = gl.load(row_starts + row).to(gl.int32)
+        row_end = gl.load(row_ends + row).to(gl.int32)
+    row_end = gl.maximum(row_end, row_start)
+    row_len = gl.maximum(row_end - row_start, 0)
+    selected_count = gl.minimum(row_len, TOPK)
+    if group == 0:
+        gl.store(lens_out + row, selected_count)
+
+    if row_len <= TOPK:
+        if group == 0:
+            output_offsets = gl.arange(0, TOPK, layout=output_layout)
+            valid = output_offsets < row_len
+            output_values = row_start + output_offsets
+            if IS_DECODE:
+                block_idx = output_values // page_size
+                physical_page = gl.load(
+                    block_table + req * block_table_stride + block_idx,
+                    mask=valid & (block_idx < block_table_cols),
+                    other=0,
+                )
+                output_values = physical_page * page_size + output_values % page_size
+            gl.store(
+                out + row * out_stride + output_offsets,
+                gl.where(valid, output_values, -1),
+            )
+        return
+
+    hist_layout: gl.constexpr = _vector_layout(
+        _PERSISTENT_PREFILL_NUM_BUCKETS,
+        gl.num_warps(),
+        _PERSISTENT_PREFILL_NUM_BUCKETS // (64 * gl.num_warps()),
+    )
+    group_layout: gl.constexpr = _vector_layout(
+        _PERSISTENT_PREFILL_NUM_BUCKETS // 2,
+        gl.num_warps(),
+        1,
+    )
+    wait_threads: gl.constexpr = 64 * gl.num_warps()
+    wait_layout: gl.constexpr = _vector_layout(
+        wait_threads,
+        gl.num_warps(),
+        1,
+    )
+    wait_offsets = gl.arange(0, wait_threads, layout=wait_layout)
+    hist_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[_PERSISTENT_PREFILL_NUM_BUCKETS, 1]],
+        [_PERSISTENT_PREFILL_NUM_BUCKETS],
+        [0],
+    )
+    histogram_zeros = gl.zeros(
+        [_PERSISTENT_PREFILL_NUM_BUCKETS],
+        gl.int32,
+        layout=hist_layout,
+    )
+    shared_histogram = gl.allocate_shared_memory(
+        gl.int32,
+        [_PERSISTENT_PREFILL_NUM_BUCKETS],
+        hist_shared_layout,
+        value=histogram_zeros,
+    )
+    compact_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[TOPK, 1]],
+        [TOPK],
+        [0],
+    )
+    shared_greater_offsets = gl.allocate_shared_memory(
+        gl.int32,
+        [TOPK],
+        compact_shared_layout,
+    )
+    shared_equal_offsets = gl.allocate_shared_memory(
+        gl.int32,
+        [TOPK],
+        compact_shared_layout,
+    )
+    output_counter_layout: gl.constexpr = _vector_layout(
+        2,
+        gl.num_warps(),
+        1,
+    )
+    output_counter_shared_layout: gl.constexpr = (
+        gl.PaddedSharedLayout.with_identity_for(
+            [[2, 1]],
+            [2],
+            [0],
+        )
+    )
+    shared_output_counters = gl.allocate_shared_memory(
+        gl.int32,
+        [2],
+        output_counter_shared_layout,
+        value=gl.zeros([2], gl.int32, layout=output_counter_layout),
+    )
+    gl.barrier()
+
+    bucket_offsets = gl.arange(
+        0,
+        _PERSISTENT_PREFILL_NUM_BUCKETS,
+        layout=hist_layout,
+    )
+    row_logits = logits + row * logits_stride
+    full_tiles = n_cols // BLOCK_N
+    tail_size = n_cols - full_tiles * BLOCK_N
+    tail_owner = full_tiles % GROUPS_PER_ROW
+    threshold = gl.full([], 0, gl.uint32)
+    threshold_shift = gl.full([], 32, gl.int32)
+    remaining = gl.full([], TOPK, gl.int32)
+    done = gl.full([], False, gl.int1)
+    pass_index = gl.full([], 0, gl.int32)
+
+    while (pass_index < _PERSISTENT_PREFILL_NUM_PASSES) & ~done:
+        if pass_index != 0:
+            gl.barrier()
+            shared_histogram.store(histogram_zeros)
+            gl.barrier()
+
+        shift = gl.maximum(21 - pass_index * 11, 0)
+        bucket_mask = gl.where(pass_index == 2, 0x3FF, 0x7FF)
+
+        for tile in range(group, full_tiles, GROUPS_PER_ROW):
+            offsets = tile * BLOCK_N + gl.arange(
+                0,
+                BLOCK_N,
+                layout=value_layout,
+            )
+            offsets = gl.max_contiguous(
+                gl.multiple_of(offsets.to(gl.int32), 4),
+                4,
+            )
+            values = gl.amd.cdna4.buffer_load(
+                ptr=row_logits,
+                offsets=offsets,
+            )
+            valid = (offsets >= row_start) & (offsets < row_end)
+            keys = _fp32_to_topk_key(values)
+            if pass_index == 0:
+                prefix_match = valid
+            else:
+                prefix_match = valid & (
+                    ((keys >> threshold_shift) << threshold_shift) == threshold
+                )
+            buckets = (keys >> shift) & bucket_mask
+            shared_histogram.atomic_scatter_add(
+                gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+                buckets.to(gl.int32),
+                axis=0,
+                mask=prefix_match,
+            )
+
+        if (tail_size != 0) & (group == tail_owner):
+            _persistent_histogram_tail(
+                row_logits,
+                shared_histogram,
+                row_start,
+                row_end,
+                n_cols,
+                full_tiles,
+                pass_index,
+                threshold_shift,
+                threshold,
+                shift,
+                bucket_mask,
+                BLOCK_N,
+                value_layout,
+            )
+
+        gl.barrier()
+        local_counts = shared_histogram.load(hist_layout)
+        row_histogram = (
+            histograms
+            + (row * _PERSISTENT_PREFILL_NUM_PASSES + pass_index)
+            * _PERSISTENT_PREFILL_NUM_BUCKETS
+        )
+        gl.atomic_add(
+            row_histogram + bucket_offsets,
+            local_counts,
+            mask=local_counts != 0,
+            sem="relaxed",
+            scope="gpu",
+        )
+        gl.barrier()
+
+        old = gl.atomic_add(
+            arrivals
+            + (row * _PERSISTENT_PREFILL_NUM_PASSES + pass_index)
+            * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+            1,
+            sem="acq_rel",
+            scope="gpu",
+        )
+        if old == GROUPS_PER_ROW - 1:
+            gl.atomic_add(
+                pass_done + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+                1,
+                sem="release",
+                scope="gpu",
+            )
+        else:
+            _persistent_wait_until_at_least(
+                pass_done + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+                pass_index + 1,
+                wait_offsets,
+            )
+        gl.barrier()
+
+        total_counts = gl.load(
+            row_histogram + bucket_offsets,
+            volatile=True,
+        )
+        count_pairs = total_counts.reshape([_PERSISTENT_PREFILL_NUM_BUCKETS // 2, 2])
+        count_low, count_high = gl.split(count_pairs)
+        count_low = gl.convert_layout(count_low, group_layout)
+        count_high = gl.convert_layout(count_high, group_layout)
+        group_counts = count_low + count_high
+        cumulative = gl.associative_scan(group_counts, 0, _topk_add)
+        before_group = cumulative - group_counts
+        selected_group = (before_group < remaining) & (cumulative >= remaining)
+        bucket_pairs = bucket_offsets.reshape([_PERSISTENT_PREFILL_NUM_BUCKETS // 2, 2])
+        bucket_low, bucket_high = gl.split(bucket_pairs)
+        bucket_low = gl.convert_layout(bucket_low, group_layout)
+        bucket_high = gl.convert_layout(bucket_high, group_layout)
+        select_low = before_group + count_low >= remaining
+        group_bucket = gl.where(select_low, bucket_low, bucket_high)
+        group_selected_before = before_group + gl.where(select_low, 0, count_low)
+        group_selected_count = gl.where(select_low, count_low, count_high)
+        selected_bucket = gl.sum(
+            gl.where(selected_group, group_bucket, 0),
+            axis=0,
+        ).to(gl.int32)
+        selected_greater = gl.sum(
+            gl.where(selected_group, group_selected_before, 0),
+            axis=0,
+        ).to(gl.int32)
+        selected_bucket_count = gl.sum(
+            gl.where(selected_group, group_selected_count, 0),
+            axis=0,
+        ).to(gl.int32)
+        threshold |= selected_bucket.to(gl.uint32) << shift
+        threshold_shift = shift
+        remaining -= selected_greater
+        done = selected_bucket_count == remaining
+        pass_index += 1
+
+    for tile in range(group, full_tiles, GROUPS_PER_ROW):
+        offsets = tile * BLOCK_N + gl.arange(
+            0,
+            BLOCK_N,
+            layout=value_layout,
+        )
+        offsets = gl.max_contiguous(
+            gl.multiple_of(offsets.to(gl.int32), 4),
+            4,
+        )
+        values = gl.amd.cdna4.buffer_load(
+            ptr=row_logits,
+            offsets=offsets,
+        )
+        valid = (offsets >= row_start) & (offsets < row_end)
+        keys = _fp32_to_topk_key(values)
+        truncated_keys = (keys >> threshold_shift) << threshold_shift
+        greater = valid & (truncated_keys < threshold)
+        equal = valid & (truncated_keys == threshold)
+        reservation_mask = greater | equal
+        reservation_counter = gl.where(greater, 0, 1).to(gl.int32)
+        reservation = shared_output_counters.atomic_scatter_add(
+            gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+            reservation_counter,
+            axis=0,
+            mask=reservation_mask,
+        )
+        shared_greater_offsets.atomic_scatter_xchg(
+            offsets.to(gl.int32),
+            reservation,
+            axis=0,
+            mask=greater & (reservation < TOPK),
+        )
+        shared_equal_offsets.atomic_scatter_xchg(
+            offsets.to(gl.int32),
+            reservation,
+            axis=0,
+            mask=equal & (reservation < TOPK),
+        )
+
+    if (tail_size != 0) & (group == tail_owner):
+        _persistent_emit_tail(
+            row_logits,
+            shared_output_counters,
+            shared_greater_offsets,
+            shared_equal_offsets,
+            row_start,
+            row_end,
+            n_cols,
+            full_tiles,
+            threshold_shift,
+            threshold,
+            TOPK,
+            BLOCK_N,
+            value_layout,
+        )
+
+    gl.barrier()
+    output_counter_offsets = gl.arange(0, 2, layout=output_counter_layout)
+    local_output_counts = shared_output_counters.load(output_counter_layout)
+    local_greater = gl.sum(
+        gl.where(output_counter_offsets == 0, local_output_counts, 0),
+        axis=0,
+    ).to(gl.int32)
+    local_equal = gl.sum(
+        gl.where(output_counter_offsets == 1, local_output_counts, 0),
+        axis=0,
+    ).to(gl.int32)
+    greater_start = gl.atomic_add(
+        output_counters + (row * 2) * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+        local_greater,
+        sem="acq_rel",
+        scope="gpu",
+    )
+    equal_start = gl.atomic_add(
+        output_counters + (row * 2 + 1) * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+        local_equal,
+        sem="acq_rel",
+        scope="gpu",
+    )
+    copy_offsets = gl.arange(0, TOPK, layout=output_layout)
+    greater_values = shared_greater_offsets.load(output_layout)
+    equal_values = shared_equal_offsets.load(output_layout)
+    greater_positions = greater_start + copy_offsets
+    equal_positions = equal_start + copy_offsets
+    greater_write = (copy_offsets < local_greater) & (greater_positions < TOPK)
+    equal_write = (copy_offsets < local_equal) & (equal_positions < remaining)
+    if IS_DECODE:
+        greater_block_idx = greater_values // page_size
+        greater_page = gl.load(
+            block_table + req * block_table_stride + greater_block_idx,
+            mask=(greater_block_idx >= 0)
+            & (greater_block_idx < block_table_cols)
+            & greater_write,
+            other=0,
+        )
+        greater_values = greater_page * page_size + greater_values % page_size
+        equal_block_idx = equal_values // page_size
+        equal_page = gl.load(
+            block_table + req * block_table_stride + equal_block_idx,
+            mask=(equal_block_idx >= 0)
+            & (equal_block_idx < block_table_cols)
+            & equal_write,
+            other=0,
+        )
+        equal_values = equal_page * page_size + equal_values % page_size
+    gl.store(
+        out + row * out_stride + greater_positions,
+        greater_values,
+        mask=greater_write,
+    )
+    gl.store(
+        out + row * out_stride + (TOPK - 1 - equal_positions),
+        equal_values,
+        mask=equal_write,
+    )
+
+    gl.barrier()
+    reset_old = gl.atomic_add(
+        reset_arrivals + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+        1,
+        sem="acq_rel",
+        scope="gpu",
+    )
+    if reset_old == GROUPS_PER_ROW - 1:
+        for reset_pass in gl.static_range(_PERSISTENT_PREFILL_NUM_PASSES):
+            gl.store(
+                histograms
+                + (row * _PERSISTENT_PREFILL_NUM_PASSES + reset_pass)
+                * _PERSISTENT_PREFILL_NUM_BUCKETS
+                + bucket_offsets,
+                histogram_zeros,
+            )
+            gl.store(
+                arrivals
+                + (row * _PERSISTENT_PREFILL_NUM_PASSES + reset_pass)
+                * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+                0,
+            )
+        gl.store(
+            pass_done + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+            0,
+        )
+        gl.store(
+            output_counters + (row * 2) * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+            0,
+        )
+        gl.store(
+            output_counters + (row * 2 + 1) * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+            0,
+        )
+        gl.store(
+            reset_arrivals + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+            0,
+        )
 
 @gluon.jit
 def _find_topk_threshold_key(
@@ -2463,6 +3066,252 @@ def _device_compute_units(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+def _persistent_prefill_groups(
+    rows: int,
+    cols: int,
+    topk: int,
+    device: torch.device,
+) -> int | None:
+    if (
+        rows < _PERSISTENT_PREFILL_MIN_ROWS
+        or topk != _PERSISTENT_PREFILL_TOPK
+        or cols < _PERSISTENT_PREFILL_MIN_COLS
+        or cols > _PERSISTENT_PREFILL_MAX_COLS
+    ):
+        return None
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    max_groups = _device_compute_units(device_index) // rows
+    target_groups = 2 if cols < _PERSISTENT_PREFILL_FOUR_GROUP_MIN_COLS else 4
+    if max_groups >= target_groups:
+        return target_groups
+    if target_groups == 4 and max_groups >= 2:
+        return 2
+    return None
+
+
+def _persistent_decode_groups(
+    rows: int,
+    cols: int,
+    topk: int,
+    device: torch.device,
+) -> int | None:
+    if (
+        rows <= 0
+        or topk != _PERSISTENT_PREFILL_TOPK
+        or cols <= _PERSISTENT_DECODE_MIN_COLS
+        or cols > _PERSISTENT_DECODE_MAX_COLS
+    ):
+        return None
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    groups = min(
+        _PERSISTENT_DECODE_MAX_GROUPS,
+        _device_compute_units(device_index) // rows,
+    )
+    return groups if groups >= 2 else None
+
+
+def _next_power_of_two(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (value - 1).bit_length()
+
+
+def _persistent_topk_workspace(
+    rows: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, ...]:
+    """Return zero-once scratch owned by the current stream and size bucket."""
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    stream_id = int(torch.cuda.current_stream(device_index).cuda_stream)
+    row_bucket = _next_power_of_two(rows)
+    key = (device_index, stream_id, row_bucket)
+    capturing = torch.cuda.is_current_stream_capturing()
+    with _persistent_topk_workspace_lock:
+        workspace = _persistent_topk_workspace_cache.get(key)
+        if workspace is not None:
+            _persistent_topk_workspace_cache.move_to_end(key)
+            if capturing:
+                _persistent_topk_graph_workspace_keys.add(key)
+    if workspace is not None:
+        return workspace
+
+    # Retaining a stream-local allocation keeps graph pointers alive and avoids
+    # cross-stream races. The kernel restores every touched word to zero.
+    workspace = (
+        torch.zeros(
+            (
+                row_bucket,
+                _PERSISTENT_PREFILL_NUM_PASSES,
+                _PERSISTENT_PREFILL_NUM_BUCKETS,
+            ),
+            dtype=torch.int32,
+            device=device,
+        ),
+        torch.zeros(
+            (
+                row_bucket,
+                _PERSISTENT_PREFILL_NUM_PASSES,
+                _PERSISTENT_PREFILL_COUNTER_STRIDE,
+            ),
+            dtype=torch.int32,
+            device=device,
+        ),
+        torch.zeros(
+            (row_bucket, _PERSISTENT_PREFILL_COUNTER_STRIDE),
+            dtype=torch.int32,
+            device=device,
+        ),
+        torch.zeros(
+            (row_bucket, _PERSISTENT_PREFILL_COUNTER_STRIDE),
+            dtype=torch.int32,
+            device=device,
+        ),
+        torch.zeros(
+            (row_bucket, 2, _PERSISTENT_PREFILL_COUNTER_STRIDE),
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
+    with _persistent_topk_workspace_lock:
+        existing = _persistent_topk_workspace_cache.get(key)
+        if existing is not None:
+            _persistent_topk_workspace_cache.move_to_end(key)
+            if capturing:
+                _persistent_topk_graph_workspace_keys.add(key)
+            return existing
+
+        if len(_persistent_topk_workspace_cache) >= (
+            _PERSISTENT_PREFILL_WORKSPACE_CACHE_MAXSIZE
+        ):
+            evict_key = next(
+                (
+                    cached_key
+                    for cached_key in _persistent_topk_workspace_cache
+                    if cached_key not in _persistent_topk_graph_workspace_keys
+                ),
+                None,
+            )
+            if evict_key is None:
+                # Allocations made during capture belong to the graph's memory
+                # pool, so an uncached workspace remains valid for replay.
+                return workspace
+            del _persistent_topk_workspace_cache[evict_key]
+
+        _persistent_topk_workspace_cache[key] = workspace
+        if capturing:
+            _persistent_topk_graph_workspace_keys.add(key)
+        return workspace
+
+
+def _dsa_persistent_radix_topk(
+    logits: torch.Tensor,
+    block_table: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    page_size: int,
+    q_len_per_req: int,
+    is_decode: bool,
+    topk: int,
+    groups: int,
+    workspace: tuple[torch.Tensor, ...],
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, cols = logits.shape
+    histograms, arrivals, pass_done, reset_arrivals, output_counters = workspace
+    block_table_stride = block_table.stride(0) if is_decode else 0
+    block_table_cols = block_table.shape[1] if is_decode else 0
+    _dsa_persistent_radix_topk_kernel[(rows, groups)](
+        logits,
+        histograms,
+        arrivals,
+        pass_done,
+        reset_arrivals,
+        output_counters,
+        block_table,
+        row_starts,
+        row_ends,
+        out,
+        lens_out,
+        logits.stride(0),
+        block_table_stride,
+        out.stride(0),
+        block_table_cols=block_table_cols,
+        n_cols=cols,
+        page_size=page_size,
+        q_len_per_req=q_len_per_req,
+        IS_DECODE=is_decode,
+        GROUPS_PER_ROW=groups,
+        TOPK=topk,
+        BLOCK_N=_PERSISTENT_PREFILL_BLOCK_N,
+        num_warps=_PERSISTENT_PREFILL_NUM_WARPS,
+    )
+    return out, lens_out
+
+
+def _dsa_persistent_prefill_radix_topk(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    groups: int,
+    workspace: tuple[torch.Tensor, ...],
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _dsa_persistent_radix_topk(
+        logits,
+        row_starts,
+        row_starts,
+        row_ends,
+        page_size=1,
+        q_len_per_req=1,
+        is_decode=False,
+        topk=topk,
+        groups=groups,
+        workspace=workspace,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def _dsa_persistent_decode_topk_slots(
+    logits: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    q_len_per_req: int,
+    groups: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    workspace = _persistent_topk_workspace(logits.shape[0], logits.device)
+    return _dsa_persistent_radix_topk(
+        logits,
+        block_table,
+        seq_lens,
+        seq_lens,
+        page_size=page_size,
+        q_len_per_req=q_len_per_req,
+        is_decode=True,
+        topk=topk,
+        groups=groups,
+        workspace=workspace,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
 def _radix_groups_per_row(
     rows: int,
     tiles: int,
@@ -3104,6 +3953,25 @@ def _dsa_decode_topk_slots(
             )
         return out, lens_out
 
+    persistent_groups = _persistent_decode_groups(
+        rows,
+        cols,
+        topk,
+        logits.device,
+    )
+    if persistent_groups is not None:
+        return _dsa_persistent_decode_topk_slots(
+            logits,
+            block_table,
+            seq_lens,
+            page_size=page_size,
+            topk=topk,
+            q_len_per_req=q_len_per_req,
+            groups=persistent_groups,
+            out=out,
+            lens_out=lens_out,
+        )
+
     if cols <= _ONEBLOCK_DECODE_RUNTIME_MAX_COLS:
         if (
             cols < _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS
@@ -3209,6 +4077,28 @@ def _dsa_prefill_topk_indices(
                 num_warps=8,
             )
         return out, lens_out
+
+    persistent_groups = _persistent_prefill_groups(
+        rows,
+        cols,
+        topk,
+        logits.device,
+    )
+    if persistent_groups is not None:
+        workspace = _persistent_topk_workspace(
+            rows,
+            logits.device,
+        )
+        return _dsa_persistent_prefill_radix_topk(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            groups=persistent_groups,
+            workspace=workspace,
+            out=out,
+            lens_out=lens_out,
+        )
 
     if cols <= _ONEBLOCK_RADIX_MAX_COLS:
         if cols < _ONEBLOCK_COMPACT_FINAL_MIN_COLS:
