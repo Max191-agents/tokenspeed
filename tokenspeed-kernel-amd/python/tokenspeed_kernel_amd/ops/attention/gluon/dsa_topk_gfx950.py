@@ -98,6 +98,10 @@ _COMPILED_RUNNER_KNOB_ENV_VARS = (
     "AMDGCN_USE_BUFFER_ATOMICS",
     "AMDGCN_ANALYZE_SMALL_TENSOR_RANGE",
 )
+_COMPILED_RUNNER_KNOB_ENV_BYTE_KEYS = tuple(
+    os.fsencode(name) for name in _COMPILED_RUNNER_KNOB_ENV_VARS
+)
+_COMPILED_RUNNER_CANONICAL_ENVIRONMENT = (None,) * len(_COMPILED_RUNNER_KNOB_ENV_VARS)
 _TRIVIAL_DECODE_POINTER_DTYPES = (torch.int32,) * 4
 _RUNTIME_RADIX_POINTER_DTYPES = (torch.float32,) + (torch.int32,) * 5
 _MANUAL_RADIX_POINTER_DTYPES = (torch.float32,) + (torch.int32,) * 6
@@ -113,6 +117,7 @@ class _CompiledRunnerPlan:
         "target_getter",
         "target_key",
         "knob_key",
+        "environment_key",
         "pointer_refs",
     )
 
@@ -134,6 +139,7 @@ class _CompiledRunnerPlan:
         self.target_getter = target_getter
         self.target_key = target_key
         self.knob_key = knob_key
+        self.environment_key = _compiled_runner_environment_key()
         self.pointer_refs = tuple(ref(pointer) for pointer in pointer_args)
 
     def pointers_match(self, args: tuple[object, ...]) -> bool:
@@ -259,6 +265,26 @@ def _compiled_runner_knob_key() -> tuple[object, ...]:
     )
 
 
+def _compiled_runner_environment_key() -> tuple[object, ...]:
+    data = getattr(os.environ, "_data", None)
+    if os.name == "posix" and isinstance(data, dict):
+        # POSIX _Environ stores exact byte values; fixed lookups avoid six
+        # descriptor getenv calls. Other implementations use the public API.
+        keys = _COMPILED_RUNNER_KNOB_ENV_BYTE_KEYS
+        return (
+            data.get(keys[0]),
+            data.get(keys[1]),
+            data.get(keys[2]),
+            data.get(keys[3]),
+            data.get(keys[4]),
+            data.get(keys[5]),
+        )
+    return tuple(
+        None if (value := os.environ.get(name)) is None else os.fsencode(value)
+        for name in _COMPILED_RUNNER_KNOB_ENV_VARS
+    )
+
+
 def _compiled_runner_knob_mutation_guard() -> tuple[object, ...]:
     knobs = triton.knobs
     return (
@@ -299,13 +325,32 @@ def _compiled_runner_plan_state_matches(
     kernel: object,
     driver: object,
 ) -> bool:
+    knobs = triton.knobs
+    if (
+        driver is not plan.driver
+        or kernel.debug
+        or kernel.pre_run_hooks
+        or kernel.used_global_vals
+        or knobs.runtime.debug
+        or knobs.runtime.add_stages_inspection_hook is not None
+        or knobs.compilation.instrumentation_mode
+        or knobs.runtime.__dict__
+        or knobs.language.__dict__
+        or knobs.amd.__dict__
+        or knobs.compilation.__dict__
+        or _compiled_runner_environment_key() != plan.environment_key
+    ):
+        return False
+    # Empty knob dictionaries plus the exact six-variable environment key imply
+    # the descriptor values under which supported plans are compiled.
     return (
-        driver is plan.driver
-        and driver.get_current_device() == plan.device
+        driver.get_current_device() == plan.device
         and _compiled_runner_target_getter(driver) is plan.target_getter
-        and _compiled_runner_target_key(driver) == plan.target_key
-        and _compiled_runner_knob_key() == plan.knob_key
-        and _compiled_runner_mutable_state(kernel) == plan.mutable_state
+        # For the gated HIP ABI, the target can otherwise change only with the
+        # device or override_arch, both checked above. Misses revalidate it fully.
+        and plan.target_key == ("hip", "gfx950", 64)
+        and plan.knob_key == _COMPILED_RUNNER_CANONICAL_KNOBS
+        and plan.environment_key == _COMPILED_RUNNER_CANONICAL_ENVIRONMENT
     )
 
 
@@ -356,6 +401,17 @@ def _compiled_runner_route_key(
     )
 
 
+def _cache_compiled_runner_plan(
+    cache: OrderedDict[tuple[object, ...], _CompiledRunnerPlan],
+    key: tuple[object, ...],
+    plan: _CompiledRunnerPlan,
+) -> None:
+    cache[key] = plan
+    cache.move_to_end(key)
+    while len(cache) > _COMPILED_RUNNER_CACHE_SIZE:
+        cache.popitem(last=False)
+
+
 def _launch_warmed_compiled_kernel(
     kernel: object,
     grid: tuple[int, int, int],
@@ -375,6 +431,7 @@ def _launch_warmed_compiled_kernel(
     if dispatch_cache is not None and dispatch_key is not None:
         plan = dispatch_cache.get(dispatch_key)
         if plan is not None:
+            dispatch_cache.move_to_end(dispatch_key)
             driver = triton.runtime.driver.active
             pointer_args = args[: len(pointer_dtypes)]
             same_pointers = plan.pointers_match(pointer_args)
@@ -412,6 +469,8 @@ def _launch_warmed_compiled_kernel(
         num_warps,
     )
     plan = _compiled_runner_cache.get(key)
+    if plan is not None:
+        _compiled_runner_cache.move_to_end(key)
     mutable_state = _compiled_runner_mutable_state(kernel)
     if plan is not None:
         pointer_args = args[: len(pointer_dtypes)]
@@ -430,9 +489,7 @@ def _launch_warmed_compiled_kernel(
             if not same_pointers:
                 plan.update_pointers(pointer_args)
             if dispatch_cache is not None and dispatch_key is not None:
-                dispatch_cache[dispatch_key] = plan
-                if len(dispatch_cache) > _COMPILED_RUNNER_CACHE_SIZE:
-                    dispatch_cache.popitem(last=False)
+                _cache_compiled_runner_plan(dispatch_cache, dispatch_key, plan)
             plan.runner(*args)
             return
 
@@ -454,6 +511,8 @@ def _launch_warmed_compiled_kernel(
 
     with _compiled_runner_cache_lock:
         plan = _compiled_runner_cache.get(key)
+        if plan is not None:
+            _compiled_runner_cache.move_to_end(key)
         if plan is None:
             target_key = _compiled_runner_target_key(driver)
             target_getter = _compiled_runner_target_getter(driver)
@@ -496,6 +555,8 @@ def _launch_warmed_compiled_kernel(
                 and _compiled_runner_target_getter(driver) is target_getter
                 and _compiled_runner_knob_key() == knob_key
                 and _compiled_runner_mutable_state(kernel) == mutable_state
+                and _compiled_runner_environment_key()
+                == _COMPILED_RUNNER_CANONICAL_ENVIRONMENT
             )
             if compiled is not None and environment_unchanged:
                 plan = _CompiledRunnerPlan(
@@ -508,10 +569,8 @@ def _launch_warmed_compiled_kernel(
                     knob_key,
                     args[: len(pointer_dtypes)],
                 )
-                _compiled_runner_cache[key] = plan
+                _cache_compiled_runner_plan(_compiled_runner_cache, key, plan)
                 _compiled_runner_environments[environment_key] = environment
-                if len(_compiled_runner_cache) > _COMPILED_RUNNER_CACHE_SIZE:
-                    _compiled_runner_cache.popitem(last=False)
     if plan is not None:
         pointer_args = args[: len(pointer_dtypes)]
         same_pointers = plan.pointers_match(pointer_args)
@@ -521,9 +580,7 @@ def _launch_warmed_compiled_kernel(
             if not same_pointers:
                 plan.update_pointers(pointer_args)
             if dispatch_cache is not None and dispatch_key is not None:
-                dispatch_cache[dispatch_key] = plan
-                if len(dispatch_cache) > _COMPILED_RUNNER_CACHE_SIZE:
-                    dispatch_cache.popitem(last=False)
+                _cache_compiled_runner_plan(dispatch_cache, dispatch_key, plan)
             plan.runner(*args)
             return
 
@@ -1459,13 +1516,13 @@ def _dsa_trivial_decode_topk2048_kernel(
     gl.store(lens_out + row, gl.minimum(candidate_len, 2048).to(gl.int32))
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("out_stride",))
 def _dsa_trivial_prefill_topk2048_kernel(
     row_starts,
     row_ends,
     out,
     lens_out,
-    out_stride: gl.constexpr,
+    out_stride,
 ):
     row = gl.program_id(0)
     layout: gl.constexpr = _vector_layout(2048, gl.num_warps(), 4)
@@ -3724,10 +3781,17 @@ def _dsa_persistent_radix_topk(
     grid = (rows, groups, 1)
     dispatch_key = (grid, specialization_key)
     compiled_plan = _persistent_runner_plans.get(dispatch_key)
+    if compiled_plan is not None:
+        _persistent_runner_plans.move_to_end(dispatch_key)
+    driver = triton.runtime.driver.active
     if (
         compiled_plan is not None
-        and triton.runtime.driver.active is compiled_plan.driver
-        and compiled_plan.pointers_match(kernel_args[:11])
+        and compiled_plan.pointers_match(kernel_args)
+        and _compiled_runner_plan_state_matches(
+            compiled_plan,
+            _dsa_persistent_radix_topk_kernel,
+            driver,
+        )
     ):
         compiled_plan.runner(*kernel_args)
     else:
@@ -4424,10 +4488,17 @@ def _dsa_decode_topk_slots(
             specialization_key = kernel_args[7:]
             dispatch_key = (rows, specialization_key)
             compiled_plan = _trivial_decode_runner_plans.get(dispatch_key)
+            if compiled_plan is not None:
+                _trivial_decode_runner_plans.move_to_end(dispatch_key)
+            driver = triton.runtime.driver.active
             if (
                 compiled_plan is not None
-                and triton.runtime.driver.active is compiled_plan.driver
-                and compiled_plan.pointers_match(kernel_args[:4])
+                and compiled_plan.pointers_match(kernel_args)
+                and _compiled_runner_plan_state_matches(
+                    compiled_plan,
+                    _dsa_trivial_decode_topk2048_kernel,
+                    driver,
+                )
             ):
                 compiled_plan.runner(*kernel_args)
             else:
@@ -4514,10 +4585,17 @@ def _dsa_decode_topk_slots(
             specialization_key = kernel_args[10:]
             dispatch_key = (rows, specialization_key)
             compiled_plan = _runtime_decode_runner_plans.get(dispatch_key)
+            if compiled_plan is not None:
+                _runtime_decode_runner_plans.move_to_end(dispatch_key)
+            driver = triton.runtime.driver.active
             if (
                 compiled_plan is not None
-                and triton.runtime.driver.active is compiled_plan.driver
-                and compiled_plan.pointers_match(kernel_args[:6])
+                and compiled_plan.pointers_match(kernel_args)
+                and _compiled_runner_plan_state_matches(
+                    compiled_plan,
+                    _dsa_runtime_radix_topk_kernel,
+                    driver,
+                )
             ):
                 compiled_plan.runner(*kernel_args)
             else:
@@ -4603,17 +4681,34 @@ def _dsa_prefill_topk_indices(
                 lens_out,
                 out.stride(0),
             )
-            specialization_key = kernel_args[4:]
-            _launch_warmed_compiled_kernel(
-                _dsa_trivial_prefill_topk2048_kernel,
-                (rows, 1, 1),
-                kernel_args,
-                _TRIVIAL_DECODE_POINTER_DTYPES,
-                specialization_key,
-                dispatch_cache=_trivial_prefill_runner_plans,
-                dispatch_key=(rows, specialization_key),
-                num_warps=8,
-            )
+            specialization_key = ()
+            dispatch_key = (rows, specialization_key)
+            compiled_plan = _trivial_prefill_runner_plans.get(dispatch_key)
+            if compiled_plan is not None:
+                _trivial_prefill_runner_plans.move_to_end(dispatch_key)
+            driver = triton.runtime.driver.active
+            if (
+                compiled_plan is not None
+                and compiled_plan.pointers_match(kernel_args)
+                and _compiled_runner_plan_state_matches(
+                    compiled_plan,
+                    _dsa_trivial_prefill_topk2048_kernel,
+                    driver,
+                )
+            ):
+                compiled_plan.runner(*kernel_args)
+            else:
+                _launch_warmed_compiled_kernel(
+                    _dsa_trivial_prefill_topk2048_kernel,
+                    (rows, 1, 1),
+                    kernel_args,
+                    _TRIVIAL_DECODE_POINTER_DTYPES,
+                    specialization_key,
+                    dispatch_cache=_trivial_prefill_runner_plans,
+                    dispatch_key=dispatch_key,
+                    native_scalar_count=1,
+                    num_warps=8,
+                )
         else:
             _dsa_trivial_topk_kernel[(rows,)](
                 row_starts,
