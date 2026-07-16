@@ -1174,6 +1174,57 @@ def test_dsa_decode_topk_dispatches_runtime_radix_for_batched_queries() -> None:
     )
 
 
+@pytest.mark.parametrize("cols", (512, 1024, 2048))
+def test_dsa_decode_topk_trivial_2048_maps_grouped_queries_to_physical_slots(
+    cols: int,
+) -> None:
+    page_size = 64
+    q_len_per_req = 4
+    requests = 2
+    rows = requests * q_len_per_req
+    topk = 2048
+    pages = math.ceil(cols / page_size)
+    seq_lens = torch.tensor(
+        [cols, cols - 53],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    logical_pages = torch.arange(pages, device="cuda", dtype=torch.int32)
+    block_table = torch.stack(
+        (
+            4096 + logical_pages.flip(0),
+            8192 + logical_pages.flip(0),
+        )
+    )
+    logits = torch.zeros((rows, cols), device="cuda", dtype=torch.float32)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    dsa_topk_gfx950._dsa_decode_topk_slots(
+        logits,
+        block_table,
+        seq_lens,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    expected = torch.full_like(out, -1)
+    expected_lens = torch.empty_like(lens_out)
+    for row in range(rows):
+        req, q_offset = divmod(row, q_len_per_req)
+        candidate_len = int(seq_lens[req].item()) - (q_len_per_req - 1) + q_offset
+        offsets = torch.arange(candidate_len, device="cuda", dtype=torch.int32)
+        physical_pages = block_table[req].index_select(0, offsets // page_size)
+        expected[row, :candidate_len] = physical_pages * page_size + offsets % page_size
+        expected_lens[row] = candidate_len
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    torch.testing.assert_close(lens_out, expected_lens, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("cols", [8192, 131072, 524288])
 def test_dsa_decode_topk_maps_grouped_queries_to_physical_slots(
     cols: int,
