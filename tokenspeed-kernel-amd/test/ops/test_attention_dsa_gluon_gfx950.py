@@ -1030,7 +1030,7 @@ def test_dsa_prefill_topk_dispatches_staged_groups_across_rows() -> None:
     )
 
 
-def test_dsa_decode_topk_dispatches_staged_groups_for_batched_queries() -> None:
+def test_dsa_decode_topk_dispatches_runtime_radix_for_batched_queries() -> None:
     page_size = 64
     q_len_per_req = 4
     requests = 16
@@ -1057,9 +1057,6 @@ def test_dsa_decode_topk_dispatches_staged_groups_for_batched_queries() -> None:
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    tiles = dsa_topk_gfx950.triton.cdiv(cols, dsa_topk_gfx950._RADIX_TOPK_BLOCK_N)
-    groups = dsa_topk_gfx950._radix_groups_per_row(rows, tiles, logits.device)
-    assert groups < tiles
     dsa_topk_gfx950._dsa_decode_topk_slots(
         logits,
         block_table,
@@ -1081,12 +1078,14 @@ def test_dsa_decode_topk_dispatches_staged_groups_for_batched_queries() -> None:
     )
 
 
-def test_dsa_decode_topk_oneblock_maps_grouped_queries_to_physical_slots() -> None:
+@pytest.mark.parametrize("cols", [8192, 131072, 524288])
+def test_dsa_decode_topk_maps_grouped_queries_to_physical_slots(
+    cols: int,
+) -> None:
     page_size = 64
     q_len_per_req = 4
     requests = 3
     rows = requests * q_len_per_req
-    cols = 8192
     topk = 2048
     seq_lens = cols - torch.arange(requests, device="cuda", dtype=torch.int32) * 53
     q_offsets = torch.arange(q_len_per_req, device="cuda", dtype=torch.int32)
