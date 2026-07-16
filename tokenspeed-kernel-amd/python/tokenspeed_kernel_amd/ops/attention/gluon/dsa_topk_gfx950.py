@@ -59,6 +59,10 @@ _ONEBLOCK_RADIX_BUCKETS = 1 << max(_ONEBLOCK_RADIX_SCHEDULE)
 _ONEBLOCK_DECODE_RADIX_BLOCK_N = 8192
 _ONEBLOCK_DECODE_SHORT_LOAD_ELEMS = 4
 _ONEBLOCK_DECODE_LONG_LOAD_ELEMS = 8
+# Benchmark/test-only selector; production keeps the native histogram disabled.
+_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_QUALIFICATION = False
+_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_MAX_COLS = 16 * 1024
+_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_CONFIG = (16 * 1024, 16)
 _ONEBLOCK_PREFILL_RADIX_BLOCK_N = 4096
 _ONEBLOCK_COMPACT_FINAL_BLOCK_N = 4096
 _ONEBLOCK_COMPACT_FINAL_MIN_COLS = 65536
@@ -1829,6 +1833,44 @@ def _accumulate_runtime_radix_histogram_tile(
 
 
 @gluon.jit
+def _runtime_radix_native_histogram(
+    candidate_logits,
+    candidate_len,
+    vector_end,
+    prefix,
+    prefix_shift,
+    shift,
+    pass_index,
+    value_layout: gl.constexpr,
+    histogram_layout: gl.constexpr,
+    MAX_BUCKETS: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    _, values, valid = _load_oneblock_tile(
+        candidate_logits,
+        0,
+        candidate_len,
+        vector_end,
+        value_layout,
+        BLOCK_N,
+        True,
+    )
+    keys = _fp32_to_topk_key(values)
+    if pass_index == 0:
+        prefix_match = valid
+    else:
+        positioned_keys = (keys >> prefix_shift) << prefix_shift
+        prefix_match = valid & (positioned_keys == prefix)
+    buckets = (keys >> shift) & (MAX_BUCKETS - 1)
+    return gl.histogram(
+        buckets.to(gl.int32),
+        MAX_BUCKETS,
+        mask=prefix_match,
+        layout=histogram_layout,
+    )
+
+
+@gluon.jit
 def _emit_runtime_radix_topk_tile(
     candidate_logits,
     candidate_start,
@@ -2607,6 +2649,7 @@ def _dsa_runtime_radix_topk_kernel(
     MAX_BUCKETS: gl.constexpr,
     BLOCK_N: gl.constexpr,
     LOAD_ELEMS: gl.constexpr,
+    USE_NATIVE_HISTOGRAM: gl.constexpr,
 ):
     row = gl.program_id(0)
     value_layout: gl.constexpr = _vector_layout(
@@ -2639,12 +2682,13 @@ def _dsa_runtime_radix_topk_kernel(
         [MAX_BUCKETS],
         [0],
     )
-    histogram_zeros = gl.zeros([MAX_BUCKETS], gl.int32, layout=histogram_layout)
-    shared_histogram = gl.allocate_shared_memory(
-        gl.int32,
-        [MAX_BUCKETS],
-        shared_layout,
-    )
+    if not USE_NATIVE_HISTOGRAM:
+        histogram_zeros = gl.zeros([MAX_BUCKETS], gl.int32, layout=histogram_layout)
+        shared_histogram = gl.allocate_shared_memory(
+            gl.int32,
+            [MAX_BUCKETS],
+            shared_layout,
+        )
     output_counter_layout: gl.constexpr = _vector_layout(2, gl.num_warps(), 1)
     output_counter_shared_layout: gl.constexpr = (
         gl.PaddedSharedLayout.with_identity_for([[2, 1]], [2], [0])
@@ -2704,45 +2748,61 @@ def _dsa_runtime_radix_topk_kernel(
     bucket_offsets = gl.arange(0, MAX_BUCKETS, layout=histogram_layout)
 
     while (pass_index < 3) & ~done:
-        gl.barrier()
-        shared_histogram.store(histogram_zeros)
-        gl.barrier()
+        if not USE_NATIVE_HISTOGRAM:
+            gl.barrier()
+            shared_histogram.store(histogram_zeros)
+            gl.barrier()
 
         shift = gl.maximum(20 - pass_index * 12, 0)
-        full_end = candidate_len & -BLOCK_N
-        for tile_start in range(0, full_end, BLOCK_N):
-            _accumulate_runtime_radix_histogram_tile(
+        if USE_NATIVE_HISTOGRAM:
+            counts = _runtime_radix_native_histogram(
                 candidate_logits,
-                tile_start,
                 candidate_len,
                 vector_end,
                 prefix,
                 prefix_shift,
                 shift,
                 pass_index,
-                shared_histogram,
                 value_layout,
+                histogram_layout,
+                MAX_BUCKETS,
                 BLOCK_N,
-                False,
             )
-        if full_end < candidate_len:
-            _accumulate_runtime_radix_histogram_tile(
-                candidate_logits,
-                full_end,
-                candidate_len,
-                vector_end,
-                prefix,
-                prefix_shift,
-                shift,
-                pass_index,
-                shared_histogram,
-                value_layout,
-                BLOCK_N,
-                True,
-            )
+        else:
+            full_end = candidate_len & -BLOCK_N
+            for tile_start in range(0, full_end, BLOCK_N):
+                _accumulate_runtime_radix_histogram_tile(
+                    candidate_logits,
+                    tile_start,
+                    candidate_len,
+                    vector_end,
+                    prefix,
+                    prefix_shift,
+                    shift,
+                    pass_index,
+                    shared_histogram,
+                    value_layout,
+                    BLOCK_N,
+                    False,
+                )
+            if full_end < candidate_len:
+                _accumulate_runtime_radix_histogram_tile(
+                    candidate_logits,
+                    full_end,
+                    candidate_len,
+                    vector_end,
+                    prefix,
+                    prefix_shift,
+                    shift,
+                    pass_index,
+                    shared_histogram,
+                    value_layout,
+                    BLOCK_N,
+                    True,
+                )
 
-        gl.barrier()
-        counts = shared_histogram.load(histogram_layout)
+            gl.barrier()
+            counts = shared_histogram.load(histogram_layout)
         count_pairs = counts.reshape([MAX_BUCKETS // 2, 2])
         count_low, count_high = gl.split(count_pairs)
         count_low = gl.convert_layout(count_low, group_layout)
@@ -3671,6 +3731,21 @@ def _dsa_prefill_radix_deterministic_scatter_kernel(
 
 def _load_elems(block: int, num_warps: int) -> int:
     return max(1, triton.cdiv(int(block), 64 * int(num_warps)))
+
+
+def _decode_runtime_radix_config(cols: int) -> tuple[int, int, bool]:
+    if (
+        _ONEBLOCK_DECODE_NATIVE_HISTOGRAM_QUALIFICATION
+        and cols <= _ONEBLOCK_DECODE_NATIVE_HISTOGRAM_MAX_COLS
+    ):
+        block_n, load_elems = _ONEBLOCK_DECODE_NATIVE_HISTOGRAM_CONFIG
+        return block_n, load_elems, True
+    load_elems = (
+        _ONEBLOCK_DECODE_SHORT_LOAD_ELEMS
+        if cols < _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS
+        else _ONEBLOCK_DECODE_LONG_LOAD_ELEMS
+    )
+    return _ONEBLOCK_DECODE_RADIX_BLOCK_N, load_elems, False
 
 
 def _contiguous(tensor: torch.Tensor) -> torch.Tensor:
@@ -4674,10 +4749,8 @@ def _dsa_decode_topk_slots(
             cols < _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS
             or cols > _ONEBLOCK_RADIX_MAX_COLS
         ):
-            load_elems = (
-                _ONEBLOCK_DECODE_SHORT_LOAD_ELEMS
-                if cols < _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS
-                else _ONEBLOCK_DECODE_LONG_LOAD_ELEMS
+            block_n, load_elems, use_native_histogram = _decode_runtime_radix_config(
+                cols
             )
             kernel_args = (
                 logits,
@@ -4696,8 +4769,9 @@ def _dsa_decode_topk_slots(
                 True,
                 False,
                 _ONEBLOCK_RADIX_BUCKETS,
-                _ONEBLOCK_DECODE_RADIX_BLOCK_N,
+                block_n,
                 load_elems,
+                use_native_histogram,
             )
             specialization_key = kernel_args[10:]
             dispatch_key = (rows, specialization_key)
@@ -4891,6 +4965,7 @@ def _dsa_prefill_topk_indices(
                 _ONEBLOCK_RADIX_BUCKETS,
                 _ONEBLOCK_PREFILL_RADIX_BLOCK_N,
                 _load_elems(_ONEBLOCK_PREFILL_RADIX_BLOCK_N, 16),
+                False,
             )
             specialization_key = kernel_args[10:]
             _launch_warmed_compiled_kernel(
@@ -4964,6 +5039,7 @@ def _dsa_prefill_topk_indices(
             _ONEBLOCK_RADIX_BUCKETS,
             _ONEBLOCK_PREFILL_RADIX_BLOCK_N,
             _load_elems(_ONEBLOCK_PREFILL_RADIX_BLOCK_N, 16),
+            False,
         )
         specialization_key = kernel_args[10:]
         _launch_warmed_compiled_kernel(

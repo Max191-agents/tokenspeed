@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import inspect
 import math
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -1080,6 +1081,552 @@ def _assert_decode_topk_slots(
         ).values
         torch.testing.assert_close(actual_values.cpu(), expected_values.cpu())
         assert bool((actual[row, count:] == -1).all())
+
+
+def _make_dispatch_tensor(*shape: int) -> SimpleNamespace:
+    strides = []
+    stride = 1
+    for extent in reversed(shape):
+        strides.append(stride)
+        stride *= extent
+    strides.reverse()
+    return SimpleNamespace(
+        shape=shape,
+        device=SimpleNamespace(type="cuda", index=0),
+        stride=lambda dim: strides[dim],
+    )
+
+
+def _record_decode_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    cols: int,
+) -> tuple[object, tuple[object, ...], tuple[object, ...], dict[str, object]]:
+    launches: list[
+        tuple[object, tuple[object, ...], tuple[object, ...], dict[str, object]]
+    ] = []
+
+    def record_launch(
+        kernel,
+        grid,
+        args,
+        pointer_dtypes,
+        specialization_key,
+        **kwargs,
+    ) -> None:
+        del pointer_dtypes
+        launches.append((kernel, args, specialization_key, kwargs | {"grid": grid}))
+
+    monkeypatch.setattr(dsa_topk_gfx950, "_persistent_decode_groups", lambda *_: None)
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_get_cached_compiled_runner_plan",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_launch_warmed_compiled_kernel",
+        record_launch,
+    )
+    rows = 2
+    dsa_topk_gfx950._dsa_decode_topk_slots(
+        _make_dispatch_tensor(rows, cols),
+        _make_dispatch_tensor(rows, math.ceil(cols / 64)),
+        _make_dispatch_tensor(rows),
+        page_size=64,
+        topk=2048,
+        q_len_per_req=1,
+        out=_make_dispatch_tensor(rows, 2048),
+        lens_out=_make_dispatch_tensor(rows),
+    )
+    assert len(launches) == 1
+    return launches[0]
+
+
+def _record_prefill_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    cols: int,
+) -> tuple[object, tuple[object, ...], tuple[object, ...], dict[str, object]]:
+    launches: list[
+        tuple[object, tuple[object, ...], tuple[object, ...], dict[str, object]]
+    ] = []
+
+    def record_launch(
+        kernel,
+        grid,
+        args,
+        pointer_dtypes,
+        specialization_key,
+        **kwargs,
+    ) -> None:
+        del pointer_dtypes
+        launches.append((kernel, args, specialization_key, kwargs | {"grid": grid}))
+
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_persistent_prefill_groups",
+        lambda *_: None,
+    )
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_launch_warmed_compiled_kernel",
+        record_launch,
+    )
+    rows = 2
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        _make_dispatch_tensor(rows, cols),
+        _make_dispatch_tensor(rows),
+        _make_dispatch_tensor(rows),
+        topk=2048,
+        out=_make_dispatch_tensor(rows, 2048),
+        lens_out=_make_dispatch_tensor(rows),
+    )
+    assert len(launches) == 1
+    return launches[0]
+
+
+def test_dsa_native_histogram_source_contract() -> None:
+    assert not dsa_topk_gfx950._ONEBLOCK_DECODE_NATIVE_HISTOGRAM_QUALIFICATION
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_NATIVE_HISTOGRAM_MAX_COLS == 16384
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_NATIVE_HISTOGRAM_CONFIG == (16384, 16)
+    assert dsa_topk_gfx950._ONEBLOCK_RADIX_SCHEDULE == (12, 12, 8)
+    assert dsa_topk_gfx950._ONEBLOCK_RADIX_BUCKETS == 4096
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_RADIX_BLOCK_N == 8192
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_SHORT_LOAD_ELEMS == 4
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_LONG_LOAD_ELEMS == 8
+
+    params = {
+        param.name: param
+        for param in dsa_topk_gfx950._dsa_runtime_radix_topk_kernel.params
+    }
+    constexpr_tail = (
+        "MAX_BUCKETS",
+        "BLOCK_N",
+        "LOAD_ELEMS",
+        "USE_NATIVE_HISTOGRAM",
+    )
+    assert tuple(params)[-len(constexpr_tail) :] == constexpr_tail
+    assert all(params[name].is_constexpr for name in constexpr_tail)
+
+    helper_source = inspect.getsource(
+        dsa_topk_gfx950._runtime_radix_native_histogram.fn
+    )
+    assert helper_source.count("gl.histogram(") == 1
+    assert "atomic_scatter_add" not in helper_source
+    assert "MAX_BUCKETS" in helper_source
+    assert "BLOCK_N" in helper_source
+
+    kernel_source = inspect.getsource(dsa_topk_gfx950._dsa_runtime_radix_topk_kernel.fn)
+    assert "if USE_NATIVE_HISTOGRAM:" in kernel_source
+    assert kernel_source.count("_runtime_radix_native_histogram(") == 1
+    assert "shared_histogram.store(histogram_zeros)" in kernel_source
+
+
+@pytest.mark.parametrize("cols", (4096, 8192, 12288, 16384))
+def test_dsa_native_histogram_selector_dispatches_whole_medium_region(
+    monkeypatch: pytest.MonkeyPatch,
+    cols: int,
+) -> None:
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_QUALIFICATION",
+        True,
+    )
+
+    kernel, args, specialization_key, kwargs = _record_decode_dispatch(
+        monkeypatch,
+        cols,
+    )
+
+    assert kernel is dsa_topk_gfx950._dsa_runtime_radix_topk_kernel
+    assert args[16:19] == (16384, 16, True)
+    assert specialization_key == args[10:]
+    assert specialization_key[-3:] == (16384, 16, True)
+    assert kwargs["dispatch_cache"] is dsa_topk_gfx950._runtime_decode_runner_plans
+    assert kwargs["dispatch_key"] == (2, specialization_key)
+    assert kwargs["native_scalar_count"] == 4
+    assert kwargs["num_warps"] == 16
+    assert kwargs["grid"] == (2, 1, 1)
+
+
+@pytest.mark.parametrize("cols", (4096, 16384, 32768, 90001))
+def test_dsa_native_histogram_is_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+    cols: int,
+) -> None:
+    kernel, args, specialization_key, kwargs = _record_decode_dispatch(
+        monkeypatch,
+        cols,
+    )
+
+    expected_load_elems = 4 if cols < 65536 else 8
+    assert kernel is dsa_topk_gfx950._dsa_runtime_radix_topk_kernel
+    assert args[16:19] == (8192, expected_load_elems, False)
+    assert specialization_key == args[10:]
+    assert kwargs["dispatch_cache"] is dsa_topk_gfx950._runtime_decode_runner_plans
+
+
+def test_dsa_native_histogram_selector_keeps_control_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_QUALIFICATION",
+        True,
+    )
+
+    kernel_2k, _, _, _ = _record_decode_dispatch(monkeypatch, 2048)
+    kernel_32k, args_32k, _, _ = _record_decode_dispatch(monkeypatch, 32768)
+    kernel_manual, _, _, _ = _record_decode_dispatch(monkeypatch, 65536)
+    prefill_kernel, prefill_args, _, prefill_kwargs = _record_prefill_dispatch(
+        monkeypatch,
+        16384,
+    )
+
+    assert kernel_2k is dsa_topk_gfx950._dsa_trivial_decode_topk2048_kernel
+    assert kernel_32k is dsa_topk_gfx950._dsa_runtime_radix_topk_kernel
+    assert args_32k[16:19] == (8192, 4, False)
+    assert kernel_manual is dsa_topk_gfx950._dsa_oneblock_manual_radix_topk_kernel
+    assert prefill_kernel is dsa_topk_gfx950._dsa_runtime_radix_topk_kernel
+    assert prefill_args[16:19] == (4096, 4, False)
+    assert (
+        prefill_kwargs["dispatch_cache"]
+        is dsa_topk_gfx950._runtime_prefill_runner_plans
+    )
+
+
+def test_dsa_native_histogram_medium_lengths_share_specialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_QUALIFICATION",
+        True,
+    )
+    specialization_keys = [
+        _record_decode_dispatch(monkeypatch, cols)[2]
+        for cols in (4096, 8192, 12288, 16384)
+    ]
+
+    assert len(set(specialization_keys)) == 1
+    assert specialization_keys[0][-3:] == (16384, 16, True)
+
+
+def test_dsa_native_histogram_config_is_a_distinct_specialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_QUALIFICATION",
+        True,
+    )
+    specialization_keys = []
+    for config in ((16384, 8), (16384, 16)):
+        monkeypatch.setattr(
+            dsa_topk_gfx950,
+            "_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_CONFIG",
+            config,
+        )
+        _, args, specialization_key, _ = _record_decode_dispatch(monkeypatch, 16384)
+        assert args[16:19] == (*config, True)
+        specialization_keys.append(specialization_key)
+
+    assert len(set(specialization_keys)) == len(specialization_keys)
+
+
+@dataclass(frozen=True)
+class _NativeHistogramDecodeCase:
+    logits: torch.Tensor
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    q_len_per_req: int
+
+
+def _make_native_histogram_logits(
+    row_ends: torch.Tensor,
+    *,
+    cols: int,
+    topk: int,
+    seed: int,
+    oversized_ties: bool = False,
+) -> torch.Tensor:
+    if oversized_ties:
+        logits = torch.full(
+            (row_ends.numel(), cols),
+            -17.0,
+            device="cuda",
+            dtype=torch.float32,
+        )
+    else:
+        logits = torch.empty(
+            (row_ends.numel(), cols),
+            device="cuda",
+            dtype=torch.float32,
+        ).uniform_(-1.0, 1.0, generator=_generator("cuda", seed))
+
+    for row, row_end in enumerate(row_ends.cpu().tolist()):
+        if row_end <= 0:
+            continue
+        if oversized_ties:
+            if row % 3 == 0:
+                logits[row, :row_end] = float("inf")
+            elif row % 3 == 1:
+                logits[row, :row_end] = -float("inf")
+            else:
+                logits[row, :row_end] = -float("inf")
+                logits[row, : min(37, row_end)] = float("inf")
+                tie_end = min(row_end, 37 + topk + 257)
+                logits[row, 37:tie_end] = 1.0
+            continue
+
+        if row_end >= topk + 64:
+            high_count = topk - 32
+            logits[row, :high_count] = torch.linspace(
+                4.0,
+                3.0,
+                high_count,
+                device="cuda",
+            )
+            logits[row, high_count : high_count + 64] = 2.0
+            logits[row, high_count + 64 : row_end : 257] = -float("inf")
+        logits[row, 0] = float("inf")
+        logits[row, row_end - 1] = -float("inf")
+    return logits
+
+
+def _make_native_histogram_decode_case(
+    cols: int,
+    *,
+    seed: int,
+    oversized_ties: bool = False,
+) -> _NativeHistogramDecodeCase:
+    q_len_per_req = 4
+    seq_lens = torch.tensor(
+        (cols - 11, cols, min(cols, 1537)),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    q_offsets = torch.arange(q_len_per_req, device="cuda", dtype=torch.int32)
+    row_ends = (seq_lens[:, None] - (q_len_per_req - 1) + q_offsets[None, :]).reshape(
+        -1
+    )
+    logits = _make_native_histogram_logits(
+        row_ends,
+        cols=cols,
+        topk=2048,
+        seed=seed,
+        oversized_ties=oversized_ties,
+    )
+    return _NativeHistogramDecodeCase(
+        logits=logits,
+        seq_lens=seq_lens,
+        block_table=_make_reversed_decode_block_table(
+            seq_lens.numel(),
+            cols,
+            64,
+        ),
+        q_len_per_req=q_len_per_req,
+    )
+
+
+def _run_native_histogram_decode_case(
+    case: _NativeHistogramDecodeCase,
+    *,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = case.logits.shape[0]
+    if out is None:
+        out = torch.empty((rows, 2048), device="cuda", dtype=torch.int32)
+    if lens_out is None:
+        lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    return dsa_topk_gfx950._dsa_decode_topk_slots(
+        case.logits,
+        case.block_table,
+        case.seq_lens,
+        page_size=64,
+        topk=2048,
+        q_len_per_req=case.q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def _assert_native_histogram_decode_case(
+    case: _NativeHistogramDecodeCase,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> None:
+    _assert_decode_topk_slots(
+        case.logits,
+        out,
+        lens_out,
+        case.seq_lens,
+        case.block_table,
+        page_size=64,
+        q_len_per_req=case.q_len_per_req,
+        topk=2048,
+    )
+
+
+@pytest.mark.parametrize("cols", (2048, 4096, 8192, 12288, 16384, 32768))
+def test_dsa_native_histogram_decode_controls_match_exact_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+    cols: int,
+) -> None:
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_QUALIFICATION",
+        True,
+    )
+    case = _make_native_histogram_decode_case(cols, seed=1907 + cols)
+
+    out, lens_out = _run_native_histogram_decode_case(case)
+
+    _assert_native_histogram_decode_case(case, out, lens_out)
+
+
+def test_dsa_native_histogram_decode_repeats_ties_and_infinities(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+) -> None:
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_QUALIFICATION",
+        True,
+    )
+    case = _make_native_histogram_decode_case(
+        16384,
+        seed=2907,
+        oversized_ties=True,
+    )
+    out = torch.empty((case.logits.shape[0], 2048), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((case.logits.shape[0],), device="cuda", dtype=torch.int32)
+
+    for _ in range(2):
+        out.fill_(123456)
+        lens_out.fill_(-7)
+        _run_native_histogram_decode_case(case, out=out, lens_out=lens_out)
+        _assert_native_histogram_decode_case(case, out, lens_out)
+
+
+def test_dsa_native_histogram_decode_replays_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+) -> None:
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_QUALIFICATION",
+        True,
+    )
+    case = _make_native_histogram_decode_case(16384, seed=3907)
+    out = torch.empty((case.logits.shape[0], 2048), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((case.logits.shape[0],), device="cuda", dtype=torch.int32)
+    _run_native_histogram_decode_case(case, out=out, lens_out=lens_out)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_native_histogram_decode_case(case, out=out, lens_out=lens_out)
+    out.fill_(-7)
+    lens_out.fill_(-7)
+    graph.replay()
+
+    _assert_native_histogram_decode_case(case, out, lens_out)
+
+
+def test_dsa_native_histogram_decode_uses_two_streams(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+) -> None:
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_QUALIFICATION",
+        True,
+    )
+    case_a = _make_native_histogram_decode_case(16384, seed=4907)
+    case_b = _make_native_histogram_decode_case(16384, seed=5907)
+    out_a = torch.empty(
+        (case_a.logits.shape[0], 2048), device="cuda", dtype=torch.int32
+    )
+    out_b = torch.empty_like(out_a)
+    lens_a = torch.empty((case_a.logits.shape[0],), device="cuda", dtype=torch.int32)
+    lens_b = torch.empty_like(lens_a)
+    _run_native_histogram_decode_case(case_a, out=out_a, lens_out=lens_a)
+
+    current_stream = torch.cuda.current_stream()
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    stream_a.wait_stream(current_stream)
+    stream_b.wait_stream(current_stream)
+    with torch.cuda.stream(stream_a):
+        _run_native_histogram_decode_case(case_a, out=out_a, lens_out=lens_a)
+    with torch.cuda.stream(stream_b):
+        _run_native_histogram_decode_case(case_b, out=out_b, lens_out=lens_b)
+    current_stream.wait_stream(stream_a)
+    current_stream.wait_stream(stream_b)
+
+    _assert_native_histogram_decode_case(case_a, out_a, lens_a)
+    _assert_native_histogram_decode_case(case_b, out_b, lens_b)
+
+
+def test_dsa_native_histogram_selector_keeps_prefill_ragged_rows_exact(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+) -> None:
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_ONEBLOCK_DECODE_NATIVE_HISTOGRAM_QUALIFICATION",
+        True,
+    )
+    cols = 16384
+    row_starts = torch.tensor(
+        (0, 13, 257, cols // 4 + 3, cols - 1537),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_ends = torch.tensor(
+        (cols, cols - 7, cols - 31, cols - 3, cols),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    logits = torch.empty(
+        (row_starts.numel(), cols),
+        device="cuda",
+        dtype=torch.float32,
+    ).uniform_(-1.0, 1.0, generator=_generator("cuda", 6907))
+    for row, (start, end) in enumerate(
+        zip(row_starts.cpu().tolist(), row_ends.cpu().tolist(), strict=True)
+    ):
+        logits[row, start] = float("inf")
+        logits[row, end - 1] = -float("inf")
+    out = torch.empty(
+        (row_starts.numel(), 2048),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    lens_out = torch.empty(
+        (row_starts.numel(),),
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=2048,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=2048,
+    )
 
 
 @pytest.mark.parametrize(
