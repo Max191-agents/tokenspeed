@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -195,7 +195,9 @@ def _make_random_case(
     return case
 
 
-def _make_rank_case(*, seq_len_sum: int, seed: int) -> _PrefillCase:
+def _make_rank_case(
+    *, seq_len_sum: int, minimum_candidates: int = 2048, seed: int
+) -> _PrefillCase:
     num_pages = math.ceil(seq_len_sum / _PAGE_SIZE)
     num_slots = num_pages * _PAGE_SIZE
     head_ids = torch.arange(_HEADS, device="cuda")
@@ -242,7 +244,7 @@ def _make_rank_case(*, seq_len_sum: int, seed: int) -> _PrefillCase:
         row_ends=torch.tensor([row_end], device="cuda", dtype=torch.int32),
     )
     _assert_model_contract(case)
-    assert row_end - row_start > 2048
+    assert row_end - row_start >= minimum_candidates
     return case
 
 
@@ -300,6 +302,51 @@ def _make_high_dynamic_range_case(*, seq_len_sum: int, seed: int) -> _PrefillCas
     assert bool(torch.isfinite(q_abs).all())
     assert float(per_head_amax.min().item()) >= 600.0
     assert float(per_head_amax.max().item()) >= 9.0e9
+    return case
+
+
+def _make_mixed_range_case(
+    *, seq_len_sum: int, producer_group: int, seed: int
+) -> _PrefillCase:
+    case = _make_random_case(
+        tokens=1,
+        seq_len_sum=seq_len_sum,
+        row_starts=[3],
+        row_ends=[seq_len_sum - 5],
+        seed=seed,
+    )
+    base = torch.linspace(-1.0, 1.0, _HEAD_DIM, device="cuda", dtype=torch.float32)
+    head_amplitudes = torch.full((_HEADS,), 0.5, device="cuda", dtype=torch.float32)
+    group_start = producer_group * 8
+    head_amplitudes[group_start : group_start + 8] = torch.linspace(
+        600.0,
+        4096.0,
+        8,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    q = (head_amplitudes[:, None] * base).to(torch.bfloat16).unsqueeze(0)
+    head_ids = torch.arange(_HEADS, device="cuda")
+    signed_coefficients = torch.where(
+        head_ids.remainder(2) == 0,
+        0.25,
+        -0.125,
+    )
+    weights = (
+        signed_coefficients * head_amplitudes.reciprocal() * (_HEADS**-0.5)
+    ).unsqueeze(0)
+    case = replace(
+        case,
+        q=q.contiguous(),
+        weights=weights.to(torch.float32).contiguous(),
+    )
+
+    producer_groups = (
+        case.q.float().abs().amax(dim=-1).reshape(4, 8).amax(dim=1) > 256.0
+    )
+    expected_groups = torch.zeros(4, device="cuda", dtype=torch.bool)
+    expected_groups[producer_group] = True
+    assert torch.equal(producer_groups, expected_groups)
     return case
 
 
@@ -437,9 +484,33 @@ def test_range_safe_prefill_matches_high_dynamic_range_bf16_reference() -> None:
     _assert_logits_match(actual, expected)
 
 
-def test_scaled_residual_topk_set_and_rank_are_exact_above_2048_candidates() -> None:
-    topk = 2048
-    case = _make_rank_case(seq_len_sum=2179, seed=6401)
+@pytest.mark.parametrize("producer_group", range(4))
+def test_short_prefill_broadcasts_one_producer_groups_range_guard(
+    producer_group: int,
+) -> None:
+    case = _make_mixed_range_case(
+        seq_len_sum=509,
+        producer_group=producer_group,
+        seed=6370 + producer_group,
+    )
+    expected = _reference_prefill_logits(case)
+    actual = _launch(case, tiles_per_program=2)
+
+    _assert_logits_match(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("seq_len_sum", "topk"),
+    [(2048, 512), (2179, 2048)],
+)
+def test_scaled_residual_topk_set_and_rank_are_exact(
+    seq_len_sum: int, topk: int
+) -> None:
+    case = _make_rank_case(
+        seq_len_sum=seq_len_sum,
+        minimum_candidates=topk,
+        seed=6401 + seq_len_sum,
+    )
     expected = _reference_prefill_logits(case)
     actual = _launch(case, tiles_per_program=1)
     _assert_logits_match(actual, expected)
@@ -463,9 +534,18 @@ def test_scaled_residual_topk_set_and_rank_are_exact_above_2048_candidates() -> 
     )
 
 
-def test_public_prefill_topk_matches_production_mfma_score_set() -> None:
-    topk = 2048
-    case = _make_rank_case(seq_len_sum=2179, seed=6402)
+@pytest.mark.parametrize(
+    ("seq_len_sum", "topk"),
+    [(2048, 512), (2179, 2048)],
+)
+def test_public_prefill_topk_matches_production_mfma_score_set(
+    seq_len_sum: int, topk: int
+) -> None:
+    case = _make_rank_case(
+        seq_len_sum=seq_len_sum,
+        minimum_candidates=topk,
+        seed=6402 + seq_len_sum,
+    )
     expected = _reference_prefill_logits(case)
     expected_indices = torch.topk(expected[0], k=topk).indices
 

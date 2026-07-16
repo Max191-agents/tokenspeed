@@ -76,23 +76,38 @@ def test_two_stage_kernel_preprocesses_scaled_weights_without_dummy_component() 
     assert "two_component" not in source
 
 
-def test_short_kernel_uses_bit_guarded_range_normalization_without_scratch() -> None:
+def test_production_short_kernel_uses_cta_uniform_range_normalization() -> None:
     source = _SOURCE.read_text()
-    fused_start = source.index(
-        "def _dsa_prefill_logits_fp8_tiled_fused_range_safe_kernel"
-    )
-    fused_end = source.index(
-        "def _dsa_preprocess_prefill_query_fp8_kernel", fused_start
-    )
-    fused_source = source[fused_start:fused_end]
+    wide_start = source.index("def _dsa_prefill_logits_fp8_tiled_fused_wide_kernel(")
+    wide_end = source.index("def _prepare_fused_range_safe_query(")
+    wide_source = source[wide_start:wide_end]
 
-    assert "q_mag_bits = q_bf16.to(gl.uint16, bitcast=True) & 0x7FFF" in fused_source
-    assert "axis=0) > 0x4380" in fused_source
-    assert "if needs_scaling:" in fused_source
-    assert "q_normalized = q_fp32 / q_scale" in fused_source
-    assert "q_mid = (q_scaled_residual * 32.0).to(gl.float8e4nv)" in fused_source
-    assert "q_residual = q_fp32 - q_hi.to(gl.float32)" in fused_source
-    assert "query_fp8_scratch" not in fused_source
+    assert "q_mag_bits = q_bf16.to(gl.uint16, bitcast=True) & 0x7FFF" in wide_source
+    assert "mfma_wave_mag_bits = q_wave_mag_shared.load" in wide_source
+    assert "needs_scaling = gl.max(mfma_wave_mag_bits, axis=0) > 0x4380" in wide_source
+    assert wide_source.count("if needs_scaling:") == 2
+    assert "q_normalized = q_fp32 / producer_head_scale" in wide_source
+    assert "q_mid = (q_scaled_residual * 32.0).to(gl.float8e4nv)" in wide_source
+    assert "q_residual = q_fp32 - q_hi.to(gl.float32)" in wide_source
+    assert "query_fp8_scratch" not in wide_source
+    assert "if seq_len_sum <= 2048:" in source
+
+
+def test_default_short_dispatch_amortizes_query_work_across_four_waves() -> None:
+    source = _SOURCE.read_text()
+    wide_start = source.index("def _dsa_prefill_logits_fp8_tiled_fused_wide_kernel(")
+    wide_end = source.index("def _prepare_fused_range_safe_query(")
+    wide_source = source[wide_start:wide_end]
+
+    assert "_SHORT_BLOCK_N = 128" in source
+    assert "_SHORT_NUM_WARPS = 4" in source
+    assert "warps_per_cta=[1, NUM_WARPS]" in wide_source
+    assert "q_hi_shared.store(q_hi)" in wide_source
+    assert "q_mid_shared.store(q_mid)" in wide_source
+    assert "gl.barrier()" in wide_source
+    assert "q_hi_shared.load(dot_q_layout)" in wide_source
+    assert "mfma_k = _load_packed_k_gather_wide(" in wide_source
+    assert "gl.convert_layout(mfma_k" not in wide_source
     assert "if seq_len_sum <= 2048:" in source
 
 

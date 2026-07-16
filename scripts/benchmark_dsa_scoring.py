@@ -502,22 +502,48 @@ def _measure(
 ) -> tuple[list[float], float]:
     import torch
 
+    return _measure_captured_gpu_work(
+        launch,
+        warmups=warmups,
+        samples=samples,
+        torch_module=torch,
+    )
+
+
+def _measure_captured_gpu_work(
+    launch: Callable[[], None],
+    *,
+    warmups: int,
+    samples: int,
+    torch_module: Any,
+) -> tuple[list[float], float]:
+    """Measure only the GPU work submitted by a static production launch."""
+    if warmups < 1 or samples < 1:
+        raise ValueError("warmups and samples must be positive")
+
+    torch = torch_module
     launch()
     torch.cuda.synchronize()
-    for _ in range(warmups):
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
         launch()
     torch.cuda.synchronize()
 
-    elapsed: list[float] = []
+    for _ in range(warmups):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    event_pairs = []
     wall_start = time.monotonic()
     for _ in range(samples):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        launch()
+        graph.replay()
         end.record()
-        end.synchronize()
-        elapsed.append(float(start.elapsed_time(end)))
+        event_pairs.append((start, end))
+    event_pairs[-1][1].synchronize()
+    elapsed = [float(start.elapsed_time(end)) for start, end in event_pairs]
     return elapsed, time.monotonic() - wall_start
 
 
@@ -631,13 +657,18 @@ def _tokenspeed_runners(
             softmax_scale=SOFTMAX_SCALE,
         )
 
-    tiles_per_program = 2 if 512 < seq_len <= 2048 else 1
+    return launch, logits, _tokenspeed_prefill_launch_metadata(seq_len)
+
+
+def _tokenspeed_prefill_launch_metadata(seq_len: int) -> dict[str, Any]:
+    """Describe the production prefill dispatch selected for a sequence length."""
     short_prefill = seq_len <= 2048
-    metadata = {
-        "grid": [PREFILL_ROWS, math.ceil(seq_len / (block_n * tiles_per_program))],
+    block_n = 128 if short_prefill else 32
+    return {
+        "grid": [PREFILL_ROWS, math.ceil(seq_len / block_n)],
         "block_n": block_n,
         "block_d": HEAD_DIM,
-        "num_warps": 1,
+        "num_warps": 4 if short_prefill else 1,
         "waves_per_eu": 3,
         "query_decomposition": (
             "bit_guarded_e4m3_hi_plus_scaled_residual"
@@ -650,12 +681,11 @@ def _tokenspeed_runners(
             else ["query_preprocess", "packed_mfma_score"]
         ),
         "dispatches_per_launch": 1 if short_prefill else 2,
-        "tiles_per_program": tiles_per_program,
+        "tiles_per_program": 1,
         "workspace_slots": "identity_slots",
         "row_starts": "all_zero",
         "row_ends": "seq_len-63_through_seq_len",
     }
-    return launch, logits, metadata
 
 
 def _aiter_runner(
@@ -878,10 +908,13 @@ def _run_backend(args: argparse.Namespace) -> None:
             "warmups": args.warmups,
             "samples_per_cell": args.samples,
             "compile_launches_per_cell": 1,
+            "capture_launches_per_cell": 1,
             "compile_in_timing": False,
             "allocation_in_timing": False,
             "topk_in_timing": False,
-            "event_timing": "torch.cuda.Event",
+            "host_submission_in_timing": False,
+            "measured_execution": "captured_production_graph_replay",
+            "event_timing": "torch.cuda.Event_batched_until_cell_end",
             "softmax_scale": SOFTMAX_SCALE,
             "cells": [f"{mode}:{seq_len}" for mode, seq_len in cells],
         },
@@ -1007,11 +1040,16 @@ def _combine(args: argparse.Namespace) -> None:
         (
             payload["benchmark"]["warmups"],
             payload["benchmark"]["samples_per_cell"],
+            payload["benchmark"]["compile_launches_per_cell"],
+            payload["benchmark"]["capture_launches_per_cell"],
+            payload["benchmark"]["host_submission_in_timing"],
+            payload["benchmark"]["measured_execution"],
+            payload["benchmark"]["event_timing"],
         )
         for payload in payloads
     }
     if len(measurement_configs) != 1:
-        raise SystemExit("rounds use different warmup or sample counts")
+        raise SystemExit("rounds use different measurement settings")
     gpu_identities = {
         json.dumps(
             {
@@ -1108,6 +1146,27 @@ def _combine(args: argparse.Namespace) -> None:
             }
         )
 
+    (
+        warmups,
+        samples_per_cell,
+        compile_launches,
+        capture_launches,
+        host_submission_in_timing,
+        measured_execution,
+        event_timing,
+    ) = next(iter(measurement_configs))
+    round_input_records = []
+    for path, round_payload in zip(args.inputs, payloads, strict=True):
+        resolved = path.resolve()
+        round_input_records.append(
+            {
+                "path": str(resolved),
+                "sha256": _sha256_file(resolved),
+                "backend": round_payload["backend"],
+                "round": round_payload["round"],
+            }
+        )
+
     payload = {
         "schema": COMPARISON_SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -1128,6 +1187,26 @@ def _combine(args: argparse.Namespace) -> None:
         },
         "cells": comparison_rows,
         "round_inputs": [str(path) for path in args.inputs],
+        "provenance": {
+            "fixture": {
+                "fixture_id": next(iter(fixture_ids)),
+                "manifest_sha256": next(iter(manifest_hashes)),
+            },
+            "gpu": json.loads(next(iter(gpu_identities))),
+            "harness_sha256": next(iter(harness_hashes)),
+            "measurement": {
+                "warmups": warmups,
+                "samples_per_cell_exact": samples_per_cell,
+                "round_count_per_backend": len(REQUIRED_ROUNDS),
+                "aggregation": "median_of_three_round_medians",
+                "compile_launches_per_cell": compile_launches,
+                "capture_launches_per_cell": capture_launches,
+                "host_submission_in_timing": host_submission_in_timing,
+                "measured_execution": measured_execution,
+                "event_timing": event_timing,
+            },
+            "round_inputs": round_input_records,
+        },
     }
     _write_json(args.output.resolve(), payload)
     print(json.dumps(payload, indent=2, sort_keys=True))

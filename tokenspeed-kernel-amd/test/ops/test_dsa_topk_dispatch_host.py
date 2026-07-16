@@ -46,14 +46,10 @@ def _scoring_inputs(heads: int, workspace_rows: int) -> tuple[torch.Tensor, ...]
     )
 
 
-@pytest.mark.parametrize(
-    "workspace_rows,expected_tiles",
-    [(512, 1), (513, 2), (2048, 2), (2049, 1)],
-)
-def test_production_prefill_uses_tuned_mfma_configuration(
+@pytest.mark.parametrize("workspace_rows", [512, 513, 2048, 2049])
+def test_production_prefill_uses_current_mfma_configuration(
     monkeypatch: pytest.MonkeyPatch,
     workspace_rows: int,
-    expected_tiles: int,
 ) -> None:
     inputs = _scoring_inputs(heads=32, workspace_rows=workspace_rows)
     logits = inputs[6]
@@ -80,7 +76,7 @@ def test_production_prefill_uses_tuned_mfma_configuration(
     assert result is logits
     assert launch_kwargs == {
         "softmax_scale": 0.125,
-        "tiles_per_program": expected_tiles,
+        "tiles_per_program": 1,
     }
 
 

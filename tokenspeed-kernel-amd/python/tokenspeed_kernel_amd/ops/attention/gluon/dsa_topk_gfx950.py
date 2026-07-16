@@ -848,11 +848,6 @@ def _launch_dsa_prefill_logits_fp8_production(
             softmax_scale=softmax_scale,
         )
 
-    workspace_rows = int(logits.shape[1])
-    if 512 < workspace_rows <= 2048:
-        tiles_per_program = 2
-    else:
-        tiles_per_program = 1
     return launch_dsa_prefill_logits_fp8_mfma_gfx950(
         q,
         index_k_cache,
@@ -864,7 +859,7 @@ def _launch_dsa_prefill_logits_fp8_production(
         query_fp8_scratch,
         scaled_weights_scratch,
         softmax_scale=softmax_scale,
-        tiles_per_program=tiles_per_program,
+        tiles_per_program=1,
     )
 
 

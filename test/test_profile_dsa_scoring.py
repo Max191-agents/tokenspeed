@@ -81,15 +81,15 @@ def test_tokenspeed_short_prefill_dispatch_metadata() -> None:
         backend="tokenspeed",
         mode="prefill",
         seq_len=1024,
-        launch={"grid": [64, 16]},
+        launch={"grid": [64, 8]},
         backend_files=files,
     )
 
     assert [dispatch["kernel_symbol"] for dispatch in dispatches] == [
-        "_dsa_prefill_logits_fp8_tiled_fused_range_safe_kernel"
+        "_dsa_prefill_logits_fp8_tiled_fused_wide_kernel"
     ]
     assert dispatches[0]["stage"] == ("fused_query_decomposition_and_packed_mfma_score")
-    assert dispatches[0]["grid"] == [64, 16]
+    assert dispatches[0]["grid"] == [64, 8]
 
 
 def test_tokenspeed_long_prefill_dispatch_sequence_and_grids() -> None:
@@ -158,3 +158,17 @@ def test_profile_counts_include_every_callable_invocation() -> None:
         "profiled_target_dispatches": 20,
         "total_target_dispatches": 32,
     }
+
+
+def test_priming_launch_timer_includes_device_synchronization() -> None:
+    trace: list[str] = []
+    timestamps = iter((10.0, 10.125))
+
+    elapsed = profile._prime_and_measure_wall_seconds(
+        lambda: trace.append("launch"),
+        lambda: trace.append("synchronize"),
+        clock=lambda: next(timestamps),
+    )
+
+    assert elapsed == 0.125
+    assert trace == ["launch", "synchronize"]

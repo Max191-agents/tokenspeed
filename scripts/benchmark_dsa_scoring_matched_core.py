@@ -713,11 +713,14 @@ def _run_backend(args: argparse.Namespace) -> None:
             "warmups": args.warmups,
             "samples_per_cell": args.samples,
             "compile_launches_per_cell": 1,
+            "capture_launches_per_cell": 1,
             "compile_in_timing": False,
             "allocation_in_timing": False,
             "output_initialization_in_timing": False,
             "topk_in_timing": False,
-            "event_timing": "torch.cuda.Event",
+            "host_submission_in_timing": False,
+            "measured_execution": "captured_matched_core_graph_replay",
+            "event_timing": "torch.cuda.Event_batched_until_cell_end",
             "softmax_scale": 1.0,
             "cells": [f"{mode}:{seq_len}" for mode, seq_len in cells],
         },
@@ -1005,6 +1008,11 @@ def _combine(args: argparse.Namespace) -> None:
         (
             payload["benchmark"]["warmups"],
             payload["benchmark"]["samples_per_cell"],
+            payload["benchmark"]["compile_launches_per_cell"],
+            payload["benchmark"]["capture_launches_per_cell"],
+            payload["benchmark"]["host_submission_in_timing"],
+            payload["benchmark"]["measured_execution"],
+            payload["benchmark"]["event_timing"],
         )
         for payload in payloads
     }
@@ -1212,7 +1220,15 @@ def _combine(args: argparse.Namespace) -> None:
             }
         )
 
-    warmups, samples_per_cell = next(iter(measurement_configs))
+    (
+        warmups,
+        samples_per_cell,
+        compile_launches,
+        capture_launches,
+        host_submission_in_timing,
+        measured_execution,
+        event_timing,
+    ) = next(iter(measurement_configs))
     common_provenance = {
         "fixture": {
             "fixture_id": next(iter(fixture_ids)),
@@ -1233,7 +1249,11 @@ def _combine(args: argparse.Namespace) -> None:
             "samples_per_cell_exact": samples_per_cell,
             "round_count_per_backend": len(shared.REQUIRED_ROUNDS),
             "aggregation": "median_of_three_round_medians",
-            "event_timing": "torch.cuda.Event",
+            "compile_launches_per_cell": compile_launches,
+            "capture_launches_per_cell": capture_launches,
+            "host_submission_in_timing": host_submission_in_timing,
+            "measured_execution": measured_execution,
+            "event_timing": event_timing,
         },
         "timing_scope": payloads[0]["timing_scope"],
         "timing_scope_fingerprint": next(iter(timing_scope_fingerprints)),

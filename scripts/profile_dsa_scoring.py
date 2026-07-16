@@ -7,9 +7,10 @@ import argparse
 import gc
 import json
 import math
+import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import benchmark_dsa_scoring as benchmark
 
@@ -21,6 +22,18 @@ _AITER_KERNEL_MODULE = "aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa
 _PYTORCH_FILL_SOURCE = "torch.Tensor.fill_"
 _PYTORCH_FILL_BLOCK_SIZE = 256
 _PYTORCH_FILL_VECTOR_WIDTH = 4
+
+
+def _prime_and_measure_wall_seconds(
+    launch: Callable[[], None],
+    synchronize: Callable[[], None],
+    *,
+    clock: Callable[[], float] = time.perf_counter,
+) -> float:
+    started = clock()
+    launch()
+    synchronize()
+    return clock() - started
 
 
 def _backend_file_path(
@@ -75,7 +88,7 @@ def _profile_dispatches(
                 {
                     "stage": "fused_query_decomposition_and_packed_mfma_score",
                     "kernel_symbol": (
-                        "_dsa_prefill_logits_fp8_tiled_fused_range_safe_kernel"
+                        "_dsa_prefill_logits_fp8_tiled_fused_wide_kernel"
                     ),
                     "source": source,
                     "grid": score_grid,
@@ -215,8 +228,10 @@ def _profile(args: argparse.Namespace) -> None:
             backend_files=backend_files,
         )
 
-        launch()
-        torch.cuda.synchronize()
+        priming_launch_wall_seconds = _prime_and_measure_wall_seconds(
+            launch,
+            torch.cuda.synchronize,
+        )
         for _ in range(args.warmups):
             launch()
         torch.cuda.synchronize()
@@ -233,6 +248,7 @@ def _profile(args: argparse.Namespace) -> None:
         "fixture_id": manifest["fixture_id"],
         "visibility": visibility,
         "device": str(torch.cuda.get_device_name(torch.cuda.current_device())),
+        "priming_launch_wall_seconds": priming_launch_wall_seconds,
         **_profile_counts(
             dispatches=dispatches,
             warmups=args.warmups,

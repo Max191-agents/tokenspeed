@@ -43,6 +43,7 @@ __all__ = [
     "_dsa_matched_core_fp8_mfma_kernel",
     "_dsa_preprocess_prefill_query_fp8_kernel",
     "_dsa_prefill_logits_fp8_mfma_kernel",
+    "_dsa_prefill_logits_fp8_tiled_fused_wide_kernel",
     "_dsa_prefill_logits_fp8_tiled_fused_range_safe_kernel",
     "_dsa_prefill_logits_fp8_tiled_kernel",
     "_dsa_prefill_logits_fp8_tiled_multi_component_kernel",
@@ -56,7 +57,9 @@ _HEAD_DIM = 128
 _PAGE_SIZE = 64
 _ROW_BYTES = 132
 _BLOCK_N = 32
+_SHORT_BLOCK_N = 128
 _NUM_WARPS = 1
+_SHORT_NUM_WARPS = 4
 _WAVES_PER_EU = 3
 _SHORT_PREFILL_WAVES_PER_EU = 3
 _BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
@@ -66,6 +69,7 @@ _G_HEAD_DIM = gl.constexpr(_HEAD_DIM)
 _G_PAGE_SIZE = gl.constexpr(_PAGE_SIZE)
 _G_ROW_BYTES = gl.constexpr(_ROW_BYTES)
 _G_BLOCK_N = gl.constexpr(_BLOCK_N)
+_G_SHORT_BLOCK_N = gl.constexpr(_SHORT_BLOCK_N)
 
 
 @gluon.jit
@@ -163,6 +167,38 @@ def _load_packed_k_scale(
 
 
 @gluon.jit
+def _load_packed_k_gather_wide(
+    index_k_fp8,
+    kv_workspace_slots,
+    block_start,
+    row_start,
+    row_end,
+    seq_len_sum,
+    dot_k_layout: gl.constexpr,
+):
+    """Load a 128-candidate packed tile directly in MFMA operand layout."""
+    candidates = block_start + gl.arange(
+        0, _G_SHORT_BLOCK_N, layout=gl.SliceLayout(0, dot_k_layout)
+    )
+    dims = gl.arange(0, _G_HEAD_DIM, layout=gl.SliceLayout(1, dot_k_layout))
+    valid = (
+        (candidates < seq_len_sum) & (candidates >= row_start) & (candidates < row_end)
+    )
+    slot_u = gl.amd.cdna4.buffer_load(
+        ptr=kv_workspace_slots,
+        offsets=candidates.to(gl.int32),
+        mask=valid,
+        other=0,
+    ).to(gl.uint64)
+    pages = slot_u >> 6
+    row_offsets = gl.multiple_of((slot_u << 7) + (pages << 8), _G_HEAD_DIM)
+    byte_offsets = row_offsets[None, :] + dims[:, None].to(gl.int64)
+    byte_offsets = gl.max_contiguous(byte_offsets, [16, 1])
+    pointers = gl.max_contiguous(index_k_fp8 + byte_offsets, [16, 1])
+    return gl.load(pointers, mask=valid[None, :], other=0.0)
+
+
+@gluon.jit
 def _folded_weighted_head_sum(
     head_scores,
     head_weights,
@@ -177,6 +213,36 @@ def _folded_weighted_head_sum(
     # only the remaining chain and cross-lane reductions.
     bit_shape: gl.constexpr = (2, 2, 2, 2, 2, _G_BLOCK_N)
     folded_shape: gl.constexpr = (2, _G_BLOCK_N, 4, 2, 2)
+    axis_order: gl.constexpr = (2, 5, 0, 1, 3, 4)
+    scores = head_scores.reshape(bit_shape).permute(axis_order).reshape(folded_shape)
+    weights = weights.reshape(bit_shape).permute(axis_order).reshape(folded_shape)
+
+    scores_low, scores_high = scores.split()
+    weights_low, weights_high = weights.split()
+    scores_00, scores_01 = scores_low.split()
+    scores_10, scores_11 = scores_high.split()
+    weights_00, weights_01 = weights_low.split()
+    weights_10, weights_11 = weights_high.split()
+
+    folded = scores_00 * weights_00
+    folded = gl.fma(scores_01, weights_01, folded)
+    folded = gl.fma(scores_10, weights_10, folded)
+    folded = gl.fma(scores_11, weights_11, folded)
+    folded = gl.sum(folded, axis=2)
+    folded = gl.sum(folded, axis=0)
+    return gl.convert_layout(folded, gl.SliceLayout(0, mfma_layout))
+
+
+@gluon.jit
+def _folded_weighted_head_sum_wide(
+    head_scores,
+    head_weights,
+    mfma_layout: gl.constexpr,
+):
+    """Reduce signed weighted heads independently in each N-owning wave."""
+    weights = head_weights[:, None].broadcast_to([_G_NUM_HEADS, _G_SHORT_BLOCK_N])
+    bit_shape: gl.constexpr = (2, 2, 2, 2, 2, _G_SHORT_BLOCK_N)
+    folded_shape: gl.constexpr = (2, _G_SHORT_BLOCK_N, 4, 2, 2)
     axis_order: gl.constexpr = (2, 5, 0, 1, 3, 4)
     scores = head_scores.reshape(bit_shape).permute(axis_order).reshape(folded_shape)
     weights = weights.reshape(bit_shape).permute(axis_order).reshape(folded_shape)
@@ -268,6 +334,52 @@ def _score_fp8_multi_component_tile(
 
 
 @gluon.jit
+def _score_fp8_multi_component_wide_tile(
+    mfma_q_hi,
+    mfma_q_mid,
+    head_weights,
+    mfma_k,
+    k_scale,
+    valid,
+    softmax_scale: gl.constexpr,
+    mfma_layout: gl.constexpr,
+):
+    head_scores = gl.zeros(
+        [_G_NUM_HEADS, _G_SHORT_BLOCK_N],
+        dtype=gl.float32,
+        layout=mfma_layout,
+    )
+    head_scores = gl.amd.cdna4.mfma_scaled(
+        a=mfma_q_hi,
+        a_scale=None,
+        a_format="e4m3",
+        b=mfma_k,
+        b_scale=None,
+        b_format="e4m3",
+        acc=head_scores,
+    )
+    residual_scores = gl.zeros(
+        [_G_NUM_HEADS, _G_SHORT_BLOCK_N],
+        dtype=gl.float32,
+        layout=mfma_layout,
+    )
+    residual_scores = gl.amd.cdna4.mfma_scaled(
+        a=mfma_q_mid,
+        a_scale=None,
+        a_format="e4m3",
+        b=mfma_k,
+        b_scale=None,
+        b_format="e4m3",
+        acc=residual_scores,
+    )
+    head_scores += residual_scores * 0.03125
+    head_scores = gl.maximum(head_scores, 0.0)
+    scores = _folded_weighted_head_sum_wide(head_scores, head_weights, mfma_layout)
+    scores *= k_scale * softmax_scale
+    return gl.where(valid, scores, -float("inf"))
+
+
+@gluon.jit
 def _score_and_store_packed_tile(
     mfma_q,
     mfma_k,
@@ -333,6 +445,53 @@ def _score_and_store_packed_multi_component_tile(
     valid = in_bounds & (candidates >= row_start) & (candidates < row_end)
     k_scale = _load_packed_k_scale(index_k_scale, kv_workspace_slots, candidates, valid)
     scores = _score_fp8_multi_component_tile(
+        mfma_q_hi,
+        mfma_q_mid,
+        head_weights,
+        mfma_k,
+        k_scale,
+        valid,
+        softmax_scale,
+        mfma_layout,
+    )
+    output_offsets = token.to(gl.int64) * logits_stride + candidates
+    if USE_BUFFER_STORE:
+        gl.amd.cdna4.buffer_store(
+            scores,
+            ptr=logits,
+            offsets=output_offsets.to(gl.int32),
+            mask=in_bounds,
+        )
+    else:
+        gl.store(logits + output_offsets, scores, mask=in_bounds)
+
+
+@gluon.jit
+def _score_and_store_packed_multi_component_wide_tile(
+    mfma_q_hi,
+    mfma_q_mid,
+    mfma_k,
+    head_weights,
+    index_k_scale,
+    kv_workspace_slots,
+    logits,
+    token,
+    block_start,
+    row_start,
+    row_end,
+    seq_len_sum,
+    logits_stride: gl.constexpr,
+    softmax_scale: gl.constexpr,
+    mfma_layout: gl.constexpr,
+    USE_BUFFER_STORE: gl.constexpr,
+):
+    candidates = block_start + gl.arange(
+        0, _G_SHORT_BLOCK_N, layout=gl.SliceLayout(0, mfma_layout)
+    )
+    in_bounds = candidates < seq_len_sum
+    valid = in_bounds & (candidates >= row_start) & (candidates < row_end)
+    k_scale = _load_packed_k_scale(index_k_scale, kv_workspace_slots, candidates, valid)
+    scores = _score_fp8_multi_component_wide_tile(
         mfma_q_hi,
         mfma_q_mid,
         head_weights,
@@ -559,6 +718,275 @@ def _dsa_prefill_logits_fp8_tiled_kernel(
 
 
 @gluon.jit
+def _dsa_prefill_logits_fp8_tiled_fused_wide_kernel(
+    q,
+    index_k_fp8,
+    index_k_scale,
+    weights,
+    kv_workspace_slots,
+    row_starts,
+    row_ends,
+    logits,
+    logits_stride: gl.constexpr,
+    seq_len_sum: gl.int32,
+    softmax_scale: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    USE_BUFFER_STORE: gl.constexpr,
+):
+    """Amortize short-prefill query preparation across four N-owning waves."""
+    token = gl.program_id(0)
+    block_start = gl.program_id(1) * _G_SHORT_BLOCK_N
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[32, 32, 64],
+        transposed=False,
+        warps_per_cta=[1, NUM_WARPS],
+    )
+    dot_q_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=16
+    )
+    dot_k_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=16
+    )
+    q_load_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 16],
+        threads_per_warp=[8, 8],
+        warps_per_cta=[NUM_WARPS, 1],
+        order=[1, 0],
+    )
+    q_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[512, 16]],
+        [_G_NUM_HEADS, _G_HEAD_DIM],
+        [1, 0],
+    )
+    head_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[512, 16]],
+        [_G_NUM_HEADS],
+        [0],
+    )
+    wave_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[512, 16]],
+        [NUM_WARPS],
+        [0],
+    )
+    q_hi_shared = gl.allocate_shared_memory(
+        gl.float8e4nv,
+        [_G_NUM_HEADS, _G_HEAD_DIM],
+        layout=q_shared_layout,
+    )
+    q_mid_shared = gl.allocate_shared_memory(
+        gl.float8e4nv,
+        [_G_NUM_HEADS, _G_HEAD_DIM],
+        layout=q_shared_layout,
+    )
+    q_head_mag_shared = gl.allocate_shared_memory(
+        gl.uint16,
+        [_G_NUM_HEADS],
+        layout=head_shared_layout,
+    )
+    q_wave_mag_shared = gl.allocate_shared_memory(
+        gl.uint16,
+        [NUM_WARPS],
+        layout=wave_shared_layout,
+    )
+    heads = gl.arange(0, _G_NUM_HEADS, layout=gl.SliceLayout(1, q_load_layout))
+    dims = gl.arange(0, _G_HEAD_DIM, layout=gl.SliceLayout(0, q_load_layout))
+    q_offsets = (
+        token * (_G_NUM_HEADS * _G_HEAD_DIM)
+        + heads[:, None] * _G_HEAD_DIM
+        + dims[None, :]
+    ).to(gl.int32)
+    q_bf16 = gl.amd.cdna4.buffer_load(ptr=q, offsets=q_offsets)
+    q_mag_bits = q_bf16.to(gl.uint16, bitcast=True) & 0x7FFF
+    q_head_mag_bits = gl.max(q_mag_bits, axis=1, keep_dims=True)
+    q_wave_mag_bits = gl.max(
+        q_head_mag_bits.reshape([NUM_WARPS, _G_NUM_HEADS // NUM_WARPS]),
+        axis=1,
+    )
+    q_fp32 = q_bf16.to(gl.float32)
+    q_hi = q_fp32.to(gl.float8e4nv)
+    q_residual = q_fp32 - q_hi.to(gl.float32)
+    q_mid = (q_residual * 32.0).to(gl.float8e4nv)
+    q_hi_shared.store(q_hi)
+    q_mid_shared.store(q_mid)
+    q_wave_mag_shared.store(q_wave_mag_bits.to(gl.uint16))
+    gl.barrier()
+
+    mfma_wave_mag_bits = q_wave_mag_shared.load(gl.SliceLayout(1, mfma_layout))
+    needs_scaling = gl.max(mfma_wave_mag_bits, axis=0) > 0x4380
+    if needs_scaling:
+        q_bf16 = gl.amd.cdna4.buffer_load(ptr=q, offsets=q_offsets)
+        q_mag_bits = q_bf16.to(gl.uint16, bitcast=True) & 0x7FFF
+        producer_head_mag_bits = gl.max(q_mag_bits, axis=1, keep_dims=True)
+        q_fp32 = q_bf16.to(gl.float32)
+        producer_head_amax = (
+            producer_head_mag_bits.to(gl.uint16)
+            .to(gl.bfloat16, bitcast=True)
+            .to(gl.float32)
+        )
+        producer_head_scale = gl.maximum(producer_head_amax * (1.0 / 256.0), 1.0)
+        q_normalized = q_fp32 / producer_head_scale
+        q_hi = q_normalized.to(gl.float8e4nv)
+        q_scaled_residual = q_normalized - q_hi.to(gl.float32)
+        q_mid = (q_scaled_residual * 32.0).to(gl.float8e4nv)
+        q_hi_shared.store(q_hi)
+        q_mid_shared.store(q_mid)
+        q_head_mag_shared.store(
+            producer_head_mag_bits.reshape([_G_NUM_HEADS]).to(gl.uint16)
+        )
+        gl.barrier()
+
+    mfma_q_hi = q_hi_shared.load(dot_q_layout)
+    mfma_q_mid = q_mid_shared.load(dot_q_layout)
+    weight_heads = gl.arange(0, _G_NUM_HEADS, layout=gl.SliceLayout(1, mfma_layout))
+    head_weights = gl.amd.cdna4.buffer_load(
+        ptr=weights,
+        offsets=(token * _G_NUM_HEADS + weight_heads).to(gl.int32),
+    ).to(gl.float32)
+    if needs_scaling:
+        mfma_head_mag_bits = q_head_mag_shared.load(gl.SliceLayout(1, mfma_layout))
+        mfma_head_amax = (
+            mfma_head_mag_bits.to(gl.uint16)
+            .to(gl.bfloat16, bitcast=True)
+            .to(gl.float32)
+        )
+        head_weights *= gl.maximum(mfma_head_amax * (1.0 / 256.0), 1.0)
+
+    row_start = gl.load(row_starts + token).to(gl.int32)
+    row_end = gl.load(row_ends + token).to(gl.int32)
+    mfma_k = _load_packed_k_gather_wide(
+        index_k_fp8,
+        kv_workspace_slots,
+        block_start,
+        row_start,
+        row_end,
+        seq_len_sum,
+        dot_k_layout,
+    )
+    _score_and_store_packed_multi_component_wide_tile(
+        mfma_q_hi,
+        mfma_q_mid,
+        mfma_k,
+        head_weights,
+        index_k_scale,
+        kv_workspace_slots,
+        logits,
+        token,
+        block_start,
+        row_start,
+        row_end,
+        seq_len_sum,
+        logits_stride,
+        softmax_scale,
+        mfma_layout,
+        USE_BUFFER_STORE,
+    )
+
+
+@gluon.jit
+def _prepare_fused_range_safe_query(
+    q,
+    weights,
+    token,
+    q_load_layout: gl.constexpr,
+    mfma_layout: gl.constexpr,
+    dot_q_layout: gl.constexpr,
+):
+    heads = gl.arange(0, _G_NUM_HEADS, layout=gl.SliceLayout(1, q_load_layout))
+    dims = gl.arange(0, _G_HEAD_DIM, layout=gl.SliceLayout(0, q_load_layout))
+    q_offsets = (
+        token * (_G_NUM_HEADS * _G_HEAD_DIM)
+        + heads[:, None] * _G_HEAD_DIM
+        + dims[None, :]
+    ).to(gl.int32)
+    q_bf16 = gl.amd.cdna4.buffer_load(ptr=q, offsets=q_offsets)
+    q_mag_bits = q_bf16.to(gl.uint16, bitcast=True) & 0x7FFF
+    q_head_mag_bits = gl.max(q_mag_bits, axis=1, keep_dims=True)
+    needs_scaling = gl.max(q_head_mag_bits.reshape([_G_NUM_HEADS]), axis=0) > 0x4380
+    weight_heads = gl.arange(0, _G_NUM_HEADS, layout=gl.SliceLayout(1, mfma_layout))
+    head_weights = gl.amd.cdna4.buffer_load(
+        ptr=weights,
+        offsets=(token * _G_NUM_HEADS + weight_heads).to(gl.int32),
+    ).to(gl.float32)
+    if needs_scaling:
+        q_fp32 = q_bf16.to(gl.float32)
+        q_amax = (
+            q_head_mag_bits.to(gl.uint16).to(gl.bfloat16, bitcast=True).to(gl.float32)
+        )
+        q_scale = gl.maximum(q_amax * (1.0 / 256.0), 1.0)
+        q_normalized = q_fp32 / q_scale
+        q_hi = q_normalized.to(gl.float8e4nv)
+        q_scaled_residual = q_normalized - q_hi.to(gl.float32)
+        q_mid = (q_scaled_residual * 32.0).to(gl.float8e4nv)
+        head_scale = gl.convert_layout(
+            q_scale.reshape([_G_NUM_HEADS]), gl.SliceLayout(1, mfma_layout)
+        )
+        head_weights *= head_scale
+    else:
+        q_fp32 = q_bf16.to(gl.float32)
+        q_hi = q_fp32.to(gl.float8e4nv)
+        q_residual = q_fp32 - q_hi.to(gl.float32)
+        q_mid = (q_residual * 32.0).to(gl.float8e4nv)
+    mfma_q_hi = gl.convert_layout(q_hi, dot_q_layout)
+    mfma_q_mid = gl.convert_layout(q_mid, dot_q_layout)
+    return mfma_q_hi, mfma_q_mid, head_weights
+
+
+@gluon.jit
+def _score_fused_range_safe_program(
+    mfma_q_hi,
+    mfma_q_mid,
+    head_weights,
+    index_k_fp8,
+    index_k_scale,
+    kv_workspace_slots,
+    logits,
+    token,
+    first_block,
+    row_start,
+    row_end,
+    seq_len_sum,
+    logits_stride: gl.constexpr,
+    softmax_scale: gl.constexpr,
+    TILES_PER_PROGRAM: gl.constexpr,
+    k_load_layout: gl.constexpr,
+    dot_k_layout: gl.constexpr,
+    mfma_layout: gl.constexpr,
+    USE_BUFFER_STORE: gl.constexpr,
+):
+    for tile_index in gl.static_range(0, TILES_PER_PROGRAM):
+        block_start = first_block + tile_index * _G_BLOCK_N
+        k_block = _load_packed_k_gather(
+            index_k_fp8,
+            kv_workspace_slots,
+            block_start,
+            row_start,
+            row_end,
+            seq_len_sum,
+            k_load_layout,
+        )
+        mfma_k = gl.convert_layout(k_block, dot_k_layout)
+        _score_and_store_packed_multi_component_tile(
+            mfma_q_hi,
+            mfma_q_mid,
+            mfma_k,
+            head_weights,
+            index_k_scale,
+            kv_workspace_slots,
+            logits,
+            token,
+            block_start,
+            row_start,
+            row_end,
+            seq_len_sum,
+            logits_stride,
+            softmax_scale,
+            mfma_layout,
+            USE_BUFFER_STORE,
+        )
+
+
+@gluon.jit
 def _dsa_prefill_logits_fp8_tiled_fused_range_safe_kernel(
     q,
     index_k_fp8,
@@ -600,77 +1028,38 @@ def _dsa_prefill_logits_fp8_tiled_fused_range_safe_kernel(
         warps_per_cta=[1, NUM_WARPS],
         order=[0, 1],
     )
-    heads = gl.arange(0, _G_NUM_HEADS, layout=gl.SliceLayout(1, q_load_layout))
-    dims = gl.arange(0, _G_HEAD_DIM, layout=gl.SliceLayout(0, q_load_layout))
-    q_offsets = (
-        token * (_G_NUM_HEADS * _G_HEAD_DIM)
-        + heads[:, None] * _G_HEAD_DIM
-        + dims[None, :]
-    ).to(gl.int32)
-    q_bf16 = gl.amd.cdna4.buffer_load(ptr=q, offsets=q_offsets)
-    q_mag_bits = q_bf16.to(gl.uint16, bitcast=True) & 0x7FFF
-    q_head_mag_bits = gl.max(q_mag_bits, axis=1, keep_dims=True)
-    needs_scaling = gl.max(q_head_mag_bits.reshape([_G_NUM_HEADS]), axis=0) > 0x4380
-    weight_heads = gl.arange(0, _G_NUM_HEADS, layout=gl.SliceLayout(1, mfma_layout))
-    head_weights = gl.amd.cdna4.buffer_load(
-        ptr=weights,
-        offsets=(token * _G_NUM_HEADS + weight_heads).to(gl.int32),
-    ).to(gl.float32)
-    if needs_scaling:
-        q_fp32 = q_bf16.to(gl.float32)
-        q_amax = (
-            q_head_mag_bits.to(gl.uint16).to(gl.bfloat16, bitcast=True).to(gl.float32)
-        )
-        q_scale = gl.maximum(q_amax * (1.0 / 256.0), 1.0)
-        q_normalized = q_fp32 / q_scale
-        q_hi = q_normalized.to(gl.float8e4nv)
-        q_scaled_residual = q_normalized - q_hi.to(gl.float32)
-        q_mid = (q_scaled_residual * 32.0).to(gl.float8e4nv)
-        head_scale = gl.convert_layout(
-            q_scale.reshape([_G_NUM_HEADS]), gl.SliceLayout(1, mfma_layout)
-        )
-        head_weights *= head_scale
-    else:
-        q_fp32 = q_bf16.to(gl.float32)
-        q_hi = q_fp32.to(gl.float8e4nv)
-        q_residual = q_fp32 - q_hi.to(gl.float32)
-        q_mid = (q_residual * 32.0).to(gl.float8e4nv)
-    mfma_q_hi = gl.convert_layout(q_hi, dot_q_layout)
-    mfma_q_mid = gl.convert_layout(q_mid, dot_q_layout)
-
+    mfma_q_hi, mfma_q_mid, head_weights = _prepare_fused_range_safe_query(
+        q,
+        weights,
+        token,
+        q_load_layout,
+        mfma_layout,
+        dot_q_layout,
+    )
     row_start = gl.load(row_starts + token).to(gl.int32)
     row_end = gl.load(row_ends + token).to(gl.int32)
     first_block = gl.program_id(1) * (TILES_PER_PROGRAM * _G_BLOCK_N)
-    for tile_index in gl.static_range(0, TILES_PER_PROGRAM):
-        block_start = first_block + tile_index * _G_BLOCK_N
-        k_block = _load_packed_k_gather(
-            index_k_fp8,
-            kv_workspace_slots,
-            block_start,
-            row_start,
-            row_end,
-            seq_len_sum,
-            k_load_layout,
-        )
-        mfma_k = gl.convert_layout(k_block, dot_k_layout)
-        _score_and_store_packed_multi_component_tile(
-            mfma_q_hi,
-            mfma_q_mid,
-            mfma_k,
-            head_weights,
-            index_k_scale,
-            kv_workspace_slots,
-            logits,
-            token,
-            block_start,
-            row_start,
-            row_end,
-            seq_len_sum,
-            logits_stride,
-            softmax_scale,
-            mfma_layout,
-            USE_BUFFER_STORE,
-        )
+    _score_fused_range_safe_program(
+        mfma_q_hi,
+        mfma_q_mid,
+        head_weights,
+        index_k_fp8,
+        index_k_scale,
+        kv_workspace_slots,
+        logits,
+        token,
+        first_block,
+        row_start,
+        row_end,
+        seq_len_sum,
+        logits_stride,
+        softmax_scale,
+        TILES_PER_PROGRAM,
+        k_load_layout,
+        dot_k_layout,
+        mfma_layout,
+        USE_BUFFER_STORE,
+    )
 
 
 @gluon.jit
@@ -1059,14 +1448,13 @@ def launch_dsa_prefill_logits_fp8_mfma_gfx950(
     tiles_per_program = int(tiles_per_program)
     if tiles_per_program not in (1, 2, 4):
         raise ValueError("tiles_per_program must be 1, 2, or 4")
-    grid = (
-        q.shape[0],
-        (seq_len_sum + tiles_per_program * _BLOCK_N - 1)
-        // (tiles_per_program * _BLOCK_N),
-    )
     use_buffer_store = logits.numel() * logits.element_size() < _BUFFER_LIMIT_BYTES
     if seq_len_sum <= 2048:
-        _dsa_prefill_logits_fp8_tiled_fused_range_safe_kernel[grid](
+        short_grid = (
+            q.shape[0],
+            (seq_len_sum + _SHORT_BLOCK_N - 1) // _SHORT_BLOCK_N,
+        )
+        _dsa_prefill_logits_fp8_tiled_fused_wide_kernel[short_grid](
             q,
             index_k_cache.view(torch.float8_e4m3fn),
             index_k_cache.view(torch.float32),
@@ -1078,14 +1466,18 @@ def launch_dsa_prefill_logits_fp8_mfma_gfx950(
             logits.stride(0),
             seq_len_sum,
             softmax_scale=float(softmax_scale),
-            NUM_WARPS=_NUM_WARPS,
-            TILES_PER_PROGRAM=tiles_per_program,
+            NUM_WARPS=_SHORT_NUM_WARPS,
             USE_BUFFER_STORE=use_buffer_store,
-            num_warps=_NUM_WARPS,
+            num_warps=_SHORT_NUM_WARPS,
             waves_per_eu=_SHORT_PREFILL_WAVES_PER_EU,
         )
         return logits
 
+    grid = (
+        q.shape[0],
+        (seq_len_sum + tiles_per_program * _BLOCK_N - 1)
+        // (tiles_per_program * _BLOCK_N),
+    )
     _dsa_preprocess_prefill_query_fp8_kernel[(q.shape[0],)](
         q,
         weights,

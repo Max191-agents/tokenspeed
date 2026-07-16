@@ -169,6 +169,11 @@ def _round_payload(
         "benchmark": {
             "warmups": 10,
             "samples_per_cell": benchmark.shared.MIN_SAMPLES,
+            "compile_launches_per_cell": 1,
+            "capture_launches_per_cell": 1,
+            "host_submission_in_timing": False,
+            "measured_execution": "captured_matched_core_graph_replay",
+            "event_timing": "torch.cuda.Event_batched_until_cell_end",
             "cells": [cell_id],
         },
         "coverage": benchmark._coverage(((mode, seq_len),)),
@@ -287,3 +292,8 @@ def test_combine_preserves_provenance_and_labels_partial_grid(
     assert set(combined["provenance"]["backends"]) == set(
         benchmark.BACKEND_NAMES.values()
     )
+    measurement = combined["provenance"]["common"]["measurement"]
+    assert measurement["capture_launches_per_cell"] == 1
+    assert measurement["host_submission_in_timing"] is False
+    assert measurement["measured_execution"] == ("captured_matched_core_graph_replay")
+    assert measurement["event_timing"] == ("torch.cuda.Event_batched_until_cell_end")
