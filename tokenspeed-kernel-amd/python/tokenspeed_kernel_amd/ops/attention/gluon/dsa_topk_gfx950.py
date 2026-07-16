@@ -41,7 +41,7 @@ _PREFILL_RADIX_SCHEDULE = ((21, 11), (10, 11), (0, 10))
 _PREFILL_RADIX_BLOCK_N = 4096
 _PREFILL_RADIX_HIST_TARGET_GROUPS_PER_CU = 2
 _PREFILL_RADIX_SCATTER_TARGET_GROUPS_PER_CU = 2
-_ONEBLOCK_RADIX_SCHEDULE = (11, 11, 10)
+_ONEBLOCK_RADIX_SCHEDULE = (12, 12, 8)
 _ONEBLOCK_RADIX_BUCKETS = 1 << max(_ONEBLOCK_RADIX_SCHEDULE)
 _ONEBLOCK_DECODE_RADIX_BLOCK_N = 8192
 _ONEBLOCK_PREFILL_RADIX_BLOCK_N = 4096
@@ -70,6 +70,13 @@ def _fp32_to_ordered_key(x):
     bits = x.to(gl.uint32, bitcast=True)
     sign = bits & 0x80000000
     return bits ^ gl.where(sign != 0, 0xFFFFFFFF, 0x80000000)
+
+
+@gluon.jit
+def _fp32_to_topk_key(x):
+    bits = x.to(gl.uint32, bitcast=True)
+    sign = bits & 0x80000000
+    return bits ^ gl.where(sign != 0, 0, 0x7FFFFFFF)
 
 
 @gluon.jit
@@ -371,7 +378,7 @@ def _accumulate_oneblock_histogram_tile(
         BLOCK_N,
         IS_TAIL,
     )
-    keys = _fp32_to_ordered_key(values)
+    keys = _fp32_to_topk_key(values)
     if FIRST_PASS:
         prefix_match = valid
     else:
@@ -413,8 +420,8 @@ def _emit_oneblock_topk_tile(
         BLOCK_N,
         IS_TAIL,
     )
-    keys = _fp32_to_ordered_key(values)
-    greater_mask = valid & (keys > prefix)
+    keys = _fp32_to_topk_key(values)
+    greater_mask = valid & (keys < prefix)
     equal_mask = valid & (keys == prefix)
     reservation_mask = greater_mask | equal_mask
     reservation_counter = gl.where(greater_mask, 0, 1).to(gl.int32)
@@ -478,7 +485,7 @@ def _accumulate_compact_final_histogram_tile(
         BLOCK_N,
         IS_TAIL,
     )
-    keys = _fp32_to_ordered_key(values)
+    keys = _fp32_to_topk_key(values)
     high_prefix = keys >> RADIX_BITS
     prefix_match = valid & (high_prefix == prefix)
     buckets = keys & ((1 << RADIX_BITS) - 1)
@@ -489,7 +496,7 @@ def _accumulate_compact_final_histogram_tile(
         mask=prefix_match,
     )
 
-    definite_winner = valid & (high_prefix > prefix)
+    definite_winner = valid & (high_prefix < prefix)
     reservation_mask = definite_winner | prefix_match
     reservation_counter = gl.where(definite_winner, 0, 2).to(gl.int32)
     reservation = shared_output_counters.atomic_scatter_add(
@@ -556,7 +563,7 @@ def _emit_compact_final_topk(
     valid = compact_positions < compact_count
     keys = shared_compact_keys.load(output_layout)
     logical_offsets = shared_compact_offsets.load(output_layout)
-    greater_mask = valid & (keys > prefix)
+    greater_mask = valid & (keys < prefix)
     equal_mask = valid & (keys == prefix)
     reservation_mask = greater_mask | equal_mask
     reservation_counter = gl.where(greater_mask, 0, 1).to(gl.int32)
@@ -883,18 +890,18 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         count_low = gl.convert_layout(count_low, group_layout)
         count_high = gl.convert_layout(count_high, group_layout)
         group_counts = count_low + count_high
-        group_descending = gl.associative_scan(group_counts, 0, _topk_add, reverse=True)
-        group_greater = group_descending - group_counts
-        selected_group = (group_greater < remaining) & (group_descending >= remaining)
+        group_cumulative = gl.associative_scan(group_counts, 0, _topk_add)
+        group_greater = group_cumulative - group_counts
+        selected_group = (group_greater < remaining) & (group_cumulative >= remaining)
         bucket_pairs = bucket_offsets.reshape([MAX_BUCKETS // 2, 2])
         bucket_low, bucket_high = gl.split(bucket_pairs)
         bucket_low = gl.convert_layout(bucket_low, group_layout)
         bucket_high = gl.convert_layout(bucket_high, group_layout)
-        select_high = group_greater + count_high >= remaining
-        group_bucket = gl.where(select_high, bucket_high, bucket_low)
-        group_selected_greater = group_greater + gl.where(select_high, 0, count_high)
+        select_low = group_greater + count_low >= remaining
+        group_bucket = gl.where(select_low, bucket_low, bucket_high)
+        group_selected_greater = group_greater + gl.where(select_low, 0, count_low)
         if USE_COMPACT_FINAL:
-            group_selected_count = gl.where(select_high, count_high, count_low)
+            group_selected_count = gl.where(select_low, count_low, count_high)
         selected_bucket = gl.sum(gl.where(selected_group, group_bucket, 0), axis=0).to(
             gl.int32
         )
