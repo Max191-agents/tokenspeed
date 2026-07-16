@@ -2751,31 +2751,48 @@ def _dsa_runtime_radix_topk_kernel(
 
         gl.barrier()
         counts = shared_histogram.load(histogram_layout)
-        count_pairs = counts.reshape([NUM_BUCKETS // 2, 2])
-        count_low, count_high = gl.split(count_pairs)
-        count_low = gl.convert_layout(count_low, group_layout)
-        count_high = gl.convert_layout(count_high, group_layout)
-        group_counts = count_low + count_high
-        group_cumulative = gl.associative_scan(group_counts, 0, _topk_add)
-        group_greater = group_cumulative - group_counts
-        selected_group = (group_greater < remaining) & (group_cumulative >= remaining)
-        bucket_pairs = bucket_offsets.reshape([NUM_BUCKETS // 2, 2])
-        bucket_low, bucket_high = gl.split(bucket_pairs)
-        bucket_low = gl.convert_layout(bucket_low, group_layout)
-        bucket_high = gl.convert_layout(bucket_high, group_layout)
-        select_low = group_greater + count_low >= remaining
-        group_bucket = gl.where(select_low, bucket_low, bucket_high)
-        group_selected_greater = group_greater + gl.where(select_low, 0, count_low)
-        group_selected_count = gl.where(select_low, count_low, count_high)
-        selected_bucket = gl.sum(gl.where(selected_group, group_bucket, 0), axis=0).to(
-            gl.int32
-        )
-        selected_greater = gl.sum(
-            gl.where(selected_group, group_selected_greater, 0), axis=0
-        ).to(gl.int32)
-        selected_bucket_count = gl.sum(
-            gl.where(selected_group, group_selected_count, 0), axis=0
-        ).to(gl.int32)
+        if RADIX_BITS == 10:
+            # The 1,024 bins map one-to-one onto this 1,024-thread workgroup.
+            bucket_cumulative = gl.associative_scan(counts, 0, _topk_add)
+            bucket_greater = bucket_cumulative - counts
+            selected = (bucket_greater < remaining) & (bucket_cumulative >= remaining)
+            selected_bucket = gl.sum(gl.where(selected, bucket_offsets, 0), axis=0).to(
+                gl.int32
+            )
+            selected_greater = gl.sum(gl.where(selected, bucket_greater, 0), axis=0).to(
+                gl.int32
+            )
+            selected_bucket_count = gl.sum(gl.where(selected, counts, 0), axis=0).to(
+                gl.int32
+            )
+        else:
+            count_pairs = counts.reshape([NUM_BUCKETS // 2, 2])
+            count_low, count_high = gl.split(count_pairs)
+            count_low = gl.convert_layout(count_low, group_layout)
+            count_high = gl.convert_layout(count_high, group_layout)
+            group_counts = count_low + count_high
+            group_cumulative = gl.associative_scan(group_counts, 0, _topk_add)
+            group_greater = group_cumulative - group_counts
+            selected_group = (group_greater < remaining) & (
+                group_cumulative >= remaining
+            )
+            bucket_pairs = bucket_offsets.reshape([NUM_BUCKETS // 2, 2])
+            bucket_low, bucket_high = gl.split(bucket_pairs)
+            bucket_low = gl.convert_layout(bucket_low, group_layout)
+            bucket_high = gl.convert_layout(bucket_high, group_layout)
+            select_low = group_greater + count_low >= remaining
+            group_bucket = gl.where(select_low, bucket_low, bucket_high)
+            group_selected_greater = group_greater + gl.where(select_low, 0, count_low)
+            group_selected_count = gl.where(select_low, count_low, count_high)
+            selected_bucket = gl.sum(
+                gl.where(selected_group, group_bucket, 0), axis=0
+            ).to(gl.int32)
+            selected_greater = gl.sum(
+                gl.where(selected_group, group_selected_greater, 0), axis=0
+            ).to(gl.int32)
+            selected_bucket_count = gl.sum(
+                gl.where(selected_group, group_selected_count, 0), axis=0
+            ).to(gl.int32)
         prefix |= selected_bucket.to(gl.uint32) << shift
         remaining -= selected_greater
         prefix_shift = shift
