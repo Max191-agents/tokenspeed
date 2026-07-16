@@ -1012,10 +1012,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if self.attention_backend not in self._MLA_KERNEL_BACKENDS:
             need_save_kv = not self.use_fused_set_kv_buffer
 
+        v = K[..., : self.kv_lora_rank] if K is not None else None
+
         attn_output = self.attn_mqa(
             Q,
             K,
-            K[..., : self.kv_lora_rank],
+            v,
             ctx,
             out_cache_loc,
             save_kv_cache=need_save_kv,

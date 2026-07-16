@@ -69,8 +69,9 @@ def test_glm_dsa_real_token_count_for_prefill_graph(
 def test_glm_dsa_real_token_count_requires_prefill_metadata():
     ctx = _context(None, bs=1, num_extends=1)
 
-    with active_forward(ctx), pytest.raises(
-        RuntimeError, match="requires CPU extend-length metadata"
+    with (
+        active_forward(ctx),
+        pytest.raises(RuntimeError, match="requires CPU extend-length metadata"),
     ):
         _glm_dsa_real_token_count(ctx)
 
@@ -209,3 +210,54 @@ def test_glm_dsa_prefill_token_mismatch_stays_strict():
         GlmMoeDsaAttention._compute_prefill_topk_indices(
             SimpleNamespace(), SimpleNamespace(), ctx, 2
         )
+
+
+def test_glm_dsa_attention_accepts_fused_kv_cache_write():
+    calls = []
+
+    def attn_mqa(q, k, v, ctx, out_cache_loc, **kwargs):
+        calls.append((q, k, v, ctx, out_cache_loc, kwargs))
+        return torch.ones((2, 1, 2))
+
+    attention = SimpleNamespace(
+        attention_backend="dsa",
+        _MLA_KERNEL_BACKENDS=GlmMoeDsaAttention._MLA_KERNEL_BACKENDS,
+        use_fused_set_kv_buffer=False,
+        kv_lora_rank=2,
+        num_local_heads=1,
+        v_head_dim=1,
+        w_vc=torch.ones((1, 2, 1)),
+        attn_mqa=attn_mqa,
+    )
+    q = torch.ones((2, 1, 3))
+    ctx = SimpleNamespace()
+    out_cache_loc = torch.arange(2)
+    output = torch.empty((2, 1))
+    topk_indices = torch.arange(4).view(2, 2)
+    topk_lens = torch.full((2,), 2)
+
+    result = GlmMoeDsaAttention.forward_absorb_attn_v_proj(
+        attention,
+        q,
+        None,
+        ctx,
+        out_cache_loc,
+        output,
+        topk_indices=topk_indices,
+        topk_lens=topk_lens,
+    )
+
+    assert result is output
+    assert torch.equal(output, torch.full_like(output, 2))
+    assert len(calls) == 1
+    call_q, call_k, call_v, call_ctx, call_locs, kwargs = calls[0]
+    assert call_q is q
+    assert call_k is None
+    assert call_v is None
+    assert call_ctx is ctx
+    assert call_locs is out_cache_loc
+    assert kwargs == {
+        "save_kv_cache": False,
+        "topk_indices": topk_indices,
+        "topk_lens": topk_lens,
+    }
