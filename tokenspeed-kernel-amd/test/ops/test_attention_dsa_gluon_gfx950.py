@@ -1139,6 +1139,74 @@ def test_dsa_prefill_topk_dispatches_persistent_groups_across_rows(
     assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace)
 
 
+@pytest.mark.parametrize(
+    ("cols", "groups"),
+    (
+        (131072, 2),
+        (262144, 4),
+        (524288, 4),
+        (1048576, 4),
+    ),
+)
+def test_dsa_persistent_prefill_histogram_ranges_are_exact(
+    cols: int,
+    groups: int,
+) -> None:
+    rows = 4
+    topk = 2048
+    block_n = dsa_topk_gfx950._PERSISTENT_PREFILL_BLOCK_N
+    row_starts = torch.tensor(
+        [17, block_n + 31, 2 * block_n + 47, 3 * block_n + 63],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_ends = torch.tensor(
+        [cols - 29, cols - 53, cols - 79, cols - 101],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=8203,
+    )
+    starts = row_starts.cpu().tolist()
+    ends = row_ends.cpu().tolist()
+    logits[1, starts[1] : ends[1]] = 0.0
+    logits[1, starts[1] : starts[1] + 37] = float("inf")
+    logits[1, starts[1] + 37 : ends[1] : 257] = -float("inf")
+    logits[2, starts[2] : ends[2]] = -float("inf")
+    logits[3, starts[3] : ends[3]] = float("inf")
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+
+    for _ in range(2):
+        out.fill_(-1)
+        lens_out.fill_(-1)
+        dsa_topk_gfx950._dsa_persistent_prefill_radix_topk(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            groups=groups,
+            workspace=workspace,
+            out=out,
+            lens_out=lens_out,
+        )
+        _assert_grouped_radix_topk(
+            logits,
+            out,
+            lens_out,
+            row_starts,
+            row_ends,
+            topk=topk,
+        )
+        assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace)
+
+
 def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
     rows = 64
     cols = 262144
@@ -2600,7 +2668,7 @@ def test_runtime_decode_plan_reuses_native_strides(
             assert current_plan is plan
 
 
-@pytest.mark.parametrize("cols", [8192, 131072, 524288])
+@pytest.mark.parametrize("cols", [8192, 131072, 262144, 524288])
 def test_dsa_decode_topk_maps_grouped_queries_to_physical_slots(
     cols: int,
 ) -> None:
