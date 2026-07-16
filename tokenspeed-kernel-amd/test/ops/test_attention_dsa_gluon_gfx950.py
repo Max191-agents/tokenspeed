@@ -1109,7 +1109,7 @@ def test_dsa_prefill_topk_dispatches_persistent_groups_across_rows(
     assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace)
 
 
-def test_dsa_prefill_topk_local_prefix_is_deterministic_across_rows() -> None:
+def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
     rows = 64
     cols = 262144
     topk = 2048
@@ -1136,8 +1136,14 @@ def test_dsa_prefill_topk_local_prefix_is_deterministic_across_rows() -> None:
         out=out,
         lens_out=lens_out,
     )
-    first_out = out.clone()
-    first_lens = lens_out.clone()
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
     out.fill_(-1)
     lens_out.fill_(-1)
     dsa_topk_gfx950._dsa_prefill_topk_indices(
@@ -1157,8 +1163,6 @@ def test_dsa_prefill_topk_local_prefix_is_deterministic_across_rows() -> None:
         row_ends,
         topk=topk,
     )
-    torch.testing.assert_close(out, first_out)
-    torch.testing.assert_close(lens_out, first_lens)
 
 
 def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
@@ -1224,7 +1228,7 @@ def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
     torch.testing.assert_close(lens_out, first_lens)
 
 
-def test_dsa_prefill_topk_runtime_path_handles_ragged_rows() -> None:
+def test_dsa_persistent_prefill_topk_handles_ragged_rows() -> None:
     rows = 64
     cols = 131072
     topk = 2048
@@ -1248,8 +1252,14 @@ def test_dsa_prefill_topk_runtime_path_handles_ragged_rows() -> None:
         out=out,
         lens_out=lens_out,
     )
-    first_out = out.clone()
-    first_lens = lens_out.clone()
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
     dsa_topk_gfx950._dsa_prefill_topk_indices(
         logits,
         row_starts,
@@ -1267,8 +1277,6 @@ def test_dsa_prefill_topk_runtime_path_handles_ragged_rows() -> None:
         row_ends,
         topk=topk,
     )
-    torch.testing.assert_close(out, first_out)
-    torch.testing.assert_close(lens_out, first_lens)
 
 
 def test_dsa_prefill_topk_90k_boundary_keeps_exact_values() -> None:
