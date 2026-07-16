@@ -1364,6 +1364,7 @@ def _dsa_runtime_radix_topk_kernel(
     topk: gl.constexpr,
     q_len_per_req: gl.constexpr,
     IS_DECODE: gl.constexpr,
+    DETERMINISTIC_EMIT: gl.constexpr,
     MAX_BUCKETS: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
@@ -1535,7 +1536,7 @@ def _dsa_runtime_radix_topk_kernel(
 
     count_greater = selected_count - remaining
     emit_full_end = candidate_len & -BLOCK_N
-    if IS_DECODE:
+    if IS_DECODE or not DETERMINISTIC_EMIT:
         for tile_start in range(0, emit_full_end, BLOCK_N):
             _emit_runtime_radix_topk_tile(
                 candidate_logits,
@@ -3123,6 +3124,7 @@ def _dsa_decode_topk_slots(
                 topk=topk,
                 q_len_per_req=q_len_per_req,
                 IS_DECODE=True,
+                DETERMINISTIC_EMIT=False,
                 MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
                 BLOCK_N=_ONEBLOCK_DECODE_RADIX_BLOCK_N,
                 num_warps=16,
@@ -3225,6 +3227,7 @@ def _dsa_prefill_topk_indices(
                 topk=topk,
                 q_len_per_req=1,
                 IS_DECODE=False,
+                DETERMINISTIC_EMIT=False,
                 MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
                 BLOCK_N=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
                 num_warps=16,
@@ -3274,6 +3277,7 @@ def _dsa_prefill_topk_indices(
             topk=topk,
             q_len_per_req=1,
             IS_DECODE=False,
+            DETERMINISTIC_EMIT=True,
             MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
             BLOCK_N=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
             num_warps=16,
