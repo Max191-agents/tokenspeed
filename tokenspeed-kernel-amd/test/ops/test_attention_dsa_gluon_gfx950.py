@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import inspect
 import math
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -1103,7 +1104,7 @@ def _assert_persistent_workspace_reset(workspace: tuple[torch.Tensor, ...]) -> N
     assert all(int(torch.count_nonzero(tensor).item()) == 0 for tensor in workspace)
 
 
-def test_dsa_persistent_workspace_uses_one_cyclic_pass_arrival_per_row() -> None:
+def test_dsa_persistent_workspace_uses_one_monotonic_pass_arrival_per_row() -> None:
     rows = 33
     workspace = dsa_topk_gfx950._persistent_topk_workspace(
         rows,
@@ -1112,6 +1113,14 @@ def test_dsa_persistent_workspace_uses_one_cyclic_pass_arrival_per_row() -> None
 
     _assert_persistent_workspace_layout(workspace, rows)
     _assert_persistent_workspace_reset(workspace)
+
+
+def test_dsa_persistent_pass_arrival_uses_monotonic_generations() -> None:
+    source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_kernel.fn)
+
+    assert "generation_last_arrival = (pass_index + 1) * GROUPS_PER_ROW - 1" in source
+    assert "gl.atomic_xchg(" not in source
+    assert source.count("pass_arrivals + row * COUNTER_STRIDE") == 2
 
 
 @pytest.mark.parametrize(
