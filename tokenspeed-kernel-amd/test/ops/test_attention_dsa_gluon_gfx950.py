@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import ast
+import heapq
 import importlib.metadata
 import math
-from collections import OrderedDict
+import random
+import struct
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
 
@@ -1080,6 +1085,289 @@ def _assert_decode_topk_slots(
         ).values
         torch.testing.assert_close(actual_values.cpu(), expected_values.cpu())
         assert bool((actual[row, count:] == -1).all())
+
+
+@dataclass(frozen=True)
+class _PersistentPrefillCpuTrace:
+    pass_count: int
+    compact_passes: tuple[int | None, ...]
+    local_selected_counts: tuple[tuple[int, ...], ...]
+    global_selected_counts: tuple[int, ...]
+
+
+def _fp32_topk_key_cpu(value: float) -> int:
+    bits = struct.unpack("<I", struct.pack("<f", value))[0]
+    return bits ^ (0 if bits & 0x80000000 else 0x7FFFFFFF)
+
+
+def _persistent_prefill_owned_offsets(
+    n_cols: int,
+    row_start: int,
+    row_end: int,
+    groups: int,
+    block_n: int,
+) -> list[list[int]]:
+    owned = [[] for _ in range(groups)]
+    full_tiles = n_cols // block_n
+    for tile in range(full_tiles):
+        tile_start = max(row_start, tile * block_n)
+        tile_end = min(row_end, (tile + 1) * block_n)
+        if tile_start < tile_end:
+            owned[tile % groups].extend(range(tile_start, tile_end))
+
+    tail_start = full_tiles * block_n
+    if tail_start < n_cols:
+        tail_start = max(row_start, tail_start)
+        tail_end = min(row_end, n_cols)
+        if tail_start < tail_end:
+            owned[full_tiles % groups].extend(range(tail_start, tail_end))
+    return owned
+
+
+def _persistent_prefill_grouped_cpu_select(
+    keys: Sequence[int],
+    row_start: int,
+    row_end: int,
+    *,
+    groups: int,
+    topk: int = 2048,
+    block_n: int = 16384,
+) -> _PersistentPrefillCpuTrace:
+    row_end = max(row_start, row_end)
+    selected_count = min(row_end - row_start, topk)
+    assert selected_count == topk
+    owned = _persistent_prefill_owned_offsets(
+        len(keys),
+        row_start,
+        row_end,
+        groups,
+        block_n,
+    )
+    assert sum(map(len, owned)) == row_end - row_start
+
+    threshold = 0
+    threshold_shift = 32
+    remaining = topk
+    compact: list[list[int] | None] = [None] * groups
+    compact_passes: list[int | None] = [None] * groups
+    direct = [[] for _ in range(groups)]
+    local_candidate_counts = [len(group_offsets) for group_offsets in owned]
+    local_selected_counts: list[tuple[int, ...]] = []
+    global_selected_counts: list[int] = []
+
+    for pass_index, (shift, num_buckets) in enumerate(
+        ((21, 2048), (10, 2048), (0, 1024))
+    ):
+        local_histograms = []
+        for group in range(groups):
+            source = owned[group] if compact[group] is None else compact[group]
+            assert source is not None
+            if pass_index == 0:
+                prefix = source
+            else:
+                prefix = [
+                    offset
+                    for offset in source
+                    if ((keys[offset] >> threshold_shift) << threshold_shift)
+                    == threshold
+                ]
+
+            compact_this_pass = (
+                compact[group] is None
+                and pass_index != 0
+                and local_candidate_counts[group] <= topk
+            )
+            if compact_this_pass:
+                assert len(prefix) == local_candidate_counts[group]
+                compact[group] = prefix
+                compact_passes[group] = pass_index
+                direct[group] = [
+                    offset
+                    for offset in owned[group]
+                    if ((keys[offset] >> threshold_shift) << threshold_shift)
+                    < threshold
+                ]
+
+            histogram = [0] * num_buckets
+            bucket_mask = num_buckets - 1
+            for offset in prefix:
+                histogram[(keys[offset] >> shift) & bucket_mask] += 1
+            local_histograms.append(histogram)
+
+        total_counts = [
+            sum(histogram[bucket] for histogram in local_histograms)
+            for bucket in range(num_buckets)
+        ]
+        selected_bucket = -1
+        selected_greater = 0
+        for bucket, count in enumerate(total_counts):
+            if selected_greater < remaining <= selected_greater + count:
+                selected_bucket = bucket
+                break
+            selected_greater += count
+        assert selected_bucket >= 0
+
+        local_candidate_counts = [
+            histogram[selected_bucket] for histogram in local_histograms
+        ]
+        selected_bucket_count = sum(local_candidate_counts)
+        local_selected_counts.append(tuple(local_candidate_counts))
+        global_selected_counts.append(selected_bucket_count)
+        threshold |= selected_bucket << shift
+        threshold_shift = shift
+        remaining -= selected_greater
+        if selected_bucket_count == remaining:
+            break
+
+    selected = [offset for group_direct in direct for offset in group_direct]
+    equal = []
+    for group in range(groups):
+        source = owned[group] if compact[group] is None else compact[group]
+        assert source is not None
+        for offset in source:
+            truncated_key = (keys[offset] >> threshold_shift) << threshold_shift
+            if truncated_key < threshold:
+                selected.append(offset)
+            elif truncated_key == threshold:
+                equal.append(offset)
+    assert len(selected) == topk - remaining
+    selected.extend(equal[:remaining])
+    assert len(selected) == topk
+    assert len(selected) == len(set(selected))
+
+    expected_keys = heapq.nsmallest(topk, keys[row_start:row_end])
+    actual_keys = [keys[offset] for offset in selected]
+    assert Counter(actual_keys) == Counter(expected_keys)
+    return _PersistentPrefillCpuTrace(
+        pass_count=len(global_selected_counts),
+        compact_passes=tuple(compact_passes),
+        local_selected_counts=tuple(local_selected_counts),
+        global_selected_counts=tuple(global_selected_counts),
+    )
+
+
+def _radix_cpu_key(first: int, second: int, third: int = 0) -> int:
+    return (first << 21) | (second << 10) | third
+
+
+def _mixed_group_compaction_cpu_keys() -> list[int]:
+    block_n = 16384
+    keys = [_radix_cpu_key(600, 0)] * (4 * block_n)
+    local_prefix_counts = (2500, 500, 500, 500)
+    local_second_greater = (600, 100, 50, 50)
+    local_second_equal = (100, 50, 50, 24)
+    for group in range(4):
+        cursor = group * block_n
+        for offset in range(cursor, cursor + 256):
+            keys[offset] = _radix_cpu_key(400, group, offset & 0x3FF)
+        cursor += 256
+        greater = local_second_greater[group]
+        equal = local_second_equal[group]
+        prefix = local_prefix_counts[group]
+        for offset in range(cursor, cursor + greater):
+            keys[offset] = _radix_cpu_key(500, 100, offset & 0x3FF)
+        cursor += greater
+        for offset in range(cursor, cursor + equal):
+            keys[offset] = _radix_cpu_key(500, 200, offset & 0x3FF)
+        cursor += equal
+        for offset in range(cursor, cursor + prefix - greater - equal):
+            keys[offset] = _radix_cpu_key(500, 300, offset & 0x3FF)
+
+    keys[0] = _fp32_topk_key_cpu(float("inf"))
+    keys[-3] = _fp32_topk_key_cpu(0.0)
+    keys[-2] = _fp32_topk_key_cpu(-0.0)
+    keys[-1] = _fp32_topk_key_cpu(-float("inf"))
+    return keys
+
+
+def _persistent_kernel_source() -> str:
+    source = Path(dsa_topk_gfx950.__file__).read_text()
+    tree = ast.parse(source)
+    kernel = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_dsa_persistent_radix_topk_kernel"
+    )
+    kernel_source = ast.get_source_segment(source, kernel)
+    assert kernel_source is not None
+    return kernel_source
+
+
+def test_dsa_persistent_prefill_compaction_gate_uses_local_bucket_count() -> None:
+    source = _persistent_kernel_source()
+    local_reduction = """local_candidate_count = gl.sum(
+                gl.where(bucket_offsets == selected_bucket, local_counts, 0),
+                axis=0,
+            ).to(gl.int32)"""
+
+    assert "(local_candidate_count <= TOPK)" in source
+    assert local_reduction in source
+    assert source.index(local_reduction) > source.index("selected_bucket = gl.sum(")
+    assert "(candidate_count <= TOPK)" not in source
+    assert "candidate_count = selected_bucket_count" not in source
+
+
+def test_dsa_persistent_prefill_per_group_compaction_cpu_contract() -> None:
+    base_rng = random.Random(8203)
+    base_keys = [_fp32_topk_key_cpu(base_rng.gauss(0.0, 1.0)) for _ in range(65536)]
+    base_keys[3] = _fp32_topk_key_cpu(float("inf"))
+    base_keys[-4] = _fp32_topk_key_cpu(0.0)
+    base_keys[-3] = _fp32_topk_key_cpu(-0.0)
+    base_keys[-2] = _fp32_topk_key_cpu(-float("inf"))
+    repeated_cases = (
+        (131072, 2, 17, 131043),
+        (147493, 2, 16391, 147430),
+        (262144, 4, 47, 262065),
+        (524288, 4, 32777, 524187),
+        (1048576, 4, 63, 1048445),
+    )
+    repeated_traces = []
+    for cols, groups, row_start, row_end in repeated_cases:
+        keys = (base_keys * math.ceil(cols / len(base_keys)))[:cols]
+        repeated_traces.append(
+            _persistent_prefill_grouped_cpu_select(
+                keys,
+                row_start,
+                row_end,
+                groups=groups,
+            )
+        )
+
+    mixed_keys = _mixed_group_compaction_cpu_keys()
+    mixed_trace = _persistent_prefill_grouped_cpu_select(
+        mixed_keys,
+        0,
+        len(mixed_keys),
+        groups=4,
+    )
+    assert mixed_trace.pass_count == 2
+    assert mixed_trace.compact_passes == (None, 1, 1, 1)
+    assert mixed_trace.local_selected_counts[0] == (2500, 500, 500, 500)
+    assert mixed_trace.global_selected_counts == (4000, 224)
+
+    tie_cols = 65536 + 123
+    tie_start = 17
+    tie_end = tie_cols - 31
+    tie_key = _fp32_topk_key_cpu(1.0)
+    tie_keys = [tie_key] * tie_cols
+    tie_keys[tie_start] = _fp32_topk_key_cpu(float("inf"))
+    tie_keys[tie_end - 1] = _fp32_topk_key_cpu(-float("inf"))
+    tie_trace = _persistent_prefill_grouped_cpu_select(
+        tie_keys,
+        tie_start,
+        tie_end,
+        groups=4,
+    )
+    assert tie_trace.pass_count == 3
+    assert tie_trace.compact_passes == (None, None, None, None)
+    assert all(count > 2048 for count in tie_trace.local_selected_counts[0])
+
+    assert any(trace.pass_count == 2 for trace in repeated_traces)
+    assert any(
+        any(pass_index is not None for pass_index in trace.compact_passes)
+        for trace in repeated_traces
+    )
 
 
 @pytest.mark.parametrize(

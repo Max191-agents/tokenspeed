@@ -1154,7 +1154,7 @@ def _dsa_persistent_radix_topk_kernel(
     done = gl.full([], False, gl.int1)
     pass_index = gl.full([], 0, gl.int32)
     if not IS_DECODE:
-        candidate_count = row_len
+        local_candidate_count = row_len
         compact_count = gl.full([], 0, gl.int32)
         compact_ready = gl.full([], False, gl.int1)
 
@@ -1214,10 +1214,9 @@ def _dsa_persistent_radix_topk_kernel(
                     value_layout,
                 )
         else:
-            # The prior global histogram gives an exact population bound, so no
-            # group can overflow once the selected prefix fits in this buffer.
+            # The prior local histogram gives an exact per-group population bound.
             compact_this_pass = (
-                ~compact_ready & (pass_index != 0) & (candidate_count <= TOPK)
+                ~compact_ready & (pass_index != 0) & (local_candidate_count <= TOPK)
             )
             if compact_ready:
                 compact_positions = gl.arange(0, TOPK, layout=output_layout)
@@ -1449,12 +1448,15 @@ def _dsa_persistent_radix_topk_kernel(
             gl.where(selected_group, group_selected_count, 0),
             axis=0,
         ).to(gl.int32)
+        if not IS_DECODE:
+            local_candidate_count = gl.sum(
+                gl.where(bucket_offsets == selected_bucket, local_counts, 0),
+                axis=0,
+            ).to(gl.int32)
         threshold |= selected_bucket.to(gl.uint32) << shift
         threshold_shift = shift
         remaining -= selected_greater
         done = selected_bucket_count == remaining
-        if not IS_DECODE:
-            candidate_count = selected_bucket_count
         pass_index += 1
 
     full_emit = True
