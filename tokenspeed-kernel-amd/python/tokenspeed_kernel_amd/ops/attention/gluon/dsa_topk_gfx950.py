@@ -41,6 +41,7 @@ _PREFILL_RADIX_SCHEDULE = ((21, 11), (10, 11), (0, 10))
 _PREFILL_RADIX_BLOCK_N = 4096
 _PREFILL_RADIX_HIST_TARGET_GROUPS_PER_CU = 2
 _PREFILL_RADIX_SCATTER_TARGET_GROUPS_PER_CU = 2
+_PREFILL_LOCAL_GROUP_PREFIX_MIN_COLS = 262144
 _ONEBLOCK_RADIX_SCHEDULE = (12, 12, 8)
 _ONEBLOCK_RADIX_BUCKETS = 1 << max(_ONEBLOCK_RADIX_SCHEDULE)
 _ONEBLOCK_DECODE_RADIX_BLOCK_N = 8192
@@ -50,6 +51,8 @@ _ONEBLOCK_COMPACT_FINAL_MIN_COLS = 65536
 _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS = 65536
 _ONEBLOCK_DECODE_RUNTIME_MAX_COLS = 256 * 1024
 _ONEBLOCK_RADIX_MAX_COLS = 90000
+_PREFILL_RUNTIME_RADIX_MIN_COLS = 98304
+_PREFILL_RUNTIME_RADIX_MAX_COLS = 196608
 _PREFILL_HIST_DERIVED_MIN_COLS = 524288
 
 __all__ = [
@@ -84,6 +87,38 @@ def _fp32_to_topk_key(x):
 @gluon.jit
 def _topk_add(a, b):
     return a + b
+
+
+@gluon.jit
+def _rank_four_items_per_thread(
+    values,
+    start,
+    thread_layout: gl.constexpr,
+    value_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    values_2x2 = values.reshape([BLOCK_N // 4, 2, 2])
+    even, odd = gl.split(values_2x2)
+    value0, value2 = gl.split(even)
+    value1, value3 = gl.split(odd)
+    value0 = gl.convert_layout(value0, thread_layout)
+    value1 = gl.convert_layout(value1, thread_layout)
+    value2 = gl.convert_layout(value2, thread_layout)
+    value3 = gl.convert_layout(value3, thread_layout)
+
+    thread_count = value0 + value1 + value2 + value3
+    thread_inclusive = gl.associative_scan(thread_count, 0, _topk_add)
+    position0 = start + thread_inclusive - thread_count
+    position1 = position0 + value0
+    position2 = position1 + value1
+    position3 = position2 + value2
+
+    even_positions = gl.join(position0, position2)
+    odd_positions = gl.join(position1, position3)
+    positions = gl.join(even_positions, odd_positions).reshape([BLOCK_N])
+    return gl.convert_layout(positions, value_layout), gl.sum(thread_count, axis=0).to(
+        gl.int32
+    )
 
 
 @gluon.jit
@@ -623,6 +658,70 @@ def _emit_runtime_radix_topk_tile(
         logical_offsets,
         mask=equal_mask & (equal_rank < remaining),
     )
+
+
+@gluon.jit
+def _emit_runtime_radix_topk_tile_deterministic(
+    candidate_logits,
+    candidate_start,
+    tile_start,
+    candidate_len,
+    vector_end,
+    prefix,
+    prefix_shift,
+    count_greater,
+    remaining,
+    selected_count,
+    greater_cursor,
+    equal_cursor,
+    out,
+    row,
+    out_stride: gl.constexpr,
+    thread_layout: gl.constexpr,
+    value_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    IS_TAIL: gl.constexpr,
+):
+    offsets, values, valid = _load_oneblock_tile(
+        candidate_logits,
+        tile_start,
+        candidate_len,
+        vector_end,
+        value_layout,
+        BLOCK_N,
+        IS_TAIL,
+    )
+    keys = _fp32_to_topk_key(values)
+    positioned_keys = (keys >> prefix_shift) << prefix_shift
+    greater_mask = valid & (positioned_keys < prefix)
+    equal_mask = valid & (positioned_keys == prefix)
+    greater_position, tile_greater = _rank_four_items_per_thread(
+        greater_mask.to(gl.int32),
+        greater_cursor,
+        thread_layout,
+        value_layout,
+        BLOCK_N,
+    )
+    equal_rank, tile_equal = _rank_four_items_per_thread(
+        equal_mask.to(gl.int32),
+        equal_cursor,
+        thread_layout,
+        value_layout,
+        BLOCK_N,
+    )
+    equal_position = count_greater + equal_rank
+    logical_offsets = candidate_start + offsets.to(gl.int32)
+    gl.store(
+        out + row * out_stride + greater_position,
+        logical_offsets,
+        mask=greater_mask & (greater_position < selected_count),
+    )
+    gl.store(
+        out + row * out_stride + equal_position,
+        logical_offsets,
+        mask=equal_mask & (equal_rank < remaining),
+    )
+    return tile_greater, tile_equal
 
 
 @gluon.jit
@@ -1274,6 +1373,11 @@ def _dsa_runtime_radix_topk_kernel(
         gl.num_warps(),
         triton.cdiv(BLOCK_N, 64 * gl.num_warps()),
     )
+    thread_layout: gl.constexpr = _vector_layout(
+        BLOCK_N // 4,
+        gl.num_warps(),
+        1,
+    )
     histogram_layout: gl.constexpr = _vector_layout(
         MAX_BUCKETS,
         gl.num_warps(),
@@ -1431,46 +1535,96 @@ def _dsa_runtime_radix_topk_kernel(
 
     count_greater = selected_count - remaining
     emit_full_end = candidate_len & -BLOCK_N
-    for tile_start in range(0, emit_full_end, BLOCK_N):
-        _emit_runtime_radix_topk_tile(
-            candidate_logits,
-            candidate_start,
-            tile_start,
-            candidate_len,
-            vector_end,
-            prefix,
-            prefix_shift,
-            count_greater,
-            remaining,
-            selected_count,
-            shared_output_counters,
-            out,
-            row,
-            out_stride,
-            value_layout,
-            BLOCK_N,
-            False,
-        )
-    if emit_full_end < candidate_len:
-        _emit_runtime_radix_topk_tile(
-            candidate_logits,
-            candidate_start,
-            emit_full_end,
-            candidate_len,
-            vector_end,
-            prefix,
-            prefix_shift,
-            count_greater,
-            remaining,
-            selected_count,
-            shared_output_counters,
-            out,
-            row,
-            out_stride,
-            value_layout,
-            BLOCK_N,
-            True,
-        )
+    if IS_DECODE:
+        for tile_start in range(0, emit_full_end, BLOCK_N):
+            _emit_runtime_radix_topk_tile(
+                candidate_logits,
+                candidate_start,
+                tile_start,
+                candidate_len,
+                vector_end,
+                prefix,
+                prefix_shift,
+                count_greater,
+                remaining,
+                selected_count,
+                shared_output_counters,
+                out,
+                row,
+                out_stride,
+                value_layout,
+                BLOCK_N,
+                False,
+            )
+        if emit_full_end < candidate_len:
+            _emit_runtime_radix_topk_tile(
+                candidate_logits,
+                candidate_start,
+                emit_full_end,
+                candidate_len,
+                vector_end,
+                prefix,
+                prefix_shift,
+                count_greater,
+                remaining,
+                selected_count,
+                shared_output_counters,
+                out,
+                row,
+                out_stride,
+                value_layout,
+                BLOCK_N,
+                True,
+            )
+    else:
+        greater_cursor = 0
+        equal_cursor = 0
+        for tile_start in range(0, emit_full_end, BLOCK_N):
+            tile_greater, tile_equal = _emit_runtime_radix_topk_tile_deterministic(
+                candidate_logits,
+                candidate_start,
+                tile_start,
+                candidate_len,
+                vector_end,
+                prefix,
+                prefix_shift,
+                count_greater,
+                remaining,
+                selected_count,
+                greater_cursor,
+                equal_cursor,
+                out,
+                row,
+                out_stride,
+                thread_layout,
+                value_layout,
+                BLOCK_N,
+                False,
+            )
+            greater_cursor += tile_greater
+            equal_cursor += tile_equal
+        if emit_full_end < candidate_len:
+            _emit_runtime_radix_topk_tile_deterministic(
+                candidate_logits,
+                candidate_start,
+                emit_full_end,
+                candidate_len,
+                vector_end,
+                prefix,
+                prefix_shift,
+                count_greater,
+                remaining,
+                selected_count,
+                greater_cursor,
+                equal_cursor,
+                out,
+                row,
+                out_stride,
+                thread_layout,
+                value_layout,
+                BLOCK_N,
+                True,
+            )
 
     if IS_DECODE:
         gl.barrier()
@@ -2172,12 +2326,18 @@ def _dsa_prefill_radix_deterministic_scatter_kernel(
     groups_per_row: gl.constexpr,
     row_groups_stride: gl.constexpr,
     group_stride: gl.constexpr,
+    LOCAL_GROUP_PREFIX: gl.constexpr,
     BLOCK_N: gl.constexpr,
     LOAD_ELEMS: gl.constexpr,
+    BLOCK_GROUPS: gl.constexpr,
+    GROUP_LOAD_ELEMS: gl.constexpr,
 ):
     row = gl.program_id(0)
     group = gl.program_id(1)
     layout: gl.constexpr = _vector_layout(BLOCK_N, gl.num_warps(), LOAD_ELEMS)
+    group_layout: gl.constexpr = _vector_layout(
+        BLOCK_GROUPS, gl.num_warps(), GROUP_LOAD_ELEMS
+    )
     row_start = gl.load(row_starts + row).to(gl.int32)
     row_end = gl.load(row_ends + row).to(gl.int32)
     candidate_logits = logits + row * logits_stride + row_start
@@ -2188,9 +2348,26 @@ def _dsa_prefill_radix_deterministic_scatter_kernel(
     threshold = gl.load(prefixes + row).to(gl.uint32)
     keep_equal = gl.load(remaining + row).to(gl.int32)
     count_greater = topk - keep_equal
-    group_base = (row * row_groups_stride + group) * group_stride
-    greater_base = gl.load(group_offsets + group_base).to(gl.int32)
-    equal_base = gl.load(group_offsets + group_base + 1).to(gl.int32)
+    if LOCAL_GROUP_PREFIX:
+        group_ids = gl.arange(0, BLOCK_GROUPS, layout=group_layout)
+        prior_group = group_ids < group
+        row_group_base = row * row_groups_stride * group_stride
+        greater_counts = gl.load(
+            group_offsets + row_group_base + group_ids * group_stride,
+            mask=(group_ids < groups_per_row) & prior_group,
+            other=0,
+        )
+        equal_counts = gl.load(
+            group_offsets + row_group_base + group_ids * group_stride + 1,
+            mask=(group_ids < groups_per_row) & prior_group,
+            other=0,
+        )
+        greater_base = gl.sum(greater_counts, axis=0).to(gl.int32)
+        equal_base = gl.sum(equal_counts, axis=0).to(gl.int32)
+    else:
+        group_base = (row * row_groups_stride + group) * group_stride
+        greater_base = gl.load(group_offsets + group_base).to(gl.int32)
+        equal_base = gl.load(group_offsets + group_base + 1).to(gl.int32)
     greater_cursor = 0
     equal_cursor = 0
 
@@ -2520,6 +2697,9 @@ def _dsa_prefill_radix_topk(
     # The histogram and scatter grids share one scratch buffer with a common row stride.
     workspace_groups = max(groups, hist_groups)
     block_groups = triton.next_power_of_2(groups)
+    use_local_group_prefix = (
+        cols >= _PREFILL_LOCAL_GROUP_PREFIX_MIN_COLS and groups <= 8
+    )
     hist_group_stride = _PREFILL_RADIX_BUCKETS
     hist = torch.empty(
         (rows, workspace_groups, hist_group_stride),
@@ -2579,15 +2759,16 @@ def _dsa_prefill_radix_topk(
             LOAD_ELEMS=_load_elems(_RADIX_TOPK_BLOCK_N, 8),
             num_warps=8,
         )
-        _dsa_radix_group_prefix_kernel[(rows,)](
-            hist,
-            groups_per_row=groups,
-            row_groups_stride=workspace_groups,
-            group_stride=hist_group_stride,
-            BLOCK_GROUPS=block_groups,
-            LOAD_ELEMS=_load_elems(block_groups, 1),
-            num_warps=1,
-        )
+        if not use_local_group_prefix:
+            _dsa_radix_group_prefix_kernel[(rows,)](
+                hist,
+                groups_per_row=groups,
+                row_groups_stride=workspace_groups,
+                group_stride=hist_group_stride,
+                BLOCK_GROUPS=block_groups,
+                LOAD_ELEMS=_load_elems(block_groups, 1),
+                num_warps=1,
+            )
         _dsa_prefill_radix_deterministic_scatter_kernel[(rows, groups)](
             logits,
             prefixes,
@@ -2604,8 +2785,11 @@ def _dsa_prefill_radix_topk(
             groups_per_row=groups,
             row_groups_stride=workspace_groups,
             group_stride=hist_group_stride,
+            LOCAL_GROUP_PREFIX=use_local_group_prefix,
             BLOCK_N=_RADIX_TOPK_BLOCK_N,
             LOAD_ELEMS=_load_elems(_RADIX_TOPK_BLOCK_N, 8),
+            BLOCK_GROUPS=block_groups,
+            GROUP_LOAD_ELEMS=_load_elems(block_groups, 8),
             num_warps=8,
         )
     else:
@@ -2649,6 +2833,9 @@ def _dsa_prefill_hist_derived_radix_topk(
         target_groups_per_cu=_PREFILL_RADIX_SCATTER_TARGET_GROUPS_PER_CU,
     )
     block_groups = triton.next_power_of_2(groups)
+    use_local_group_prefix = (
+        cols >= _PREFILL_LOCAL_GROUP_PREFIX_MIN_COLS and groups <= 8
+    )
     hist_group_stride = _PREFILL_RADIX_BUCKETS
     hist = torch.empty(
         (rows, groups, hist_group_stride),
@@ -2742,15 +2929,16 @@ def _dsa_prefill_hist_derived_radix_topk(
         LOAD_ELEMS=_load_elems(block_n, 8),
         num_warps=8,
     )
-    _dsa_radix_group_prefix_kernel[(rows,)](
-        group_offsets,
-        groups_per_row=groups,
-        row_groups_stride=groups,
-        group_stride=2,
-        BLOCK_GROUPS=block_groups,
-        LOAD_ELEMS=_load_elems(block_groups, 1),
-        num_warps=1,
-    )
+    if not use_local_group_prefix:
+        _dsa_radix_group_prefix_kernel[(rows,)](
+            group_offsets,
+            groups_per_row=groups,
+            row_groups_stride=groups,
+            group_stride=2,
+            BLOCK_GROUPS=block_groups,
+            LOAD_ELEMS=_load_elems(block_groups, 1),
+            num_warps=1,
+        )
     _dsa_prefill_radix_deterministic_scatter_kernel[(rows, groups)](
         logits,
         prefixes,
@@ -2767,8 +2955,11 @@ def _dsa_prefill_hist_derived_radix_topk(
         groups_per_row=groups,
         row_groups_stride=groups,
         group_stride=2,
+        LOCAL_GROUP_PREFIX=use_local_group_prefix,
         BLOCK_N=block_n,
         LOAD_ELEMS=_load_elems(block_n, 8),
+        BLOCK_GROUPS=block_groups,
+        GROUP_LOAD_ELEMS=_load_elems(block_groups, 8),
         num_warps=8,
     )
     return out, lens_out
@@ -3065,6 +3256,28 @@ def _dsa_prefill_topk_indices(
                 USE_RADIX_EARLY_STOP=False,
                 num_warps=16,
             )
+        return out, lens_out
+
+    if _PREFILL_RUNTIME_RADIX_MIN_COLS <= cols <= _PREFILL_RUNTIME_RADIX_MAX_COLS:
+        _dsa_runtime_radix_topk_kernel[(rows,)](
+            logits,
+            row_starts,
+            row_starts,
+            row_ends,
+            out,
+            lens_out,
+            logits.stride(0),
+            0,
+            out.stride(0),
+            0,
+            page_size=1,
+            topk=topk,
+            q_len_per_req=1,
+            IS_DECODE=False,
+            MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
+            BLOCK_N=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
+            num_warps=16,
+        )
         return out, lens_out
 
     if cols >= _PREFILL_HIST_DERIVED_MIN_COLS:
