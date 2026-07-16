@@ -1,7 +1,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from tokenspeed_kernel import platform
 
 

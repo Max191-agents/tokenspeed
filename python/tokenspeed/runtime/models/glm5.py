@@ -101,6 +101,41 @@ class GlmDsaDecodeWindow:
     q_len_per_req: int
 
 
+def _glm_dsa_real_token_count(ctx: ForwardContext) -> int | None:
+    """Return the live row count hidden by a padded prefill-graph replay."""
+    if current_forward_ctx() is None:
+        return None
+
+    num_extends = max(int(ctx.num_extends), 0)
+    num_prefill_tokens = 0
+    if num_extends > 0:
+        chunk_meta = getattr(ctx.attn_backend, "chunked_prefill_metadata", None)
+        extend_lens_cpu = getattr(chunk_meta, "extend_seq_lens_cpu", None)
+        if extend_lens_cpu is None:
+            raise RuntimeError(
+                "GLM DSA prefill graph requires CPU extend-length metadata"
+            )
+        if isinstance(extend_lens_cpu, torch.Tensor):
+            active_extend_lens = extend_lens_cpu[:num_extends].tolist()
+        else:
+            active_extend_lens = list(extend_lens_cpu[:num_extends])
+        if len(active_extend_lens) != num_extends:
+            raise RuntimeError(
+                "GLM DSA prefill graph has incomplete extend-length metadata: "
+                f"expected={num_extends}, actual={len(active_extend_lens)}"
+            )
+        active_extend_lens = [int(length) for length in active_extend_lens]
+        if any(length < 0 for length in active_extend_lens):
+            raise RuntimeError(
+                "GLM DSA prefill graph requires nonnegative extend lengths"
+            )
+        num_prefill_tokens = sum(active_extend_lens)
+
+    spec_width = int(getattr(ctx.attn_backend, "spec_num_tokens", 1) or 1)
+    num_decode_reqs = max(int(ctx.bs) - num_extends, 0)
+    return num_prefill_tokens + num_decode_reqs * spec_width
+
+
 def _glm_dsa_skip_indexer_topk(config, layer_id: int | None) -> bool:
     if layer_id is None:
         return False
@@ -773,11 +808,15 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         # the pre-attn comm: at replay ``_padded_to`` pins ``global_num_tokens``
         # to the padded bucket, so the comm must see padded-length rows; only
         # the DSA stack below needs exactly the real rows.
-        _metadata = getattr(ctx.attn_backend, "forward_metadata", None)
-        _token_to_req = getattr(_metadata, "token_to_req_indices", None)
-        if current_forward_ctx() is not None and _token_to_req is not None:
+        _real_token_count = _glm_dsa_real_token_count(ctx)
+        if _real_token_count is not None:
+            if _real_token_count > qkv.shape[0]:
+                raise RuntimeError(
+                    "GLM DSA prefill graph token count exceeds padded input: "
+                    f"metadata={_real_token_count}, rows={qkv.shape[0]}"
+                )
             positions, qkv, out_cache_loc = slice_to_real_tokens(
-                _token_to_req.numel(), positions, qkv, out_cache_loc
+                _real_token_count, positions, qkv, out_cache_loc
             )
         q_a, latent_cache = qkv.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -809,6 +848,10 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         )
         if should_compute_indexer:
             hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
+            if _real_token_count is not None:
+                (hidden_states,) = slice_to_real_tokens(
+                    _real_token_count, hidden_states
+                )
             indexer_output = self.indexer(hidden_states, q_norm, positions)
             ctx.token_to_kv_pool.set_index_k_buffer(
                 self.attn_mqa.layer_id,
