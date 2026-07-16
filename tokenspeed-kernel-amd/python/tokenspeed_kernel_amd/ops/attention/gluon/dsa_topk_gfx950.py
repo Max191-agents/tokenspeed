@@ -101,6 +101,7 @@ _COMPILED_RUNNER_KNOB_ENV_VARS = (
 _TRIVIAL_DECODE_POINTER_DTYPES = (torch.int32,) * 4
 _RUNTIME_RADIX_POINTER_DTYPES = (torch.float32,) + (torch.int32,) * 5
 _MANUAL_RADIX_POINTER_DTYPES = (torch.float32,) + (torch.int32,) * 6
+_PERSISTENT_RADIX_POINTER_DTYPES = (torch.float32,) + (torch.int32,) * 10
 
 
 class _CompiledRunnerPlan:
@@ -163,6 +164,20 @@ class _CompiledRunnerPlan:
                 and self.pointer_refs[5]() is args[5]
                 and self.pointer_refs[6]() is args[6]
             )
+        if count == 11:
+            return (
+                self.pointer_refs[0]() is args[0]
+                and self.pointer_refs[1]() is args[1]
+                and self.pointer_refs[2]() is args[2]
+                and self.pointer_refs[3]() is args[3]
+                and self.pointer_refs[4]() is args[4]
+                and self.pointer_refs[5]() is args[5]
+                and self.pointer_refs[6]() is args[6]
+                and self.pointer_refs[7]() is args[7]
+                and self.pointer_refs[8]() is args[8]
+                and self.pointer_refs[9]() is args[9]
+                and self.pointer_refs[10]() is args[10]
+            )
         return all(
             pointer_ref() is pointer
             for pointer_ref, pointer in zip(self.pointer_refs, args, strict=True)
@@ -196,6 +211,9 @@ _runtime_prefill_runner_plans: OrderedDict[tuple[object, ...], _CompiledRunnerPl
     OrderedDict()
 )
 _manual_prefill_runner_plans: OrderedDict[tuple[object, ...], _CompiledRunnerPlan] = (
+    OrderedDict()
+)
+_persistent_runner_plans: OrderedDict[tuple[object, ...], _CompiledRunnerPlan] = (
     OrderedDict()
 )
 
@@ -571,6 +589,7 @@ def _rank_four_items_per_thread(
         gl.int32
     )
 
+
 @gluon.jit
 def _persistent_wait_until_at_least(address, target, thread_offset):
     return gl.inline_asm_elementwise(
@@ -707,6 +726,7 @@ def _persistent_emit_tail(
     do_not_specialize=(
         "logits_stride",
         "block_table_stride",
+        "out_stride",
         "block_table_cols",
         "n_cols",
     ),
@@ -725,7 +745,7 @@ def _dsa_persistent_radix_topk_kernel(
     lens_out,
     logits_stride,
     block_table_stride,
-    out_stride: gl.constexpr,
+    out_stride,
     block_table_cols,
     n_cols,
     page_size: gl.constexpr,
@@ -734,6 +754,9 @@ def _dsa_persistent_radix_topk_kernel(
     GROUPS_PER_ROW: gl.constexpr,
     TOPK: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    NUM_BUCKETS: gl.constexpr,
+    NUM_PASSES: gl.constexpr,
+    COUNTER_STRIDE: gl.constexpr,
 ):
     row = gl.program_id(0)
     group = gl.program_id(1)
@@ -782,12 +805,12 @@ def _dsa_persistent_radix_topk_kernel(
         return
 
     hist_layout: gl.constexpr = _vector_layout(
-        _PERSISTENT_PREFILL_NUM_BUCKETS,
+        NUM_BUCKETS,
         gl.num_warps(),
-        _PERSISTENT_PREFILL_NUM_BUCKETS // (64 * gl.num_warps()),
+        NUM_BUCKETS // (64 * gl.num_warps()),
     )
     group_layout: gl.constexpr = _vector_layout(
-        _PERSISTENT_PREFILL_NUM_BUCKETS // 2,
+        NUM_BUCKETS // 2,
         gl.num_warps(),
         1,
     )
@@ -799,18 +822,18 @@ def _dsa_persistent_radix_topk_kernel(
     )
     wait_offsets = gl.arange(0, wait_threads, layout=wait_layout)
     hist_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[_PERSISTENT_PREFILL_NUM_BUCKETS, 1]],
-        [_PERSISTENT_PREFILL_NUM_BUCKETS],
+        [[NUM_BUCKETS, 1]],
+        [NUM_BUCKETS],
         [0],
     )
     histogram_zeros = gl.zeros(
-        [_PERSISTENT_PREFILL_NUM_BUCKETS],
+        [NUM_BUCKETS],
         gl.int32,
         layout=hist_layout,
     )
     shared_histogram = gl.allocate_shared_memory(
         gl.int32,
-        [_PERSISTENT_PREFILL_NUM_BUCKETS],
+        [NUM_BUCKETS],
         hist_shared_layout,
         value=histogram_zeros,
     )
@@ -851,7 +874,7 @@ def _dsa_persistent_radix_topk_kernel(
 
     bucket_offsets = gl.arange(
         0,
-        _PERSISTENT_PREFILL_NUM_BUCKETS,
+        NUM_BUCKETS,
         layout=hist_layout,
     )
     row_logits = logits + row * logits_stride
@@ -864,7 +887,7 @@ def _dsa_persistent_radix_topk_kernel(
     done = gl.full([], False, gl.int1)
     pass_index = gl.full([], 0, gl.int32)
 
-    while (pass_index < _PERSISTENT_PREFILL_NUM_PASSES) & ~done:
+    while (pass_index < NUM_PASSES) & ~done:
         if pass_index != 0:
             gl.barrier()
             shared_histogram.store(histogram_zeros)
@@ -922,11 +945,7 @@ def _dsa_persistent_radix_topk_kernel(
 
         gl.barrier()
         local_counts = shared_histogram.load(hist_layout)
-        row_histogram = (
-            histograms
-            + (row * _PERSISTENT_PREFILL_NUM_PASSES + pass_index)
-            * _PERSISTENT_PREFILL_NUM_BUCKETS
-        )
+        row_histogram = histograms + (row * NUM_PASSES + pass_index) * NUM_BUCKETS
         gl.atomic_add(
             row_histogram + bucket_offsets,
             local_counts,
@@ -937,23 +956,21 @@ def _dsa_persistent_radix_topk_kernel(
         gl.barrier()
 
         old = gl.atomic_add(
-            arrivals
-            + (row * _PERSISTENT_PREFILL_NUM_PASSES + pass_index)
-            * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+            arrivals + (row * NUM_PASSES + pass_index) * COUNTER_STRIDE,
             1,
             sem="acq_rel",
             scope="gpu",
         )
         if old == GROUPS_PER_ROW - 1:
             gl.atomic_add(
-                pass_done + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+                pass_done + row * COUNTER_STRIDE,
                 1,
                 sem="release",
                 scope="gpu",
             )
         else:
             _persistent_wait_until_at_least(
-                pass_done + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+                pass_done + row * COUNTER_STRIDE,
                 pass_index + 1,
                 wait_offsets,
             )
@@ -963,7 +980,7 @@ def _dsa_persistent_radix_topk_kernel(
             row_histogram + bucket_offsets,
             volatile=True,
         )
-        count_pairs = total_counts.reshape([_PERSISTENT_PREFILL_NUM_BUCKETS // 2, 2])
+        count_pairs = total_counts.reshape([NUM_BUCKETS // 2, 2])
         count_low, count_high = gl.split(count_pairs)
         count_low = gl.convert_layout(count_low, group_layout)
         count_high = gl.convert_layout(count_high, group_layout)
@@ -971,7 +988,7 @@ def _dsa_persistent_radix_topk_kernel(
         cumulative = gl.associative_scan(group_counts, 0, _topk_add)
         before_group = cumulative - group_counts
         selected_group = (before_group < remaining) & (cumulative >= remaining)
-        bucket_pairs = bucket_offsets.reshape([_PERSISTENT_PREFILL_NUM_BUCKETS // 2, 2])
+        bucket_pairs = bucket_offsets.reshape([NUM_BUCKETS // 2, 2])
         bucket_low, bucket_high = gl.split(bucket_pairs)
         bucket_low = gl.convert_layout(bucket_low, group_layout)
         bucket_high = gl.convert_layout(bucket_high, group_layout)
@@ -1066,13 +1083,13 @@ def _dsa_persistent_radix_topk_kernel(
         axis=0,
     ).to(gl.int32)
     greater_start = gl.atomic_add(
-        output_counters + (row * 2) * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+        output_counters + (row * 2) * COUNTER_STRIDE,
         local_greater,
         sem="acq_rel",
         scope="gpu",
     )
     equal_start = gl.atomic_add(
-        output_counters + (row * 2 + 1) * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+        output_counters + (row * 2 + 1) * COUNTER_STRIDE,
         local_equal,
         sem="acq_rel",
         scope="gpu",
@@ -1116,42 +1133,40 @@ def _dsa_persistent_radix_topk_kernel(
 
     gl.barrier()
     reset_old = gl.atomic_add(
-        reset_arrivals + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+        reset_arrivals + row * COUNTER_STRIDE,
         1,
         sem="acq_rel",
         scope="gpu",
     )
     if reset_old == GROUPS_PER_ROW - 1:
-        for reset_pass in gl.static_range(_PERSISTENT_PREFILL_NUM_PASSES):
+        for reset_pass in gl.static_range(NUM_PASSES):
             gl.store(
                 histograms
-                + (row * _PERSISTENT_PREFILL_NUM_PASSES + reset_pass)
-                * _PERSISTENT_PREFILL_NUM_BUCKETS
+                + (row * NUM_PASSES + reset_pass) * NUM_BUCKETS
                 + bucket_offsets,
                 histogram_zeros,
             )
             gl.store(
-                arrivals
-                + (row * _PERSISTENT_PREFILL_NUM_PASSES + reset_pass)
-                * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+                arrivals + (row * NUM_PASSES + reset_pass) * COUNTER_STRIDE,
                 0,
             )
         gl.store(
-            pass_done + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+            pass_done + row * COUNTER_STRIDE,
             0,
         )
         gl.store(
-            output_counters + (row * 2) * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+            output_counters + (row * 2) * COUNTER_STRIDE,
             0,
         )
         gl.store(
-            output_counters + (row * 2 + 1) * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+            output_counters + (row * 2 + 1) * COUNTER_STRIDE,
             0,
         )
         gl.store(
-            reset_arrivals + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
+            reset_arrivals + row * COUNTER_STRIDE,
             0,
         )
+
 
 @gluon.jit
 def _find_topk_threshold_key(
@@ -3678,7 +3693,7 @@ def _dsa_persistent_radix_topk(
     histograms, arrivals, pass_done, reset_arrivals, output_counters = workspace
     block_table_stride = block_table.stride(0) if is_decode else 0
     block_table_cols = block_table.shape[1] if is_decode else 0
-    _dsa_persistent_radix_topk_kernel[(rows, groups)](
+    kernel_args = (
         logits,
         histograms,
         arrivals,
@@ -3693,16 +3708,40 @@ def _dsa_persistent_radix_topk(
         logits.stride(0),
         block_table_stride,
         out.stride(0),
-        block_table_cols=block_table_cols,
-        n_cols=cols,
-        page_size=page_size,
-        q_len_per_req=q_len_per_req,
-        IS_DECODE=is_decode,
-        GROUPS_PER_ROW=groups,
-        TOPK=topk,
-        BLOCK_N=_PERSISTENT_PREFILL_BLOCK_N,
-        num_warps=_PERSISTENT_PREFILL_NUM_WARPS,
+        block_table_cols,
+        cols,
+        page_size,
+        q_len_per_req,
+        is_decode,
+        groups,
+        topk,
+        _PERSISTENT_PREFILL_BLOCK_N,
+        _PERSISTENT_PREFILL_NUM_BUCKETS,
+        _PERSISTENT_PREFILL_NUM_PASSES,
+        _PERSISTENT_PREFILL_COUNTER_STRIDE,
     )
+    specialization_key = kernel_args[16:]
+    grid = (rows, groups, 1)
+    dispatch_key = (grid, specialization_key)
+    compiled_plan = _persistent_runner_plans.get(dispatch_key)
+    if (
+        compiled_plan is not None
+        and triton.runtime.driver.active is compiled_plan.driver
+        and compiled_plan.pointers_match(kernel_args[:11])
+    ):
+        compiled_plan.runner(*kernel_args)
+    else:
+        _launch_warmed_compiled_kernel(
+            _dsa_persistent_radix_topk_kernel,
+            grid,
+            kernel_args,
+            _PERSISTENT_RADIX_POINTER_DTYPES,
+            specialization_key,
+            dispatch_cache=_persistent_runner_plans,
+            dispatch_key=dispatch_key,
+            native_scalar_count=5,
+            num_warps=_PERSISTENT_PREFILL_NUM_WARPS,
+        )
     return out, lens_out
 
 
