@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import importlib
+import importlib.metadata
 import json
 import math
+import os
 import socket
 import statistics
 import sys
@@ -37,9 +40,9 @@ COMPARISON_SCHEMA = "tokenspeed.dsa-scoring-matched-core-comparison.v1"
 COMPARISON_KIND = "matched_layout_computational_core"
 
 TOKENSPEED_MODULE = (
-    "tokenspeed_kernel_amd.ops.attention.gluon.dsa_score_fp8_mfma_gfx950"
+    "tokenspeed_kernel_amd.ops.attention.gluon.dsa_score_fp8_async_gfx950"
 )
-TOKENSPEED_HOOK = "launch_dsa_matched_core_fp8_gfx950"
+TOKENSPEED_HOOK = "launch_dsa_matched_core_fp8_async_gfx950"
 AITER_WRAPPER_MODULE = "aiter.ops.triton.attention.fp8_mqa_logits"
 AITER_KERNEL_MODULE = "aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits"
 
@@ -47,6 +50,10 @@ BACKEND_NAMES = {
     "tokenspeed": "tokenspeed_matched_contiguous_fp8_core",
     "aiter": "aiter_matched_contiguous_fp8_core",
 }
+
+REFERENCE_SEQ_LEN = min(shared.SEQ_LENS)
+REFERENCE_ATOL = 5.0e-4
+REFERENCE_RTOL = 5.0e-3
 
 
 def _module_file(module_name: str) -> dict[str, str]:
@@ -66,6 +73,54 @@ def _backend_files(backend: str) -> list[dict[str, str]]:
         else (AITER_WRAPPER_MODULE, AITER_KERNEL_MODULE)
     )
     return [_module_file(module_name) for module_name in modules]
+
+
+def _runtime_module_metadata(module: Any) -> dict[str, Any]:
+    path_value = getattr(module, "__file__", None)
+    path = Path(path_value).resolve() if path_value else None
+    package = str(getattr(module, "__package__", None) or module.__name__)
+    package_root = package.split(".", 1)[0]
+    try:
+        distribution_version = importlib.metadata.version(package_root)
+    except importlib.metadata.PackageNotFoundError:
+        distribution_version = None
+    return {
+        "module": module.__name__,
+        "module_version": getattr(module, "__version__", None),
+        "distribution": package_root,
+        "distribution_version": distribution_version,
+        "path": str(path) if path is not None else None,
+        "sha256": shared._sha256_file(path) if path is not None else None,
+    }
+
+
+def _compiler_runtime_metadata(backend: str) -> dict[str, Any]:
+    import torch
+
+    if backend == "tokenspeed":
+        selector = importlib.import_module("tokenspeed_kernel_amd._triton")
+        compiler_module = selector.triton
+        selector_metadata = _runtime_module_metadata(selector)
+    else:
+        compiler_module = importlib.import_module("triton")
+        selector_metadata = None
+
+    metadata = {
+        "python": {
+            "version": sys.version,
+            "executable": str(Path(sys.executable).resolve()),
+        },
+        "torch": {
+            "version": torch.__version__,
+            "git_version": getattr(torch.version, "git_version", None),
+            "hip": getattr(torch.version, "hip", None),
+            "debug_build": bool(getattr(torch.version, "debug", False)),
+        },
+        "kernel_compiler": _runtime_module_metadata(compiler_module),
+        "tokenspeed_triton_selector": selector_metadata,
+        "tokenspeed_triton_package_env": os.environ.get("TOKENSPEED_TRITON_PACKAGE"),
+    }
+    return {**metadata, "fingerprint": shared._canonical_hash(metadata)}
 
 
 def _load_mode_inputs(
@@ -185,6 +240,11 @@ def _tokenspeed_runner(
         "output_layout": "contiguous_float32_rows_by_seq_len",
         "logical_seq_len": seq_len,
         "softmax_scale": 1.0,
+        "bounds_control": {
+            "included_in_timing": True,
+            "mechanism": "common seq_len argument and implementation predicates",
+            "valid_range_per_row": [0, seq_len],
+        },
     }
     return launch, logits, metadata, Path(module.__file__).resolve()
 
@@ -265,18 +325,31 @@ def _aiter_runner(
         "output_layout": "contiguous_float32_rows_by_seq_len",
         "logical_seq_len": seq_len,
         "softmax_scale": 1.0,
+        "bounds_control": {
+            "included_in_timing": True,
+            "mechanism": (
+                "AITER loads per-row cu_start=0 and cu_end=seq_len and executes "
+                "its rectangular bounds predicates"
+            ),
+            "valid_range_per_row": [0, seq_len],
+        },
     }
     return launch, logits, metadata, Path(module.__file__).resolve()
 
 
 def _slice_identity(
-    manifest: dict[str, Any], logical_name: str, rows: int | None = None
+    fixture_dir: Path,
+    manifest: dict[str, Any],
+    logical_name: str,
+    rows: int | None = None,
 ) -> dict[str, Any]:
     metadata = manifest["arrays"][logical_name]
+    source_path = (fixture_dir / metadata["filename"]).resolve()
     slice_spec = "all" if rows is None else f"rows[0:{rows}]"
     identity = {
         "fixture_id": manifest["fixture_id"],
         "logical_name": logical_name,
+        "source_path": str(source_path),
         "source_sha256": metadata["sha256"],
         "slice": slice_spec,
     }
@@ -284,15 +357,165 @@ def _slice_identity(
 
 
 def _cell_input_identity(
-    manifest: dict[str, Any], mode: str, seq_len: int
+    fixture_dir: Path,
+    manifest: dict[str, Any],
+    mode: str,
+    seq_len: int,
 ) -> dict[str, Any]:
     identity = {
-        "query": _slice_identity(manifest, f"{mode}_q_e4m3fn_bits"),
-        "key": _slice_identity(manifest, "key_e4m3fn_bits", seq_len),
-        "key_scale": _slice_identity(manifest, "key_scale_f32", seq_len),
-        "weights": _slice_identity(manifest, f"{mode}_weights_f32"),
+        "query": _slice_identity(fixture_dir, manifest, f"{mode}_q_e4m3fn_bits"),
+        "key": _slice_identity(fixture_dir, manifest, "key_e4m3fn_bits", seq_len),
+        "key_scale": _slice_identity(fixture_dir, manifest, "key_scale_f32", seq_len),
+        "weights": _slice_identity(fixture_dir, manifest, f"{mode}_weights_f32"),
     }
     return {**identity, "combined_id": shared._canonical_hash(identity)}
+
+
+def _coverage(cells: Sequence[tuple[str, int]]) -> dict[str, Any]:
+    expected = [
+        f"{mode}:{seq_len}" for seq_len in shared.SEQ_LENS for mode in shared.MODES
+    ]
+    present_set = {f"{mode}:{seq_len}" for mode, seq_len in cells}
+    present = [cell_id for cell_id in expected if cell_id in present_set]
+    missing = [cell_id for cell_id in expected if cell_id not in present_set]
+    return {
+        "expected_cell_count": len(expected),
+        "present_cell_count": len(present),
+        "full_grid": not missing,
+        "partial_comparison": bool(missing),
+        "present_cells": present,
+        "missing_cells": missing,
+    }
+
+
+def _tensor_sha256(tensor: Any) -> str:
+    contiguous = tensor.detach().contiguous().cpu()
+    return hashlib.sha256(contiguous.numpy().tobytes()).hexdigest()
+
+
+def _independent_cpu_reference(
+    q: Any,
+    key_fp8: Any,
+    key_scales: Any,
+    weights: Any,
+) -> Any:
+    import torch
+
+    q_bits = q.detach().view(torch.uint8).cpu().contiguous()
+    key_bits = key_fp8.detach().view(torch.uint8).cpu().contiguous()
+    q_fp32 = q_bits.view(torch.float8_e4m3fn).float()
+    key_fp32 = key_bits.view(torch.float8_e4m3fn).float()
+    scales_fp32 = key_scales.detach().float().cpu().contiguous()
+    weights_fp32 = weights.detach().float().cpu().contiguous()
+    per_head = torch.einsum("rhd,sd->rhs", q_fp32, key_fp32)
+    per_head *= scales_fp32[None, None, :]
+    return (torch.relu(per_head) * weights_fp32[:, :, None]).sum(dim=1)
+
+
+def _full_reference_error(
+    actual: Any,
+    expected: Any,
+    *,
+    atol: float,
+    rtol: float,
+) -> dict[str, Any]:
+    import torch
+
+    actual_cpu = actual.detach().float().cpu().contiguous()
+    expected_cpu = expected.detach().float().cpu().contiguous()
+    if actual_cpu.shape != expected_cpu.shape:
+        raise RuntimeError(
+            "independent reference shape mismatch: "
+            f"actual={tuple(actual_cpu.shape)}, expected={tuple(expected_cpu.shape)}"
+        )
+    finite_match = torch.isfinite(actual_cpu) == torch.isfinite(expected_cpu)
+    close = torch.isclose(actual_cpu, expected_cpu, atol=atol, rtol=rtol)
+    matches = finite_match & close
+    absolute_error = torch.abs(actual_cpu - expected_cpu)
+    finite_error = torch.where(
+        torch.isfinite(absolute_error), absolute_error, torch.zeros_like(absolute_error)
+    )
+    relative_error = finite_error / torch.clamp(torch.abs(expected_cpu), min=1.0e-30)
+    mismatch_count = int((~matches).sum().item())
+    return {
+        "passed": mismatch_count == 0,
+        "element_count": actual_cpu.numel(),
+        "mismatch_count": mismatch_count,
+        "maximum_absolute_error": float(finite_error.max().item()),
+        "maximum_relative_error": float(relative_error.max().item()),
+        "atol": atol,
+        "rtol": rtol,
+        "actual_fp32_sha256": _tensor_sha256(actual_cpu),
+        "expected_fp32_sha256": _tensor_sha256(expected_cpu),
+    }
+
+
+def _run_independent_reference_checks(
+    *,
+    backend: str,
+    fixture_dir: Path,
+    manifest: dict[str, Any],
+    device: Any,
+) -> dict[str, Any]:
+    import torch
+
+    key_fp8, key_scales = shared._load_key_inputs(
+        fixture_dir,
+        manifest,
+        rows=REFERENCE_SEQ_LEN,
+        device=device,
+    )
+    checks = []
+    runner = _tokenspeed_runner if backend == "tokenspeed" else _aiter_runner
+    for mode in shared.MODES:
+        q, weights = _load_mode_inputs(mode, fixture_dir, manifest, device)
+        _validate_matched_inputs(q, key_fp8, key_scales, weights, REFERENCE_SEQ_LEN)
+        launch, logits, _, _ = runner(
+            q=q,
+            key_fp8=key_fp8,
+            key_scales=key_scales,
+            weights=weights,
+            seq_len=REFERENCE_SEQ_LEN,
+        )
+        launch()
+        torch.cuda.synchronize()
+        expected = _independent_cpu_reference(q, key_fp8, key_scales, weights)
+        error = _full_reference_error(
+            logits,
+            expected,
+            atol=REFERENCE_ATOL,
+            rtol=REFERENCE_RTOL,
+        )
+        checks.append(
+            {
+                "cell_id": f"{mode}:{REFERENCE_SEQ_LEN}",
+                "input_identity": _cell_input_identity(
+                    fixture_dir, manifest, mode, REFERENCE_SEQ_LEN
+                ),
+                **error,
+            }
+        )
+        del launch, logits, expected, q, weights
+    del key_fp8, key_scales
+    all_passed = all(check["passed"] for check in checks)
+    artifact = {
+        "kind": "independent_full_small_cell_cpu_reference",
+        "reference_definition": (
+            "CPU FP32 dot of decoded fixture FP8 q and K bytes, multiplied by "
+            "FP32 per-row scales, per-head ReLU, signed FP32 head reduction"
+        ),
+        "measured_timing_includes_reference": False,
+        "cells": checks,
+        "all_passed": all_passed,
+    }
+    artifact["artifact_id"] = shared._canonical_hash(artifact)
+    if not all_passed:
+        failures = [check["cell_id"] for check in checks if not check["passed"]]
+        raise SystemExit(
+            "matched-core independent CPU reference failed for "
+            f"{', '.join(failures)}"
+        )
+    return artifact
 
 
 def _probe_indices(limit: int) -> list[int]:
@@ -343,6 +566,15 @@ def _cell_result(
     probe: dict[str, Any],
 ) -> dict[str, Any]:
     rows = 1 if mode == "decode" else shared.PREFILL_ROWS
+    launch_contract = {
+        "backend": BACKEND_NAMES[backend],
+        "mode": mode,
+        "seq_len": seq_len,
+        "q_shape": [rows, shared.NUM_HEADS, shared.HEAD_DIM],
+        "key_shape": [seq_len, shared.HEAD_DIM],
+        "output_shape": list(output_shape),
+        "launch": launch,
+    }
     return {
         "cell_id": f"{mode}:{seq_len}",
         "backend": BACKEND_NAMES[backend],
@@ -360,6 +592,7 @@ def _cell_result(
         "measurement_wall_seconds": wall_seconds,
         "input_identity": input_identity,
         "launch": launch,
+        "launch_fingerprint": shared._canonical_hash(launch_contract),
         "numerical_probe": probe,
     }
 
@@ -437,7 +670,9 @@ def _run_backend(args: argparse.Namespace) -> None:
                         wall_seconds=wall_seconds,
                         output_shape=logits.shape,
                         launch=launch_metadata,
-                        input_identity=_cell_input_identity(manifest, mode, seq_len),
+                        input_identity=_cell_input_identity(
+                            fixture_dir, manifest, mode, seq_len
+                        ),
                         probe=probe,
                     )
                 )
@@ -445,6 +680,13 @@ def _run_backend(args: argparse.Namespace) -> None:
             del key_fp8, key_scales
             gc.collect()
             torch.cuda.empty_cache()
+
+        independent_correctness = _run_independent_reference_checks(
+            backend=args.backend,
+            fixture_dir=fixture_dir,
+            manifest=manifest,
+            device=device,
+        )
 
     finished_at_ns = time.time_ns()
     if backend_source is None:
@@ -464,6 +706,7 @@ def _run_backend(args: argparse.Namespace) -> None:
         "finished_at_ns": finished_at_ns,
         "fixture": {
             "fixture_id": manifest["fixture_id"],
+            "manifest_path": str((fixture_dir / "manifest.json").resolve()),
             "manifest_sha256": shared._sha256_file(fixture_dir / "manifest.json"),
         },
         "benchmark": {
@@ -478,6 +721,7 @@ def _run_backend(args: argparse.Namespace) -> None:
             "softmax_scale": 1.0,
             "cells": [f"{mode}:{seq_len}" for mode, seq_len in cells],
         },
+        "coverage": _coverage(cells),
         "timing_scope": {
             "classification": COMPARISON_KIND,
             "warning": (
@@ -499,13 +743,14 @@ def _run_backend(args: argparse.Namespace) -> None:
                 "per-head ReLU",
                 "signed head weighting and reduction",
                 "FP32 output stores",
+                "rectangular bounds-control loads and predicates",
             ],
             "excluded": [
                 "BF16 query to FP8 conversion",
                 "packed-cache construction",
                 "page-table lookup",
                 "workspace-slot lookup",
-                "causal or ragged row masking",
+                "nontrivial causal or ragged row ranges",
                 "softmax scaling",
                 "output allocation or initialization",
                 "TopK",
@@ -514,7 +759,13 @@ def _run_backend(args: argparse.Namespace) -> None:
                 "All 64 query rows score all S keys; realistic causal ranges "
                 "are measured only by the production-layout benchmark."
             ),
+            "aiter_bounds_overhead": (
+                "AITER still loads cu_start=0 and cu_end=S for every query row "
+                "and executes its rectangular range predicates; that control "
+                "work is included even though every requested output is valid."
+            ),
         },
+        "independent_correctness": independent_correctness,
         "environment": {
             "python": sys.version,
             "torch": torch.__version__,
@@ -530,6 +781,8 @@ def _run_backend(args: argparse.Namespace) -> None:
             "backend_source": str(backend_source),
             "backend_git": shared._git_metadata(backend_source),
             "backend_files": _backend_files(args.backend),
+            "compiler_runtime": _compiler_runtime_metadata(args.backend),
+            "harness_path": str(Path(__file__).resolve()),
             "harness_sha256": shared._sha256_file(Path(__file__).resolve()),
             "shared_fixture_harness": {
                 "path": str(Path(shared.__file__).resolve()),
@@ -555,19 +808,86 @@ def _validate_round(path: Path, payload: dict[str, Any]) -> None:
         raise SystemExit(f"{path} has unknown backend {payload.get('backend')!r}")
     if payload.get("round") not in shared.REQUIRED_ROUNDS:
         raise SystemExit(f"{path} has invalid round {payload.get('round')!r}")
-    if payload["benchmark"]["samples_per_cell"] < shared.MIN_SAMPLES:
+    expected_samples = payload["benchmark"]["samples_per_cell"]
+    if expected_samples < shared.MIN_SAMPLES:
         raise SystemExit(f"{path} has fewer than {shared.MIN_SAMPLES} samples per cell")
+    manifest_path = Path(payload["fixture"]["manifest_path"])
+    if not manifest_path.is_absolute():
+        raise SystemExit(f"{path} fixture manifest path is not resolved")
+    compiler_runtime = dict(payload["environment"]["compiler_runtime"])
+    compiler_fingerprint = compiler_runtime.pop("fingerprint", None)
+    if compiler_fingerprint != shared._canonical_hash(compiler_runtime):
+        raise SystemExit(f"{path} has an invalid compiler/runtime fingerprint")
     result_ids = [result["cell_id"] for result in payload["results"]]
     if len(result_ids) != len(set(result_ids)):
         raise SystemExit(f"{path} contains duplicate cells")
     if set(result_ids) != set(payload["benchmark"]["cells"]):
         raise SystemExit(f"{path} results do not match its declared cells")
+    declared_cells = tuple(
+        (cell_id.split(":", 1)[0], int(cell_id.split(":", 1)[1]))
+        for cell_id in payload["benchmark"]["cells"]
+    )
+    if payload.get("coverage") != _coverage(declared_cells):
+        raise SystemExit(f"{path} has invalid full-grid coverage metadata")
+
+    correctness = dict(payload.get("independent_correctness", {}))
+    correctness_id = correctness.pop("artifact_id", None)
+    if correctness_id != shared._canonical_hash(correctness):
+        raise SystemExit(f"{path} has an invalid independent correctness artifact")
+    expected_reference_cells = {f"{mode}:{REFERENCE_SEQ_LEN}" for mode in shared.MODES}
+    reference_cells = correctness.get("cells", [])
+    if (
+        correctness.get("all_passed") is not True
+        or {check.get("cell_id") for check in reference_cells}
+        != expected_reference_cells
+    ):
+        raise SystemExit(f"{path} lacks passing full-small-cell reference checks")
+    if any(check.get("passed") is not True for check in reference_cells):
+        raise SystemExit(f"{path} contains a failed independent reference check")
+
     for result in payload["results"]:
         samples = result["samples_ms"]
-        if result["sample_count"] != len(samples) or len(samples) < shared.MIN_SAMPLES:
+        if (
+            result["sample_count"] != expected_samples
+            or len(samples) != expected_samples
+        ):
             raise SystemExit(
-                f"{path} {result['cell_id']} does not contain "
-                f"{shared.MIN_SAMPLES} samples"
+                f"{path} {result['cell_id']} does not contain exactly "
+                f"{expected_samples} samples"
+            )
+        input_identity = dict(result["input_identity"])
+        combined_id = input_identity.pop("combined_id", None)
+        if combined_id != shared._canonical_hash(input_identity):
+            raise SystemExit(
+                f"{path} {result['cell_id']} has an invalid input identity"
+            )
+        for source in input_identity.values():
+            source_without_id = dict(source)
+            slice_id = source_without_id.pop("slice_id", None)
+            if slice_id != shared._canonical_hash(source_without_id):
+                raise SystemExit(
+                    f"{path} {result['cell_id']} has an invalid input slice identity"
+                )
+            if not Path(source["source_path"]).is_absolute():
+                raise SystemExit(
+                    f"{path} {result['cell_id']} has an unresolved input path"
+                )
+            if len(source["source_sha256"]) != 64:
+                raise SystemExit(
+                    f"{path} {result['cell_id']} has an invalid input SHA256"
+                )
+        launch_contract = {
+            "backend": payload["backend"],
+            "mode": result["mode"],
+            "seq_len": result["seq_len"],
+            "q_shape": result["q_shape"],
+            "key_shape": result["key_shape"],
+            "output_shape": result["output_shape"],
+            "launch": result["launch"],
+        }
+        if result.get("launch_fingerprint") != shared._canonical_hash(launch_contract):
+            raise SystemExit(
+                f"{path} {result['cell_id']} has an invalid launch fingerprint"
             )
         if not math.isclose(
             result["round_median_ms"],
@@ -660,15 +980,25 @@ def _combine(args: argparse.Namespace) -> None:
     _validate_alternating_runs(payloads)
 
     fixture_ids = {payload["fixture"]["fixture_id"] for payload in payloads}
+    manifest_paths = {payload["fixture"]["manifest_path"] for payload in payloads}
     manifest_hashes = {payload["fixture"]["manifest_sha256"] for payload in payloads}
+    harness_paths = {payload["environment"]["harness_path"] for payload in payloads}
     harness_hashes = {payload["environment"]["harness_sha256"] for payload in payloads}
+    shared_harness_paths = {
+        payload["environment"]["shared_fixture_harness"]["path"] for payload in payloads
+    }
     shared_harness_hashes = {
         payload["environment"]["shared_fixture_harness"]["sha256"]
         for payload in payloads
     }
-    if len(fixture_ids) != 1 or len(manifest_hashes) != 1:
+    if len(fixture_ids) != 1 or len(manifest_paths) != 1 or len(manifest_hashes) != 1:
         raise SystemExit("matched-core rounds do not use one identical fixture")
-    if len(harness_hashes) != 1 or len(shared_harness_hashes) != 1:
+    if (
+        len(harness_paths) != 1
+        or len(harness_hashes) != 1
+        or len(shared_harness_paths) != 1
+        or len(shared_harness_hashes) != 1
+    ):
         raise SystemExit("matched-core benchmark source changed between rounds")
 
     measurement_configs = {
@@ -680,6 +1010,11 @@ def _combine(args: argparse.Namespace) -> None:
     }
     if len(measurement_configs) != 1:
         raise SystemExit("matched-core rounds use different measurement settings")
+    timing_scope_fingerprints = {
+        shared._canonical_hash(payload["timing_scope"]) for payload in payloads
+    }
+    if len(timing_scope_fingerprints) != 1:
+        raise SystemExit("matched-core timing scope changed between rounds")
     gpu_identities = {
         json.dumps(
             {
@@ -722,6 +1057,13 @@ def _combine(args: argparse.Namespace) -> None:
         }
         if len(fingerprints) != 1:
             raise SystemExit(f"{backend} source changed between rounds")
+        compiler_fingerprints = {
+            payload["environment"]["compiler_runtime"]["fingerprint"]
+            for payload in payloads
+            if payload["backend"] == backend
+        }
+        if len(compiler_fingerprints) != 1:
+            raise SystemExit(f"{backend} compiler/runtime changed between rounds")
 
     grouped: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = defaultdict(list)
     for payload in payloads:
@@ -734,12 +1076,22 @@ def _combine(args: argparse.Namespace) -> None:
         f"{mode}:{seq_len}" for seq_len in shared.SEQ_LENS for mode in shared.MODES
     }
     found_cells = {cell_id for _, cell_id in grouped}
+    extra_cells = found_cells - expected_cells
+    missing_cells = expected_cells - found_cells
+    if extra_cells:
+        raise SystemExit(
+            f"matched-core comparison contains unsupported cells: {sorted(extra_cells)}"
+        )
     if not args.allow_partial and found_cells != expected_cells:
         raise SystemExit(
             "strict matched-core comparison requires all 24 cells; "
-            f"missing={sorted(expected_cells - found_cells)}, "
-            f"extra={sorted(found_cells - expected_cells)}"
+            f"missing={sorted(missing_cells)}"
         )
+    aggregate_cells = tuple(
+        (cell_id.split(":", 1)[0], int(cell_id.split(":", 1)[1]))
+        for cell_id in found_cells
+    )
+    aggregate_coverage = _coverage(aggregate_cells)
 
     tokenspeed_name = BACKEND_NAMES["tokenspeed"]
     aiter_name = BACKEND_NAMES["aiter"]
@@ -757,15 +1109,23 @@ def _combine(args: argparse.Namespace) -> None:
                 raise SystemExit(f"{backend} {cell_id} does not cover rounds 1, 2, 3")
             rows_by_backend[backend] = rows
 
-        input_ids = {
-            result["input_identity"]["combined_id"]
+        input_identities = {
+            json.dumps(result["input_identity"], sort_keys=True)
             for backend_rows in rows_by_backend.values()
             for _, result in backend_rows
         }
-        if len(input_ids) != 1:
+        if len(input_identities) != 1:
             raise SystemExit(
                 f"{cell_id} did not use identical matched-core input identities"
             )
+        input_identity = json.loads(next(iter(input_identities)))
+
+        launch_fingerprints: dict[str, str] = {}
+        for backend, backend_rows in rows_by_backend.items():
+            fingerprints = {result["launch_fingerprint"] for _, result in backend_rows}
+            if len(fingerprints) != 1:
+                raise SystemExit(f"{backend} {cell_id} launch changed between rounds")
+            launch_fingerprints[backend] = next(iter(fingerprints))
 
         probe_results = []
         for round_index in range(len(shared.REQUIRED_ROUNDS)):
@@ -798,7 +1158,8 @@ def _combine(args: argparse.Namespace) -> None:
                 "cell_id": cell_id,
                 "mode": mode,
                 "seq_len": int(seq_len_text),
-                "input_identity": next(iter(input_ids)),
+                "input_identity": input_identity,
+                "launch_fingerprints": launch_fingerprints,
                 "tokenspeed_round_medians_ms": tokenspeed_round_medians,
                 "aiter_round_medians_ms": aiter_round_medians,
                 "tokenspeed_median_of_round_medians_ms": tokenspeed_ms,
@@ -818,6 +1179,67 @@ def _combine(args: argparse.Namespace) -> None:
             f"{probe_mismatches} values; this is not a valid performance comparison"
         )
 
+    backend_provenance: dict[str, Any] = {}
+    for backend in BACKEND_NAMES.values():
+        backend_rounds = sorted(
+            (payload for payload in payloads if payload["backend"] == backend),
+            key=lambda payload: payload["round"],
+        )
+        first = backend_rounds[0]
+        backend_provenance[backend] = {
+            "backend_source": first["environment"]["backend_source"],
+            "backend_git": first["environment"]["backend_git"],
+            "backend_files": first["environment"]["backend_files"],
+            "compiler_runtime": first["environment"]["compiler_runtime"],
+            "independent_correctness_artifacts": [
+                {
+                    "round": payload["round"],
+                    **payload["independent_correctness"],
+                }
+                for payload in backend_rounds
+            ],
+        }
+
+    round_inputs = []
+    for path, round_payload in zip(args.inputs, payloads, strict=True):
+        resolved = path.resolve()
+        round_inputs.append(
+            {
+                "path": str(resolved),
+                "sha256": shared._sha256_file(resolved),
+                "backend": round_payload["backend"],
+                "round": round_payload["round"],
+            }
+        )
+
+    warmups, samples_per_cell = next(iter(measurement_configs))
+    common_provenance = {
+        "fixture": {
+            "fixture_id": next(iter(fixture_ids)),
+            "manifest_path": next(iter(manifest_paths)),
+            "manifest_sha256": next(iter(manifest_hashes)),
+        },
+        "matched_core_harness": {
+            "path": next(iter(harness_paths)),
+            "sha256": next(iter(harness_hashes)),
+        },
+        "shared_fixture_harness": {
+            "path": next(iter(shared_harness_paths)),
+            "sha256": next(iter(shared_harness_hashes)),
+        },
+        "gpu": json.loads(next(iter(gpu_identities))),
+        "measurement": {
+            "warmups": warmups,
+            "samples_per_cell_exact": samples_per_cell,
+            "round_count_per_backend": len(shared.REQUIRED_ROUNDS),
+            "aggregation": "median_of_three_round_medians",
+            "event_timing": "torch.cuda.Event",
+        },
+        "timing_scope": payloads[0]["timing_scope"],
+        "timing_scope_fingerprint": next(iter(timing_scope_fingerprints)),
+        "round_inputs": round_inputs,
+    }
+
     payload = {
         "schema": COMPARISON_SCHEMA,
         "schema_version": SCHEMA_VERSION,
@@ -829,6 +1251,8 @@ def _combine(args: argparse.Namespace) -> None:
         ),
         "created_at_utc": shared._utc_now(),
         "fixture_id": next(iter(fixture_ids)),
+        "coverage": aggregate_coverage,
+        "partial_comparison": aggregate_coverage["partial_comparison"],
         "aggregation": "median_of_three_round_medians",
         "alternating_serial_rounds_verified": True,
         "identical_input_identities_verified": True,
@@ -837,6 +1261,10 @@ def _combine(args: argparse.Namespace) -> None:
             "aiter_matched_contiguous_fp8_core_ms / "
             "tokenspeed_matched_contiguous_fp8_core_ms"
         ),
+        "provenance": {
+            "common": common_provenance,
+            "backends": backend_provenance,
+        },
         "summary": {
             "cell_count": len(comparison_rows),
             "all_tokenspeed_meet_or_beat_aiter": all(
@@ -848,7 +1276,7 @@ def _combine(args: argparse.Namespace) -> None:
             ),
         },
         "cells": comparison_rows,
-        "round_inputs": [str(path) for path in args.inputs],
+        "round_inputs": round_inputs,
     }
     shared._write_json(args.output.resolve(), payload)
     print(json.dumps(payload, indent=2, sort_keys=True))
