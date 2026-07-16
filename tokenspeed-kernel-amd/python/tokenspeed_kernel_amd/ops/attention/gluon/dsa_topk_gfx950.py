@@ -570,6 +570,7 @@ def _accumulate_runtime_radix_histogram_tile(
 @gluon.jit
 def _emit_runtime_radix_topk_tile(
     candidate_logits,
+    candidate_start,
     tile_start,
     candidate_len,
     vector_end,
@@ -610,7 +611,7 @@ def _emit_runtime_radix_topk_tile(
     greater_position = reservation
     equal_rank = reservation
     equal_position = count_greater + equal_rank
-    logical_offsets = offsets.to(gl.int32)
+    logical_offsets = candidate_start + offsets.to(gl.int32)
     gl.store(
         out + row * out_stride + greater_position,
         logical_offsets,
@@ -1248,10 +1249,11 @@ def _dsa_oneblock_manual_radix_topk_kernel(
 
 
 @gluon.jit
-def _dsa_decode_runtime_radix_topk_kernel(
+def _dsa_runtime_radix_topk_kernel(
     logits,
     block_table,
-    seq_lens,
+    row_starts,
+    row_ends,
     out,
     lens_out,
     logits_stride: gl.constexpr,
@@ -1261,6 +1263,7 @@ def _dsa_decode_runtime_radix_topk_kernel(
     page_size: gl.constexpr,
     topk: gl.constexpr,
     q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
     MAX_BUCKETS: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
@@ -1308,12 +1311,18 @@ def _dsa_decode_runtime_radix_topk_kernel(
     )
     gl.barrier()
 
-    req = row // q_len_per_req
-    q_offset = row - req * q_len_per_req
-    candidate_end = gl.load(seq_lens + req).to(gl.int32)
-    if q_len_per_req != 1:
-        candidate_end = candidate_end - (q_len_per_req - 1) + q_offset
-    candidate_len = gl.maximum(candidate_end, 0)
+    if IS_DECODE:
+        req = row // q_len_per_req
+        q_offset = row - req * q_len_per_req
+        candidate_start = gl.full([], 0, gl.int32)
+        candidate_end = gl.load(row_ends + req).to(gl.int32)
+        if q_len_per_req != 1:
+            candidate_end = candidate_end - (q_len_per_req - 1) + q_offset
+    else:
+        req = row
+        candidate_start = gl.load(row_starts + row).to(gl.int32)
+        candidate_end = gl.load(row_ends + row).to(gl.int32)
+    candidate_len = gl.maximum(candidate_end - candidate_start, 0)
     selected_count = gl.minimum(candidate_len, topk).to(gl.int32)
     output_offsets = gl.arange(0, topk, layout=output_layout)
     gl.store(lens_out + row, selected_count)
@@ -1321,21 +1330,25 @@ def _dsa_decode_runtime_radix_topk_kernel(
 
     if candidate_len <= topk:
         valid = output_offsets < candidate_len
-        logical_offsets = output_offsets.to(gl.int32)
-        block_idx = logical_offsets // page_size
-        block_offset = logical_offsets - block_idx * page_size
-        page = gl.load(
-            block_table + req * block_table_stride + block_idx,
-            mask=valid & (block_idx < block_table_cols),
-            other=0,
-        ).to(gl.int32)
+        logical_offsets = candidate_start + output_offsets.to(gl.int32)
+        if IS_DECODE:
+            block_idx = logical_offsets // page_size
+            block_offset = logical_offsets - block_idx * page_size
+            page = gl.load(
+                block_table + req * block_table_stride + block_idx,
+                mask=valid & (block_idx < block_table_cols),
+                other=0,
+            ).to(gl.int32)
+            indices = page * page_size + block_offset
+        else:
+            indices = logical_offsets
         gl.store(
             out + row * out_stride + output_offsets,
-            gl.where(valid, page * page_size + block_offset, -1),
+            gl.where(valid, indices, -1),
         )
         return
 
-    candidate_logits = logits + row * logits_stride
+    candidate_logits = logits + row * logits_stride + candidate_start
     vector_end = candidate_len & -4
     prefix = gl.full([], 0, gl.uint32)
     prefix_shift = gl.full([], 0, gl.int32)
@@ -1420,6 +1433,7 @@ def _dsa_decode_runtime_radix_topk_kernel(
     for tile_start in range(0, emit_full_end, BLOCK_N):
         _emit_runtime_radix_topk_tile(
             candidate_logits,
+            candidate_start,
             tile_start,
             candidate_len,
             vector_end,
@@ -1439,6 +1453,7 @@ def _dsa_decode_runtime_radix_topk_kernel(
     if emit_full_end < candidate_len:
         _emit_runtime_radix_topk_tile(
             candidate_logits,
+            candidate_start,
             emit_full_end,
             candidate_len,
             vector_end,
@@ -1456,25 +1471,26 @@ def _dsa_decode_runtime_radix_topk_kernel(
             True,
         )
 
-    gl.barrier()
-    valid_output = output_offsets < selected_count
-    logical_offsets = gl.load(
-        out + row * out_stride + output_offsets,
-        mask=valid_output,
-        other=0,
-    ).to(gl.int32)
-    block_idx = logical_offsets // page_size
-    block_offset = logical_offsets - block_idx * page_size
-    page = gl.load(
-        block_table + req * block_table_stride + block_idx,
-        mask=valid_output & (block_idx < block_table_cols),
-        other=0,
-    ).to(gl.int32)
-    gl.store(
-        out + row * out_stride + output_offsets,
-        page * page_size + block_offset,
-        mask=valid_output,
-    )
+    if IS_DECODE:
+        gl.barrier()
+        valid_output = output_offsets < selected_count
+        logical_offsets = gl.load(
+            out + row * out_stride + output_offsets,
+            mask=valid_output,
+            other=0,
+        ).to(gl.int32)
+        block_idx = logical_offsets // page_size
+        block_offset = logical_offsets - block_idx * page_size
+        page = gl.load(
+            block_table + req * block_table_stride + block_idx,
+            mask=valid_output & (block_idx < block_table_cols),
+            other=0,
+        ).to(gl.int32)
+        gl.store(
+            out + row * out_stride + output_offsets,
+            page * page_size + block_offset,
+            mask=valid_output,
+        )
 
 
 @gluon.jit
@@ -2897,9 +2913,10 @@ def _dsa_decode_topk_slots(
 
     if cols <= _ONEBLOCK_RADIX_MAX_COLS:
         if cols < _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS:
-            _dsa_decode_runtime_radix_topk_kernel[(rows,)](
+            _dsa_runtime_radix_topk_kernel[(rows,)](
                 logits,
                 block_table,
+                seq_lens,
                 seq_lens,
                 out,
                 lens_out,
@@ -2910,6 +2927,7 @@ def _dsa_decode_topk_slots(
                 page_size=int(page_size),
                 topk=topk,
                 q_len_per_req=q_len_per_req,
+                IS_DECODE=True,
                 MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
                 BLOCK_N=_ONEBLOCK_DECODE_RADIX_BLOCK_N,
                 num_warps=16,
@@ -2996,32 +3014,53 @@ def _dsa_prefill_topk_indices(
         return out, lens_out
 
     if cols <= _ONEBLOCK_RADIX_MAX_COLS:
-        _dsa_oneblock_manual_radix_topk_kernel[(rows,)](
-            logits,
-            row_starts,
-            row_starts,
-            row_starts,
-            row_ends,
-            out,
-            lens_out,
-            logits.stride(0),
-            0,
-            out.stride(0),
-            0,
-            page_size=1,
-            topk=topk,
-            q_len_per_req=1,
-            IS_DECODE=False,
-            RADIX0_BITS=_ONEBLOCK_RADIX_SCHEDULE[0],
-            RADIX1_BITS=_ONEBLOCK_RADIX_SCHEDULE[1],
-            RADIX2_BITS=_ONEBLOCK_RADIX_SCHEDULE[2],
-            MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
-            BLOCK_N=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
-            COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
-            USE_COMPACT_FINAL=cols >= _ONEBLOCK_COMPACT_FINAL_MIN_COLS,
-            USE_RADIX_EARLY_STOP=False,
-            num_warps=16,
-        )
+        if cols < _ONEBLOCK_COMPACT_FINAL_MIN_COLS:
+            _dsa_runtime_radix_topk_kernel[(rows,)](
+                logits,
+                row_starts,
+                row_starts,
+                row_ends,
+                out,
+                lens_out,
+                logits.stride(0),
+                0,
+                out.stride(0),
+                0,
+                page_size=1,
+                topk=topk,
+                q_len_per_req=1,
+                IS_DECODE=False,
+                MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
+                BLOCK_N=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
+                num_warps=16,
+            )
+        else:
+            _dsa_oneblock_manual_radix_topk_kernel[(rows,)](
+                logits,
+                row_starts,
+                row_starts,
+                row_starts,
+                row_ends,
+                out,
+                lens_out,
+                logits.stride(0),
+                0,
+                out.stride(0),
+                0,
+                page_size=1,
+                topk=topk,
+                q_len_per_req=1,
+                IS_DECODE=False,
+                RADIX0_BITS=_ONEBLOCK_RADIX_SCHEDULE[0],
+                RADIX1_BITS=_ONEBLOCK_RADIX_SCHEDULE[1],
+                RADIX2_BITS=_ONEBLOCK_RADIX_SCHEDULE[2],
+                MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
+                BLOCK_N=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
+                COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
+                USE_COMPACT_FINAL=True,
+                USE_RADIX_EARLY_STOP=False,
+                num_warps=16,
+            )
         return out, lens_out
 
     if cols >= _PREFILL_HIST_DERIVED_MIN_COLS:
