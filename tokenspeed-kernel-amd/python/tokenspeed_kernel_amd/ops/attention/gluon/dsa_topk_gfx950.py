@@ -38,9 +38,14 @@ _RADIX_TOPK_TARGET_GROUPS_PER_CU = 4
 _PREFILL_RADIX_BITS = 11
 _PREFILL_RADIX_BUCKETS = 1 << _PREFILL_RADIX_BITS
 _PREFILL_RADIX_SCHEDULE = ((21, 11), (10, 11), (0, 10))
-_PREFILL_RADIX_BLOCK_N = 8192
-_PREFILL_RADIX_HIST_TARGET_GROUPS_PER_CU = 1
+_PREFILL_RADIX_BLOCK_N = 4096
+_PREFILL_RADIX_HIST_TARGET_GROUPS_PER_CU = 2
 _PREFILL_RADIX_SCATTER_TARGET_GROUPS_PER_CU = 2
+_ONEBLOCK_RADIX_SCHEDULE = (11, 11, 10)
+_ONEBLOCK_RADIX_BUCKETS = 1 << max(_ONEBLOCK_RADIX_SCHEDULE)
+_ONEBLOCK_RADIX_BLOCK_N = 4096
+_ONEBLOCK_RADIX_MAX_COLS = 90000
+_PREFILL_HIST_DERIVED_MIN_COLS = 524288
 
 __all__ = [
     "gluon_dsa_decode_topk_fp8_gfx950",
@@ -67,6 +72,38 @@ def _fp32_to_ordered_key(x):
 @gluon.jit
 def _topk_add(a, b):
     return a + b
+
+
+@gluon.jit
+def _rank_four_items_per_thread(
+    values,
+    start,
+    thread_layout: gl.constexpr,
+    value_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    values_2x2 = values.reshape([BLOCK_N // 4, 2, 2])
+    even, odd = gl.split(values_2x2)
+    value0, value2 = gl.split(even)
+    value1, value3 = gl.split(odd)
+    value0 = gl.convert_layout(value0, thread_layout)
+    value1 = gl.convert_layout(value1, thread_layout)
+    value2 = gl.convert_layout(value2, thread_layout)
+    value3 = gl.convert_layout(value3, thread_layout)
+
+    thread_count = value0 + value1 + value2 + value3
+    thread_inclusive = gl.associative_scan(thread_count, 0, _topk_add)
+    position0 = start + thread_inclusive - thread_count
+    position1 = position0 + value0
+    position2 = position1 + value1
+    position3 = position2 + value2
+
+    even_positions = gl.join(position0, position2)
+    odd_positions = gl.join(position1, position3)
+    positions = gl.join(even_positions, odd_positions).reshape([BLOCK_N])
+    return gl.convert_layout(positions, value_layout), gl.sum(thread_count, axis=0).to(
+        gl.int32
+    )
 
 
 @gluon.jit
@@ -256,6 +293,316 @@ def _dsa_prefill_select_topk_kernel(
 
 
 @gluon.jit
+def _dsa_trivial_topk_kernel(
+    block_table,
+    seq_lens,
+    row_starts,
+    row_ends,
+    out,
+    lens_out,
+    block_table_stride: gl.constexpr,
+    out_stride: gl.constexpr,
+    block_table_cols: gl.constexpr,
+    page_size: gl.constexpr,
+    topk: gl.constexpr,
+    q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
+    TOPK_LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    layout: gl.constexpr = _vector_layout(topk, gl.num_warps(), TOPK_LOAD_ELEMS)
+    offsets = gl.arange(0, topk, layout=layout)
+
+    if IS_DECODE:
+        req = row // q_len_per_req
+        q_offset = row - req * q_len_per_req
+        candidate_len = gl.load(seq_lens + req).to(gl.int32)
+        if q_len_per_req != 1:
+            candidate_len = candidate_len - (q_len_per_req - 1) + q_offset
+        valid = offsets < candidate_len
+        block_idx = offsets.to(gl.int32) // page_size
+        block_offset = offsets.to(gl.int32) - block_idx * page_size
+        page = gl.load(
+            block_table + req * block_table_stride + block_idx,
+            mask=valid & (block_idx < block_table_cols),
+            other=0,
+        ).to(gl.int32)
+        indices = page * page_size + block_offset
+    else:
+        row_start = gl.load(row_starts + row).to(gl.int32)
+        row_end = gl.load(row_ends + row).to(gl.int32)
+        candidate_len = gl.maximum(row_end - row_start, 0)
+        valid = offsets < candidate_len
+        indices = row_start + offsets.to(gl.int32)
+
+    gl.store(out + row * out_stride + offsets, gl.where(valid, indices, -1))
+    gl.store(lens_out + row, gl.minimum(candidate_len, topk).to(gl.int32))
+
+
+@gluon.jit
+def _dsa_oneblock_manual_radix_topk_kernel(
+    logits,
+    block_table,
+    seq_lens,
+    row_starts,
+    row_ends,
+    out,
+    lens_out,
+    logits_stride: gl.constexpr,
+    block_table_stride: gl.constexpr,
+    out_stride: gl.constexpr,
+    block_table_cols: gl.constexpr,
+    page_size: gl.constexpr,
+    topk: gl.constexpr,
+    q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
+    RADIX0_BITS: gl.constexpr,
+    RADIX1_BITS: gl.constexpr,
+    RADIX2_BITS: gl.constexpr,
+    MAX_BUCKETS: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    row = gl.program_id(0)
+    value_layout: gl.constexpr = _vector_layout(
+        BLOCK_N,
+        gl.num_warps(),
+        triton.cdiv(BLOCK_N, 64 * gl.num_warps()),
+    )
+    thread_layout: gl.constexpr = _vector_layout(
+        BLOCK_N // 4,
+        gl.num_warps(),
+        triton.cdiv(BLOCK_N // 4, 64 * gl.num_warps()),
+    )
+    histogram_layout: gl.constexpr = _vector_layout(
+        MAX_BUCKETS,
+        gl.num_warps(),
+        triton.cdiv(MAX_BUCKETS, 64 * gl.num_warps()),
+    )
+    group_layout: gl.constexpr = _vector_layout(
+        MAX_BUCKETS // 2,
+        gl.num_warps(),
+        triton.cdiv(MAX_BUCKETS // 2, 64 * gl.num_warps()),
+    )
+    output_layout: gl.constexpr = _vector_layout(
+        topk,
+        gl.num_warps(),
+        triton.cdiv(topk, 64 * gl.num_warps()),
+    )
+    shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[MAX_BUCKETS, 1]],
+        [MAX_BUCKETS],
+        [0],
+    )
+    histogram_zeros = gl.zeros([MAX_BUCKETS], gl.int32, layout=histogram_layout)
+    shared_histogram = gl.allocate_shared_memory(
+        gl.int32,
+        [MAX_BUCKETS],
+        shared_layout,
+        value=histogram_zeros,
+    )
+    gl.barrier()
+
+    if IS_DECODE:
+        req = row // q_len_per_req
+        q_offset = row - req * q_len_per_req
+        candidate_start = gl.full([], 0, gl.int32)
+        candidate_end = gl.load(seq_lens + req).to(gl.int32)
+        if q_len_per_req != 1:
+            candidate_end = candidate_end - (q_len_per_req - 1) + q_offset
+    else:
+        req = row
+        candidate_start = gl.load(row_starts + row).to(gl.int32)
+        candidate_end = gl.load(row_ends + row).to(gl.int32)
+
+    candidate_len = gl.maximum(candidate_end - candidate_start, 0)
+    selected_count = gl.minimum(candidate_len, topk).to(gl.int32)
+    output_offsets = gl.arange(0, topk, layout=output_layout)
+    gl.store(lens_out + row, selected_count)
+    gl.store(out + row * out_stride + output_offsets, -1)
+
+    if candidate_len <= topk:
+        valid = output_offsets < candidate_len
+        logical_offsets = candidate_start + output_offsets.to(gl.int32)
+        if IS_DECODE:
+            block_idx = logical_offsets // page_size
+            block_offset = logical_offsets - block_idx * page_size
+            page = gl.load(
+                block_table + req * block_table_stride + block_idx,
+                mask=valid & (block_idx < block_table_cols),
+                other=0,
+            ).to(gl.int32)
+            indices = page * page_size + block_offset
+        else:
+            indices = logical_offsets
+        gl.store(
+            out + row * out_stride + output_offsets,
+            gl.where(valid, indices, -1),
+        )
+        return
+
+    candidate_logits = logits + row * logits_stride + candidate_start
+    vector_end = candidate_len & -4
+    prefix = gl.full([], 0, gl.uint32)
+    remaining = selected_count
+    bucket_offsets = gl.arange(0, MAX_BUCKETS, layout=histogram_layout)
+
+    for pass_index in gl.static_range(3):
+        radix_bits = RADIX0_BITS
+        shift = 32 - RADIX0_BITS
+        if pass_index == 1:
+            radix_bits = RADIX1_BITS
+            shift = 32 - RADIX0_BITS - RADIX1_BITS
+        elif pass_index == 2:
+            radix_bits = RADIX2_BITS
+            shift = 0
+
+        if pass_index != 0:
+            gl.barrier()
+            shared_histogram.store(histogram_zeros)
+            gl.barrier()
+
+        bucket_mask = (1 << radix_bits) - 1
+        for tile_start in range(0, candidate_len, BLOCK_N):
+            offsets = tile_start + gl.arange(0, BLOCK_N, layout=value_layout)
+            offsets = gl.max_contiguous(gl.multiple_of(offsets.to(gl.int32), 4), 4)
+            valid = offsets < candidate_len
+            if tile_start + BLOCK_N <= candidate_len:
+                values = gl.amd.cdna4.buffer_load(
+                    ptr=candidate_logits,
+                    offsets=offsets,
+                )
+            else:
+                vector_mask = gl.max_constancy(offsets < vector_end, 4)
+                vector_values = gl.amd.cdna4.buffer_load(
+                    ptr=candidate_logits,
+                    offsets=offsets,
+                    mask=vector_mask,
+                    other=-float("inf"),
+                )
+                tail_mask = (offsets >= vector_end) & valid
+                tail_values = gl.load(
+                    candidate_logits + offsets,
+                    mask=tail_mask,
+                    other=-float("inf"),
+                )
+                values = gl.where(tail_mask, tail_values, vector_values)
+            keys = _fp32_to_ordered_key(values)
+            if pass_index == 0:
+                prefix_match = valid
+            else:
+                prefix_match = valid & ((keys >> (shift + radix_bits)) == prefix)
+            buckets = (keys >> shift) & bucket_mask
+            shared_histogram.atomic_scatter_add(
+                gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+                buckets.to(gl.int32),
+                axis=0,
+                mask=prefix_match,
+            )
+
+        gl.barrier()
+        counts = shared_histogram.load(histogram_layout)
+        count_pairs = counts.reshape([MAX_BUCKETS // 2, 2])
+        count_low, count_high = gl.split(count_pairs)
+        count_low = gl.convert_layout(count_low, group_layout)
+        count_high = gl.convert_layout(count_high, group_layout)
+        group_counts = count_low + count_high
+        group_descending = gl.associative_scan(group_counts, 0, _topk_add, reverse=True)
+        group_greater = group_descending - group_counts
+        selected_group = (group_greater < remaining) & (group_descending >= remaining)
+        bucket_pairs = bucket_offsets.reshape([MAX_BUCKETS // 2, 2])
+        bucket_low, bucket_high = gl.split(bucket_pairs)
+        bucket_low = gl.convert_layout(bucket_low, group_layout)
+        bucket_high = gl.convert_layout(bucket_high, group_layout)
+        select_high = group_greater + count_high >= remaining
+        group_bucket = gl.where(select_high, bucket_high, bucket_low)
+        group_selected_greater = group_greater + gl.where(select_high, 0, count_high)
+        selected_bucket = gl.sum(gl.where(selected_group, group_bucket, 0), axis=0).to(
+            gl.int32
+        )
+        selected_greater = gl.sum(
+            gl.where(selected_group, group_selected_greater, 0), axis=0
+        ).to(gl.int32)
+        prefix = (prefix << radix_bits) | selected_bucket.to(gl.uint32)
+        remaining -= selected_greater
+
+    count_greater = selected_count - remaining
+    greater_cursor = gl.full([], 0, gl.int32)
+    equal_cursor = gl.full([], 0, gl.int32)
+
+    for tile_start in range(0, candidate_len, BLOCK_N):
+        offsets = tile_start + gl.arange(0, BLOCK_N, layout=value_layout)
+        offsets = gl.max_contiguous(gl.multiple_of(offsets.to(gl.int32), 4), 4)
+        valid = offsets < candidate_len
+        if tile_start + BLOCK_N <= candidate_len:
+            values = gl.amd.cdna4.buffer_load(
+                ptr=candidate_logits,
+                offsets=offsets,
+            )
+        else:
+            vector_mask = gl.max_constancy(offsets < vector_end, 4)
+            vector_values = gl.amd.cdna4.buffer_load(
+                ptr=candidate_logits,
+                offsets=offsets,
+                mask=vector_mask,
+                other=-float("inf"),
+            )
+            tail_mask = (offsets >= vector_end) & valid
+            tail_values = gl.load(
+                candidate_logits + offsets,
+                mask=tail_mask,
+                other=-float("inf"),
+            )
+            values = gl.where(tail_mask, tail_values, vector_values)
+        keys = _fp32_to_ordered_key(values)
+        greater_mask = valid & (keys > prefix)
+        equal_mask = valid & (keys == prefix)
+        greater_position, tile_greater = _rank_four_items_per_thread(
+            greater_mask.to(gl.int32),
+            greater_cursor,
+            thread_layout,
+            value_layout,
+            BLOCK_N,
+        )
+        equal_rank, tile_equal = _rank_four_items_per_thread(
+            equal_mask.to(gl.int32),
+            equal_cursor,
+            thread_layout,
+            value_layout,
+            BLOCK_N,
+        )
+        equal_position = count_greater + equal_rank
+        greater_write = greater_mask & (greater_position < selected_count)
+        equal_write = equal_mask & (equal_rank < remaining)
+        write_mask = greater_write | equal_write
+        logical_offsets = candidate_start + offsets.to(gl.int32)
+
+        if IS_DECODE:
+            block_idx = logical_offsets // page_size
+            block_offset = logical_offsets - block_idx * page_size
+            page = gl.load(
+                block_table + req * block_table_stride + block_idx,
+                mask=write_mask & (block_idx < block_table_cols),
+                other=0,
+            ).to(gl.int32)
+            indices = page * page_size + block_offset
+        else:
+            indices = logical_offsets
+
+        gl.store(
+            out + row * out_stride + greater_position,
+            indices,
+            mask=greater_write,
+        )
+        gl.store(
+            out + row * out_stride + equal_position,
+            indices,
+            mask=equal_write,
+        )
+        greater_cursor += tile_greater
+        equal_cursor += tile_equal
+
+
+@gluon.jit
 def _dsa_decode_radix_init_kernel(
     seq_lens,
     out,
@@ -311,6 +658,13 @@ def _dsa_prefill_radix_init_kernel(
     gl.store(counters + row * 2, 0)
     gl.store(counters + row * 2 + 1, 0)
     gl.store(out + row * out_stride + top_offsets, -1, mask=top_offsets < topk)
+    if candidate_len <= topk:
+        valid = top_offsets < candidate_len
+        gl.store(
+            out + row * out_stride + top_offsets,
+            gl.where(valid, row_start + top_offsets.to(gl.int32), -1),
+            mask=top_offsets < topk,
+        )
 
 
 @gluon.jit
@@ -405,6 +759,8 @@ def _dsa_radix_grouped_hist_kernel(
 def _dsa_prefill_wide_radix_grouped_hist_kernel(
     logits,
     prefixes,
+    row_starts,
+    row_ends,
     hist,
     logits_stride: gl.constexpr,
     tiles_per_row: gl.constexpr,
@@ -413,6 +769,9 @@ def _dsa_prefill_wide_radix_grouped_hist_kernel(
     hist_group_stride: gl.constexpr,
     n_cols: gl.constexpr,
     shift: gl.constexpr,
+    topk: gl.constexpr,
+    q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
     RADIX_BITS: gl.constexpr,
     NUM_BUCKETS: gl.constexpr,
     BLOCK_N: gl.constexpr,
@@ -443,20 +802,65 @@ def _dsa_prefill_wide_radix_grouped_hist_kernel(
     )
     gl.barrier()
     prefix = gl.load(prefixes + row).to(gl.uint32)
+    if IS_DECODE:
+        req = row // q_len_per_req
+        q_offset = row - req * q_len_per_req
+        candidate_start = gl.full([], 0, gl.int32)
+        candidate_end = gl.load(row_ends + req).to(gl.int32)
+        if q_len_per_req != 1:
+            candidate_end = candidate_end - (q_len_per_req - 1) + q_offset
+    else:
+        candidate_start = gl.load(row_starts + row).to(gl.int32)
+        candidate_end = gl.load(row_ends + row).to(gl.int32)
+    candidate_len = gl.maximum(candidate_end - candidate_start, 0)
+    if not IS_DECODE:
+        if candidate_len <= topk:
+            bucket_offsets = gl.arange(0, NUM_BUCKETS, layout=hist_layout)
+            base = (row * row_groups_stride + group) * hist_group_stride
+            gl.store(hist + base + bucket_offsets, 0)
+            return
 
     for tile in range(group, tiles_per_row, groups_per_row):
-        offsets = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
-        mask = offsets < n_cols
-        values = gl.load(
-            logits + row * logits_stride + offsets,
-            mask=mask,
-            other=-float("inf"),
-        )
+        if IS_DECODE:
+            candidate_logits = logits + row * logits_stride + candidate_start
+            vector_end = candidate_len & -4
+            offsets = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
+            offsets = gl.max_contiguous(gl.multiple_of(offsets.to(gl.int32), 4), 4)
+            if tile * BLOCK_N + BLOCK_N <= candidate_len:
+                values = gl.amd.cdna4.buffer_load(
+                    ptr=candidate_logits,
+                    offsets=offsets,
+                )
+                valid = gl.full([BLOCK_N], True, gl.int1, layout=layout)
+            else:
+                valid = offsets < candidate_len
+                vector_mask = gl.max_constancy(offsets < vector_end, 4)
+                vector_values = gl.amd.cdna4.buffer_load(
+                    ptr=candidate_logits,
+                    offsets=offsets,
+                    mask=vector_mask,
+                    other=-float("inf"),
+                )
+                tail_mask = (offsets >= vector_end) & valid
+                tail_values = gl.load(
+                    candidate_logits + offsets,
+                    mask=tail_mask,
+                    other=-float("inf"),
+                )
+                values = gl.where(tail_mask, tail_values, vector_values)
+        else:
+            offsets = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
+            valid = offsets < n_cols
+            values = gl.load(
+                logits + row * logits_stride + offsets,
+                mask=valid,
+                other=-float("inf"),
+            )
         keys = _fp32_to_ordered_key(values)
         if shift + RADIX_BITS == 32:
-            prefix_match = mask
+            prefix_match = valid
         else:
-            prefix_match = mask & ((keys >> (shift + RADIX_BITS)) == prefix)
+            prefix_match = valid & ((keys >> (shift + RADIX_BITS)) == prefix)
         bucket = (keys >> shift) & (NUM_BUCKETS - 1)
         shared_hist.atomic_scatter_add(
             gl.full([BLOCK_N], 1, gl.int32, layout=layout),
@@ -516,6 +920,42 @@ def _dsa_prefill_wide_radix_update_kernel(
         ((prefix << RADIX_BITS) | selected.to(gl.uint32)).to(gl.int32),
     )
     gl.store(remaining + row, kth - selected_greater)
+
+
+@gluon.jit
+def _dsa_prefill_derive_group_counts_from_hist_kernel(
+    prefixes,
+    hist,
+    group_offsets,
+    groups_per_row: gl.constexpr,
+    hist_group_stride: gl.constexpr,
+    RADIX_BITS: gl.constexpr,
+    NUM_BUCKETS: gl.constexpr,
+    PASS_INDEX: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    group = gl.program_id(1)
+    layout: gl.constexpr = _vector_layout(
+        NUM_BUCKETS,
+        gl.num_warps(),
+        LOAD_ELEMS,
+    )
+    buckets = gl.arange(0, NUM_BUCKETS, layout=layout)
+    counts = gl.load(
+        hist + (row * groups_per_row + group) * hist_group_stride + buckets
+    )
+    selected = gl.load(prefixes + row).to(gl.uint32) & (NUM_BUCKETS - 1)
+    greater = gl.sum(gl.where(buckets > selected, counts, 0), axis=0).to(gl.int32)
+    offset_base = (row * groups_per_row + group) * 2
+    if PASS_INDEX == 0:
+        gl.store(group_offsets + offset_base, greater)
+    else:
+        accumulated = gl.load(group_offsets + offset_base).to(gl.int32)
+        gl.store(group_offsets + offset_base, accumulated + greater)
+    if PASS_INDEX == 2:
+        equal = gl.sum(gl.where(buckets == selected, counts, 0), axis=0).to(gl.int32)
+        gl.store(group_offsets + offset_base + 1, equal)
 
 
 @gluon.jit
@@ -599,10 +1039,9 @@ def _dsa_decode_radix_scatter_slots_kernel(
             mask=mask,
             other=-float("inf"),
         )
-        finite = values != -float("inf")
         keys = _fp32_to_ordered_key(values)
-        greater = mask & finite & (keys > threshold)
-        equal = mask & finite & (keys == threshold)
+        greater = mask & (keys > threshold)
+        equal = mask & (keys == threshold)
 
         greater_i32 = greater.to(gl.int32)
         equal_i32 = equal.to(gl.int32)
@@ -662,6 +1101,8 @@ def _dsa_prefill_radix_scatter_kernel(
     layout: gl.constexpr = _vector_layout(BLOCK_N, gl.num_warps(), LOAD_ELEMS)
     row_start = gl.load(row_starts + row).to(gl.int32)
     row_end = gl.load(row_ends + row).to(gl.int32)
+    if row_end - row_start <= topk:
+        return
     threshold = gl.load(prefixes + row).to(gl.uint32)
     keep_equal = gl.load(remaining + row).to(gl.int32)
     count_greater = topk - keep_equal
@@ -674,10 +1115,9 @@ def _dsa_prefill_radix_scatter_kernel(
             mask=mask,
             other=-float("inf"),
         )
-        finite = values != -float("inf")
         keys = _fp32_to_ordered_key(values)
-        greater = mask & finite & (keys > threshold)
-        equal = mask & finite & (keys == threshold)
+        greater = mask & (keys > threshold)
+        equal = mask & (keys == threshold)
 
         greater_i32 = greater.to(gl.int32)
         equal_i32 = equal.to(gl.int32)
@@ -719,6 +1159,8 @@ def _dsa_prefill_radix_group_count_kernel(
     groups_per_row: gl.constexpr,
     row_groups_stride: gl.constexpr,
     group_stride: gl.constexpr,
+    topk: gl.constexpr,
+    HIST_DERIVED_FIXUP_ONLY: gl.constexpr,
     BLOCK_N: gl.constexpr,
     LOAD_ELEMS: gl.constexpr,
 ):
@@ -730,8 +1172,16 @@ def _dsa_prefill_radix_group_count_kernel(
     row_end = gl.load(row_ends + row).to(gl.int32)
     candidate_logits = logits + row * logits_stride + row_start
     candidate_len = gl.maximum(row_end - row_start, 0)
+    if candidate_len <= topk:
+        base = (row * row_groups_stride + group) * group_stride
+        gl.store(group_offsets + base, 0)
+        gl.store(group_offsets + base + 1, 0)
+        return
     vector_end = candidate_len & -4
     threshold = gl.load(prefixes + row).to(gl.uint32)
+    if HIST_DERIVED_FIXUP_ONLY:
+        if (row_start == 0) & (threshold != 0x007FFFFF):
+            return
     counts = gl.zeros([2], gl.int32, layout=count_layout)
 
     for tile in range(group, tiles_per_row, groups_per_row):
@@ -759,10 +1209,9 @@ def _dsa_prefill_radix_group_count_kernel(
                 other=-float("inf"),
             )
             values = gl.where(tail_mask, tail_values, vector_values)
-        finite = values != -float("inf")
         keys = _fp32_to_ordered_key(values)
-        greater = mask & finite & (keys > threshold)
-        equal = mask & finite & (keys == threshold)
+        greater = mask & (keys > threshold)
+        equal = mask & (keys == threshold)
         count_bin = gl.where(greater, 0, 1).to(gl.int32)
         counts += gl.histogram(
             count_bin,
@@ -841,6 +1290,8 @@ def _dsa_prefill_radix_deterministic_scatter_kernel(
     row_end = gl.load(row_ends + row).to(gl.int32)
     candidate_logits = logits + row * logits_stride + row_start
     candidate_len = gl.maximum(row_end - row_start, 0)
+    if candidate_len <= topk:
+        return
     vector_end = candidate_len & -4
     threshold = gl.load(prefixes + row).to(gl.uint32)
     keep_equal = gl.load(remaining + row).to(gl.int32)
@@ -876,10 +1327,9 @@ def _dsa_prefill_radix_deterministic_scatter_kernel(
                 other=-float("inf"),
             )
             values = gl.where(tail_mask, tail_values, vector_values)
-        finite = values != -float("inf")
         keys = _fp32_to_ordered_key(values)
-        greater = mask & finite & (keys > threshold)
-        equal = mask & finite & (keys == threshold)
+        greater = mask & (keys > threshold)
+        equal = mask & (keys == threshold)
 
         greater_i32 = greater.to(gl.int32)
         equal_i32 = equal.to(gl.int32)
@@ -1032,6 +1482,8 @@ def _run_radix_prefix_passes(
 
 def _run_prefill_wide_radix_prefix_passes(
     logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
     hist: torch.Tensor,
     prefixes: torch.Tensor,
     remaining: torch.Tensor,
@@ -1042,12 +1494,18 @@ def _run_prefill_wide_radix_prefix_passes(
     groups: int,
     row_groups_stride: int,
     hist_group_stride: int,
+    block_n: int,
+    topk: int,
+    q_len_per_req: int,
+    is_decode: bool,
 ) -> None:
     for shift, radix_bits in _PREFILL_RADIX_SCHEDULE:
         num_buckets = 1 << radix_bits
         _dsa_prefill_wide_radix_grouped_hist_kernel[(rows, groups)](
             logits,
             prefixes,
+            row_starts,
+            row_ends,
             hist,
             logits.stride(0),
             tiles_per_row=tiles,
@@ -1056,10 +1514,13 @@ def _run_prefill_wide_radix_prefix_passes(
             hist_group_stride=hist_group_stride,
             n_cols=cols,
             shift=shift,
+            topk=topk,
+            q_len_per_req=q_len_per_req,
+            IS_DECODE=is_decode,
             RADIX_BITS=radix_bits,
             NUM_BUCKETS=num_buckets,
-            BLOCK_N=_PREFILL_RADIX_BLOCK_N,
-            LOAD_ELEMS=_load_elems(_PREFILL_RADIX_BLOCK_N, 8),
+            BLOCK_N=block_n,
+            LOAD_ELEMS=_load_elems(block_n, 8),
             num_warps=8,
         )
         _dsa_prefill_wide_radix_update_kernel[(rows,)](
@@ -1191,6 +1652,8 @@ def _dsa_prefill_radix_topk(
     )
     _run_prefill_wide_radix_prefix_passes(
         logits,
+        row_starts,
+        row_ends,
         hist,
         prefixes,
         remaining,
@@ -1200,6 +1663,10 @@ def _dsa_prefill_radix_topk(
         groups=hist_groups,
         row_groups_stride=workspace_groups,
         hist_group_stride=hist_group_stride,
+        block_n=_PREFILL_RADIX_BLOCK_N,
+        topk=topk,
+        q_len_per_req=1,
+        is_decode=False,
     )
     if groups < tiles:
         _dsa_prefill_radix_group_count_kernel[(rows, groups)](
@@ -1214,6 +1681,8 @@ def _dsa_prefill_radix_topk(
             groups_per_row=groups,
             row_groups_stride=workspace_groups,
             group_stride=hist_group_stride,
+            topk=topk,
+            HIST_DERIVED_FIXUP_ONLY=False,
             BLOCK_N=_RADIX_TOPK_BLOCK_N,
             LOAD_ELEMS=_load_elems(_RADIX_TOPK_BLOCK_N, 8),
             num_warps=8,
@@ -1267,6 +1736,388 @@ def _dsa_prefill_radix_topk(
             num_warps=8,
         )
     return out, lens_out
+
+
+def _dsa_prefill_hist_derived_radix_topk(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, cols = logits.shape
+    block_n = _RADIX_TOPK_BLOCK_N
+    tiles = triton.cdiv(int(cols), block_n)
+    groups = _radix_groups_per_row(
+        rows,
+        tiles,
+        logits.device,
+        target_groups_per_cu=_PREFILL_RADIX_SCATTER_TARGET_GROUPS_PER_CU,
+    )
+    block_groups = triton.next_power_of_2(groups)
+    hist_group_stride = _PREFILL_RADIX_BUCKETS
+    hist = torch.empty(
+        (rows, groups, hist_group_stride),
+        dtype=torch.int32,
+        device=logits.device,
+    )
+    group_offsets = torch.empty(
+        (rows, groups, 2), dtype=torch.int32, device=logits.device
+    )
+    prefixes = torch.empty((rows,), dtype=torch.int32, device=logits.device)
+    remaining = torch.empty((rows,), dtype=torch.int32, device=logits.device)
+    counters = torch.empty((rows, 2), dtype=torch.int32, device=logits.device)
+
+    _dsa_prefill_radix_init_kernel[(rows,)](
+        row_starts,
+        row_ends,
+        out,
+        lens_out,
+        prefixes,
+        remaining,
+        counters,
+        out.stride(0),
+        topk=topk,
+        TOPK_LOAD_ELEMS=_load_elems(topk, 8),
+        num_warps=8,
+    )
+    for pass_index, (shift, radix_bits) in enumerate(_PREFILL_RADIX_SCHEDULE):
+        num_buckets = 1 << radix_bits
+        _dsa_prefill_wide_radix_grouped_hist_kernel[(rows, groups)](
+            logits,
+            prefixes,
+            row_starts,
+            row_ends,
+            hist,
+            logits.stride(0),
+            tiles_per_row=tiles,
+            groups_per_row=groups,
+            row_groups_stride=groups,
+            hist_group_stride=hist_group_stride,
+            n_cols=cols,
+            shift=shift,
+            topk=topk,
+            q_len_per_req=1,
+            IS_DECODE=False,
+            RADIX_BITS=radix_bits,
+            NUM_BUCKETS=num_buckets,
+            BLOCK_N=block_n,
+            LOAD_ELEMS=_load_elems(block_n, 8),
+            num_warps=8,
+        )
+        _dsa_prefill_wide_radix_update_kernel[(rows,)](
+            prefixes,
+            remaining,
+            hist,
+            groups_per_row=groups,
+            row_groups_stride=groups,
+            hist_group_stride=hist_group_stride,
+            RADIX_BITS=radix_bits,
+            NUM_BUCKETS=num_buckets,
+            LOAD_ELEMS=_load_elems(num_buckets, 8),
+            num_warps=8,
+        )
+        _dsa_prefill_derive_group_counts_from_hist_kernel[(rows, groups)](
+            prefixes,
+            hist,
+            group_offsets,
+            groups_per_row=groups,
+            hist_group_stride=hist_group_stride,
+            RADIX_BITS=radix_bits,
+            NUM_BUCKETS=num_buckets,
+            PASS_INDEX=pass_index,
+            LOAD_ELEMS=_load_elems(num_buckets, 8),
+            num_warps=8,
+        )
+
+    _dsa_prefill_radix_group_count_kernel[(rows, groups)](
+        logits,
+        prefixes,
+        row_starts,
+        row_ends,
+        group_offsets,
+        logits.stride(0),
+        n_cols=cols,
+        tiles_per_row=tiles,
+        groups_per_row=groups,
+        row_groups_stride=groups,
+        group_stride=2,
+        topk=topk,
+        HIST_DERIVED_FIXUP_ONLY=True,
+        BLOCK_N=block_n,
+        LOAD_ELEMS=_load_elems(block_n, 8),
+        num_warps=8,
+    )
+    _dsa_radix_group_prefix_kernel[(rows,)](
+        group_offsets,
+        groups_per_row=groups,
+        row_groups_stride=groups,
+        group_stride=2,
+        BLOCK_GROUPS=block_groups,
+        LOAD_ELEMS=_load_elems(block_groups, 1),
+        num_warps=1,
+    )
+    _dsa_prefill_radix_deterministic_scatter_kernel[(rows, groups)](
+        logits,
+        prefixes,
+        remaining,
+        group_offsets,
+        row_starts,
+        row_ends,
+        out,
+        logits.stride(0),
+        out.stride(0),
+        n_cols=cols,
+        topk=topk,
+        tiles_per_row=tiles,
+        groups_per_row=groups,
+        row_groups_stride=groups,
+        group_stride=2,
+        BLOCK_N=block_n,
+        LOAD_ELEMS=_load_elems(block_n, 8),
+        num_warps=8,
+    )
+    return out, lens_out
+
+
+def _dsa_decode_staged_wide_radix_topk_slots(
+    logits: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    q_len_per_req: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, cols = logits.shape
+    hist_tiles = triton.cdiv(int(cols), _PREFILL_RADIX_BLOCK_N)
+    hist_groups = _radix_groups_per_row(
+        rows,
+        hist_tiles,
+        logits.device,
+        target_groups_per_cu=_PREFILL_RADIX_HIST_TARGET_GROUPS_PER_CU,
+    )
+    scatter_tiles = triton.cdiv(int(cols), _RADIX_TOPK_BLOCK_N)
+    scatter_groups = _radix_groups_per_row(
+        rows,
+        scatter_tiles,
+        logits.device,
+    )
+    workspace_groups = max(hist_groups, scatter_groups)
+    hist_group_stride = _PREFILL_RADIX_BUCKETS
+    hist = torch.empty(
+        (rows, workspace_groups, hist_group_stride),
+        dtype=torch.int32,
+        device=logits.device,
+    )
+    prefixes = torch.empty((rows,), dtype=torch.int32, device=logits.device)
+    remaining = torch.empty((rows,), dtype=torch.int32, device=logits.device)
+    counters = torch.empty((rows, 2), dtype=torch.int32, device=logits.device)
+
+    _dsa_decode_radix_init_kernel[(rows,)](
+        seq_lens,
+        out,
+        lens_out,
+        prefixes,
+        remaining,
+        counters,
+        out.stride(0),
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        TOPK_LOAD_ELEMS=_load_elems(topk, 8),
+        num_warps=8,
+    )
+    _run_prefill_wide_radix_prefix_passes(
+        logits,
+        seq_lens,
+        seq_lens,
+        hist,
+        prefixes,
+        remaining,
+        rows=rows,
+        cols=cols,
+        tiles=hist_tiles,
+        groups=hist_groups,
+        row_groups_stride=workspace_groups,
+        hist_group_stride=hist_group_stride,
+        block_n=_PREFILL_RADIX_BLOCK_N,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        is_decode=True,
+    )
+    _dsa_decode_radix_scatter_slots_kernel[(rows, scatter_groups)](
+        logits,
+        prefixes,
+        remaining,
+        counters,
+        block_table,
+        seq_lens,
+        out,
+        logits.stride(0),
+        block_table.stride(0),
+        out.stride(0),
+        block_table.shape[1],
+        n_cols=cols,
+        page_size=int(page_size),
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        tiles_per_row=scatter_tiles,
+        groups_per_row=scatter_groups,
+        BLOCK_N=_RADIX_TOPK_BLOCK_N,
+        LOAD_ELEMS=_load_elems(_RADIX_TOPK_BLOCK_N, 8),
+        num_warps=8,
+    )
+    return out, lens_out
+
+
+def _dsa_decode_topk_slots(
+    logits: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    q_len_per_req: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, cols = logits.shape
+    if cols <= topk:
+        _dsa_trivial_topk_kernel[(rows,)](
+            block_table,
+            seq_lens,
+            seq_lens,
+            seq_lens,
+            out,
+            lens_out,
+            block_table.stride(0),
+            out.stride(0),
+            block_table.shape[1],
+            page_size=int(page_size),
+            topk=topk,
+            q_len_per_req=q_len_per_req,
+            IS_DECODE=True,
+            TOPK_LOAD_ELEMS=_load_elems(topk, 16),
+            num_warps=16,
+        )
+        return out, lens_out
+
+    if cols <= _ONEBLOCK_RADIX_MAX_COLS:
+        _dsa_oneblock_manual_radix_topk_kernel[(rows,)](
+            logits,
+            block_table,
+            seq_lens,
+            seq_lens,
+            seq_lens,
+            out,
+            lens_out,
+            logits.stride(0),
+            block_table.stride(0),
+            out.stride(0),
+            block_table.shape[1],
+            page_size=int(page_size),
+            topk=topk,
+            q_len_per_req=q_len_per_req,
+            IS_DECODE=True,
+            RADIX0_BITS=_ONEBLOCK_RADIX_SCHEDULE[0],
+            RADIX1_BITS=_ONEBLOCK_RADIX_SCHEDULE[1],
+            RADIX2_BITS=_ONEBLOCK_RADIX_SCHEDULE[2],
+            MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
+            BLOCK_N=_ONEBLOCK_RADIX_BLOCK_N,
+            num_warps=16,
+        )
+        return out, lens_out
+
+    return _dsa_decode_staged_wide_radix_topk_slots(
+        logits,
+        block_table,
+        seq_lens,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def _dsa_prefill_topk_indices(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, cols = logits.shape
+    if cols <= topk:
+        _dsa_trivial_topk_kernel[(rows,)](
+            row_starts,
+            row_starts,
+            row_starts,
+            row_ends,
+            out,
+            lens_out,
+            0,
+            out.stride(0),
+            0,
+            page_size=1,
+            topk=topk,
+            q_len_per_req=1,
+            IS_DECODE=False,
+            TOPK_LOAD_ELEMS=_load_elems(topk, 16),
+            num_warps=16,
+        )
+        return out, lens_out
+
+    if cols <= _ONEBLOCK_RADIX_MAX_COLS:
+        _dsa_oneblock_manual_radix_topk_kernel[(rows,)](
+            logits,
+            row_starts,
+            row_starts,
+            row_starts,
+            row_ends,
+            out,
+            lens_out,
+            logits.stride(0),
+            0,
+            out.stride(0),
+            0,
+            page_size=1,
+            topk=topk,
+            q_len_per_req=1,
+            IS_DECODE=False,
+            RADIX0_BITS=_ONEBLOCK_RADIX_SCHEDULE[0],
+            RADIX1_BITS=_ONEBLOCK_RADIX_SCHEDULE[1],
+            RADIX2_BITS=_ONEBLOCK_RADIX_SCHEDULE[2],
+            MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
+            BLOCK_N=_ONEBLOCK_RADIX_BLOCK_N,
+            num_warps=16,
+        )
+        return out, lens_out
+
+    if cols >= _PREFILL_HIST_DERIVED_MIN_COLS:
+        return _dsa_prefill_hist_derived_radix_topk(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+
+    return _dsa_prefill_radix_topk(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
 
 
 def gluon_dsa_decode_topk_fp8_gfx950(
@@ -1358,39 +2209,16 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         BLOCK_D=128,
         num_warps=4,
     )
-    if _use_radix_topk(max_seq_len):
-        return _dsa_decode_radix_topk_slots(
-            logits,
-            block_table,
-            seq_lens,
-            page_size=int(page_size),
-            topk=topk,
-            q_len_per_req=q_len_per_req,
-            out=out,
-            lens_out=lens_out,
-        )
-
-    select_warps = 8
-    select_block = triton.next_power_of_2(max(max_seq_len, topk))
-    _dsa_decode_select_topk_kernel[(q.shape[0],)](
+    return _dsa_decode_topk_slots(
         logits,
         block_table,
         seq_lens,
-        out,
-        lens_out,
-        logits.stride(0),
-        block_table.stride(0),
-        out.stride(0),
-        block_table.shape[1],
         page_size=int(page_size),
         topk=topk,
         q_len_per_req=q_len_per_req,
-        BLOCK_N=select_block,
-        LOAD_ELEMS=_load_elems(select_block, select_warps),
-        TOPK_LOAD_ELEMS=_load_elems(topk, select_warps),
-        num_warps=select_warps,
+        out=out,
+        lens_out=lens_out,
     )
-    return out, lens_out
 
 
 def gluon_dsa_prefill_topk_fp8_gfx950(
@@ -1453,8 +2281,6 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
     else:
         max_query_rows = max(1, int(max_logits_bytes) // (max(seq_len_sum, 1) * 4))
     block_n = 32
-    select_warps = 8
-    select_block = triton.next_power_of_2(max(seq_len_sum, topk))
     for start in range(0, q.shape[0], max_query_rows):
         end = min(start + max_query_rows, q.shape[0])
         logits = torch.empty(
@@ -1483,29 +2309,12 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             BLOCK_D=128,
             num_warps=4,
         )
-        if _use_radix_topk(seq_len_sum):
-            _dsa_prefill_radix_topk(
-                logits,
-                row_starts[start:end],
-                row_ends[start:end],
-                topk=topk,
-                out=out[start:end],
-                lens_out=lens_out[start:end],
-            )
-            continue
-
-        _dsa_prefill_select_topk_kernel[(end - start,)](
+        _dsa_prefill_topk_indices(
             logits,
             row_starts[start:end],
             row_ends[start:end],
-            out[start:end],
-            lens_out[start:end],
-            logits.stride(0),
-            out.stride(0),
             topk=topk,
-            BLOCK_N=select_block,
-            LOAD_ELEMS=_load_elems(select_block, select_warps),
-            TOPK_LOAD_ELEMS=_load_elems(topk, select_warps),
-            num_warps=select_warps,
+            out=out[start:end],
+            lens_out=lens_out[start:end],
         )
     return out, lens_out
