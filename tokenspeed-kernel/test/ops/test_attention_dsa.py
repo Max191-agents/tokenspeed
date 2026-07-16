@@ -74,6 +74,34 @@ def _pack_index_k_cache(
     return packed, (x_fp8.float() * scale).reshape_as(index_k)
 
 
+def _assert_topk_values_match(
+    actual: torch.Tensor,
+    actual_lens: torch.Tensor,
+    candidate_indices: list[torch.Tensor],
+    candidate_scores: list[torch.Tensor],
+    topk: int,
+) -> None:
+    for token, (candidates, scores) in enumerate(
+        zip(candidate_indices, candidate_scores, strict=True)
+    ):
+        count = min(int(candidates.numel()), topk)
+        assert int(actual_lens[token].item()) == count
+        selected = actual[token, :count]
+        assert torch.unique(selected).numel() == count
+        matches = selected[:, None] == candidates[None, :]
+        assert bool(matches.any(dim=1).all())
+        positions = matches.to(torch.int32).argmax(dim=1)
+        selected_scores = scores.index_select(0, positions)
+        expected_scores = torch.topk(scores, count).values
+        torch.testing.assert_close(
+            torch.sort(selected_scores, descending=True).values,
+            expected_scores,
+            rtol=1.0e-4,
+            atol=1.0e-5,
+        )
+        assert bool((actual[token, count:] == -1).all())
+
+
 def test_dsa_decode_topk_fp8(device: str, require) -> None:
     require("attention", "dsa_decode_topk", "triton", torch.bfloat16, "q")
 
@@ -102,8 +130,8 @@ def test_dsa_decode_topk_fp8(device: str, require) -> None:
         solution="triton",
     )
 
-    expected = torch.full_like(topk_slots, -1)
-    expected_lens = torch.minimum(seq_lens, torch.full_like(seq_lens, topk))
+    candidate_indices = []
+    candidate_scores = []
     for token in range(q.shape[0]):
         scores = []
         slots = []
@@ -111,18 +139,14 @@ def test_dsa_decode_topk_fp8(device: str, require) -> None:
             page = int(block_table[token, offset // page_size].item())
             slot = page * page_size + offset % page_size
             per_head = (q[token].float() * index_k[slot].float()).sum(dim=-1)
-            scores.append((per_head * weights[token]).sum() * (128**-0.5))
+            scores.append((torch.relu(per_head) * weights[token]).sum() * (128**-0.5))
             slots.append(slot)
-        local = torch.topk(
-            torch.stack(scores), int(expected_lens[token].item())
-        ).indices
-        expected[token, : local.numel()] = torch.tensor(
-            [slots[int(i)] for i in local.tolist()], device=device, dtype=torch.int32
-        )
+        candidate_indices.append(torch.tensor(slots, device=device, dtype=torch.int32))
+        candidate_scores.append(torch.stack(scores))
 
-    torch.testing.assert_close(topk_lens.cpu(), expected_lens.cpu())
-    torch.testing.assert_close(topk_slots[:, :65].cpu(), expected[:, :65].cpu())
-    assert (topk_slots[0, int(expected_lens[0].item()) :] == -1).all()
+    _assert_topk_values_match(
+        topk_slots, topk_lens, candidate_indices, candidate_scores, topk
+    )
 
 
 @pytest.mark.parametrize("q_len_per_req", [2, 4])
@@ -162,6 +186,8 @@ def test_dsa_decode_topk_fp8_mtp(device: str, q_len_per_req: int, require) -> No
         solution="triton",
     )
 
+    candidate_indices = []
+    candidate_scores = []
     for r in range(num_reqs):
         for jj in range(q_len_per_req):
             token = r * q_len_per_req + jj
@@ -172,14 +198,18 @@ def test_dsa_decode_topk_fp8_mtp(device: str, q_len_per_req: int, require) -> No
                 page = int(block_table[r, off // page_size].item())
                 slot = page * page_size + off % page_size
                 per_head = (q[token].float() * index_k[slot].float()).sum(dim=-1)
-                scores.append((per_head * weights[token]).sum() * (128**-0.5))
+                scores.append(
+                    (torch.relu(per_head) * weights[token]).sum() * (128**-0.5)
+                )
                 slots.append(slot)
-            k = min(causal_len, topk)
-            local = torch.topk(torch.stack(scores), k).indices
-            ref = {slots[int(i)] for i in local.tolist()}
-            got = {int(x) for x in topk_slots[token, :k].tolist() if x >= 0}
-            assert int(topk_lens[token].item()) == k, (token, topk_lens[token], k)
-            assert ref == got, f"token {token}: {len(ref ^ got)} slots differ"
+            candidate_indices.append(
+                torch.tensor(slots, device=device, dtype=torch.int32)
+            )
+            candidate_scores.append(torch.stack(scores))
+
+    _assert_topk_values_match(
+        topk_slots, topk_lens, candidate_indices, candidate_scores, topk
+    )
 
 
 def test_dsa_prefill_topk_fp8(device: str, require) -> None:
@@ -210,28 +240,26 @@ def test_dsa_prefill_topk_fp8(device: str, require) -> None:
         solution="triton",
     )
 
-    expected = torch.full_like(workspace_indices, -1)
-    expected_lens = torch.minimum(
-        row_ends - row_starts, torch.full_like(row_ends, topk)
-    )
+    candidate_indices = []
+    candidate_scores = []
     for token in range(q.shape[0]):
         scores = []
         rows = []
         for row in range(int(row_starts[token].item()), int(row_ends[token].item())):
             slot = int(kv_workspace_slots[row].item())
             per_head = (q[token].float() * index_k[slot].float()).sum(dim=-1)
-            scores.append((per_head * weights[token]).sum() * (128**-0.5))
+            scores.append((torch.relu(per_head) * weights[token]).sum() * (128**-0.5))
             rows.append(row)
-        local = torch.topk(
-            torch.stack(scores), int(expected_lens[token].item())
-        ).indices
-        expected[token, : local.numel()] = torch.tensor(
-            [rows[int(i)] for i in local.tolist()], device=device, dtype=torch.int32
-        )
+        candidate_indices.append(torch.tensor(rows, device=device, dtype=torch.int32))
+        candidate_scores.append(torch.stack(scores))
 
-    torch.testing.assert_close(topk_lens.cpu(), expected_lens.cpu())
-    torch.testing.assert_close(workspace_indices[:, :65].cpu(), expected[:, :65].cpu())
-    assert (workspace_indices[0, int(expected_lens[0].item()) :] == -1).all()
+    _assert_topk_values_match(
+        workspace_indices,
+        topk_lens,
+        candidate_indices,
+        candidate_scores,
+        topk,
+    )
 
 
 def test_dsa_plan_triton(device: str) -> None:

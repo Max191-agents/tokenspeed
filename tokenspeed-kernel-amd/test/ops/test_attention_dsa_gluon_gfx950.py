@@ -74,6 +74,13 @@ class _TopKPrefillCase:
 
 
 @dataclass(frozen=True)
+class _TopKReference:
+    lens: torch.Tensor
+    candidate_indices: tuple[torch.Tensor, ...]
+    candidate_scores: tuple[torch.Tensor, ...]
+
+
+@dataclass(frozen=True)
 class _DSACase:
     name: str
     mode: str
@@ -359,14 +366,16 @@ def _randn_bf16(
     ).to(torch.bfloat16)
 
 
-def _normal_weights(
+def _model_weights(
     shape: Sequence[int],
     *,
     device: str,
     generator: torch.Generator,
 ) -> torch.Tensor:
-    logits = torch.randn(shape, device=device, dtype=torch.float32, generator=generator)
-    return torch.softmax(logits, dim=-1).contiguous()
+    weights = torch.randn(
+        shape, device=device, dtype=torch.float32, generator=generator
+    )
+    return (weights * float(shape[-1]) ** -0.5).contiguous()
 
 
 def _round_up_to_page(slots: int, page_size: int) -> int:
@@ -422,7 +431,7 @@ def _index_scores(
     softmax_scale: float,
 ) -> torch.Tensor:
     per_head = index_k.float() @ q.float().transpose(0, 1)
-    return (per_head * weights.float()).sum(dim=1) * softmax_scale
+    return (torch.relu(per_head) * weights.float()).sum(dim=1) * softmax_scale
 
 
 def _reference_decode_topk(
@@ -436,9 +445,10 @@ def _reference_decode_topk(
     topk: int,
     softmax_scale: float,
     q_len_per_req: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    out = torch.full((q.shape[0], topk), -1, device=q.device, dtype=torch.int32)
+) -> _TopKReference:
     lens = torch.empty((q.shape[0],), device=q.device, dtype=torch.int32)
+    candidate_indices: list[torch.Tensor] = []
+    candidate_scores: list[torch.Tensor] = []
     for token in range(q.shape[0]):
         req = token // int(q_len_per_req)
         q_offset = token - req * int(q_len_per_req)
@@ -447,8 +457,6 @@ def _reference_decode_topk(
             seq_len = seq_len - (int(q_len_per_req) - 1) + q_offset
         count = min(seq_len, int(topk))
         lens[token] = count
-        if count == 0:
-            continue
         offsets = torch.arange(seq_len, device=q.device, dtype=torch.long)
         pages = block_table[req].long().index_select(0, offsets // page_size)
         slots = pages * int(page_size) + offsets.remainder(page_size)
@@ -458,9 +466,9 @@ def _reference_decode_topk(
             index_k.index_select(0, slots),
             softmax_scale,
         )
-        selected = torch.topk(scores, count).indices
-        out[token, :count] = slots.index_select(0, selected).to(torch.int32)
-    return out, lens
+        candidate_indices.append(slots.to(torch.int32))
+        candidate_scores.append(scores)
+    return _TopKReference(lens, tuple(candidate_indices), tuple(candidate_scores))
 
 
 def _reference_prefill_topk(
@@ -473,14 +481,12 @@ def _reference_prefill_topk(
     *,
     topk: int,
     softmax_scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    out = torch.full((q.shape[0], topk), -1, device=q.device, dtype=torch.int32)
+) -> _TopKReference:
     candidate_lens = (row_ends - row_starts).clamp_min(0)
     lens = torch.minimum(candidate_lens, torch.full_like(candidate_lens, int(topk)))
+    candidate_indices: list[torch.Tensor] = []
+    candidate_scores: list[torch.Tensor] = []
     for token in range(q.shape[0]):
-        count = int(lens[token].item())
-        if count == 0:
-            continue
         rows = torch.arange(
             int(row_starts[token].item()),
             int(row_ends[token].item()),
@@ -494,23 +500,33 @@ def _reference_prefill_topk(
             index_k.index_select(0, slots),
             softmax_scale,
         )
-        selected = torch.topk(scores, count).indices
-        out[token, :count] = rows.index_select(0, selected).to(torch.int32)
-    return out, lens
+        candidate_indices.append(rows.to(torch.int32))
+        candidate_scores.append(scores)
+    return _TopKReference(lens, tuple(candidate_indices), tuple(candidate_scores))
 
 
 def _assert_topk_matches(
     actual: torch.Tensor,
     actual_lens: torch.Tensor,
-    expected: torch.Tensor,
-    expected_lens: torch.Tensor,
+    expected: _TopKReference,
 ) -> None:
-    torch.testing.assert_close(actual_lens.cpu(), expected_lens.cpu())
+    torch.testing.assert_close(actual_lens.cpu(), expected.lens.cpu())
     for token in range(actual.shape[0]):
-        count = int(expected_lens[token].item())
-        actual_selected = torch.sort(actual[token, :count].cpu()).values
-        expected_selected = torch.sort(expected[token, :count].cpu()).values
-        torch.testing.assert_close(actual_selected, expected_selected)
+        count = int(expected.lens[token].item())
+        actual_selected = actual[token, :count]
+        assert torch.unique(actual_selected).numel() == count
+        candidates = expected.candidate_indices[token]
+        matches = actual_selected[:, None] == candidates[None, :]
+        assert bool(matches.any(dim=1).all())
+        positions = matches.to(torch.int32).argmax(dim=1)
+        actual_scores = expected.candidate_scores[token].index_select(0, positions)
+        expected_scores = torch.topk(expected.candidate_scores[token], count).values
+        torch.testing.assert_close(
+            torch.sort(actual_scores, descending=True).values,
+            expected_scores,
+            rtol=1.0e-4,
+            atol=1.0e-5,
+        )
         assert (actual[token, count:] == -1).all()
 
 
@@ -554,7 +570,7 @@ def test_dsa_decode_topk_fp8_glm52_cases(case: _TopKDecodeCase) -> None:
         device=device,
         generator=gen,
     )
-    weights = _normal_weights((tokens, case.index_heads), device=device, generator=gen)
+    weights = _model_weights((tokens, case.index_heads), device=device, generator=gen)
     packed_index_k, index_k = _pack_index_k_cache(
         _randn_bf16((num_slots, head_dim), device=device, generator=gen),
         page_size,
@@ -573,7 +589,7 @@ def test_dsa_decode_topk_fp8_glm52_cases(case: _TopKDecodeCase) -> None:
         q_len_per_req=case.q_len_per_req,
         index_k_cache=packed_index_k,
     )
-    expected_slots, expected_lens = _reference_decode_topk(
+    expected = _reference_decode_topk(
         q,
         weights,
         index_k,
@@ -585,7 +601,7 @@ def test_dsa_decode_topk_fp8_glm52_cases(case: _TopKDecodeCase) -> None:
         q_len_per_req=case.q_len_per_req,
     )
 
-    _assert_topk_matches(topk_slots, topk_lens, expected_slots, expected_lens)
+    _assert_topk_matches(topk_slots, topk_lens, expected)
 
 
 def test_dsa_decode_topk_fp8_accepts_strided_inputs() -> None:
@@ -602,7 +618,7 @@ def test_dsa_decode_topk_fp8_accepts_strided_inputs() -> None:
         _randn_bf16((tokens, 1, head_dim), device=device, generator=gen)
     )
     weights = _strided_last_dim(
-        _normal_weights((tokens, 1), device=device, generator=gen)
+        _model_weights((tokens, 1), device=device, generator=gen)
     )
     packed_index_k, index_k = _pack_index_k_cache(
         _randn_bf16((num_slots, head_dim), device=device, generator=gen),
@@ -625,7 +641,7 @@ def test_dsa_decode_topk_fp8_accepts_strided_inputs() -> None:
         q_len_per_req=1,
         index_k_cache=packed_index_k,
     )
-    expected_slots, expected_lens = _reference_decode_topk(
+    expected = _reference_decode_topk(
         q,
         weights,
         index_k,
@@ -636,7 +652,7 @@ def test_dsa_decode_topk_fp8_accepts_strided_inputs() -> None:
         softmax_scale=softmax_scale,
     )
 
-    _assert_topk_matches(topk_slots, topk_lens, expected_slots, expected_lens)
+    _assert_topk_matches(topk_slots, topk_lens, expected)
 
 
 @pytest.mark.parametrize(
@@ -660,7 +676,7 @@ def test_dsa_prefill_topk_fp8_glm52_cases(case: _TopKPrefillCase) -> None:
         device=device,
         generator=gen,
     )
-    weights = _normal_weights(
+    weights = _model_weights(
         (num_tokens, case.index_heads), device=device, generator=gen
     )
     packed_index_k, index_k = _pack_index_k_cache(
@@ -679,7 +695,7 @@ def test_dsa_prefill_topk_fp8_glm52_cases(case: _TopKPrefillCase) -> None:
         index_k_cache=packed_index_k,
         page_size=page_size,
     )
-    expected_indices, expected_lens = _reference_prefill_topk(
+    expected = _reference_prefill_topk(
         q,
         weights,
         index_k,
@@ -690,7 +706,7 @@ def test_dsa_prefill_topk_fp8_glm52_cases(case: _TopKPrefillCase) -> None:
         softmax_scale=softmax_scale,
     )
 
-    _assert_topk_matches(workspace_indices, topk_lens, expected_indices, expected_lens)
+    _assert_topk_matches(workspace_indices, topk_lens, expected)
 
 
 def test_dsa_prefill_topk_fp8_accepts_strided_inputs() -> None:
@@ -709,7 +725,7 @@ def test_dsa_prefill_topk_fp8_accepts_strided_inputs() -> None:
         _randn_bf16((num_tokens, 1, head_dim), device=device, generator=gen)
     )
     weights = _strided_last_dim(
-        _normal_weights((num_tokens, 1), device=device, generator=gen)
+        _model_weights((num_tokens, 1), device=device, generator=gen)
     )
     packed_index_k, index_k = _pack_index_k_cache(
         _randn_bf16((num_slots, head_dim), device=device, generator=gen),
@@ -731,7 +747,7 @@ def test_dsa_prefill_topk_fp8_accepts_strided_inputs() -> None:
         index_k_cache=packed_index_k,
         page_size=page_size,
     )
-    expected_indices, expected_lens = _reference_prefill_topk(
+    expected = _reference_prefill_topk(
         q,
         weights,
         index_k,
@@ -742,7 +758,7 @@ def test_dsa_prefill_topk_fp8_accepts_strided_inputs() -> None:
         softmax_scale=softmax_scale,
     )
 
-    _assert_topk_matches(workspace_indices, topk_lens, expected_indices, expected_lens)
+    _assert_topk_matches(workspace_indices, topk_lens, expected)
 
 
 def test_dsa_prefill_select_topk_keeps_late_values_above_threshold() -> None:

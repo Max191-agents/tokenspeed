@@ -714,6 +714,85 @@ def _dsa_prefill_radix_topk(
     return out, lens_out
 
 
+def _launch_dsa_decode_logits_fp8(
+    q: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    logits: torch.Tensor,
+    *,
+    page_size: int,
+    row_bytes: int,
+    softmax_scale: float,
+    q_len_per_req: int,
+) -> torch.Tensor:
+    max_seq_len = int(logits.shape[1])
+    block_n = 32
+    _dsa_decode_logits_fp8_kernel[(q.shape[0], triton.cdiv(max_seq_len, block_n))](
+        q,
+        index_k_cache.view(torch.float8_e4m3fn),
+        index_k_cache.view(torch.float32),
+        weights,
+        seq_lens,
+        block_table,
+        logits,
+        block_table.stride(0),
+        logits.stride(0),
+        page_size=page_size,
+        row_bytes=row_bytes,
+        max_seq_len=max_seq_len,
+        num_heads=q.shape[1],
+        head_dim=q.shape[2],
+        num_groups=q.shape[2] // 128,
+        softmax_scale=softmax_scale,
+        q_len_per_req=q_len_per_req,
+        BLOCK_N=block_n,
+        BLOCK_D=128,
+        num_warps=4,
+    )
+    return logits
+
+
+def _launch_dsa_prefill_logits_fp8(
+    q: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    logits: torch.Tensor,
+    *,
+    page_size: int,
+    row_bytes: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    seq_len_sum = int(logits.shape[1])
+    block_n = 32
+    _dsa_prefill_logits_fp8_kernel[(q.shape[0], triton.cdiv(seq_len_sum, block_n))](
+        q,
+        index_k_cache.view(torch.float8_e4m3fn),
+        index_k_cache.view(torch.float32),
+        weights,
+        kv_workspace_slots,
+        row_starts,
+        row_ends,
+        logits,
+        logits.stride(0),
+        seq_len_sum=seq_len_sum,
+        page_size=page_size,
+        row_bytes=row_bytes,
+        num_heads=q.shape[1],
+        head_dim=q.shape[2],
+        num_groups=q.shape[2] // 128,
+        softmax_scale=softmax_scale,
+        BLOCK_N=block_n,
+        BLOCK_D=128,
+        num_warps=4,
+    )
+    return logits
+
+
 def gluon_dsa_decode_topk_fp8_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -780,28 +859,17 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     logits = torch.empty(
         (q.shape[0], max_seq_len), dtype=torch.float32, device=q.device
     )
-    block_n = 32
-    _dsa_decode_logits_fp8_kernel[(q.shape[0], triton.cdiv(max_seq_len, block_n))](
+    _launch_dsa_decode_logits_fp8(
         q,
-        index_k_cache.view(torch.float8_e4m3fn),
-        index_k_cache.view(torch.float32),
+        index_k_cache,
         weights,
         seq_lens,
         block_table,
         logits,
-        block_table.stride(0),
-        logits.stride(0),
         page_size=int(page_size),
         row_bytes=row_bytes,
-        max_seq_len=max_seq_len,
-        num_heads=q.shape[1],
-        head_dim=q.shape[2],
-        num_groups=q.shape[2] // 128,
         softmax_scale=float(softmax_scale),
         q_len_per_req=q_len_per_req,
-        BLOCK_N=block_n,
-        BLOCK_D=128,
-        num_warps=4,
     )
     if _use_radix_topk(max_seq_len):
         return _dsa_decode_radix_topk_slots(
@@ -897,7 +965,6 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
         max_query_rows = q.shape[0]
     else:
         max_query_rows = max(1, int(max_logits_bytes) // (max(seq_len_sum, 1) * 4))
-    block_n = 32
     select_warps = 8
     select_block = triton.next_power_of_2(max(seq_len_sum, topk))
     for start in range(0, q.shape[0], max_query_rows):
@@ -905,28 +972,17 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
         logits = torch.empty(
             (end - start, seq_len_sum), dtype=torch.float32, device=q.device
         )
-        _dsa_prefill_logits_fp8_kernel[
-            (end - start, triton.cdiv(seq_len_sum, block_n))
-        ](
+        _launch_dsa_prefill_logits_fp8(
             q[start:end],
-            index_k_cache.view(torch.float8_e4m3fn),
-            index_k_cache.view(torch.float32),
+            index_k_cache,
             weights[start:end],
             kv_workspace_slots,
             row_starts[start:end],
             row_ends[start:end],
             logits,
-            logits.stride(0),
-            seq_len_sum=seq_len_sum,
             page_size=int(page_size),
             row_bytes=row_bytes,
-            num_heads=q.shape[1],
-            head_dim=q.shape[2],
-            num_groups=q.shape[2] // 128,
             softmax_scale=float(softmax_scale),
-            BLOCK_N=block_n,
-            BLOCK_D=128,
-            num_warps=4,
         )
         if _use_radix_topk(seq_len_sum):
             _dsa_prefill_radix_topk(

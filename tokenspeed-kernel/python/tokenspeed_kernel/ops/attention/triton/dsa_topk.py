@@ -341,7 +341,7 @@ def _dsa_decode_logits_fp8_kernel(
                 other=0.0,
             ).to(tl.float32)
             head_score += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-        scores += head_score * head_weight
+        scores += tl.maximum(head_score, 0.0) * head_weight
 
     scores *= softmax_scale
     scores = tl.where(valid, scores, -float("inf"))
@@ -417,7 +417,7 @@ def _dsa_prefill_logits_fp8_kernel(
                 other=0.0,
             ).to(tl.float32)
             head_score += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-        scores += head_score * head_weight
+        scores += tl.maximum(head_score, 0.0) * head_weight
 
     scores *= softmax_scale
     scores = tl.where(valid, scores, -float("inf"))
