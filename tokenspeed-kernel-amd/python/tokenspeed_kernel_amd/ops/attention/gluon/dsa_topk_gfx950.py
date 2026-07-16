@@ -906,7 +906,7 @@ def _persistent_emit_tail(
 def _dsa_persistent_radix_topk_kernel(
     logits,
     histograms,
-    arrivals,
+    pass_arrivals,
     pass_done,
     reset_arrivals,
     output_counters,
@@ -1127,13 +1127,21 @@ def _dsa_persistent_radix_topk_kernel(
         )
         gl.barrier()
 
+        row_pass_arrival = pass_arrivals + row * COUNTER_STRIDE
         old = gl.atomic_add(
-            arrivals + (row * NUM_PASSES + pass_index) * COUNTER_STRIDE,
+            row_pass_arrival,
             1,
             sem="acq_rel",
             scope="gpu",
         )
         if old == GROUPS_PER_ROW - 1:
+            # Cycle the shared arrival counter before publishing this generation.
+            gl.atomic_xchg(
+                row_pass_arrival,
+                0,
+                sem="relaxed",
+                scope="gpu",
+            )
             gl.atomic_add(
                 pass_done + row * COUNTER_STRIDE,
                 1,
@@ -1318,10 +1326,10 @@ def _dsa_persistent_radix_topk_kernel(
                 + bucket_offsets,
                 histogram_zeros,
             )
-            gl.store(
-                arrivals + (row * NUM_PASSES + reset_pass) * COUNTER_STRIDE,
-                0,
-            )
+        gl.store(
+            pass_arrivals + row * COUNTER_STRIDE,
+            0,
+        )
         gl.store(
             pass_done + row * COUNTER_STRIDE,
             0,
@@ -3791,11 +3799,7 @@ def _persistent_topk_workspace(
             device=device,
         ),
         torch.zeros(
-            (
-                row_bucket,
-                _PERSISTENT_PREFILL_NUM_PASSES,
-                _PERSISTENT_PREFILL_COUNTER_STRIDE,
-            ),
+            (row_bucket, _PERSISTENT_PREFILL_COUNTER_STRIDE),
             dtype=torch.int32,
             device=device,
         ),
@@ -3862,13 +3866,13 @@ def _dsa_persistent_radix_topk(
     lens_out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows, cols = logits.shape
-    histograms, arrivals, pass_done, reset_arrivals, output_counters = workspace
+    histograms, pass_arrivals, pass_done, reset_arrivals, output_counters = workspace
     block_table_stride = block_table.stride(0) if is_decode else 0
     block_table_cols = block_table.shape[1] if is_decode else 0
     kernel_args = (
         logits,
         histograms,
-        arrivals,
+        pass_arrivals,
         pass_done,
         reset_arrivals,
         output_counters,
