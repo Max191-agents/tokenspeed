@@ -401,15 +401,33 @@ def _compiled_runner_route_key(
     )
 
 
+def _get_cached_compiled_runner_plan(
+    cache: OrderedDict[tuple[object, ...], _CompiledRunnerPlan],
+    key: tuple[object, ...],
+) -> _CompiledRunnerPlan | None:
+    try:
+        plan = cache[key]
+        cache.move_to_end(key)
+    except KeyError:
+        return None
+    return plan
+
+
 def _cache_compiled_runner_plan(
     cache: OrderedDict[tuple[object, ...], _CompiledRunnerPlan],
     key: tuple[object, ...],
     plan: _CompiledRunnerPlan,
 ) -> None:
     cache[key] = plan
-    cache.move_to_end(key)
+    try:
+        cache.move_to_end(key)
+    except KeyError:
+        return
     while len(cache) > _COMPILED_RUNNER_CACHE_SIZE:
-        cache.popitem(last=False)
+        try:
+            cache.popitem(last=False)
+        except KeyError:
+            return
 
 
 def _launch_warmed_compiled_kernel(
@@ -429,9 +447,8 @@ def _launch_warmed_compiled_kernel(
         return
 
     if dispatch_cache is not None and dispatch_key is not None:
-        plan = dispatch_cache.get(dispatch_key)
+        plan = _get_cached_compiled_runner_plan(dispatch_cache, dispatch_key)
         if plan is not None:
-            dispatch_cache.move_to_end(dispatch_key)
             driver = triton.runtime.driver.active
             pointer_args = args[: len(pointer_dtypes)]
             same_pointers = plan.pointers_match(pointer_args)
@@ -468,9 +485,7 @@ def _launch_warmed_compiled_kernel(
         native_scalar_count,
         num_warps,
     )
-    plan = _compiled_runner_cache.get(key)
-    if plan is not None:
-        _compiled_runner_cache.move_to_end(key)
+    plan = _get_cached_compiled_runner_plan(_compiled_runner_cache, key)
     mutable_state = _compiled_runner_mutable_state(kernel)
     if plan is not None:
         pointer_args = args[: len(pointer_dtypes)]
@@ -510,9 +525,7 @@ def _launch_warmed_compiled_kernel(
         return
 
     with _compiled_runner_cache_lock:
-        plan = _compiled_runner_cache.get(key)
-        if plan is not None:
-            _compiled_runner_cache.move_to_end(key)
+        plan = _get_cached_compiled_runner_plan(_compiled_runner_cache, key)
         if plan is None:
             target_key = _compiled_runner_target_key(driver)
             target_getter = _compiled_runner_target_getter(driver)
@@ -3780,9 +3793,10 @@ def _dsa_persistent_radix_topk(
     specialization_key = kernel_args[16:]
     grid = (rows, groups, 1)
     dispatch_key = (grid, specialization_key)
-    compiled_plan = _persistent_runner_plans.get(dispatch_key)
-    if compiled_plan is not None:
-        _persistent_runner_plans.move_to_end(dispatch_key)
+    compiled_plan = _get_cached_compiled_runner_plan(
+        _persistent_runner_plans,
+        dispatch_key,
+    )
     driver = triton.runtime.driver.active
     if (
         compiled_plan is not None
@@ -4487,9 +4501,10 @@ def _dsa_decode_topk_slots(
             )
             specialization_key = kernel_args[7:]
             dispatch_key = (rows, specialization_key)
-            compiled_plan = _trivial_decode_runner_plans.get(dispatch_key)
-            if compiled_plan is not None:
-                _trivial_decode_runner_plans.move_to_end(dispatch_key)
+            compiled_plan = _get_cached_compiled_runner_plan(
+                _trivial_decode_runner_plans,
+                dispatch_key,
+            )
             driver = triton.runtime.driver.active
             if (
                 compiled_plan is not None
@@ -4584,9 +4599,10 @@ def _dsa_decode_topk_slots(
             )
             specialization_key = kernel_args[10:]
             dispatch_key = (rows, specialization_key)
-            compiled_plan = _runtime_decode_runner_plans.get(dispatch_key)
-            if compiled_plan is not None:
-                _runtime_decode_runner_plans.move_to_end(dispatch_key)
+            compiled_plan = _get_cached_compiled_runner_plan(
+                _runtime_decode_runner_plans,
+                dispatch_key,
+            )
             driver = triton.runtime.driver.active
             if (
                 compiled_plan is not None
@@ -4683,9 +4699,10 @@ def _dsa_prefill_topk_indices(
             )
             specialization_key = ()
             dispatch_key = (rows, specialization_key)
-            compiled_plan = _trivial_prefill_runner_plans.get(dispatch_key)
-            if compiled_plan is not None:
-                _trivial_prefill_runner_plans.move_to_end(dispatch_key)
+            compiled_plan = _get_cached_compiled_runner_plan(
+                _trivial_prefill_runner_plans,
+                dispatch_key,
+            )
             driver = triton.runtime.driver.active
             if (
                 compiled_plan is not None
