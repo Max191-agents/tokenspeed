@@ -47,6 +47,7 @@ _ONEBLOCK_DECODE_RADIX_BLOCK_N = 8192
 _ONEBLOCK_PREFILL_RADIX_BLOCK_N = 4096
 _ONEBLOCK_COMPACT_FINAL_BLOCK_N = 4096
 _ONEBLOCK_COMPACT_FINAL_MIN_COLS = 65536
+_ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS = 65536
 _ONEBLOCK_RADIX_MAX_COLS = 90000
 _PREFILL_HIST_DERIVED_MIN_COLS = 524288
 
@@ -409,6 +410,7 @@ def _emit_oneblock_topk_tile(
     out_stride: gl.constexpr,
     value_layout: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    PREFIX_SHIFT: gl.constexpr,
     IS_TAIL: gl.constexpr,
 ):
     offsets, values, valid = _load_oneblock_tile(
@@ -421,8 +423,9 @@ def _emit_oneblock_topk_tile(
         IS_TAIL,
     )
     keys = _fp32_to_topk_key(values)
-    greater_mask = valid & (keys < prefix)
-    equal_mask = valid & (keys == prefix)
+    compared_keys = keys if PREFIX_SHIFT == 0 else keys >> PREFIX_SHIFT
+    greater_mask = valid & (compared_keys < prefix)
+    equal_mask = valid & (compared_keys == prefix)
     reservation_mask = greater_mask | equal_mask
     reservation_counter = gl.where(greater_mask, 0, 1).to(gl.int32)
     reservation = shared_output_counters.atomic_scatter_add(
@@ -627,6 +630,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     BLOCK_N: gl.constexpr,
     COMPACT_FINAL_BLOCK_N: gl.constexpr,
     USE_COMPACT_FINAL: gl.constexpr,
+    USE_RADIX_EARLY_STOP: gl.constexpr,
 ):
     row = gl.program_id(0)
     value_layout: gl.constexpr = _vector_layout(
@@ -900,7 +904,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         select_low = group_greater + count_low >= remaining
         group_bucket = gl.where(select_low, bucket_low, bucket_high)
         group_selected_greater = group_greater + gl.where(select_low, 0, count_low)
-        if USE_COMPACT_FINAL:
+        if pass_index == 1 and (USE_COMPACT_FINAL or USE_RADIX_EARLY_STOP):
             group_selected_count = gl.where(select_low, count_low, count_high)
         selected_bucket = gl.sum(gl.where(selected_group, group_bucket, 0), axis=0).to(
             gl.int32
@@ -908,12 +912,78 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         selected_greater = gl.sum(
             gl.where(selected_group, group_selected_greater, 0), axis=0
         ).to(gl.int32)
-        if USE_COMPACT_FINAL:
+        if pass_index == 1 and (USE_COMPACT_FINAL or USE_RADIX_EARLY_STOP):
             selected_bucket_count = gl.sum(
                 gl.where(selected_group, group_selected_count, 0), axis=0
             ).to(gl.int32)
         prefix = (prefix << radix_bits) | selected_bucket.to(gl.uint32)
         remaining -= selected_greater
+        if USE_RADIX_EARLY_STOP and pass_index == 1:
+            if selected_bucket_count == remaining:
+                count_greater = selected_count - remaining
+                emit_full_end = candidate_len & -BLOCK_N
+                for tile_start in range(0, emit_full_end, BLOCK_N):
+                    _emit_oneblock_topk_tile(
+                        candidate_logits,
+                        tile_start,
+                        candidate_len,
+                        vector_end,
+                        candidate_start,
+                        prefix,
+                        count_greater,
+                        remaining,
+                        selected_count,
+                        shared_output_counters,
+                        out,
+                        row,
+                        out_stride,
+                        value_layout,
+                        BLOCK_N,
+                        shift,
+                        False,
+                    )
+                if emit_full_end < candidate_len:
+                    _emit_oneblock_topk_tile(
+                        candidate_logits,
+                        emit_full_end,
+                        candidate_len,
+                        vector_end,
+                        candidate_start,
+                        prefix,
+                        count_greater,
+                        remaining,
+                        selected_count,
+                        shared_output_counters,
+                        out,
+                        row,
+                        out_stride,
+                        value_layout,
+                        BLOCK_N,
+                        shift,
+                        True,
+                    )
+
+                if IS_DECODE:
+                    gl.barrier()
+                    valid_output = output_offsets < selected_count
+                    logical_offsets = gl.load(
+                        out + row * out_stride + output_offsets,
+                        mask=valid_output,
+                        other=0,
+                    ).to(gl.int32)
+                    block_idx = logical_offsets // page_size
+                    block_offset = logical_offsets - block_idx * page_size
+                    page = gl.load(
+                        block_table + req * block_table_stride + block_idx,
+                        mask=valid_output & (block_idx < block_table_cols),
+                        other=0,
+                    ).to(gl.int32)
+                    gl.store(
+                        out + row * out_stride + output_offsets,
+                        page * page_size + block_offset,
+                        mask=valid_output,
+                    )
+                return
         if USE_COMPACT_FINAL and pass_index == 1:
             compact_count = selected_bucket_count
 
@@ -961,6 +1031,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             out_stride,
             value_layout,
             BLOCK_N,
+            0,
             False,
         )
     if full_end < candidate_len:
@@ -980,6 +1051,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             out_stride,
             value_layout,
             BLOCK_N,
+            0,
             True,
         )
 
@@ -2433,6 +2505,7 @@ def _dsa_decode_topk_slots(
             BLOCK_N=_ONEBLOCK_DECODE_RADIX_BLOCK_N,
             COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
             USE_COMPACT_FINAL=False,
+            USE_RADIX_EARLY_STOP=(cols >= _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS),
             num_warps=16,
         )
         return out, lens_out
@@ -2503,6 +2576,7 @@ def _dsa_prefill_topk_indices(
             BLOCK_N=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
             COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
             USE_COMPACT_FINAL=cols >= _ONEBLOCK_COMPACT_FINAL_MIN_COLS,
+            USE_RADIX_EARLY_STOP=False,
             num_warps=16,
         )
         return out, lens_out
