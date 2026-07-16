@@ -1285,6 +1285,8 @@ def _select_runtime_radix_bits(
 
 def test_dsa_runtime_radix_production_width_remains_12_bits() -> None:
     assert dsa_topk_gfx950._RUNTIME_RADIX_BITS == 12
+    assert dsa_topk_gfx950._RUNTIME_OUTPUT_HISTOGRAM_BITS == 11
+    assert 1 << dsa_topk_gfx950._RUNTIME_OUTPUT_HISTOGRAM_BITS == 2048
 
 
 @pytest.mark.parametrize("mode", ("decode", "prefill"))

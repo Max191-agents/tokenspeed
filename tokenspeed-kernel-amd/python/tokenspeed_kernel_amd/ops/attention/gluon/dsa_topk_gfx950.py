@@ -67,6 +67,7 @@ _ONEBLOCK_DECODE_RUNTIME_MAX_COLS = 256 * 1024
 _ONEBLOCK_RADIX_MAX_COLS = 90000
 _RUNTIME_RADIX_BITS = 12
 _RUNTIME_RADIX_SUPPORTED_BITS = (10, 11, 12)
+_RUNTIME_OUTPUT_HISTOGRAM_BITS = gl.constexpr(11)
 _PREFILL_RUNTIME_RADIX_MIN_COLS = 98304
 _PREFILL_RUNTIME_RADIX_MAX_COLS = 196608
 _PREFILL_HIST_DERIVED_MIN_COLS = 524288
@@ -1832,6 +1833,47 @@ def _accumulate_runtime_radix_histogram_tile(
 
 
 @gluon.jit
+def _accumulate_runtime_global_radix_histogram_tile(
+    candidate_logits,
+    tile_start,
+    candidate_len,
+    vector_end,
+    prefix,
+    prefix_shift,
+    shift,
+    pass_index,
+    global_histogram,
+    value_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    RADIX_BITS: gl.constexpr,
+    IS_TAIL: gl.constexpr,
+):
+    _, values, valid = _load_oneblock_tile(
+        candidate_logits,
+        tile_start,
+        candidate_len,
+        vector_end,
+        value_layout,
+        BLOCK_N,
+        IS_TAIL,
+    )
+    keys = _fp32_to_topk_key(values)
+    if pass_index == 0:
+        prefix_match = valid
+    else:
+        positioned_keys = (keys >> prefix_shift) << prefix_shift
+        prefix_match = valid & (positioned_keys == prefix)
+    buckets = (keys >> shift) & ((1 << RADIX_BITS) - 1)
+    gl.atomic_add(
+        global_histogram + buckets.to(gl.int32),
+        gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+        mask=prefix_match,
+        sem="relaxed",
+        scope="cta",
+    )
+
+
+@gluon.jit
 def _emit_runtime_radix_topk_tile(
     candidate_logits,
     candidate_start,
@@ -2614,6 +2656,9 @@ def _dsa_runtime_radix_topk_kernel(
     row = gl.program_id(0)
     NUM_BUCKETS: gl.constexpr = 1 << RADIX_BITS
     NUM_PASSES: gl.constexpr = (32 + RADIX_BITS - 1) // RADIX_BITS
+    USE_OUTPUT_HISTOGRAM: gl.constexpr = (
+        RADIX_BITS == _RUNTIME_OUTPUT_HISTOGRAM_BITS and topk == NUM_BUCKETS
+    )
     value_layout: gl.constexpr = _vector_layout(
         BLOCK_N,
         gl.num_warps(),
@@ -2639,17 +2684,18 @@ def _dsa_runtime_radix_topk_kernel(
         gl.num_warps(),
         triton.cdiv(topk, 64 * gl.num_warps()),
     )
-    shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[NUM_BUCKETS, 1]],
-        [NUM_BUCKETS],
-        [0],
-    )
     histogram_zeros = gl.zeros([NUM_BUCKETS], gl.int32, layout=histogram_layout)
-    shared_histogram = gl.allocate_shared_memory(
-        gl.int32,
-        [NUM_BUCKETS],
-        shared_layout,
-    )
+    if not USE_OUTPUT_HISTOGRAM:
+        shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[NUM_BUCKETS, 1]],
+            [NUM_BUCKETS],
+            [0],
+        )
+        shared_histogram = gl.allocate_shared_memory(
+            gl.int32,
+            [NUM_BUCKETS],
+            shared_layout,
+        )
     output_counter_layout: gl.constexpr = _vector_layout(2, gl.num_warps(), 1)
     output_counter_shared_layout: gl.constexpr = (
         gl.PaddedSharedLayout.with_identity_for([[2, 1]], [2], [0])
@@ -2707,50 +2753,95 @@ def _dsa_runtime_radix_topk_kernel(
     pass_index = gl.full([], 0, gl.int32)
     done = gl.full([], 0, gl.int1)
     bucket_offsets = gl.arange(0, NUM_BUCKETS, layout=histogram_layout)
+    output_histogram = out + row * out_stride
+    if USE_OUTPUT_HISTOGRAM:
+        gl.store(output_histogram + bucket_offsets, histogram_zeros)
+        gl.barrier()
 
     while (pass_index < NUM_PASSES) & ~done:
-        gl.barrier()
-        shared_histogram.store(histogram_zeros)
-        gl.barrier()
+        if not USE_OUTPUT_HISTOGRAM:
+            gl.barrier()
+            shared_histogram.store(histogram_zeros)
+            gl.barrier()
 
         # The partial final digit overlaps only prefix bits already fixed above.
         shift = gl.maximum(32 - (pass_index + 1) * RADIX_BITS, 0)
         full_end = candidate_len & -BLOCK_N
         for tile_start in range(0, full_end, BLOCK_N):
-            _accumulate_runtime_radix_histogram_tile(
-                candidate_logits,
-                tile_start,
-                candidate_len,
-                vector_end,
-                prefix,
-                prefix_shift,
-                shift,
-                pass_index,
-                shared_histogram,
-                value_layout,
-                BLOCK_N,
-                RADIX_BITS,
-                False,
-            )
+            if USE_OUTPUT_HISTOGRAM:
+                _accumulate_runtime_global_radix_histogram_tile(
+                    candidate_logits,
+                    tile_start,
+                    candidate_len,
+                    vector_end,
+                    prefix,
+                    prefix_shift,
+                    shift,
+                    pass_index,
+                    output_histogram,
+                    value_layout,
+                    BLOCK_N,
+                    RADIX_BITS,
+                    False,
+                )
+            else:
+                _accumulate_runtime_radix_histogram_tile(
+                    candidate_logits,
+                    tile_start,
+                    candidate_len,
+                    vector_end,
+                    prefix,
+                    prefix_shift,
+                    shift,
+                    pass_index,
+                    shared_histogram,
+                    value_layout,
+                    BLOCK_N,
+                    RADIX_BITS,
+                    False,
+                )
         if full_end < candidate_len:
-            _accumulate_runtime_radix_histogram_tile(
-                candidate_logits,
-                full_end,
-                candidate_len,
-                vector_end,
-                prefix,
-                prefix_shift,
-                shift,
-                pass_index,
-                shared_histogram,
-                value_layout,
-                BLOCK_N,
-                RADIX_BITS,
-                True,
-            )
+            if USE_OUTPUT_HISTOGRAM:
+                _accumulate_runtime_global_radix_histogram_tile(
+                    candidate_logits,
+                    full_end,
+                    candidate_len,
+                    vector_end,
+                    prefix,
+                    prefix_shift,
+                    shift,
+                    pass_index,
+                    output_histogram,
+                    value_layout,
+                    BLOCK_N,
+                    RADIX_BITS,
+                    True,
+                )
+            else:
+                _accumulate_runtime_radix_histogram_tile(
+                    candidate_logits,
+                    full_end,
+                    candidate_len,
+                    vector_end,
+                    prefix,
+                    prefix_shift,
+                    shift,
+                    pass_index,
+                    shared_histogram,
+                    value_layout,
+                    BLOCK_N,
+                    RADIX_BITS,
+                    True,
+                )
 
         gl.barrier()
-        counts = shared_histogram.load(histogram_layout)
+        if USE_OUTPUT_HISTOGRAM:
+            counts = gl.load(
+                output_histogram + bucket_offsets,
+                volatile=True,
+            )
+        else:
+            counts = shared_histogram.load(histogram_layout)
         if RADIX_BITS == 10:
             # The 1,024 bins map one-to-one onto this 1,024-thread workgroup.
             bucket_cumulative = gl.associative_scan(counts, 0, _topk_add)
@@ -2798,6 +2889,14 @@ def _dsa_runtime_radix_topk_kernel(
         prefix_shift = shift
         done = selected_bucket_count == remaining
         pass_index += 1
+        if USE_OUTPUT_HISTOGRAM:
+            continue_selection = (pass_index < NUM_PASSES) & ~done
+            gl.barrier()
+            gl.store(
+                output_histogram + bucket_offsets,
+                gl.where(continue_selection, histogram_zeros, -1),
+            )
+            gl.barrier()
 
     count_greater = selected_count - remaining
     emit_full_end = candidate_len & -BLOCK_N
