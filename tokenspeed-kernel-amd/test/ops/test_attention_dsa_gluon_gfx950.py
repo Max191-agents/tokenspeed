@@ -7,6 +7,7 @@ import math
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from threading import Event, Thread
 
 import pytest
 import torch
@@ -2147,6 +2148,77 @@ def test_compiled_runner_caches_evict_least_recently_used_plan(
     dsa_topk_gfx950._cache_compiled_runner_plan(cache, new_key, plan)
     assert list(cache) == [active_key, new_key]
     assert len(direct_launches) == 1
+
+
+class _BlockingLRUCache(OrderedDict):
+    def __init__(self, block_method: str) -> None:
+        super().__init__()
+        self.block_method = block_method
+        self.operation_started = Event()
+        self.operation_allowed = Event()
+
+    def _block(self, method: str) -> None:
+        if self.block_method == method:
+            self.operation_started.set()
+            assert self.operation_allowed.wait(timeout=5)
+
+    def move_to_end(self, key, last: bool = True) -> None:
+        self._block("move_to_end")
+        super().move_to_end(key, last=last)
+
+    def popitem(self, last: bool = True):
+        self._block("popitem")
+        return super().popitem(last=last)
+
+
+@pytest.mark.parametrize(
+    "race",
+    ("lookup_move", "insert_move", "insert_evict"),
+)
+def test_compiled_runner_lru_tolerates_concurrent_clear(
+    race: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block_method = "popitem" if race == "insert_evict" else "move_to_end"
+    cache = _BlockingLRUCache(block_method)
+    key = ("active",)
+    plan = object()
+    if race != "insert_move":
+        cache[key] = plan
+    if race == "insert_evict":
+        monkeypatch.setattr(dsa_topk_gfx950, "_COMPILED_RUNNER_CACHE_SIZE", 1)
+
+    results: list[object | None] = []
+    errors: list[BaseException] = []
+
+    def access_cache() -> None:
+        try:
+            if race == "lookup_move":
+                results.append(
+                    dsa_topk_gfx950._get_cached_compiled_runner_plan(cache, key)
+                )
+            else:
+                dsa_topk_gfx950._cache_compiled_runner_plan(
+                    cache,
+                    ("new",),
+                    plan,
+                )
+                results.append(None)
+        except BaseException as error:
+            errors.append(error)
+
+    thread = Thread(target=access_cache)
+    thread.start()
+    try:
+        assert cache.operation_started.wait(timeout=5)
+        cache.clear()
+    finally:
+        cache.operation_allowed.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert not errors
+    assert results == [None]
 
 
 @pytest.mark.skipif(
