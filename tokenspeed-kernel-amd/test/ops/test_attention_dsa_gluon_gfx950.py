@@ -995,6 +995,94 @@ def _make_grouped_radix_logits(
     return logits
 
 
+def _make_runtime_radix_scan_logits(
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    cols: int,
+    seed: int,
+) -> torch.Tensor:
+    logits = torch.full(
+        (row_starts.numel(), cols),
+        float("inf"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    generator = _generator("cuda", seed)
+    starts = row_starts.cpu().tolist()
+    ends = row_ends.cpu().tolist()
+    for row, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        assert end - start >= 6144
+        case = row % 4
+        if case == 0:
+            logits[row, start:end] = float("inf")
+        elif case == 1:
+            logits[row, start:end] = -float("inf")
+        else:
+            logits[row, start:end].uniform_(-1.0, 1.0, generator=generator)
+            if case == 2:
+                logits[row, start : start + 37] = float("inf")
+                logits[row, start + 37 : end : 257] = -float("inf")
+            else:
+                tie_start = start + (end - start - 4096) // 2
+                logits[row, tie_start : tie_start + 4096] = 2.0
+    return logits
+
+
+def _make_runtime_radix_prefill_inputs(
+    cols: int,
+    *,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    row_starts = torch.tensor(
+        [17, 31, 47, 63],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_ends = torch.tensor(
+        [cols, cols - 19, cols - 41, cols - 67],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    logits = _make_runtime_radix_scan_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        seed=seed,
+    )
+    return logits, row_starts, row_ends
+
+
+def _make_runtime_radix_decode_inputs(
+    cols: int,
+    *,
+    seed: int,
+    requests: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_len_per_req = 4
+    seq_lens = (
+        cols
+        - torch.arange(
+            requests,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        * 73
+    )
+    q_offsets = torch.arange(q_len_per_req, device="cuda", dtype=torch.int32)
+    row_ends = (seq_lens[:, None] - (q_len_per_req - 1) + q_offsets[None, :]).reshape(
+        -1
+    )
+    logits = _make_runtime_radix_scan_logits(
+        torch.zeros_like(row_ends),
+        row_ends,
+        cols=cols,
+        seed=seed,
+    )
+    block_table = _make_reversed_decode_block_table(requests, cols, 64)
+    return logits, block_table, seq_lens
+
+
 def _assert_grouped_radix_topk(
     logits: torch.Tensor,
     actual: torch.Tensor,
@@ -1020,7 +1108,12 @@ def _assert_grouped_radix_topk(
         expected_values = torch.sort(
             torch.topk(logits[row, start:end], count).values
         ).values
-        torch.testing.assert_close(actual_values.cpu(), expected_values.cpu())
+        torch.testing.assert_close(
+            actual_values.cpu(),
+            expected_values.cpu(),
+            rtol=0,
+            atol=0,
+        )
         assert bool((actual[row, count:] == -1).all())
 
 
@@ -1078,8 +1171,211 @@ def _assert_decode_topk_slots(
         expected_values = torch.sort(
             torch.topk(logits[row, :row_end], count).values
         ).values
-        torch.testing.assert_close(actual_values.cpu(), expected_values.cpu())
+        torch.testing.assert_close(
+            actual_values.cpu(),
+            expected_values.cpu(),
+            rtol=0,
+            atol=0,
+        )
         assert bool((actual[row, count:] == -1).all())
+
+
+@dataclass
+class _RuntimeRadixScanCase:
+    mode: str
+    logits: torch.Tensor
+    out: torch.Tensor
+    lens_out: torch.Tensor
+    row_starts: torch.Tensor | None = None
+    row_ends: torch.Tensor | None = None
+    block_table: torch.Tensor | None = None
+    seq_lens: torch.Tensor | None = None
+
+    def launch(self) -> None:
+        if self.mode == "decode":
+            assert self.block_table is not None
+            assert self.seq_lens is not None
+            dsa_topk_gfx950._dsa_decode_topk_slots(
+                self.logits,
+                self.block_table,
+                self.seq_lens,
+                page_size=64,
+                topk=2048,
+                q_len_per_req=4,
+                out=self.out,
+                lens_out=self.lens_out,
+            )
+            return
+
+        assert self.row_starts is not None
+        assert self.row_ends is not None
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
+            self.logits,
+            self.row_starts,
+            self.row_ends,
+            topk=2048,
+            out=self.out,
+            lens_out=self.lens_out,
+        )
+
+    def assert_exact(self) -> None:
+        if self.mode == "decode":
+            assert self.block_table is not None
+            assert self.seq_lens is not None
+            _assert_decode_topk_slots(
+                self.logits,
+                self.out,
+                self.lens_out,
+                self.seq_lens,
+                self.block_table,
+                page_size=64,
+                q_len_per_req=4,
+                topk=2048,
+            )
+            return
+
+        assert self.row_starts is not None
+        assert self.row_ends is not None
+        _assert_grouped_radix_topk(
+            self.logits,
+            self.out,
+            self.lens_out,
+            self.row_starts,
+            self.row_ends,
+            topk=2048,
+        )
+
+
+def _make_runtime_radix_scan_case(
+    mode: str,
+    cols: int,
+    *,
+    seed: int,
+    decode_requests: int = 2,
+) -> _RuntimeRadixScanCase:
+    if mode == "decode":
+        logits, block_table, seq_lens = _make_runtime_radix_decode_inputs(
+            cols,
+            seed=seed,
+            requests=decode_requests,
+        )
+        return _RuntimeRadixScanCase(
+            mode=mode,
+            logits=logits,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            out=torch.empty(
+                (logits.shape[0], 2048),
+                device="cuda",
+                dtype=torch.int32,
+            ),
+            lens_out=torch.empty(
+                (logits.shape[0],),
+                device="cuda",
+                dtype=torch.int32,
+            ),
+        )
+
+    logits, row_starts, row_ends = _make_runtime_radix_prefill_inputs(
+        cols,
+        seed=seed,
+    )
+    return _RuntimeRadixScanCase(
+        mode=mode,
+        logits=logits,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        out=torch.empty(
+            (logits.shape[0], 2048),
+            device="cuda",
+            dtype=torch.int32,
+        ),
+        lens_out=torch.empty(
+            (logits.shape[0],),
+            device="cuda",
+            dtype=torch.int32,
+        ),
+    )
+
+
+@pytest.mark.parametrize("mode", ("decode", "prefill"))
+@pytest.mark.parametrize("cols", (8192, 16384, 32768, 32781))
+def test_dsa_runtime_radix_four_bin_scan_is_exact_and_repeatable(
+    mode: str,
+    cols: int,
+) -> None:
+    case = _make_runtime_radix_scan_case(
+        mode,
+        cols,
+        seed=cols + (12000 if mode == "prefill" else 22000),
+    )
+    for _ in range(2):
+        case.out.fill_(-7)
+        case.lens_out.fill_(-7)
+        case.launch()
+        case.assert_exact()
+
+
+@pytest.mark.parametrize("mode", ("decode", "prefill"))
+def test_dsa_runtime_radix_four_bin_scan_replays_from_graph(
+    mode: str,
+    isolated_compiled_runner_caches,
+) -> None:
+    case = _make_runtime_radix_scan_case(
+        mode,
+        32781,
+        seed=32001 if mode == "decode" else 42001,
+        decode_requests=1,
+    )
+    case.launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.launch()
+    for _ in range(2):
+        case.out.fill_(-7)
+        case.lens_out.fill_(-7)
+        graph.replay()
+    torch.cuda.synchronize()
+    case.assert_exact()
+
+
+@pytest.mark.parametrize("mode", ("decode", "prefill"))
+def test_dsa_runtime_radix_four_bin_scan_is_stream_local(
+    mode: str,
+    isolated_compiled_runner_caches,
+) -> None:
+    case_a = _make_runtime_radix_scan_case(
+        mode,
+        32781,
+        seed=52001,
+        decode_requests=1,
+    )
+    case_b = _make_runtime_radix_scan_case(
+        mode,
+        32781,
+        seed=62001,
+        decode_requests=1,
+    )
+    case_a.launch()
+    torch.cuda.synchronize()
+
+    current_stream = torch.cuda.current_stream()
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    stream_a.wait_stream(current_stream)
+    stream_b.wait_stream(current_stream)
+    with torch.cuda.stream(stream_a):
+        for _ in range(3):
+            case_a.launch()
+    with torch.cuda.stream(stream_b):
+        for _ in range(3):
+            case_b.launch()
+    current_stream.wait_stream(stream_a)
+    current_stream.wait_stream(stream_b)
+
+    case_a.assert_exact()
+    case_b.assert_exact()
 
 
 @pytest.mark.parametrize(
@@ -2552,48 +2848,135 @@ def test_compiled_runner_falls_back_for_unsupported_pointer(
     assert not direct_launches
 
 
+@pytest.mark.parametrize("mode", ("decode", "prefill"))
+def test_runtime_radix_dispatch_key_is_length_invariant_and_65k_is_manual(
+    mode: str,
+    isolated_compiled_runner_caches,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launches: list[SimpleNamespace] = []
+
+    def record_launch(
+        kernel,
+        grid,
+        args,
+        pointer_dtypes,
+        specialization_key,
+        **kwargs,
+    ) -> None:
+        launches.append(
+            SimpleNamespace(
+                kernel=kernel,
+                grid=grid,
+                args=args,
+                pointer_dtypes=pointer_dtypes,
+                specialization_key=specialization_key,
+                kwargs=kwargs,
+            )
+        )
+
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_launch_warmed_compiled_kernel",
+        record_launch,
+    )
+    for cols in (8192, 16384, 32768, 32781, 65536):
+        logits = torch.empty((1, cols), device="cuda", dtype=torch.float32)
+        out = torch.empty((1, 2048), device="cuda", dtype=torch.int32)
+        lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
+        row_ends = torch.full((1,), cols, device="cuda", dtype=torch.int32)
+        if mode == "decode":
+            block_table = torch.arange(
+                math.ceil(cols / 64),
+                device="cuda",
+                dtype=torch.int32,
+            )[None, :]
+            dsa_topk_gfx950._dsa_decode_topk_slots(
+                logits,
+                block_table,
+                row_ends,
+                page_size=64,
+                topk=2048,
+                q_len_per_req=1,
+                out=out,
+                lens_out=lens_out,
+            )
+        else:
+            row_starts = torch.zeros((1,), device="cuda", dtype=torch.int32)
+            dsa_topk_gfx950._dsa_prefill_topk_indices(
+                logits,
+                row_starts,
+                row_ends,
+                topk=2048,
+                out=out,
+                lens_out=lens_out,
+            )
+
+    runtime_launches = launches[:4]
+    assert len(launches) == 5
+    assert all(
+        launch.kernel is dsa_topk_gfx950._dsa_runtime_radix_topk_kernel
+        for launch in runtime_launches
+    )
+    assert len({launch.specialization_key for launch in runtime_launches}) == 1
+    assert len({launch.kwargs["dispatch_key"] for launch in runtime_launches}) == 1
+    assert {launch.args[6] for launch in runtime_launches} == {
+        8192,
+        16384,
+        32768,
+        32781,
+    }
+    expected_runtime_cache = (
+        dsa_topk_gfx950._runtime_decode_runner_plans
+        if mode == "decode"
+        else dsa_topk_gfx950._runtime_prefill_runner_plans
+    )
+    assert all(
+        launch.kwargs["dispatch_cache"] is expected_runtime_cache
+        for launch in runtime_launches
+    )
+    for launch in runtime_launches:
+        assert launch.specialization_key == launch.args[10:]
+        assert launch.kwargs["dispatch_key"] == (1, launch.specialization_key)
+
+    manual_launch = launches[-1]
+    assert (
+        manual_launch.kernel is dsa_topk_gfx950._dsa_oneblock_manual_radix_topk_kernel
+    )
+    expected_manual_cache = (
+        dsa_topk_gfx950._manual_decode_runner_plans
+        if mode == "decode"
+        else dsa_topk_gfx950._manual_prefill_runner_plans
+    )
+    assert manual_launch.kwargs["dispatch_cache"] is expected_manual_cache
+
+
 @pytest.mark.skipif(
     not dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED,
     reason="requires the supported CompiledKernel runner ABI",
 )
-def test_runtime_decode_plan_reuses_native_strides(
+@pytest.mark.parametrize("mode", ("decode", "prefill"))
+def test_runtime_radix_plan_reuses_native_strides(
+    mode: str,
     isolated_compiled_runner_caches,
 ) -> None:
+    plan_cache = (
+        dsa_topk_gfx950._runtime_decode_runner_plans
+        if mode == "decode"
+        else dsa_topk_gfx950._runtime_prefill_runner_plans
+    )
     plan = None
-    for cols in (8192, 16384):
-        row_starts = torch.zeros((1,), device="cuda", dtype=torch.int32)
-        row_ends = torch.full((1,), cols, device="cuda", dtype=torch.int32)
-        logits = _make_grouped_radix_logits(
-            row_starts,
-            row_ends,
-            cols=cols,
-            topk=2048,
+    for cols in (8192, 16384, 32768, 32781):
+        case = _make_runtime_radix_scan_case(
+            mode,
+            cols,
+            seed=cols + 72000,
+            decode_requests=1,
         )
-        block_table = torch.arange(
-            math.ceil(cols / 64), device="cuda", dtype=torch.int32
-        )[None, :]
-        out = torch.empty((1, 2048), device="cuda", dtype=torch.int32)
-        lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
-        dsa_topk_gfx950._dsa_decode_topk_slots(
-            logits,
-            block_table,
-            row_ends,
-            page_size=64,
-            topk=2048,
-            q_len_per_req=1,
-            out=out,
-            lens_out=lens_out,
-        )
-        _assert_grouped_radix_topk(
-            logits,
-            out,
-            lens_out,
-            row_starts,
-            row_ends,
-            topk=2048,
-        )
-        assert len(dsa_topk_gfx950._runtime_decode_runner_plans) == 1
-        current_plan = next(iter(dsa_topk_gfx950._runtime_decode_runner_plans.values()))
+        case.launch()
+        case.assert_exact()
+        assert len(plan_cache) == 1
+        current_plan = next(iter(plan_cache.values()))
         if plan is None:
             plan = current_plan
         else:

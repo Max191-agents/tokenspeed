@@ -763,6 +763,63 @@ def _rank_four_items_per_thread(
 
 
 @gluon.jit
+def _select_radix_bucket_four_bins_per_thread(
+    counts,
+    remaining,
+    thread_layout: gl.constexpr,
+    MAX_BUCKETS: gl.constexpr,
+):
+    counts_2x2 = counts.reshape([MAX_BUCKETS // 4, 2, 2])
+    even, odd = gl.split(counts_2x2)
+    count0, count2 = gl.split(even)
+    count1, count3 = gl.split(odd)
+    count0 = gl.convert_layout(count0, thread_layout)
+    count1 = gl.convert_layout(count1, thread_layout)
+    count2 = gl.convert_layout(count2, thread_layout)
+    count3 = gl.convert_layout(count3, thread_layout)
+
+    thread_count = count0 + count1 + count2 + count3
+    thread_cumulative = gl.associative_scan(thread_count, 0, _topk_add)
+    thread_greater = thread_cumulative - thread_count
+    selected_thread = (thread_greater < remaining) & (thread_cumulative >= remaining)
+
+    after0 = thread_greater + count0
+    after1 = after0 + count1
+    after2 = after1 + count2
+    select0 = after0 >= remaining
+    select1 = after1 >= remaining
+    select2 = after2 >= remaining
+    local_bucket = gl.where(
+        select0,
+        0,
+        gl.where(select1, 1, gl.where(select2, 2, 3)),
+    )
+    local_greater = gl.where(
+        select0,
+        thread_greater,
+        gl.where(select1, after0, gl.where(select2, after1, after2)),
+    )
+    local_count = gl.where(
+        select0,
+        count0,
+        gl.where(select1, count1, gl.where(select2, count2, count3)),
+    )
+    thread_bucket = (
+        gl.arange(0, MAX_BUCKETS // 4, layout=thread_layout) * 4 + local_bucket
+    )
+    selected_bucket = gl.sum(gl.where(selected_thread, thread_bucket, 0), axis=0).to(
+        gl.int32
+    )
+    selected_greater = gl.sum(gl.where(selected_thread, local_greater, 0), axis=0).to(
+        gl.int32
+    )
+    selected_count = gl.sum(gl.where(selected_thread, local_count, 0), axis=0).to(
+        gl.int32
+    )
+    return selected_bucket, selected_greater, selected_count
+
+
+@gluon.jit
 def _persistent_wait_until_at_least(address, target, thread_offset):
     return gl.inline_asm_elementwise(
         asm="""
@@ -2624,10 +2681,10 @@ def _dsa_runtime_radix_topk_kernel(
         gl.num_warps(),
         triton.cdiv(MAX_BUCKETS, 64 * gl.num_warps()),
     )
-    group_layout: gl.constexpr = _vector_layout(
-        MAX_BUCKETS // 2,
+    scan_thread_layout: gl.constexpr = _vector_layout(
+        MAX_BUCKETS // 4,
         gl.num_warps(),
-        triton.cdiv(MAX_BUCKETS // 2, 64 * gl.num_warps()),
+        1,
     )
     output_layout: gl.constexpr = _vector_layout(
         topk,
@@ -2701,7 +2758,6 @@ def _dsa_runtime_radix_topk_kernel(
     remaining = selected_count
     pass_index = gl.full([], 0, gl.int32)
     done = gl.full([], 0, gl.int1)
-    bucket_offsets = gl.arange(0, MAX_BUCKETS, layout=histogram_layout)
 
     while (pass_index < 3) & ~done:
         gl.barrier()
@@ -2743,31 +2799,14 @@ def _dsa_runtime_radix_topk_kernel(
 
         gl.barrier()
         counts = shared_histogram.load(histogram_layout)
-        count_pairs = counts.reshape([MAX_BUCKETS // 2, 2])
-        count_low, count_high = gl.split(count_pairs)
-        count_low = gl.convert_layout(count_low, group_layout)
-        count_high = gl.convert_layout(count_high, group_layout)
-        group_counts = count_low + count_high
-        group_cumulative = gl.associative_scan(group_counts, 0, _topk_add)
-        group_greater = group_cumulative - group_counts
-        selected_group = (group_greater < remaining) & (group_cumulative >= remaining)
-        bucket_pairs = bucket_offsets.reshape([MAX_BUCKETS // 2, 2])
-        bucket_low, bucket_high = gl.split(bucket_pairs)
-        bucket_low = gl.convert_layout(bucket_low, group_layout)
-        bucket_high = gl.convert_layout(bucket_high, group_layout)
-        select_low = group_greater + count_low >= remaining
-        group_bucket = gl.where(select_low, bucket_low, bucket_high)
-        group_selected_greater = group_greater + gl.where(select_low, 0, count_low)
-        group_selected_count = gl.where(select_low, count_low, count_high)
-        selected_bucket = gl.sum(gl.where(selected_group, group_bucket, 0), axis=0).to(
-            gl.int32
+        selected_bucket, selected_greater, selected_bucket_count = (
+            _select_radix_bucket_four_bins_per_thread(
+                counts,
+                remaining,
+                scan_thread_layout,
+                MAX_BUCKETS,
+            )
         )
-        selected_greater = gl.sum(
-            gl.where(selected_group, group_selected_greater, 0), axis=0
-        ).to(gl.int32)
-        selected_bucket_count = gl.sum(
-            gl.where(selected_group, group_selected_count, 0), axis=0
-        ).to(gl.int32)
         prefix |= selected_bucket.to(gl.uint32) << shift
         remaining -= selected_greater
         prefix_shift = shift
