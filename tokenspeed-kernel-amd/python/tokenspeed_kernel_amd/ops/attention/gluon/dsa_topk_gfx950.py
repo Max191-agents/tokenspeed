@@ -65,6 +65,8 @@ _ONEBLOCK_COMPACT_FINAL_MIN_COLS = 65536
 _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS = 65536
 _ONEBLOCK_DECODE_RUNTIME_MAX_COLS = 256 * 1024
 _ONEBLOCK_RADIX_MAX_COLS = 90000
+_RUNTIME_RADIX_BITS = 12
+_RUNTIME_RADIX_SUPPORTED_BITS = (10, 11, 12)
 _PREFILL_RUNTIME_RADIX_MIN_COLS = 98304
 _PREFILL_RUNTIME_RADIX_MAX_COLS = 196608
 _PREFILL_HIST_DERIVED_MIN_COLS = 524288
@@ -1802,6 +1804,7 @@ def _accumulate_runtime_radix_histogram_tile(
     shared_histogram,
     value_layout: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    RADIX_BITS: gl.constexpr,
     IS_TAIL: gl.constexpr,
 ):
     _, values, valid = _load_oneblock_tile(
@@ -1819,7 +1822,7 @@ def _accumulate_runtime_radix_histogram_tile(
     else:
         positioned_keys = (keys >> prefix_shift) << prefix_shift
         prefix_match = valid & (positioned_keys == prefix)
-    buckets = (keys >> shift) & 0xFFF
+    buckets = (keys >> shift) & ((1 << RADIX_BITS) - 1)
     shared_histogram.atomic_scatter_add(
         gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
         buckets.to(gl.int32),
@@ -2604,11 +2607,13 @@ def _dsa_runtime_radix_topk_kernel(
     q_len_per_req: gl.constexpr,
     IS_DECODE: gl.constexpr,
     DETERMINISTIC_EMIT: gl.constexpr,
-    MAX_BUCKETS: gl.constexpr,
+    RADIX_BITS: gl.constexpr,
     BLOCK_N: gl.constexpr,
     LOAD_ELEMS: gl.constexpr,
 ):
     row = gl.program_id(0)
+    NUM_BUCKETS: gl.constexpr = 1 << RADIX_BITS
+    NUM_PASSES: gl.constexpr = (32 + RADIX_BITS - 1) // RADIX_BITS
     value_layout: gl.constexpr = _vector_layout(
         BLOCK_N,
         gl.num_warps(),
@@ -2620,14 +2625,14 @@ def _dsa_runtime_radix_topk_kernel(
         1,
     )
     histogram_layout: gl.constexpr = _vector_layout(
-        MAX_BUCKETS,
+        NUM_BUCKETS,
         gl.num_warps(),
-        triton.cdiv(MAX_BUCKETS, 64 * gl.num_warps()),
+        triton.cdiv(NUM_BUCKETS, 64 * gl.num_warps()),
     )
     group_layout: gl.constexpr = _vector_layout(
-        MAX_BUCKETS // 2,
+        NUM_BUCKETS // 2,
         gl.num_warps(),
-        triton.cdiv(MAX_BUCKETS // 2, 64 * gl.num_warps()),
+        triton.cdiv(NUM_BUCKETS // 2, 64 * gl.num_warps()),
     )
     output_layout: gl.constexpr = _vector_layout(
         topk,
@@ -2635,14 +2640,14 @@ def _dsa_runtime_radix_topk_kernel(
         triton.cdiv(topk, 64 * gl.num_warps()),
     )
     shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[MAX_BUCKETS, 1]],
-        [MAX_BUCKETS],
+        [[NUM_BUCKETS, 1]],
+        [NUM_BUCKETS],
         [0],
     )
-    histogram_zeros = gl.zeros([MAX_BUCKETS], gl.int32, layout=histogram_layout)
+    histogram_zeros = gl.zeros([NUM_BUCKETS], gl.int32, layout=histogram_layout)
     shared_histogram = gl.allocate_shared_memory(
         gl.int32,
-        [MAX_BUCKETS],
+        [NUM_BUCKETS],
         shared_layout,
     )
     output_counter_layout: gl.constexpr = _vector_layout(2, gl.num_warps(), 1)
@@ -2701,14 +2706,15 @@ def _dsa_runtime_radix_topk_kernel(
     remaining = selected_count
     pass_index = gl.full([], 0, gl.int32)
     done = gl.full([], 0, gl.int1)
-    bucket_offsets = gl.arange(0, MAX_BUCKETS, layout=histogram_layout)
+    bucket_offsets = gl.arange(0, NUM_BUCKETS, layout=histogram_layout)
 
-    while (pass_index < 3) & ~done:
+    while (pass_index < NUM_PASSES) & ~done:
         gl.barrier()
         shared_histogram.store(histogram_zeros)
         gl.barrier()
 
-        shift = gl.maximum(20 - pass_index * 12, 0)
+        # The partial final digit overlaps only prefix bits already fixed above.
+        shift = gl.maximum(32 - (pass_index + 1) * RADIX_BITS, 0)
         full_end = candidate_len & -BLOCK_N
         for tile_start in range(0, full_end, BLOCK_N):
             _accumulate_runtime_radix_histogram_tile(
@@ -2723,6 +2729,7 @@ def _dsa_runtime_radix_topk_kernel(
                 shared_histogram,
                 value_layout,
                 BLOCK_N,
+                RADIX_BITS,
                 False,
             )
         if full_end < candidate_len:
@@ -2738,12 +2745,13 @@ def _dsa_runtime_radix_topk_kernel(
                 shared_histogram,
                 value_layout,
                 BLOCK_N,
+                RADIX_BITS,
                 True,
             )
 
         gl.barrier()
         counts = shared_histogram.load(histogram_layout)
-        count_pairs = counts.reshape([MAX_BUCKETS // 2, 2])
+        count_pairs = counts.reshape([NUM_BUCKETS // 2, 2])
         count_low, count_high = gl.split(count_pairs)
         count_low = gl.convert_layout(count_low, group_layout)
         count_high = gl.convert_layout(count_high, group_layout)
@@ -2751,7 +2759,7 @@ def _dsa_runtime_radix_topk_kernel(
         group_cumulative = gl.associative_scan(group_counts, 0, _topk_add)
         group_greater = group_cumulative - group_counts
         selected_group = (group_greater < remaining) & (group_cumulative >= remaining)
-        bucket_pairs = bucket_offsets.reshape([MAX_BUCKETS // 2, 2])
+        bucket_pairs = bucket_offsets.reshape([NUM_BUCKETS // 2, 2])
         bucket_low, bucket_high = gl.split(bucket_pairs)
         bucket_low = gl.convert_layout(bucket_low, group_layout)
         bucket_high = gl.convert_layout(bucket_high, group_layout)
@@ -4695,7 +4703,7 @@ def _dsa_decode_topk_slots(
                 q_len_per_req,
                 True,
                 False,
-                _ONEBLOCK_RADIX_BUCKETS,
+                _RUNTIME_RADIX_BITS,
                 _ONEBLOCK_DECODE_RADIX_BLOCK_N,
                 load_elems,
             )
@@ -4888,7 +4896,7 @@ def _dsa_prefill_topk_indices(
                 1,
                 False,
                 False,
-                _ONEBLOCK_RADIX_BUCKETS,
+                _RUNTIME_RADIX_BITS,
                 _ONEBLOCK_PREFILL_RADIX_BLOCK_N,
                 _load_elems(_ONEBLOCK_PREFILL_RADIX_BLOCK_N, 16),
             )
@@ -4961,7 +4969,7 @@ def _dsa_prefill_topk_indices(
             1,
             False,
             True,
-            _ONEBLOCK_RADIX_BUCKETS,
+            _RUNTIME_RADIX_BITS,
             _ONEBLOCK_PREFILL_RADIX_BLOCK_N,
             _load_elems(_ONEBLOCK_PREFILL_RADIX_BLOCK_N, 16),
         )
