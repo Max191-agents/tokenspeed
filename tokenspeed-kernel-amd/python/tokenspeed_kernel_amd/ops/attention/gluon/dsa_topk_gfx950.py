@@ -57,7 +57,9 @@ _PREFILL_LOCAL_GROUP_PREFIX_MIN_COLS = 262144
 _ONEBLOCK_RADIX_SCHEDULE = (12, 12, 8)
 _ONEBLOCK_RADIX_BUCKETS = 1 << max(_ONEBLOCK_RADIX_SCHEDULE)
 _ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG = (8192, 8)
-_ONEBLOCK_DECODE_MANUAL_CONFIG = (8192, 4)
+_ONEBLOCK_DECODE_SHORT_MANUAL_CONFIG = (8192, 8)
+_ONEBLOCK_DECODE_LONG_MANUAL_CONFIG = (8192, 4)
+_ONEBLOCK_DECODE_SHORT_MANUAL_MAX_COLS = 65536
 _ONEBLOCK_PREFILL_RADIX_BLOCK_N = 4096
 _ONEBLOCK_COMPACT_FINAL_BLOCK_N = 4096
 _ONEBLOCK_COMPACT_FINAL_MIN_COLS = 65536
@@ -4722,7 +4724,12 @@ def _dsa_decode_topk_slots(
                     num_warps=16,
                 )
         else:
-            block_n, load_elems = _ONEBLOCK_DECODE_MANUAL_CONFIG
+            manual_config = (
+                _ONEBLOCK_DECODE_SHORT_MANUAL_CONFIG
+                if cols <= _ONEBLOCK_DECODE_SHORT_MANUAL_MAX_COLS
+                else _ONEBLOCK_DECODE_LONG_MANUAL_CONFIG
+            )
+            block_n, load_elems = manual_config
             kernel_args = (
                 logits,
                 block_table,

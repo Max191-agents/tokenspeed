@@ -1181,8 +1181,10 @@ def _record_prefill_dispatch(
 
 
 def test_dsa_manual_decode_config_source_contract() -> None:
-    assert dsa_topk_gfx950._ONEBLOCK_DECODE_MANUAL_CONFIG == (8192, 4)
     assert dsa_topk_gfx950._ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG == (8192, 8)
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_SHORT_MANUAL_CONFIG == (8192, 8)
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_LONG_MANUAL_CONFIG == (8192, 4)
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_SHORT_MANUAL_MAX_COLS == 65536
     assert dsa_topk_gfx950._ONEBLOCK_RADIX_SCHEDULE == (12, 12, 8)
     assert dsa_topk_gfx950._ONEBLOCK_PREFILL_RADIX_BLOCK_N == 4096
     assert dsa_topk_gfx950._ONEBLOCK_RADIX_MAX_COLS == 90000
@@ -1213,10 +1215,22 @@ def test_dsa_manual_decode_config_source_contract() -> None:
     )
 
 
-@pytest.mark.parametrize("cols", (2049, 8192, 16384, 32768, 65536, 90000))
+@pytest.mark.parametrize(
+    ("cols", "expected_config"),
+    (
+        (2049, (8192, 8)),
+        (8192, (8192, 8)),
+        (16384, (8192, 8)),
+        (32768, (8192, 8)),
+        (65536, (8192, 8)),
+        (65537, (8192, 4)),
+        (90000, (8192, 4)),
+    ),
+)
 def test_dsa_manual_decode_dispatches_whole_oneblock_region(
     monkeypatch: pytest.MonkeyPatch,
     cols: int,
+    expected_config: tuple[int, int],
 ) -> None:
     kernel, args, specialization_key, kwargs = _record_decode_dispatch(
         monkeypatch,
@@ -1225,10 +1239,10 @@ def test_dsa_manual_decode_dispatches_whole_oneblock_region(
 
     assert kernel is dsa_topk_gfx950._dsa_oneblock_manual_radix_topk_kernel
     assert args[15:18] == (12, 12, 8)
-    assert args[19:21] == (8192, 4)
+    assert args[19:21] == expected_config
     assert args[-3:] == (4096, False, True)
     assert specialization_key == args[11:]
-    assert specialization_key[-5:-3] == (8192, 4)
+    assert specialization_key[-5:-3] == expected_config
     assert kwargs["dispatch_cache"] is dsa_topk_gfx950._manual_decode_runner_plans
     assert kwargs["dispatch_key"] == (2, specialization_key)
     assert kwargs["native_scalar_count"] == 4
@@ -1236,15 +1250,20 @@ def test_dsa_manual_decode_dispatches_whole_oneblock_region(
     assert kwargs["grid"] == (2, 1, 1)
 
 
-def test_dsa_manual_decode_region_uses_one_specialization(
+def test_dsa_manual_decode_region_uses_two_layout_specializations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    specialization_keys = [
+    short_specialization_keys = [
         _record_decode_dispatch(monkeypatch, cols)[2]
-        for cols in (2049, 8192, 16384, 32768, 65536, 90000)
+        for cols in (2049, 8192, 16384, 32768, 65536)
+    ]
+    long_specialization_keys = [
+        _record_decode_dispatch(monkeypatch, cols)[2] for cols in (65537, 90000)
     ]
 
-    assert len(set(specialization_keys)) == 1
+    assert len(set(short_specialization_keys)) == 1
+    assert len(set(long_specialization_keys)) == 1
+    assert short_specialization_keys[0] != long_specialization_keys[0]
 
 
 def test_dsa_manual_decode_block_and_load_are_distinct_specializations(
@@ -1254,7 +1273,7 @@ def test_dsa_manual_decode_block_and_load_are_distinct_specializations(
     for config in ((8192, 4), (8192, 8), (10240, 4)):
         monkeypatch.setattr(
             dsa_topk_gfx950,
-            "_ONEBLOCK_DECODE_MANUAL_CONFIG",
+            "_ONEBLOCK_DECODE_SHORT_MANUAL_CONFIG",
             config,
         )
         _, _, specialization_key, _ = _record_decode_dispatch(monkeypatch, 8192)
