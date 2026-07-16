@@ -1289,6 +1289,105 @@ def test_dsa_runtime_radix_production_width_remains_12_bits() -> None:
 
 @pytest.mark.parametrize("mode", ("decode", "prefill"))
 @pytest.mark.parametrize("radix_bits", (10, 11, 12))
+def test_dsa_runtime_radix_width_dispatch_is_length_invariant(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_compiled_runner_caches,
+    mode: str,
+    radix_bits: int,
+) -> None:
+    _select_runtime_radix_bits(monkeypatch, radix_bits)
+    launches: list[SimpleNamespace] = []
+
+    def record_launch(
+        kernel,
+        grid,
+        args,
+        pointer_dtypes,
+        specialization_key,
+        **kwargs,
+    ) -> None:
+        launches.append(
+            SimpleNamespace(
+                kernel=kernel,
+                grid=grid,
+                args=args,
+                pointer_dtypes=pointer_dtypes,
+                specialization_key=specialization_key,
+                kwargs=kwargs,
+            )
+        )
+
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_launch_warmed_compiled_kernel",
+        record_launch,
+    )
+    for cols in (8192, 16384, 32768, 32771, 65536):
+        logits = torch.empty((1, cols), device="cuda", dtype=torch.float32)
+        out = torch.empty((1, 2048), device="cuda", dtype=torch.int32)
+        lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
+        row_ends = torch.full((1,), cols, device="cuda", dtype=torch.int32)
+        if mode == "decode":
+            block_table = torch.arange(
+                math.ceil(cols / 64),
+                device="cuda",
+                dtype=torch.int32,
+            )[None, :]
+            dsa_topk_gfx950._dsa_decode_topk_slots(
+                logits,
+                block_table,
+                row_ends,
+                page_size=64,
+                topk=2048,
+                q_len_per_req=1,
+                out=out,
+                lens_out=lens_out,
+            )
+        else:
+            row_starts = torch.zeros((1,), device="cuda", dtype=torch.int32)
+            dsa_topk_gfx950._dsa_prefill_topk_indices(
+                logits,
+                row_starts,
+                row_ends,
+                topk=2048,
+                out=out,
+                lens_out=lens_out,
+            )
+
+    runtime_launches = launches[:4]
+    assert len(launches) == 5
+    assert all(
+        launch.kernel is dsa_topk_gfx950._dsa_runtime_radix_topk_kernel
+        for launch in runtime_launches
+    )
+    assert len({launch.specialization_key for launch in runtime_launches}) == 1
+    assert len({launch.kwargs["dispatch_key"] for launch in runtime_launches}) == 1
+    assert {launch.args[6] for launch in runtime_launches} == {
+        8192,
+        16384,
+        32768,
+        32771,
+    }
+    expected_runtime_cache = (
+        dsa_topk_gfx950._runtime_decode_runner_plans
+        if mode == "decode"
+        else dsa_topk_gfx950._runtime_prefill_runner_plans
+    )
+    for launch in runtime_launches:
+        assert launch.args[15] == radix_bits
+        assert launch.specialization_key == launch.args[10:]
+        assert launch.kwargs["dispatch_cache"] is expected_runtime_cache
+        assert launch.kwargs["dispatch_key"] == (1, launch.specialization_key)
+        assert launch.kwargs["num_warps"] == 16
+
+    manual_launch = launches[-1]
+    assert (
+        manual_launch.kernel is dsa_topk_gfx950._dsa_oneblock_manual_radix_topk_kernel
+    )
+
+
+@pytest.mark.parametrize("mode", ("decode", "prefill"))
+@pytest.mark.parametrize("radix_bits", (10, 11, 12))
 @pytest.mark.parametrize(
     "cols",
     (8192, 16384, 32768, 32771),
