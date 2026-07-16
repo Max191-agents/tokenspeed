@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.attention.gluon.dsa_score_fp8_mfma_gfx950 import (
+    launch_dsa_prefill_logits_fp8_mfma_gfx950,
+)
 from tokenspeed_kernel_amd.ops.attention.gluon.dsa_score_gfx950 import (
     _check_packed_fp8_inputs,
     _dsa_decode_logits_fp8_kernel,
@@ -793,6 +796,78 @@ def _launch_dsa_prefill_logits_fp8(
     return logits
 
 
+def _launch_dsa_prefill_logits_fp8_production(
+    q: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    logits: torch.Tensor,
+    query_fp8_scratch: torch.Tensor,
+    scaled_weights_scratch: torch.Tensor,
+    *,
+    page_size: int,
+    row_bytes: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    tensors = (
+        q,
+        index_k_cache,
+        weights,
+        kv_workspace_slots,
+        row_starts,
+        row_ends,
+        logits,
+    )
+    use_glm_mfma = (
+        q.dtype == torch.bfloat16
+        and q.dim() == 3
+        and tuple(q.shape[1:]) == (32, 128)
+        and index_k_cache.dtype == torch.uint8
+        and weights.dtype == torch.float32
+        and kv_workspace_slots.dtype == torch.int64
+        and row_starts.dtype == torch.int32
+        and row_ends.dtype == torch.int32
+        and logits.dtype == torch.float32
+        and int(page_size) == 64
+        and int(row_bytes) == 132
+        and all(t.is_contiguous() for t in tensors)
+    )
+    if not use_glm_mfma:
+        return _launch_dsa_prefill_logits_fp8(
+            q,
+            index_k_cache,
+            weights,
+            kv_workspace_slots,
+            row_starts,
+            row_ends,
+            logits,
+            page_size=page_size,
+            row_bytes=row_bytes,
+            softmax_scale=softmax_scale,
+        )
+
+    workspace_rows = int(logits.shape[1])
+    if 512 < workspace_rows <= 2048:
+        tiles_per_program = 2
+    else:
+        tiles_per_program = 1
+    return launch_dsa_prefill_logits_fp8_mfma_gfx950(
+        q,
+        index_k_cache,
+        weights,
+        kv_workspace_slots,
+        row_starts,
+        row_ends,
+        logits,
+        query_fp8_scratch,
+        scaled_weights_scratch,
+        softmax_scale=softmax_scale,
+        tiles_per_program=tiles_per_program,
+    )
+
+
 def gluon_dsa_decode_topk_fp8_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -967,12 +1042,22 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
         max_query_rows = max(1, int(max_logits_bytes) // (max(seq_len_sum, 1) * 4))
     select_warps = 8
     select_block = triton.next_power_of_2(max(seq_len_sum, topk))
+    scratch_rows = min(max_query_rows, q.shape[0])
+    query_fp8_scratch = torch.empty(
+        (scratch_rows, 2, 32, 128),
+        dtype=torch.float8_e4m3fn,
+        device=q.device,
+    )
+    scaled_weights_scratch = torch.empty(
+        (scratch_rows, 32), dtype=torch.float32, device=q.device
+    )
     for start in range(0, q.shape[0], max_query_rows):
         end = min(start + max_query_rows, q.shape[0])
+        chunk_rows = end - start
         logits = torch.empty(
-            (end - start, seq_len_sum), dtype=torch.float32, device=q.device
+            (chunk_rows, seq_len_sum), dtype=torch.float32, device=q.device
         )
-        _launch_dsa_prefill_logits_fp8(
+        _launch_dsa_prefill_logits_fp8_production(
             q[start:end],
             index_k_cache,
             weights[start:end],
@@ -980,6 +1065,8 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             row_starts[start:end],
             row_ends[start:end],
             logits,
+            query_fp8_scratch[:chunk_rows],
+            scaled_weights_scratch[:chunk_rows],
             page_size=int(page_size),
             row_bytes=row_bytes,
             softmax_scale=float(softmax_scale),

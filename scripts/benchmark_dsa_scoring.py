@@ -365,6 +365,7 @@ def _backend_files(backend: str) -> list[dict[str, str]]:
     if backend == "tokenspeed":
         module_names = (
             "tokenspeed_kernel_amd.ops.attention.gluon.dsa_score_gfx950",
+            "tokenspeed_kernel_amd.ops.attention.gluon.dsa_score_fp8_mfma_gfx950",
             "tokenspeed_kernel_amd.ops.attention.gluon.dsa_topk_gfx950",
         )
     else:
@@ -560,7 +561,7 @@ def _tokenspeed_runners(
     import torch
     from tokenspeed_kernel_amd.ops.attention.gluon.dsa_topk_gfx950 import (
         _launch_dsa_decode_logits_fp8,
-        _launch_dsa_prefill_logits_fp8,
+        _launch_dsa_prefill_logits_fp8_production,
     )
 
     block_n = 32
@@ -607,9 +608,15 @@ def _tokenspeed_runners(
         device=q.device,
     )
     logits = torch.empty((PREFILL_ROWS, seq_len), dtype=torch.float32, device=q.device)
+    query_fp8_scratch = torch.empty(
+        (PREFILL_ROWS, 2, NUM_HEADS, HEAD_DIM),
+        dtype=torch.float8_e4m3fn,
+        device=q.device,
+    )
+    scaled_weights_scratch = torch.empty_like(weights, dtype=torch.float32)
 
     def launch() -> None:
-        _launch_dsa_prefill_logits_fp8(
+        _launch_dsa_prefill_logits_fp8_production(
             q,
             packed_cache,
             weights,
@@ -617,16 +624,33 @@ def _tokenspeed_runners(
             row_starts,
             row_ends,
             logits,
+            query_fp8_scratch,
+            scaled_weights_scratch,
             page_size=PAGE_SIZE,
             row_bytes=HEAD_DIM + 4,
             softmax_scale=SOFTMAX_SCALE,
         )
 
+    tiles_per_program = 2 if 512 < seq_len <= 2048 else 1
+    short_prefill = seq_len <= 2048
     metadata = {
-        "grid": [PREFILL_ROWS, math.ceil(seq_len / block_n)],
+        "grid": [PREFILL_ROWS, math.ceil(seq_len / (block_n * tiles_per_program))],
         "block_n": block_n,
         "block_d": HEAD_DIM,
-        "num_warps": 4,
+        "num_warps": 1,
+        "waves_per_eu": 3,
+        "query_decomposition": (
+            "bit_guarded_e4m3_hi_plus_scaled_residual"
+            if short_prefill
+            else "range_normalized_e4m3_hi_plus_scaled_residual"
+        ),
+        "stages": (
+            ["fused_query_decomposition_and_packed_mfma_score"]
+            if short_prefill
+            else ["query_preprocess", "packed_mfma_score"]
+        ),
+        "dispatches_per_launch": 1 if short_prefill else 2,
+        "tiles_per_program": tiles_per_program,
         "workspace_slots": "identity_slots",
         "row_starts": "all_zero",
         "row_ends": "seq_len-63_through_seq_len",
@@ -867,9 +891,11 @@ def _run_backend(args: argparse.Namespace) -> None:
                 "key_layout": "page64_packed_fp8_plus_per_row_fp32_scale",
                 "included": [
                     "page_or_workspace_addressing",
+                    "bfloat16_query_decomposition",
                     "query_and_key_loads",
                     "key_scaling",
                     "dot_products",
+                    "per_head_relu",
                     "head_reduction",
                     "softmax_scale",
                     "exact_masking_and_store",

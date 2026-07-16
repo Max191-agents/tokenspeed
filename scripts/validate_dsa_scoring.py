@@ -15,9 +15,11 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import importlib
 import json
 import math
 import os
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -75,6 +77,46 @@ def _canonical_hash(payload: Any) -> str:
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _git_metadata(path: Path) -> dict[str, Any]:
+    working_directory = path if path.is_dir() else path.parent
+
+    def git(*arguments: str) -> str | None:
+        result = subprocess.run(
+            ["git", "-C", str(working_directory), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    return {
+        "root": git("rev-parse", "--show-toplevel"),
+        "commit": git("rev-parse", "HEAD"),
+        "branch": git("branch", "--show-current"),
+        "dirty": bool(git("status", "--short")),
+    }
+
+
+def _production_source_files() -> list[dict[str, str]]:
+    module_names = (
+        "tokenspeed_kernel_amd.ops.attention.gluon.dsa_score_gfx950",
+        "tokenspeed_kernel_amd.ops.attention.gluon.dsa_score_fp8_mfma_gfx950",
+        "tokenspeed_kernel_amd.ops.attention.gluon.dsa_topk_gfx950",
+    )
+    files = []
+    for module_name in module_names:
+        module = importlib.import_module(module_name)
+        path = Path(module.__file__).resolve()
+        files.append(
+            {
+                "module": module_name,
+                "path": str(path),
+                "sha256": _sha256_file(path),
+            }
+        )
+    return files
 
 
 def _load_manifest(fixture_dir: Path) -> dict[str, Any]:
@@ -278,7 +320,7 @@ def _production_cell(
     import torch
     from tokenspeed_kernel_amd.ops.attention.gluon.dsa_topk_gfx950 import (
         _launch_dsa_decode_logits_fp8,
-        _launch_dsa_prefill_logits_fp8,
+        _launch_dsa_prefill_logits_fp8_production,
     )
 
     if mode == "decode":
@@ -317,9 +359,15 @@ def _production_cell(
         device=q.device,
     )
     logits = torch.empty((PREFILL_ROWS, seq_len), dtype=torch.float32, device=q.device)
+    query_fp8_scratch = torch.empty(
+        (PREFILL_ROWS, 2, NUM_HEADS, HEAD_DIM),
+        dtype=torch.float8_e4m3fn,
+        device=q.device,
+    )
+    scaled_weights_scratch = torch.empty_like(weights, dtype=torch.float32)
 
     def launch() -> None:
-        _launch_dsa_prefill_logits_fp8(
+        _launch_dsa_prefill_logits_fp8_production(
             q,
             packed_cache,
             weights,
@@ -327,6 +375,8 @@ def _production_cell(
             row_starts,
             row_ends,
             logits,
+            query_fp8_scratch,
+            scaled_weights_scratch,
             page_size=PAGE_SIZE,
             row_bytes=ROW_BYTES,
             softmax_scale=SOFTMAX_SCALE,
@@ -529,11 +579,17 @@ def _run(args: argparse.Namespace) -> None:
             "mask": "exact_negative_infinity",
         },
         "production": {
-            "scorer": "tokenspeed_preallocated_gluon_score_launchers",
+            "scorer": "tokenspeed_production_dispatched_gluon_score_launchers",
             "query_dtype": "bfloat16",
             "key_layout": "page64_packed_fp8_plus_per_row_fp32_scale",
             "decode_page_table": "identity_pages",
             "prefill_workspace": "identity_slots_causal_row_ends",
+            "source_files": _production_source_files(),
+        },
+        "harness": {
+            "path": str(Path(__file__).resolve()),
+            "sha256": _sha256_file(Path(__file__).resolve()),
+            "git": _git_metadata(Path(__file__).resolve()),
         },
         "environment": {
             "torch": torch.__version__,
