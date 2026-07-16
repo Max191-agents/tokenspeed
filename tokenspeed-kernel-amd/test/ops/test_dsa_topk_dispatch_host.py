@@ -31,9 +31,7 @@ def _scoring_inputs(heads: int, workspace_rows: int) -> tuple[torch.Tensor, ...]
     row_starts = torch.zeros((1,), dtype=torch.int32)
     row_ends = torch.full((1,), workspace_rows, dtype=torch.int32)
     logits = torch.empty((1, workspace_rows), dtype=torch.float32)
-    query_fp8_scratch = torch.empty(
-        (1, 2, 32, 128), dtype=torch.float8_e4m3fn
-    )
+    query_fp8_scratch = torch.empty((1, 2, 32, 128), dtype=torch.float8_e4m3fn)
     scaled_weights_scratch = torch.empty((1, 32), dtype=torch.float32)
     return (
         q,

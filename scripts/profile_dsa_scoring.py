@@ -9,8 +9,142 @@ import json
 import math
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import benchmark_dsa_scoring as benchmark
+
+_TOKENSPEED_DECODE_MODULE = "tokenspeed_kernel_amd.ops.attention.gluon.dsa_score_gfx950"
+_TOKENSPEED_PREFILL_MODULE = (
+    "tokenspeed_kernel_amd.ops.attention.gluon.dsa_score_fp8_mfma_gfx950"
+)
+_AITER_KERNEL_MODULE = "aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits"
+_PYTORCH_FILL_SOURCE = "torch.Tensor.fill_"
+_PYTORCH_FILL_BLOCK_SIZE = 256
+_PYTORCH_FILL_VECTOR_WIDTH = 4
+
+
+def _backend_file_path(
+    backend_files: Sequence[dict[str, str]], module_name: str
+) -> str:
+    for backend_file in backend_files:
+        if backend_file["module"] == module_name:
+            return backend_file["path"]
+    raise ValueError(f"backend metadata is missing source module {module_name!r}")
+
+
+def _selected_backend_source(
+    *, backend: str, mode: str, backend_files: Sequence[dict[str, str]]
+) -> str:
+    module_name = (
+        _TOKENSPEED_DECODE_MODULE
+        if backend == "tokenspeed" and mode == "decode"
+        else (
+            _TOKENSPEED_PREFILL_MODULE
+            if backend == "tokenspeed"
+            else _AITER_KERNEL_MODULE
+        )
+    )
+    return _backend_file_path(backend_files, module_name)
+
+
+def _profile_dispatches(
+    *,
+    backend: str,
+    mode: str,
+    seq_len: int,
+    launch: dict[str, Any],
+    backend_files: Sequence[dict[str, str]],
+) -> list[dict[str, Any]]:
+    if backend == "tokenspeed":
+        if mode == "decode":
+            source = _backend_file_path(backend_files, _TOKENSPEED_DECODE_MODULE)
+            return [
+                {
+                    "stage": "decode_score",
+                    "kernel_symbol": "_dsa_decode_logits_fp8_kernel",
+                    "source": source,
+                    "grid": list(launch["grid"]),
+                    "dispatches_per_launch": 1,
+                }
+            ]
+
+        source = _backend_file_path(backend_files, _TOKENSPEED_PREFILL_MODULE)
+        score_grid = list(launch["grid"])
+        if seq_len <= 2048:
+            return [
+                {
+                    "stage": "fused_query_decomposition_and_packed_mfma_score",
+                    "kernel_symbol": (
+                        "_dsa_prefill_logits_fp8_tiled_fused_range_safe_kernel"
+                    ),
+                    "source": source,
+                    "grid": score_grid,
+                    "dispatches_per_launch": 1,
+                }
+            ]
+        return [
+            {
+                "stage": "query_preprocess",
+                "kernel_symbol": "_dsa_preprocess_prefill_query_fp8_kernel",
+                "source": source,
+                "grid": [benchmark.PREFILL_ROWS],
+                "dispatches_per_launch": 1,
+            },
+            {
+                "stage": "packed_mfma_score",
+                "kernel_symbol": (
+                    "_dsa_prefill_logits_fp8_tiled_multi_component_kernel"
+                ),
+                "source": source,
+                "grid": score_grid,
+                "dispatches_per_launch": 1,
+            },
+        ]
+
+    source = _backend_file_path(backend_files, _AITER_KERNEL_MODULE)
+    rows = 1 if mode == "decode" else benchmark.PREFILL_ROWS
+    fill_elements = rows * int(launch["allocated_seq_len"])
+    fill_blocks = math.ceil(
+        fill_elements / (_PYTORCH_FILL_BLOCK_SIZE * _PYTORCH_FILL_VECTOR_WIDTH)
+    )
+    return [
+        {
+            "stage": "preallocated_neginf_fill",
+            "kernel_symbol": "FillFunctor<float>",
+            "source": _PYTORCH_FILL_SOURCE,
+            "grid": [fill_blocks],
+            "dispatches_per_launch": 1,
+        },
+        {
+            "stage": "contiguous_fp8_mqa_score",
+            "kernel_symbol": "_gluon_fp8_mqa_logits_kernel",
+            "source": source,
+            "grid": list(launch["grid"]),
+            "dispatches_per_launch": 1,
+        },
+    ]
+
+
+def _profile_counts(
+    *,
+    dispatches: Sequence[dict[str, Any]],
+    warmups: int,
+    profiled_launches: int,
+) -> dict[str, int]:
+    priming_launches = 1
+    dispatches_per_launch = sum(
+        int(dispatch["dispatches_per_launch"]) for dispatch in dispatches
+    )
+    total_callable_invocations = priming_launches + warmups + profiled_launches
+    return {
+        "priming_launches": priming_launches,
+        "warmups": warmups,
+        "profiled_launches": profiled_launches,
+        "total_callable_invocations": total_callable_invocations,
+        "dispatches_per_launch": dispatches_per_launch,
+        "profiled_target_dispatches": profiled_launches * dispatches_per_launch,
+        "total_target_dispatches": (total_callable_invocations * dispatches_per_launch),
+    }
 
 
 def _profile(args: argparse.Namespace) -> None:
@@ -57,9 +191,8 @@ def _profile(args: argparse.Namespace) -> None:
                 weights=weights,
                 packed_cache=packed_cache,
             )
-            backend_source = None
         else:
-            launch, logits, metadata, backend_source = benchmark._aiter_runner(
+            launch, logits, metadata, _ = benchmark._aiter_runner(
                 mode=args.mode,
                 seq_len=args.seq_len,
                 q=q,
@@ -67,6 +200,20 @@ def _profile(args: argparse.Namespace) -> None:
                 key_fp8=key_fp8,
                 key_scales=key_scales,
             )
+
+        backend_files = benchmark._backend_files(args.backend)
+        dispatches = _profile_dispatches(
+            backend=args.backend,
+            mode=args.mode,
+            seq_len=args.seq_len,
+            launch=metadata,
+            backend_files=backend_files,
+        )
+        backend_source = _selected_backend_source(
+            backend=args.backend,
+            mode=args.mode,
+            backend_files=backend_files,
+        )
 
         launch()
         torch.cuda.synchronize()
@@ -86,12 +233,17 @@ def _profile(args: argparse.Namespace) -> None:
         "fixture_id": manifest["fixture_id"],
         "visibility": visibility,
         "device": str(torch.cuda.get_device_name(torch.cuda.current_device())),
-        "warmups": args.warmups,
-        "profiled_launches": args.launches,
+        **_profile_counts(
+            dispatches=dispatches,
+            warmups=args.warmups,
+            profiled_launches=args.launches,
+        ),
         "finite_output_count": finite_count,
         "output_shape": list(logits.shape),
         "launch": metadata,
-        "backend_source": str(backend_source) if backend_source is not None else None,
+        "dispatches": dispatches,
+        "backend_source": backend_source,
+        "backend_files": backend_files,
     }
     if args.output is not None:
         benchmark._write_json(args.output.resolve(), payload)

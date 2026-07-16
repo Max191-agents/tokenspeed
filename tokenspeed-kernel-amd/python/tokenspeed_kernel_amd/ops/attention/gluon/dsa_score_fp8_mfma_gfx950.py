@@ -120,9 +120,7 @@ def _load_packed_k_gather(
         other=0,
     ).to(gl.uint64)
     pages = slot_u >> 6
-    row_offsets = gl.multiple_of(
-        (slot_u << 7) + (pages << 8), _G_HEAD_DIM
-    )
+    row_offsets = gl.multiple_of((slot_u << 7) + (pages << 8), _G_HEAD_DIM)
     byte_offsets = row_offsets[None, :] + dims[:, None].to(gl.int64)
     byte_offsets = gl.max_contiguous(byte_offsets, [16, 1])
     pointers = gl.max_contiguous(index_k_fp8 + byte_offsets, [16, 1])
@@ -612,9 +610,7 @@ def _dsa_prefill_logits_fp8_tiled_fused_range_safe_kernel(
     q_bf16 = gl.amd.cdna4.buffer_load(ptr=q, offsets=q_offsets)
     q_mag_bits = q_bf16.to(gl.uint16, bitcast=True) & 0x7FFF
     q_head_mag_bits = gl.max(q_mag_bits, axis=1, keep_dims=True)
-    needs_scaling = (
-        gl.max(q_head_mag_bits.reshape([_G_NUM_HEADS]), axis=0) > 0x4380
-    )
+    needs_scaling = gl.max(q_head_mag_bits.reshape([_G_NUM_HEADS]), axis=0) > 0x4380
     weight_heads = gl.arange(0, _G_NUM_HEADS, layout=gl.SliceLayout(1, mfma_layout))
     head_weights = gl.amd.cdna4.buffer_load(
         ptr=weights,
