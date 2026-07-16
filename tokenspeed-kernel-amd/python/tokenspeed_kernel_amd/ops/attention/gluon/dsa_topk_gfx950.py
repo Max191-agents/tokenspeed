@@ -250,6 +250,72 @@ def _dsa_prefill_select_topk_kernel(
 
 
 @gluon.jit
+def _dsa_decode_fill_short_rows_kernel(
+    block_table,
+    seq_lens,
+    out,
+    block_table_stride: gl.constexpr,
+    out_stride: gl.constexpr,
+    block_table_cols: gl.constexpr,
+    page_size: gl.constexpr,
+    topk: gl.constexpr,
+    q_len_per_req: gl.constexpr,
+    TOPK_LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    layout: gl.constexpr = _vector_layout(topk, gl.num_warps(), TOPK_LOAD_ELEMS)
+    offsets = gl.arange(0, topk, layout=layout)
+    req = row // q_len_per_req
+    q_offset = row - req * q_len_per_req
+    seq_len = gl.load(seq_lens + req).to(gl.int32)
+    if q_len_per_req != 1:
+        seq_len = seq_len - (q_len_per_req - 1) + q_offset
+
+    if seq_len <= topk:
+        valid = offsets < seq_len
+        local = offsets.to(gl.int32)
+        block_idx = local // page_size
+        block_offset = local - block_idx * page_size
+        page = gl.load(
+            block_table + req * block_table_stride + block_idx,
+            mask=valid & (block_idx < block_table_cols),
+            other=0,
+        ).to(gl.int32)
+        slots = page * page_size + block_offset
+        gl.store(
+            out + row * out_stride + offsets,
+            gl.where(valid, slots, -1),
+            mask=offsets < topk,
+        )
+
+
+@gluon.jit
+def _dsa_prefill_fill_short_rows_kernel(
+    row_starts,
+    row_ends,
+    out,
+    out_stride: gl.constexpr,
+    topk: gl.constexpr,
+    TOPK_LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    layout: gl.constexpr = _vector_layout(topk, gl.num_warps(), TOPK_LOAD_ELEMS)
+    offsets = gl.arange(0, topk, layout=layout)
+    row_start = gl.load(row_starts + row).to(gl.int32)
+    row_end = gl.load(row_ends + row).to(gl.int32)
+    candidate_len = gl.maximum(row_end - row_start, 0)
+
+    if candidate_len <= topk:
+        valid = offsets < candidate_len
+        local = row_start + offsets.to(gl.int32)
+        gl.store(
+            out + row * out_stride + offsets,
+            gl.where(valid, local, -1),
+            mask=offsets < topk,
+        )
+
+
+@gluon.jit
 def _dsa_decode_radix_init_kernel(
     seq_lens,
     out,
@@ -659,6 +725,19 @@ def _dsa_decode_radix_topk_slots(
         LOAD_ELEMS=_load_elems(_RADIX_TOPK_BLOCK_N, 8),
         num_warps=8,
     )
+    _dsa_decode_fill_short_rows_kernel[(rows,)](
+        block_table,
+        seq_lens,
+        out,
+        block_table.stride(0),
+        out.stride(0),
+        block_table.shape[1],
+        page_size=int(page_size),
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        TOPK_LOAD_ELEMS=_load_elems(topk, 8),
+        num_warps=8,
+    )
     return out, lens_out
 
 
@@ -712,6 +791,15 @@ def _dsa_prefill_radix_topk(
         topk=topk,
         BLOCK_N=_RADIX_TOPK_BLOCK_N,
         LOAD_ELEMS=_load_elems(_RADIX_TOPK_BLOCK_N, 8),
+        num_warps=8,
+    )
+    _dsa_prefill_fill_short_rows_kernel[(rows,)](
+        row_starts,
+        row_ends,
+        out,
+        out.stride(0),
+        topk=topk,
+        TOPK_LOAD_ELEMS=_load_elems(topk, 8),
         num_warps=8,
     )
     return out, lens_out

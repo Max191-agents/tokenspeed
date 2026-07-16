@@ -530,6 +530,25 @@ def _assert_topk_matches(
         assert (actual[token, count:] == -1).all()
 
 
+def _assert_exact_short_rows(
+    actual: torch.Tensor,
+    actual_lens: torch.Tensor,
+    expected_rows: Sequence[torch.Tensor],
+) -> None:
+    expected_lens = torch.tensor(
+        [row.numel() for row in expected_rows],
+        device=actual_lens.device,
+        dtype=torch.int32,
+    )
+    torch.testing.assert_close(actual_lens, expected_lens)
+    for row, expected in enumerate(expected_rows):
+        count = expected.numel()
+        selected = actual[row, :count]
+        torch.testing.assert_close(selected, expected)
+        assert torch.unique(selected).numel() == count
+        assert (actual[row, count:] == -1).all()
+
+
 def _strided_last_dim(tensor: torch.Tensor) -> torch.Tensor:
     backing = torch.empty(
         (*tensor.shape[:-1], tensor.shape[-1] * 2),
@@ -854,6 +873,117 @@ def test_dsa_decode_select_topk_keeps_late_values_above_threshold() -> None:
     assert selected_set.issuperset(set(greater_indices.cpu().tolist()))
     assert len(selected_set.intersection(set(equal_indices.cpu().tolist()))) == 1
     torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
+
+
+def test_dsa_decode_topk_gluon_radix_maps_short_ragged_rows() -> None:
+    device = "cuda"
+    page_size = 64
+    capacity = 262144
+    topk = 2048
+    q_len_per_req = 3
+    head_dim = 128
+    seq_lens_tuple = (130, 515)
+    seq_lens = torch.tensor(seq_lens_tuple, device=device, dtype=torch.int32)
+    rows = len(seq_lens_tuple) * q_len_per_req
+
+    block_table = torch.zeros(
+        (len(seq_lens_tuple), capacity // page_size),
+        device=device,
+        dtype=torch.int32,
+    )
+    used_pages = torch.tensor(
+        (
+            (41, 3, 57, 11, 29, 5, 61, 17, 37),
+            (53, 7, 31, 1, 47, 13, 59, 23, 43),
+        ),
+        device=device,
+        dtype=torch.int32,
+    )
+    block_table[:, : used_pages.shape[1]].copy_(used_pages)
+
+    q = torch.zeros((rows, 1, head_dim), device=device, dtype=torch.bfloat16)
+    weights = torch.ones((rows, 1), device=device, dtype=torch.float32)
+    index_k = torch.zeros(
+        (64 * page_size, head_dim), device=device, dtype=torch.bfloat16
+    )
+    packed_index_k, _ = _pack_index_k_cache(index_k, page_size)
+    out = torch.full((rows, topk), 12345, device=device, dtype=torch.int32)
+    lens_out = torch.full((rows,), -12345, device=device, dtype=torch.int32)
+
+    actual, actual_lens = gluon_dsa_decode_topk_fp8_gfx950(
+        q,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=head_dim**-0.5,
+        q_len_per_req=q_len_per_req,
+        index_k_cache=packed_index_k,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    expected_rows = []
+    for row in range(rows):
+        req = row // q_len_per_req
+        q_offset = row % q_len_per_req
+        visible_len = seq_lens_tuple[req] - (q_len_per_req - 1) + q_offset
+        local = torch.arange(visible_len, device=device, dtype=torch.int32)
+        pages = block_table[req].index_select(0, (local // page_size).long())
+        expected_rows.append(pages * page_size + local % page_size)
+
+    assert actual is out
+    assert actual_lens is lens_out
+    _assert_exact_short_rows(actual, actual_lens, expected_rows)
+
+
+def test_dsa_prefill_topk_gluon_radix_maps_short_row_ranges() -> None:
+    device = "cuda"
+    page_size = 64
+    workspace_size = 65536
+    topk = 2048
+    head_dim = 128
+    row_starts = torch.tensor(
+        (0, 7, 32760, 60000, 63488), device=device, dtype=torch.int32
+    )
+    row_lens = torch.tensor((0, 1, 513, 2047, 2048), device=device, dtype=torch.int32)
+    row_ends = row_starts + row_lens
+    rows = row_starts.numel()
+
+    physical_slots = 4096
+    workspace_offsets = torch.arange(workspace_size, device=device, dtype=torch.int64)
+    kv_workspace_slots = (workspace_offsets * 37 + 11) % physical_slots
+    q = torch.zeros((rows, 1, head_dim), device=device, dtype=torch.bfloat16)
+    weights = torch.ones((rows, 1), device=device, dtype=torch.float32)
+    index_k = torch.zeros(
+        (physical_slots, head_dim), device=device, dtype=torch.bfloat16
+    )
+    packed_index_k, _ = _pack_index_k_cache(index_k, page_size)
+    out = torch.full((rows, topk), 12345, device=device, dtype=torch.int32)
+    lens_out = torch.full((rows,), -12345, device=device, dtype=torch.int32)
+
+    actual, actual_lens = gluon_dsa_prefill_topk_fp8_gfx950(
+        q,
+        weights,
+        kv_workspace_slots,
+        row_starts,
+        row_ends,
+        topk=topk,
+        softmax_scale=head_dim**-0.5,
+        index_k_cache=packed_index_k,
+        page_size=page_size,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    expected_rows = [
+        torch.arange(start, end, device=device, dtype=torch.int32)
+        for start, end in zip(row_starts.tolist(), row_ends.tolist(), strict=True)
+    ]
+    assert actual is out
+    assert actual_lens is lens_out
+    _assert_exact_short_rows(actual, actual_lens, expected_rows)
 
 
 def test_dsa_decode_topk_gluon_long_row_uses_radix_path() -> None:
