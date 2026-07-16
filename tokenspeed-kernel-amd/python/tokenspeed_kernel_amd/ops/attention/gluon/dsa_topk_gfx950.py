@@ -111,6 +111,7 @@ _PERSISTENT_RADIX_POINTER_DTYPES = (torch.float32,) + (torch.int32,) * 10
 class _CompiledRunnerPlan:
     __slots__ = (
         "runner",
+        "ordinary_runner",
         "driver",
         "device",
         "mutable_state",
@@ -119,6 +120,19 @@ class _CompiledRunnerPlan:
         "knob_key",
         "environment_key",
         "pointer_refs",
+        "compiled",
+        "raw_launch",
+        "launch_cooperative_grid",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+        "function",
+        "packed_metadata",
+        "warp_size",
+        "arg_annotations",
+        "kernel_signature",
+        "enter_hook_chain",
+        "exit_hook_chain",
     )
 
     def __init__(
@@ -131,8 +145,12 @@ class _CompiledRunnerPlan:
         target_key: tuple[object, ...],
         knob_key: tuple[object, ...],
         pointer_args: tuple[object, ...],
+        *,
+        compiled: object | None = None,
+        grid: tuple[int, int, int] | None = None,
     ) -> None:
         self.runner = runner
+        self.ordinary_runner = runner
         self.driver = driver
         self.device = device
         self.mutable_state = mutable_state
@@ -141,6 +159,80 @@ class _CompiledRunnerPlan:
         self.knob_key = knob_key
         self.environment_key = _compiled_runner_environment_key()
         self.pointer_refs = tuple(ref(pointer) for pointer in pointer_args)
+        self.compiled = None
+        self.raw_launch = None
+        self.launch_cooperative_grid = False
+        self.grid_x = 0
+        self.grid_y = 0
+        self.grid_z = 0
+        self.function = None
+        self.packed_metadata = None
+        self.warp_size = 0
+        self.arg_annotations = None
+        self.kernel_signature = None
+        self.enter_hook_chain = None
+        self.exit_hook_chain = None
+
+        if compiled is None or grid is None or not _COMPILED_RUNNER_ABI_SUPPORTED:
+            return
+        launcher = compiled.run
+        runtime = triton.knobs.runtime
+        enter_hook_chain = runtime.launch_enter_hook
+        exit_hook_chain = runtime.launch_exit_hook
+        if (
+            launcher.global_scratch_size != 0
+            or launcher.profile_scratch_size != 0
+            or launcher.launch is not driver.utils.launch
+            or not isinstance(getattr(enter_hook_chain, "calls", None), list)
+            or not isinstance(getattr(exit_hook_chain, "calls", None), list)
+        ):
+            return
+
+        self.compiled = compiled
+        self.raw_launch = launcher.launch
+        self.launch_cooperative_grid = launcher.launch_cooperative_grid
+        self.grid_x, self.grid_y, self.grid_z = grid
+        self.function = compiled.function
+        self.packed_metadata = compiled.packed_metadata
+        self.warp_size = launcher.warp_size
+        self.arg_annotations = launcher.arg_annotations
+        self.kernel_signature = launcher.kernel_signature
+        self.enter_hook_chain = enter_hook_chain
+        self.exit_hook_chain = exit_hook_chain
+        self.runner = self._launch_raw
+
+    def _launch_raw(self, *args: object) -> None:
+        runtime = triton.knobs.runtime
+        enter_hook_chain = self.enter_hook_chain
+        exit_hook_chain = self.exit_hook_chain
+        if (
+            runtime.launch_enter_hook is not enter_hook_chain
+            or runtime.launch_exit_hook is not exit_hook_chain
+            or enter_hook_chain.calls
+            or exit_hook_chain.calls
+        ):
+            self.ordinary_runner(*args)
+            return
+
+        stream = self.driver.get_current_stream(self.device)
+        self.raw_launch(
+            self.launch_cooperative_grid,
+            self.grid_x,
+            self.grid_y,
+            self.grid_z,
+            stream,
+            self.function,
+            None,
+            None,
+            self.packed_metadata,
+            None,
+            None,
+            None,
+            self.warp_size,
+            self.arg_annotations,
+            self.kernel_signature,
+            args,
+        )
 
     def pointers_match(self, args: tuple[object, ...]) -> bool:
         count = len(self.pointer_refs)
@@ -581,6 +673,8 @@ def _launch_warmed_compiled_kernel(
                     target_key,
                     knob_key,
                     args[: len(pointer_dtypes)],
+                    compiled=compiled,
+                    grid=grid,
                 )
                 _cache_compiled_runner_plan(_compiled_runner_cache, key, plan)
                 _compiled_runner_environments[environment_key] = environment

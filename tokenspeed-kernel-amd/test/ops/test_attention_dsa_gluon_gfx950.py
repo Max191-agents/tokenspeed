@@ -8,6 +8,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from threading import Event, Thread
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -1609,6 +1610,150 @@ def test_compiled_runner_abi_gate_matches_installed_distribution() -> None:
     )
 
 
+def _make_fake_raw_compiled_plan(
+    *,
+    global_scratch_size: int = 0,
+    profile_scratch_size: int = 0,
+    descriptor_wrapper: bool = False,
+) -> tuple[
+    dsa_topk_gfx950._CompiledRunnerPlan,
+    object,
+    list[tuple[object, ...]],
+    list[tuple[object, ...]],
+    list[int],
+    object,
+]:
+    direct_launches: list[tuple[object, ...]] = []
+    ordinary_launches: list[tuple[object, ...]] = []
+    stream_devices: list[int] = []
+
+    def direct_launch(*args: object) -> None:
+        direct_launches.append(args)
+
+    def descriptor_launch(*args: object) -> None:
+        direct_launch(*args)
+
+    def get_current_stream(device: int) -> int:
+        stream_devices.append(device)
+        return 707
+
+    def unexpected_current_device() -> int:
+        raise AssertionError("raw launch queried the current device")
+
+    driver = SimpleNamespace(
+        utils=SimpleNamespace(launch=direct_launch),
+        get_current_stream=get_current_stream,
+        get_current_device=unexpected_current_device,
+    )
+    launcher = SimpleNamespace(
+        global_scratch_size=global_scratch_size,
+        profile_scratch_size=profile_scratch_size,
+        launch=descriptor_launch if descriptor_wrapper else direct_launch,
+        launch_cooperative_grid=False,
+        warp_size=64,
+        arg_annotations=object(),
+        kernel_signature=b"fake-signature",
+    )
+    compiled = SimpleNamespace(
+        run=launcher,
+        function=object(),
+        packed_metadata=(8, 1, 0),
+    )
+
+    def ordinary_runner(*args: object) -> None:
+        ordinary_launches.append(args)
+
+    plan = dsa_topk_gfx950._CompiledRunnerPlan(
+        ordinary_runner,
+        driver,
+        7,
+        (),
+        object(),
+        ("hip", "gfx950", 64),
+        dsa_topk_gfx950._COMPILED_RUNNER_CANONICAL_KNOBS,
+        (),
+        compiled=compiled,
+        grid=(2, 3, 1),
+    )
+    return (
+        plan,
+        compiled,
+        direct_launches,
+        ordinary_launches,
+        stream_devices,
+        direct_launch,
+    )
+
+
+@pytest.mark.skipif(
+    not dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED,
+    reason="requires the supported CompiledKernel runner ABI",
+)
+def test_compiled_runner_raw_plan_calls_generated_launcher() -> None:
+    (
+        plan,
+        compiled,
+        direct_launches,
+        ordinary_launches,
+        stream_devices,
+        direct_launch,
+    ) = _make_fake_raw_compiled_plan()
+
+    plan.runner("pointer", 17)
+
+    assert plan.compiled is compiled
+    assert plan.raw_launch is direct_launch
+    assert not ordinary_launches
+    assert stream_devices == [7]
+    assert len(direct_launches) == 1
+    launch = direct_launches[0]
+    assert launch[:6] == (False, 2, 3, 1, 707, compiled.function)
+    assert launch[6:8] == (None, None)
+    assert launch[8] is compiled.packed_metadata
+    assert launch[9:12] == (None, None, None)
+    assert launch[12] == 64
+    assert launch[13] is compiled.run.arg_annotations
+    assert launch[14] == b"fake-signature"
+    assert launch[15] == ("pointer", 17)
+
+
+@pytest.mark.skipif(
+    not dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED,
+    reason="requires the supported CompiledKernel runner ABI",
+)
+@pytest.mark.parametrize(
+    "unsupported_gate",
+    ("distribution_version", "global_scratch", "profile_scratch", "descriptor"),
+)
+def test_compiled_runner_raw_plan_falls_back_for_unsupported_launcher(
+    unsupported_gate: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = {}
+    if unsupported_gate == "distribution_version":
+        monkeypatch.setattr(
+            dsa_topk_gfx950,
+            "_COMPILED_RUNNER_ABI_SUPPORTED",
+            False,
+        )
+    elif unsupported_gate == "global_scratch":
+        options["global_scratch_size"] = 16
+    elif unsupported_gate == "profile_scratch":
+        options["profile_scratch_size"] = 16
+    else:
+        options["descriptor_wrapper"] = True
+
+    plan, _, direct_launches, ordinary_launches, _, _ = _make_fake_raw_compiled_plan(
+        **options
+    )
+    plan.runner("pointer")
+
+    assert plan.raw_launch is None
+    assert plan.runner is plan.ordinary_runner
+    assert not direct_launches
+    assert ordinary_launches == [("pointer",)]
+
+
 @pytest.mark.skipif(
     not dsa_topk_gfx950._COMPILED_RUNNER_ABI_SUPPORTED,
     reason="requires the supported CompiledKernel runner ABI",
@@ -1653,6 +1798,10 @@ def test_compiled_runner_uses_trivial_prefill_direct_path(
             plan = current_plan
         else:
             assert current_plan is plan
+
+    assert plan is not None
+    assert plan.compiled is not None
+    assert plan.raw_launch is plan.driver.utils.launch
 
     def fail_slow_path(*args, **kwargs) -> None:
         raise AssertionError("same-pointer trivial prefill missed the direct plan")
@@ -1713,6 +1862,8 @@ def test_trivial_prefill_direct_runner_graph_replay(
 ) -> None:
     inputs = _make_trivial_prefill_inputs(2048)
     _run_trivial_prefill(inputs)
+    plan = next(iter(dsa_topk_gfx950._trivial_prefill_runner_plans.values()))
+    assert plan.raw_launch is plan.driver.utils.launch
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -1733,19 +1884,32 @@ def test_compiled_runner_uses_current_stream_and_launch_hooks(
     inputs = _make_trivial_decode_inputs(2048)
     _run_trivial_decode(inputs)
     assert dsa_topk_gfx950._trivial_decode_runner_plans
+    plan = next(iter(dsa_topk_gfx950._trivial_decode_runner_plans.values()))
+    assert plan.raw_launch is plan.driver.utils.launch
 
-    streams: list[int] = []
+    raw_streams: list[int] = []
+    enter_streams: list[int] = []
+    exit_streams: list[int] = []
+    raw_launch = plan.raw_launch
 
-    def record_stream(metadata) -> None:
-        streams.append(metadata.get()["stream"])
+    def record_raw_launch(*args: object) -> None:
+        raw_streams.append(args[4])
+        raw_launch(*args)
 
-    hook = dsa_topk_gfx950.triton.knobs.runtime.launch_enter_hook
+    def record_enter_stream(metadata) -> None:
+        enter_streams.append(metadata.get()["stream"])
+
+    def record_exit_stream(metadata) -> None:
+        exit_streams.append(metadata.get()["stream"])
+
+    runtime = dsa_topk_gfx950.triton.knobs.runtime
+    enter_hook = runtime.launch_enter_hook
+    exit_hook = runtime.launch_exit_hook
     current_stream = torch.cuda.current_stream()
     stream_a = torch.cuda.Stream()
     stream_b = torch.cuda.Stream()
-    hook.add(record_stream)
+    plan.raw_launch = record_raw_launch
     try:
-        _run_trivial_decode(inputs)
         stream_a.wait_stream(current_stream)
         with torch.cuda.stream(stream_a):
             _run_trivial_decode(inputs)
@@ -1754,13 +1918,39 @@ def test_compiled_runner_uses_current_stream_and_launch_hooks(
         with torch.cuda.stream(stream_b):
             _run_trivial_decode(inputs)
         current_stream.wait_stream(stream_b)
-    finally:
-        hook.remove(record_stream)
+        current_stream.synchronize()
+        assert raw_streams == [stream_a.cuda_stream, stream_b.cuda_stream]
 
-    assert streams == [
-        current_stream.cuda_stream,
+        raw_streams.clear()
+        enter_hook.add(record_enter_stream)
+        exit_hook.add(record_exit_stream)
+        with torch.cuda.stream(stream_a):
+            _run_trivial_decode(inputs)
+        event = stream_a.record_event()
+        stream_b.wait_event(event)
+        with torch.cuda.stream(stream_b):
+            _run_trivial_decode(inputs)
+        current_stream.wait_stream(stream_b)
+        enter_hook.remove(record_enter_stream)
+        _run_trivial_decode(inputs)
+
+        exit_hook.remove(record_exit_stream)
+        _run_trivial_decode(inputs)
+        current_stream.synchronize()
+    finally:
+        enter_hook.remove(record_enter_stream)
+        exit_hook.remove(record_exit_stream)
+        plan.raw_launch = raw_launch
+
+    assert raw_streams == [current_stream.cuda_stream]
+    assert enter_streams == [
         stream_a.cuda_stream,
         stream_b.cuda_stream,
+    ]
+    assert exit_streams == [
+        stream_a.cuda_stream,
+        stream_b.cuda_stream,
+        current_stream.cuda_stream,
     ]
     _assert_trivial_decode(inputs)
 
@@ -1774,6 +1964,8 @@ def test_compiled_runner_graph_replay_and_capture_miss_fallback(
 ) -> None:
     inputs = _make_trivial_decode_inputs(2048)
     _run_trivial_decode(inputs)
+    plan = next(iter(dsa_topk_gfx950._trivial_decode_runner_plans.values()))
+    assert plan.raw_launch is plan.driver.utils.launch
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
