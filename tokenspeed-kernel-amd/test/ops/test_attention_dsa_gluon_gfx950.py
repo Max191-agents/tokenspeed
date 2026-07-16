@@ -1139,6 +1139,120 @@ def test_dsa_prefill_topk_dispatches_persistent_groups_across_rows(
     assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace)
 
 
+@pytest.mark.parametrize(
+    ("cols", "groups"),
+    (
+        (131072, 2),
+        (262144, 4),
+        (524288, 4),
+        (1048576, 4),
+    ),
+)
+def test_dsa_persistent_prefill_compacts_bounded_final_candidates(
+    cols: int,
+    groups: int,
+) -> None:
+    rows = 4
+    topk = 2048
+    block_n = dsa_topk_gfx950._PERSISTENT_PREFILL_BLOCK_N
+    row_starts = torch.tensor(
+        [17, block_n + 31, 2 * block_n + 47, 3 * block_n + 63],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_ends = torch.tensor(
+        [cols - 29, cols - 53, cols - 79, cols - 101],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=8203,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+
+    for _ in range(2):
+        out.fill_(-1)
+        lens_out.fill_(-1)
+        dsa_topk_gfx950._dsa_persistent_prefill_radix_topk(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            groups=groups,
+            workspace=workspace,
+            out=out,
+            lens_out=lens_out,
+        )
+        _assert_grouped_radix_topk(
+            logits,
+            out,
+            lens_out,
+            row_starts,
+            row_ends,
+            topk=topk,
+        )
+        assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace)
+
+
+def test_dsa_persistent_prefill_compacts_unaligned_tail_with_infinities() -> None:
+    rows = 4
+    cols = 524288 + 123
+    topk = 2048
+    block_n = dsa_topk_gfx950._PERSISTENT_PREFILL_BLOCK_N
+    row_starts = torch.tensor(
+        [5, block_n + 7, 2 * block_n + 9, 3 * block_n + 11],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_ends = torch.tensor(
+        [cols - 1, cols - 17, cols - 63, cols],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=8219,
+    )
+    starts = row_starts.cpu().tolist()
+    ends = row_ends.cpu().tolist()
+    logits[0, ends[0] - 1] = float("inf")
+    logits[1, starts[1] + 3] = float("inf")
+    logits[2, ends[2] - 1] = -float("inf")
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+
+    dsa_topk_gfx950._dsa_persistent_prefill_radix_topk(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        groups=4,
+        workspace=workspace,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    assert all(int(torch.count_nonzero(t).item()) == 0 for t in workspace)
+
+
 def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
     rows = 64
     cols = 262144
@@ -3215,6 +3329,8 @@ def test_dsa_persistent_prefill_topk_is_graph_capturable(
         row_ends,
         topk=topk,
     )
+    graph_workspace = dsa_topk_gfx950._persistent_topk_workspace_cache[workspace_key]
+    assert all(int(torch.count_nonzero(t).item()) == 0 for t in graph_workspace)
 
 
 def test_dsa_persistent_prefill_topk_is_stream_local() -> None:
