@@ -48,6 +48,7 @@ _ONEBLOCK_PREFILL_RADIX_BLOCK_N = 4096
 _ONEBLOCK_COMPACT_FINAL_BLOCK_N = 4096
 _ONEBLOCK_COMPACT_FINAL_MIN_COLS = 65536
 _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS = 65536
+_ONEBLOCK_DECODE_RUNTIME_MAX_COLS = 256 * 1024
 _ONEBLOCK_RADIX_MAX_COLS = 90000
 _PREFILL_HIST_DERIVED_MIN_COLS = 524288
 
@@ -2911,8 +2912,11 @@ def _dsa_decode_topk_slots(
             )
         return out, lens_out
 
-    if cols <= _ONEBLOCK_RADIX_MAX_COLS:
-        if cols < _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS:
+    if cols <= _ONEBLOCK_DECODE_RUNTIME_MAX_COLS:
+        if (
+            cols < _ONEBLOCK_DECODE_EARLY_STOP_MIN_COLS
+            or cols > _ONEBLOCK_RADIX_MAX_COLS
+        ):
             _dsa_runtime_radix_topk_kernel[(rows,)](
                 logits,
                 block_table,
