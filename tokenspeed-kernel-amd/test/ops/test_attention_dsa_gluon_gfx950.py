@@ -2195,6 +2195,49 @@ def test_dsa_persistent_decode_interleaved_plan_reuses_resident_workgroups(
 
 
 @pytest.mark.parametrize(
+    ("rows", "cols", "expected"),
+    (
+        (33, 90048, (32, 7, 32, 1, 8, 1)),
+        (65, 90048, (64, 3, 64, 1, 8, 1)),
+        (5, 1024 * 1024, (4, 32, 4, 1, 64, 1)),
+        (9, 512 * 1024, (8, 16, 8, 1, 32, 1)),
+        (17, 256 * 1024, (16, 8, 16, 1, 16, 1)),
+        (33, 1024 * 1024, (32, 7, 32, 1, 64, 1)),
+        (129, 1024 * 1024, (128, 2, 128, 1, 64, 1)),
+        (132, 512 * 1024, (128, 2, 128, 4, 32, 4)),
+    ),
+)
+def test_dsa_persistent_decode_interleaved_current_groups_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: int,
+    cols: int,
+    expected: tuple[int, int, int, int, int, int],
+) -> None:
+    monkeypatch.setattr(dsa_topk_gfx950, "_device_compute_units", lambda _: 256)
+
+    plan = dsa_topk_gfx950._persistent_decode_interleaved_current_groups_plan(
+        rows,
+        cols,
+        2048,
+        torch.device("cuda", 0),
+    )
+
+    assert plan == expected
+    assert plan is not None
+    (
+        main_rows,
+        main_groups,
+        main_row_teams,
+        tail_rows,
+        tail_groups,
+        tail_row_teams,
+    ) = plan
+    assert main_rows + tail_rows == rows
+    assert main_groups * main_row_teams <= 256
+    assert tail_groups * tail_row_teams <= main_groups * main_row_teams
+
+
+@pytest.mark.parametrize(
     ("rows", "cols", "topk"),
     ((0, 90048, 2048), (1, 90000, 2048), (1, 90048, 1024)),
 )
@@ -2203,15 +2246,19 @@ def test_dsa_persistent_decode_interleaved_plan_rejects_unsupported_inputs(
     cols: int,
     topk: int,
 ) -> None:
-    assert (
-        dsa_topk_gfx950._persistent_decode_interleaved_plan(
-            rows,
-            cols,
-            topk,
-            torch.device("cuda", 0),
+    for planner in (
+        dsa_topk_gfx950._persistent_decode_interleaved_plan,
+        dsa_topk_gfx950._persistent_decode_interleaved_current_groups_plan,
+    ):
+        assert (
+            planner(
+                rows,
+                cols,
+                topk,
+                torch.device("cuda", 0),
+            )
+            is None
         )
-        is None
-    )
 
 
 def test_dsa_persistent_decode_interleaved_groups_are_constexpr() -> None:
@@ -2227,14 +2274,16 @@ def test_dsa_persistent_decode_interleaved_groups_are_constexpr() -> None:
 
 
 @pytest.mark.parametrize(
-    ("rows", "cols", "q_len_per_req", "final_seq_len"),
+    ("rows", "cols", "q_len_per_req", "final_seq_len", "use_current_groups"),
     (
-        (33, 90048, 3, 2049),
-        (128, 90048, 4, 2049),
-        (132, 90048, 4, 90031),
-        (514, 90048, 1, 90031),
-        (5, 1024 * 1024, 1, 1024 * 1024 - 17),
-        (129, 1024 * 1024, 1, 1024 * 1024 - 17),
+        (33, 90048, 3, 2049, False),
+        (128, 90048, 4, 2049, False),
+        (132, 90048, 4, 90031, False),
+        (514, 90048, 1, 90031, False),
+        (5, 1024 * 1024, 1, 1024 * 1024 - 17, False),
+        (129, 1024 * 1024, 1, 1024 * 1024 - 17, False),
+        (33, 90048, 1, 90031, True),
+        (65, 90048, 1, 90031, True),
     ),
 )
 def test_dsa_persistent_decode_interleaved_repeat_and_reset(
@@ -2242,6 +2291,7 @@ def test_dsa_persistent_decode_interleaved_repeat_and_reset(
     cols: int,
     q_len_per_req: int,
     final_seq_len: int,
+    use_current_groups: bool,
 ) -> None:
     page_size = 64
     topk = 2048
@@ -2259,7 +2309,12 @@ def test_dsa_persistent_decode_interleaved_repeat_and_reset(
     block_table = _make_reversed_decode_block_table(requests, cols, page_size)
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
-    plan = dsa_topk_gfx950._persistent_decode_interleaved_plan(
+    planner = (
+        dsa_topk_gfx950._persistent_decode_interleaved_current_groups_plan
+        if use_current_groups
+        else dsa_topk_gfx950._persistent_decode_interleaved_plan
+    )
+    plan = planner(
         rows,
         cols,
         topk,

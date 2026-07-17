@@ -4493,19 +4493,12 @@ def _dsa_persistent_decode_topk_heterogeneous(
     return out, lens_out
 
 
-def _persistent_decode_interleaved_plan(
+def _persistent_decode_interleaved_plan_for_main_groups(
     rows: int,
     cols: int,
-    topk: int,
     device: torch.device,
-) -> tuple[int, int, int, int, int, int] | None:
-    if (
-        rows <= 0
-        or topk != _PERSISTENT_PREFILL_TOPK
-        or cols <= _PERSISTENT_DECODE_MIN_COLS
-    ):
-        return None
-
+    main_groups: int | None,
+) -> tuple[int, int, int, int, int, int]:
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
@@ -4531,7 +4524,10 @@ def _persistent_decode_interleaved_plan(
         return groups, row_teams
 
     main_rows = 1 << (rows.bit_length() - 1)
-    main_groups, main_row_teams = cohort_config(main_rows, compute_units)
+    if main_groups is None:
+        main_groups, main_row_teams = cohort_config(main_rows, compute_units)
+    else:
+        main_row_teams = min(main_rows, compute_units // main_groups)
     main_workgroups = main_groups * main_row_teams
     tail_rows = rows - main_rows
     if tail_rows == 0:
@@ -4546,6 +4542,46 @@ def _persistent_decode_interleaved_plan(
         tail_rows,
         tail_groups,
         tail_row_teams,
+    )
+
+
+def _persistent_decode_interleaved_plan(
+    rows: int,
+    cols: int,
+    topk: int,
+    device: torch.device,
+) -> tuple[int, int, int, int, int, int] | None:
+    if (
+        rows <= 0
+        or topk != _PERSISTENT_PREFILL_TOPK
+        or cols <= _PERSISTENT_DECODE_MIN_COLS
+    ):
+        return None
+    return _persistent_decode_interleaved_plan_for_main_groups(
+        rows,
+        cols,
+        device,
+        None,
+    )
+
+
+def _persistent_decode_interleaved_current_groups_plan(
+    rows: int,
+    cols: int,
+    topk: int,
+    device: torch.device,
+) -> tuple[int, int, int, int, int, int] | None:
+    default_plan = _persistent_decode_interleaved_plan(rows, cols, topk, device)
+    if default_plan is None:
+        return None
+    main_groups = _persistent_decode_groups(rows, cols, topk, device)
+    if main_groups is None:
+        return default_plan
+    return _persistent_decode_interleaved_plan_for_main_groups(
+        rows,
+        cols,
+        device,
+        main_groups,
     )
 
 
