@@ -58,6 +58,24 @@ def test_dsa_topk_has_no_dedicated_trivial_specializations() -> None:
     assert not hasattr(dsa_topk_gfx950, "_dsa_trivial_prefill_topk2048_kernel")
 
 
+def test_dsa_topk_has_no_superseded_decode_paths() -> None:
+    removed_symbols = (
+        "_dsa_decode_staged_wide_radix_topk_slots",
+        "_dsa_decode_radix_topk_slots",
+        "_dsa_persistent_radix_topk_row_pool_kernel",
+        "_dsa_persistent_radix_topk_heterogeneous_kernel",
+        "_dsa_persistent_decode_topk_split_rows",
+        "_dsa_persistent_decode_topk_heterogeneous",
+        "_persistent_decode_split_plan",
+        "_persistent_decode_heterogeneous_plan",
+        "_persistent_decode_interleaved_current_groups_plan",
+        "_dsa_decode_select_topk_kernel",
+        "_dsa_prefill_select_topk_kernel",
+    )
+
+    assert not any(hasattr(dsa_topk_gfx950, name) for name in removed_symbols)
+
+
 def test_dsa_manual_decode_config_source_contract() -> None:
     assert dsa_topk_gfx950._ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG == (8192, 8)
     assert dsa_topk_gfx950._ONEBLOCK_DECODE_SHORT_MANUAL_CONFIG == (8192, 8)
@@ -883,101 +901,6 @@ def test_dsa_prefill_topk_fp8_rejects_unsupported_capabilities(
         )
 
 
-def test_dsa_prefill_select_topk_keeps_late_values_above_threshold() -> None:
-    device = "cuda"
-    cols = 16384
-    topk = 2048
-    logits = torch.full((1, cols), -10.0, device=device, dtype=torch.float32)
-    equal_indices = torch.arange(0, 32, device=device, dtype=torch.int32)
-    greater_indices = torch.cat(
-        (
-            torch.arange(4096, 4096 + topk - 2, device=device, dtype=torch.int32),
-            torch.tensor([cols - 3], device=device, dtype=torch.int32),
-        )
-    )
-    logits[0, equal_indices.long()] = 1.0
-    logits[0, greater_indices.long()] = 2.0
-    row_starts = torch.tensor([0], device=device, dtype=torch.int32)
-    row_ends = torch.tensor([cols], device=device, dtype=torch.int32)
-    out = torch.empty((1, topk), device=device, dtype=torch.int32)
-    lens_out = torch.empty((1,), device=device, dtype=torch.int32)
-
-    num_warps = 8
-    block_n = dsa_topk_gfx950.triton.next_power_of_2(cols)
-    dsa_topk_gfx950._dsa_prefill_select_topk_kernel[(1,)](
-        logits,
-        row_starts,
-        row_ends,
-        out,
-        lens_out,
-        logits.stride(0),
-        out.stride(0),
-        topk=topk,
-        BLOCK_N=block_n,
-        LOAD_ELEMS=dsa_topk_gfx950._load_elems(block_n, num_warps),
-        TOPK_LOAD_ELEMS=dsa_topk_gfx950._load_elems(topk, num_warps),
-        num_warps=num_warps,
-    )
-    torch.cuda.synchronize()
-
-    selected = out[0, :topk]
-    selected_set = set(selected.cpu().tolist())
-    assert selected_set.issuperset(set(greater_indices.cpu().tolist()))
-    assert len(selected_set.intersection(set(equal_indices.cpu().tolist()))) == 1
-    torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
-
-
-def test_dsa_decode_select_topk_keeps_late_values_above_threshold() -> None:
-    device = "cuda"
-    page_size = 64
-    cols = 16384
-    topk = 2048
-    logits = torch.full((1, cols), -10.0, device=device, dtype=torch.float32)
-    equal_indices = torch.arange(0, 32, device=device, dtype=torch.int32)
-    greater_indices = torch.cat(
-        (
-            torch.arange(4096, 4096 + topk - 2, device=device, dtype=torch.int32),
-            torch.tensor([cols - 3], device=device, dtype=torch.int32),
-        )
-    )
-    logits[0, equal_indices.long()] = 1.0
-    logits[0, greater_indices.long()] = 2.0
-    seq_lens = torch.tensor([cols], device=device, dtype=torch.int32)
-    block_table = torch.arange(
-        math.ceil(cols / page_size), device=device, dtype=torch.int32
-    ).reshape(1, -1)
-    out = torch.empty((1, topk), device=device, dtype=torch.int32)
-    lens_out = torch.empty((1,), device=device, dtype=torch.int32)
-
-    num_warps = 8
-    block_n = dsa_topk_gfx950.triton.next_power_of_2(cols)
-    dsa_topk_gfx950._dsa_decode_select_topk_kernel[(1,)](
-        logits,
-        block_table,
-        seq_lens,
-        out,
-        lens_out,
-        logits.stride(0),
-        block_table.stride(0),
-        out.stride(0),
-        block_table.shape[1],
-        page_size=page_size,
-        topk=topk,
-        q_len_per_req=1,
-        BLOCK_N=block_n,
-        LOAD_ELEMS=dsa_topk_gfx950._load_elems(block_n, num_warps),
-        TOPK_LOAD_ELEMS=dsa_topk_gfx950._load_elems(topk, num_warps),
-        num_warps=num_warps,
-    )
-    torch.cuda.synchronize()
-
-    selected = out[0, :topk]
-    selected_set = set(selected.cpu().tolist())
-    assert selected_set.issuperset(set(greater_indices.cpu().tolist()))
-    assert len(selected_set.intersection(set(equal_indices.cpu().tolist()))) == 1
-    torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
-
-
 def test_dsa_decode_topk_gluon_long_row_uses_radix_path() -> None:
     device = "cuda"
     page_size = 64
@@ -1305,9 +1228,6 @@ def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    tiles = dsa_topk_gfx950.triton.cdiv(cols, dsa_topk_gfx950._RADIX_TOPK_BLOCK_N)
-    groups = dsa_topk_gfx950._radix_groups_per_row(rows, tiles, logits.device)
-    assert groups < tiles
     dsa_topk_gfx950._dsa_prefill_topk_indices(
         logits,
         row_starts,
@@ -1738,55 +1658,96 @@ def test_dsa_decode_topk_maps_grouped_queries_to_physical_slots(
     )
 
 
-def test_dsa_persistent_decode_groups_obey_residency_bound() -> None:
-    device = torch.device("cuda")
-    compute_units = torch.cuda.get_device_properties(device).multi_processor_count
-    topk = 2048
+@pytest.mark.parametrize(
+    ("rows", "cols", "topk"),
+    (
+        pytest.param(5, 512 * 1024, 512, id="topk512-tail"),
+        pytest.param(3, 512 * 1024, 1024, id="topk1024-tail"),
+        pytest.param(129, 256 * 1024 + 64, 2048, id="high-row-tail"),
+    ),
+)
+def test_dsa_decode_topk_persistent_replaces_staged_wide(
+    rows: int,
+    cols: int,
+    topk: int,
+) -> None:
+    page_size = 64
+    seq_lens = (
+        cols - (torch.arange(rows, device="cuda", dtype=torch.int32) * 53 + 17) % 1024
+    )
+    row_starts = torch.zeros((rows,), device="cuda", dtype=torch.int32)
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        seq_lens,
+        cols=cols,
+        topk=topk,
+        seed=3907 + topk,
+    )
+    block_table = _make_reversed_decode_block_table(rows, cols, page_size)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    assert dsa_topk_gfx950._persistent_decode_groups(1, 131072, topk, device) == 8
-    assert (
-        dsa_topk_gfx950._persistent_decode_groups(
-            compute_units // 2,
-            131072,
-            topk,
-            device,
-        )
-        == 2
-    )
-    assert (
-        dsa_topk_gfx950._persistent_decode_groups(
-            compute_units // 2 + 1,
-            131072,
-            topk,
-            device,
-        )
-        is None
-    )
-    assert dsa_topk_gfx950._persistent_decode_groups(1, 90000, topk, device) is None
-    assert dsa_topk_gfx950._persistent_decode_groups(1, 90001, topk, device) == 8
-    assert dsa_topk_gfx950._persistent_decode_groups(
-        1,
-        1024 * 1024,
+    assert dsa_topk_gfx950._use_persistent_decode(
+        rows,
+        cols,
         topk,
-        device,
-    ) == min(64, compute_units)
-    low_residency_rows = compute_units // 5
-    assert (
-        dsa_topk_gfx950._persistent_decode_groups(
-            low_residency_rows,
-            1024 * 1024,
-            topk,
-            device,
-        )
-        == 5
+        logits.device,
     )
-    high_residency_groups = compute_units // 5
-    assert dsa_topk_gfx950._persistent_decode_groups(
-        5,
-        1024 * 1024,
-        topk,
-        device,
-    ) == min(64, 1 << (high_residency_groups.bit_length() - 1))
+    dsa_topk_gfx950._dsa_decode_topk_slots(
+        logits,
+        block_table,
+        seq_lens,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=1,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_decode_topk_slots(
+        logits,
+        out,
+        lens_out,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        q_len_per_req=1,
+        topk=topk,
+    )
+    workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+    _assert_persistent_workspace_reset(workspace)
+
+
+@pytest.mark.parametrize(
+    ("rows", "cols", "topk", "expected"),
+    (
+        (1, 90000, 2048, False),
+        (1, 90001, 2048, True),
+        (128, 131072, 2048, True),
+        (129, 131072, 2048, False),
+        (1, 262144, 1024, False),
+        (1, 262145, 512, True),
+        (514, 1024 * 1024, 2048, True),
+    ),
+)
+def test_dsa_persistent_decode_preserves_oneblock_shape_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: int,
+    cols: int,
+    topk: int,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(dsa_topk_gfx950, "_device_compute_units", lambda _: 256)
+
+    assert (
+        dsa_topk_gfx950._use_persistent_decode(
+            rows,
+            cols,
+            topk,
+            torch.device("cuda", 0),
+        )
+        is expected
+    )
 
 
 def test_dsa_persistent_decode_handles_tail_ties_and_infinities() -> None:
@@ -1818,14 +1779,11 @@ def test_dsa_persistent_decode_handles_tail_ties_and_infinities() -> None:
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    assert (
-        dsa_topk_gfx950._persistent_decode_groups(
-            rows,
-            cols,
-            topk,
-            logits.device,
-        )
-        == 16
+    assert dsa_topk_gfx950._use_persistent_decode(
+        rows,
+        cols,
+        topk,
+        logits.device,
     )
     dsa_topk_gfx950._dsa_decode_topk_slots(
         logits,
@@ -1851,301 +1809,6 @@ def test_dsa_persistent_decode_handles_tail_ties_and_infinities() -> None:
     workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
     _assert_persistent_workspace_layout(workspace, rows)
     _assert_persistent_workspace_reset(workspace)
-
-
-def test_dsa_persistent_decode_row_teams_reuse_workgroups() -> None:
-    page_size = 64
-    rows = 5
-    row_teams = 2
-    groups = 2
-    cols = 147493
-    topk = 2048
-    seq_lens = torch.tensor(
-        [1024, cols - 17, cols - 113, cols, 1536],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    generator = _generator("cuda", 8907)
-    logits = torch.randn(
-        (rows, cols),
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    )
-    block_table = _make_reversed_decode_block_table(rows, cols, page_size)
-    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
-    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
-
-    for _ in range(2):
-        out.fill_(-7)
-        lens_out.fill_(-7)
-        dsa_topk_gfx950._dsa_persistent_decode_topk_slots(
-            logits,
-            block_table,
-            seq_lens,
-            page_size=page_size,
-            topk=topk,
-            q_len_per_req=1,
-            groups=groups,
-            row_teams=row_teams,
-            out=out,
-            lens_out=lens_out,
-        )
-        _assert_decode_topk_slots(
-            logits,
-            out,
-            lens_out,
-            seq_lens,
-            block_table,
-            page_size=page_size,
-            q_len_per_req=1,
-            topk=topk,
-        )
-        workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
-        _assert_persistent_workspace_reset(workspace)
-
-
-@pytest.mark.parametrize(
-    ("rows", "expected"),
-    (
-        (128, ((0, 128, 2, 128),)),
-        (129, ((0, 128, 2, 128), (128, 1, 64, 1))),
-        (132, ((0, 128, 2, 128), (128, 4, 64, 4))),
-        (
-            141,
-            (
-                (0, 128, 2, 128),
-                (128, 8, 32, 8),
-                (136, 4, 64, 4),
-                (140, 1, 64, 1),
-            ),
-        ),
-        (256, ((0, 256, 2, 128),)),
-    ),
-)
-def test_dsa_persistent_decode_split_plan_fills_resident_workgroups(
-    monkeypatch: pytest.MonkeyPatch,
-    rows: int,
-    expected: tuple[tuple[int, int, int, int], ...],
-) -> None:
-    monkeypatch.setattr(dsa_topk_gfx950, "_device_compute_units", lambda _: 256)
-
-    plan = dsa_topk_gfx950._persistent_decode_split_plan(
-        rows,
-        1024 * 1024,
-        torch.device("cuda", 0),
-    )
-
-    assert plan == expected
-    assert sum(row_count for _, row_count, _, _ in plan) == rows
-    assert all(groups * row_teams <= 256 for _, _, groups, row_teams in plan)
-
-
-@pytest.mark.parametrize(
-    ("rows", "cols", "expected"),
-    (
-        (33, 90048, (32, 7, 1, 8)),
-        (36, 90048, (32, 7, 4, 8)),
-        (5, 90048, None),
-        (5, 1024 * 1024, (4, 32, 1, 64)),
-        (33, 1024 * 1024, (32, 7, 1, 32)),
-        (128, 512 * 1024, None),
-        (129, 512 * 1024, None),
-    ),
-)
-def test_dsa_persistent_decode_heterogeneous_plan_obeys_residency(
-    monkeypatch: pytest.MonkeyPatch,
-    rows: int,
-    cols: int,
-    expected: tuple[int, int, int, int] | None,
-) -> None:
-    monkeypatch.setattr(dsa_topk_gfx950, "_device_compute_units", lambda _: 256)
-
-    plan = dsa_topk_gfx950._persistent_decode_heterogeneous_plan(
-        rows,
-        cols,
-        2048,
-        torch.device("cuda", 0),
-    )
-
-    assert plan == expected
-    if plan is not None:
-        main_rows, main_groups, tail_rows, tail_groups = plan
-        assert main_rows + tail_rows == rows
-        assert main_rows * main_groups + tail_rows * tail_groups <= 256
-
-
-def test_dsa_persistent_decode_heterogeneous_groups_are_constexpr() -> None:
-    params = {
-        param.name: param
-        for param in (
-            dsa_topk_gfx950._dsa_persistent_radix_topk_heterogeneous_kernel.params
-        )
-    }
-
-    assert params["MAIN_GROUPS_PER_ROW"].is_constexpr
-    assert params["TAIL_GROUPS_PER_ROW"].is_constexpr
-
-
-@pytest.mark.parametrize(
-    ("rows", "cols", "q_len_per_req", "final_seq_len"),
-    (
-        (33, 90048, 3, 2049),
-        (36, 90048, 4, 90031),
-        (5, 1024 * 1024, 1, 1024 * 1024 - 17),
-    ),
-)
-def test_dsa_persistent_decode_heterogeneous_repeat_and_reset(
-    rows: int,
-    cols: int,
-    q_len_per_req: int,
-    final_seq_len: int,
-) -> None:
-    page_size = 64
-    topk = 2048
-    requests = rows // q_len_per_req
-    request_ids = torch.arange(requests, device="cuda", dtype=torch.int32)
-    seq_lens = cols - (request_ids * 53 + 17) % 1024
-    seq_lens[-1] = final_seq_len
-    generator = _generator("cuda", 8937 + rows)
-    logits = torch.randn(
-        (rows, cols),
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    )
-    block_table = _make_reversed_decode_block_table(requests, cols, page_size)
-    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
-    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
-    plan = dsa_topk_gfx950._persistent_decode_heterogeneous_plan(
-        rows,
-        cols,
-        topk,
-        logits.device,
-    )
-    assert plan is not None
-    main_rows, main_groups, tail_rows, tail_groups = plan
-
-    for _ in range(2):
-        out.fill_(-7)
-        lens_out.fill_(-7)
-        dsa_topk_gfx950._dsa_persistent_decode_topk_heterogeneous(
-            logits,
-            block_table,
-            seq_lens,
-            page_size=page_size,
-            topk=topk,
-            q_len_per_req=q_len_per_req,
-            main_rows=main_rows,
-            main_groups=main_groups,
-            tail_rows=tail_rows,
-            tail_groups=tail_groups,
-            out=out,
-            lens_out=lens_out,
-        )
-        _assert_decode_topk_slots(
-            logits,
-            out,
-            lens_out,
-            seq_lens,
-            block_table,
-            page_size=page_size,
-            q_len_per_req=q_len_per_req,
-            topk=topk,
-        )
-        workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
-        _assert_persistent_workspace_reset(workspace)
-
-
-@pytest.mark.parametrize("warm_workspace", (False, True), ids=("cold-key", "warm-key"))
-def test_dsa_persistent_decode_heterogeneous_is_graph_capturable(
-    warm_workspace: bool,
-) -> None:
-    page_size = 64
-    q_len_per_req = 3
-    requests = 11
-    rows = requests * q_len_per_req
-    cols = 90048
-    topk = 2048
-    request_ids = torch.arange(requests, device="cuda", dtype=torch.int32)
-    seq_lens = cols - (request_ids * 53 + 17) % 1024
-    seq_lens[-1] = 2049
-    generator = _generator("cuda", 8947)
-    logits = torch.randn(
-        (rows, cols),
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    )
-    block_table = _make_reversed_decode_block_table(requests, cols, page_size)
-    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
-    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
-    plan = dsa_topk_gfx950._persistent_decode_heterogeneous_plan(
-        rows,
-        cols,
-        topk,
-        logits.device,
-    )
-    assert plan is not None
-    main_rows, main_groups, tail_rows, tail_groups = plan
-
-    def invoke() -> None:
-        dsa_topk_gfx950._dsa_persistent_decode_topk_heterogeneous(
-            logits,
-            block_table,
-            seq_lens,
-            page_size=page_size,
-            topk=topk,
-            q_len_per_req=q_len_per_req,
-            main_rows=main_rows,
-            main_groups=main_groups,
-            tail_rows=tail_rows,
-            tail_groups=tail_groups,
-            out=out,
-            lens_out=lens_out,
-        )
-
-    invoke()
-    capture_stream = torch.cuda.Stream()
-    capture_stream.wait_stream(torch.cuda.current_stream())
-    device_index = logits.device.index
-    assert device_index is not None
-    workspace_key = (
-        device_index,
-        int(capture_stream.cuda_stream),
-        dsa_topk_gfx950._next_power_of_two(rows),
-    )
-    assert workspace_key not in dsa_topk_gfx950._persistent_topk_workspace_cache
-    if warm_workspace:
-        with torch.cuda.stream(capture_stream):
-            invoke()
-        capture_stream.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=capture_stream):
-        invoke()
-    capture_stream.synchronize()
-    graph_workspace = dsa_topk_gfx950._persistent_topk_workspace_cache[workspace_key]
-    _assert_persistent_workspace_layout(graph_workspace, rows)
-    if warm_workspace:
-        _assert_persistent_workspace_reset(graph_workspace)
-
-    for _ in range(2):
-        out.fill_(-7)
-        lens_out.fill_(-7)
-        graph.replay()
-        torch.cuda.synchronize()
-        _assert_decode_topk_slots(
-            logits,
-            out,
-            lens_out,
-            seq_lens,
-            block_table,
-            page_size=page_size,
-            q_len_per_req=q_len_per_req,
-            topk=topk,
-        )
-        _assert_persistent_workspace_reset(graph_workspace)
 
 
 @pytest.mark.parametrize(
@@ -2195,70 +1858,23 @@ def test_dsa_persistent_decode_interleaved_plan_reuses_resident_workgroups(
 
 
 @pytest.mark.parametrize(
-    ("rows", "cols", "expected"),
-    (
-        (33, 90048, (32, 7, 32, 1, 8, 1)),
-        (65, 90048, (64, 3, 64, 1, 8, 1)),
-        (5, 1024 * 1024, (4, 32, 4, 1, 64, 1)),
-        (9, 512 * 1024, (8, 16, 8, 1, 32, 1)),
-        (17, 256 * 1024, (16, 8, 16, 1, 16, 1)),
-        (33, 1024 * 1024, (32, 7, 32, 1, 64, 1)),
-        (129, 1024 * 1024, (128, 2, 128, 1, 64, 1)),
-        (132, 512 * 1024, (128, 2, 128, 4, 32, 4)),
-    ),
-)
-def test_dsa_persistent_decode_interleaved_current_groups_plan(
-    monkeypatch: pytest.MonkeyPatch,
-    rows: int,
-    cols: int,
-    expected: tuple[int, int, int, int, int, int],
-) -> None:
-    monkeypatch.setattr(dsa_topk_gfx950, "_device_compute_units", lambda _: 256)
-
-    plan = dsa_topk_gfx950._persistent_decode_interleaved_current_groups_plan(
-        rows,
-        cols,
-        2048,
-        torch.device("cuda", 0),
-    )
-
-    assert plan == expected
-    assert plan is not None
-    (
-        main_rows,
-        main_groups,
-        main_row_teams,
-        tail_rows,
-        tail_groups,
-        tail_row_teams,
-    ) = plan
-    assert main_rows + tail_rows == rows
-    assert main_groups * main_row_teams <= 256
-    assert tail_groups * tail_row_teams <= main_groups * main_row_teams
-
-
-@pytest.mark.parametrize(
     ("rows", "cols", "topk"),
-    ((0, 90048, 2048), (1, 90000, 2048), (1, 90048, 1024)),
+    ((0, 90048, 2048), (1, 90000, 2048), (1, 90048, 256)),
 )
 def test_dsa_persistent_decode_interleaved_plan_rejects_unsupported_inputs(
     rows: int,
     cols: int,
     topk: int,
 ) -> None:
-    for planner in (
-        dsa_topk_gfx950._persistent_decode_interleaved_plan,
-        dsa_topk_gfx950._persistent_decode_interleaved_current_groups_plan,
-    ):
-        assert (
-            planner(
-                rows,
-                cols,
-                topk,
-                torch.device("cuda", 0),
-            )
-            is None
+    assert (
+        dsa_topk_gfx950._persistent_decode_interleaved_plan(
+            rows,
+            cols,
+            topk,
+            torch.device("cuda", 0),
         )
+        is None
+    )
 
 
 def test_dsa_persistent_decode_interleaved_groups_are_constexpr() -> None:
@@ -2274,16 +1890,14 @@ def test_dsa_persistent_decode_interleaved_groups_are_constexpr() -> None:
 
 
 @pytest.mark.parametrize(
-    ("rows", "cols", "q_len_per_req", "final_seq_len", "use_current_groups"),
+    ("rows", "cols", "q_len_per_req", "final_seq_len"),
     (
-        (33, 90048, 3, 2049, False),
-        (128, 90048, 4, 2049, False),
-        (132, 90048, 4, 90031, False),
-        (514, 90048, 1, 90031, False),
-        (5, 1024 * 1024, 1, 1024 * 1024 - 17, False),
-        (129, 1024 * 1024, 1, 1024 * 1024 - 17, False),
-        (33, 90048, 1, 90031, True),
-        (65, 90048, 1, 90031, True),
+        (33, 90048, 3, 2049),
+        (128, 90048, 4, 2049),
+        (132, 90048, 4, 90031),
+        (514, 90048, 1, 90031),
+        (5, 1024 * 1024, 1, 1024 * 1024 - 17),
+        (129, 1024 * 1024, 1, 1024 * 1024 - 17),
     ),
 )
 def test_dsa_persistent_decode_interleaved_repeat_and_reset(
@@ -2291,7 +1905,6 @@ def test_dsa_persistent_decode_interleaved_repeat_and_reset(
     cols: int,
     q_len_per_req: int,
     final_seq_len: int,
-    use_current_groups: bool,
 ) -> None:
     page_size = 64
     topk = 2048
@@ -2309,43 +1922,16 @@ def test_dsa_persistent_decode_interleaved_repeat_and_reset(
     block_table = _make_reversed_decode_block_table(requests, cols, page_size)
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
-    planner = (
-        dsa_topk_gfx950._persistent_decode_interleaved_current_groups_plan
-        if use_current_groups
-        else dsa_topk_gfx950._persistent_decode_interleaved_plan
-    )
-    plan = planner(
-        rows,
-        cols,
-        topk,
-        logits.device,
-    )
-    assert plan is not None
-    (
-        main_rows,
-        main_groups,
-        main_row_teams,
-        tail_rows,
-        tail_groups,
-        tail_row_teams,
-    ) = plan
-
     for _ in range(2):
         out.fill_(-7)
         lens_out.fill_(-7)
-        dsa_topk_gfx950._dsa_persistent_decode_topk_interleaved(
+        dsa_topk_gfx950._dsa_persistent_decode_topk_slots(
             logits,
             block_table,
             seq_lens,
             page_size=page_size,
             topk=topk,
             q_len_per_req=q_len_per_req,
-            main_rows=main_rows,
-            main_groups=main_groups,
-            main_row_teams=main_row_teams,
-            tail_rows=tail_rows,
-            tail_groups=tail_groups,
-            tail_row_teams=tail_row_teams,
             out=out,
             lens_out=lens_out,
         )
@@ -2374,35 +1960,13 @@ def test_dsa_persistent_decode_interleaved_refines_exact_first_pass_bucket() -> 
     block_table = _make_reversed_decode_block_table(rows, cols, page_size)
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
-    plan = dsa_topk_gfx950._persistent_decode_interleaved_plan(
-        rows,
-        cols,
-        topk,
-        logits.device,
-    )
-    assert plan is not None
-    (
-        main_rows,
-        main_groups,
-        main_row_teams,
-        tail_rows,
-        tail_groups,
-        tail_row_teams,
-    ) = plan
-
-    dsa_topk_gfx950._dsa_persistent_decode_topk_interleaved(
+    dsa_topk_gfx950._dsa_persistent_decode_topk_slots(
         logits,
         block_table,
         seq_lens,
         page_size=page_size,
         topk=topk,
         q_len_per_req=1,
-        main_rows=main_rows,
-        main_groups=main_groups,
-        main_row_teams=main_row_teams,
-        tail_rows=tail_rows,
-        tail_groups=tail_groups,
-        tail_row_teams=tail_row_teams,
         out=out,
         lens_out=lens_out,
     )
@@ -2444,162 +2008,9 @@ def test_dsa_persistent_decode_interleaved_is_graph_capturable(
     block_table = _make_reversed_decode_block_table(requests, cols, page_size)
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
-    plan = dsa_topk_gfx950._persistent_decode_interleaved_plan(
-        rows,
-        cols,
-        topk,
-        logits.device,
-    )
-    assert plan is not None
-    (
-        main_rows,
-        main_groups,
-        main_row_teams,
-        tail_rows,
-        tail_groups,
-        tail_row_teams,
-    ) = plan
 
     def invoke() -> None:
-        dsa_topk_gfx950._dsa_persistent_decode_topk_interleaved(
-            logits,
-            block_table,
-            seq_lens,
-            page_size=page_size,
-            topk=topk,
-            q_len_per_req=q_len_per_req,
-            main_rows=main_rows,
-            main_groups=main_groups,
-            main_row_teams=main_row_teams,
-            tail_rows=tail_rows,
-            tail_groups=tail_groups,
-            tail_row_teams=tail_row_teams,
-            out=out,
-            lens_out=lens_out,
-        )
-
-    invoke()
-    capture_stream = torch.cuda.Stream()
-    capture_stream.wait_stream(torch.cuda.current_stream())
-    device_index = logits.device.index
-    assert device_index is not None
-    workspace_key = (
-        device_index,
-        int(capture_stream.cuda_stream),
-        dsa_topk_gfx950._next_power_of_two(rows),
-    )
-    assert workspace_key not in dsa_topk_gfx950._persistent_topk_workspace_cache
-    if warm_workspace:
-        with torch.cuda.stream(capture_stream):
-            invoke()
-        capture_stream.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=capture_stream):
-        invoke()
-    capture_stream.synchronize()
-    graph_workspace = dsa_topk_gfx950._persistent_topk_workspace_cache[workspace_key]
-    _assert_persistent_workspace_layout(graph_workspace, rows)
-    if warm_workspace:
-        _assert_persistent_workspace_reset(graph_workspace)
-
-    for _ in range(2):
-        out.fill_(-7)
-        lens_out.fill_(-7)
-        graph.replay()
-        torch.cuda.synchronize()
-        _assert_decode_topk_slots(
-            logits,
-            out,
-            lens_out,
-            seq_lens,
-            block_table,
-            page_size=page_size,
-            q_len_per_req=q_len_per_req,
-            topk=topk,
-        )
-        _assert_persistent_workspace_reset(graph_workspace)
-
-
-@pytest.mark.parametrize(
-    ("rows", "q_len_per_req"),
-    ((129, 1), (132, 4)),
-)
-def test_dsa_persistent_decode_split_rows_repeat_and_reset(
-    rows: int,
-    q_len_per_req: int,
-) -> None:
-    page_size = 64
-    cols = 131072
-    topk = 2048
-    requests = rows // q_len_per_req
-    request_ids = torch.arange(requests, device="cuda", dtype=torch.int32)
-    seq_lens = cols - (request_ids * 53 + 17) % 1024
-    seq_lens[-1] = 1024 if q_len_per_req == 1 else 2050
-    generator = _generator("cuda", 8917 + q_len_per_req)
-    logits = torch.randn(
-        (rows, cols),
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    )
-    block_table = _make_reversed_decode_block_table(requests, cols, page_size)
-    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
-    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
-
-    for _ in range(2):
-        out.fill_(-7)
-        lens_out.fill_(-7)
-        dsa_topk_gfx950._dsa_persistent_decode_topk_split_rows(
-            logits,
-            block_table,
-            seq_lens,
-            page_size=page_size,
-            topk=topk,
-            q_len_per_req=q_len_per_req,
-            out=out,
-            lens_out=lens_out,
-        )
-        _assert_decode_topk_slots(
-            logits,
-            out,
-            lens_out,
-            seq_lens,
-            block_table,
-            page_size=page_size,
-            q_len_per_req=q_len_per_req,
-            topk=topk,
-        )
-        workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
-        _assert_persistent_workspace_reset(workspace)
-
-
-@pytest.mark.parametrize("warm_workspace", (False, True), ids=("cold-key", "warm-key"))
-def test_dsa_persistent_decode_split_rows_is_graph_capturable(
-    warm_workspace: bool,
-) -> None:
-    page_size = 64
-    q_len_per_req = 4
-    requests = 33
-    rows = requests * q_len_per_req
-    cols = 131072
-    topk = 2048
-    request_ids = torch.arange(requests, device="cuda", dtype=torch.int32)
-    seq_lens = cols - (request_ids * 53 + 17) % 1024
-    seq_lens[-1] = 2050
-    generator = _generator("cuda", 8927)
-    logits = torch.randn(
-        (rows, cols),
-        device="cuda",
-        dtype=torch.float32,
-        generator=generator,
-    )
-    block_table = _make_reversed_decode_block_table(requests, cols, page_size)
-    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
-    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
-
-    def invoke() -> None:
-        dsa_topk_gfx950._dsa_persistent_decode_topk_split_rows(
+        dsa_topk_gfx950._dsa_decode_topk_slots(
             logits,
             block_table,
             seq_lens,
@@ -2651,105 +2062,6 @@ def test_dsa_persistent_decode_split_rows_is_graph_capturable(
             topk=topk,
         )
         _assert_persistent_workspace_reset(graph_workspace)
-
-
-@pytest.mark.parametrize("pooled", (False, True), ids=("one-team-per-row", "row-pool"))
-@pytest.mark.parametrize("warm_workspace", (False, True), ids=("cold-key", "warm-key"))
-def test_dsa_persistent_decode_is_graph_capturable(
-    warm_workspace: bool,
-    pooled: bool,
-) -> None:
-    page_size = 64
-    q_len_per_req = 4
-    requests = 2
-    rows = requests * q_len_per_req
-    cols = 131072
-    topk = 2048
-    seq_lens = torch.tensor(
-        [cols - 17, cols - 71],
-        device="cuda",
-        dtype=torch.int32,
-    )
-    q_offsets = torch.arange(q_len_per_req, device="cuda", dtype=torch.int32)
-    row_ends = (seq_lens[:, None] - (q_len_per_req - 1) + q_offsets[None, :]).reshape(
-        -1
-    )
-    logits = _make_grouped_radix_logits(
-        torch.zeros_like(row_ends),
-        row_ends,
-        cols=cols,
-        topk=topk,
-        seed=5907,
-    )
-    block_table = _make_reversed_decode_block_table(requests, cols, page_size)
-    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
-    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
-
-    def invoke() -> None:
-        if pooled:
-            dsa_topk_gfx950._dsa_persistent_decode_topk_slots(
-                logits,
-                block_table,
-                seq_lens,
-                page_size=page_size,
-                topk=topk,
-                q_len_per_req=q_len_per_req,
-                groups=2,
-                row_teams=2,
-                out=out,
-                lens_out=lens_out,
-            )
-        else:
-            dsa_topk_gfx950._dsa_decode_topk_slots(
-                logits,
-                block_table,
-                seq_lens,
-                page_size=page_size,
-                topk=topk,
-                q_len_per_req=q_len_per_req,
-                out=out,
-                lens_out=lens_out,
-            )
-
-    invoke()
-    capture_stream = torch.cuda.Stream()
-    capture_stream.wait_stream(torch.cuda.current_stream())
-    device_index = logits.device.index
-    assert device_index is not None
-    workspace_key = (
-        device_index,
-        int(capture_stream.cuda_stream),
-        dsa_topk_gfx950._next_power_of_two(rows),
-    )
-    assert workspace_key not in dsa_topk_gfx950._persistent_topk_workspace_cache
-    if warm_workspace:
-        with torch.cuda.stream(capture_stream):
-            invoke()
-        capture_stream.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=capture_stream):
-        invoke()
-    capture_stream.synchronize()
-    graph_workspace = dsa_topk_gfx950._persistent_topk_workspace_cache[workspace_key]
-    _assert_persistent_workspace_layout(graph_workspace, rows)
-    if warm_workspace:
-        _assert_persistent_workspace_reset(graph_workspace)
-    out.fill_(-7)
-    graph.replay()
-    torch.cuda.synchronize()
-
-    _assert_decode_topk_slots(
-        logits,
-        out,
-        lens_out,
-        seq_lens,
-        block_table,
-        page_size=page_size,
-        q_len_per_req=q_len_per_req,
-        topk=topk,
-    )
-    _assert_persistent_workspace_reset(graph_workspace)
 
 
 def test_dsa_persistent_decode_is_stream_local() -> None:
