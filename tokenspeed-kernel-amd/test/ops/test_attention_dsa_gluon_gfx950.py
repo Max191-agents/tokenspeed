@@ -1591,11 +1591,12 @@ def test_dsa_decode_topk_dispatches_persistent_radix_for_batched_queries() -> No
 
 
 @pytest.mark.parametrize("cols", (512, 1024, 2048))
+@pytest.mark.parametrize("q_len_per_req", (1, 4))
 def test_dsa_decode_topk_trivial_2048_maps_grouped_queries_to_physical_slots(
     cols: int,
+    q_len_per_req: int,
 ) -> None:
     page_size = 64
-    q_len_per_req = 4
     requests = 2
     rows = requests * q_len_per_req
     topk = 2048
