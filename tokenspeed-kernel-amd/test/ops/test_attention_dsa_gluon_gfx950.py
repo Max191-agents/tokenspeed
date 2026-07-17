@@ -641,55 +641,94 @@ def test_dsa_decode_topk_fp8_glm52_cases(case: _TopKDecodeCase) -> None:
     _assert_topk_matches(topk_slots, topk_lens, expected_slots, expected_lens)
 
 
-def test_dsa_decode_topk_fp8_accepts_strided_inputs() -> None:
+@pytest.mark.parametrize(
+    ("invalid_input", "invalid_kind"),
+    (
+        ("q", "strided"),
+        ("weights", "strided"),
+        ("index_k_cache", "strided"),
+        ("seq_lens", "strided"),
+        ("block_table", "strided"),
+        ("seq_lens", "int64"),
+        ("block_table", "int64"),
+    ),
+)
+def test_dsa_decode_topk_fp8_rejects_noncanonical_inputs(
+    invalid_input: str,
+    invalid_kind: str,
+) -> None:
     device = "cuda"
     page_size = 64
-    head_dim = 128
     topk = 512
-    softmax_scale = head_dim**-0.5
-    gen = _generator(device, 121)
-    seq_lens_tuple = (640, 704)
-    block_table, num_slots = _make_decode_block_table(seq_lens_tuple, page_size, device)
-    tokens = len(seq_lens_tuple)
-    q = _strided_last_dim(
-        _randn_bf16((tokens, 1, head_dim), device=device, generator=gen)
-    )
-    weights = _strided_last_dim(
-        _normal_weights((tokens, 1), device=device, generator=gen)
-    )
-    packed_index_k, index_k = _pack_index_k_cache(
-        _randn_bf16((num_slots, head_dim), device=device, generator=gen),
-        page_size,
-    )
-    seq_lens = _strided_1d(
-        torch.tensor(seq_lens_tuple, device=device, dtype=torch.int32)
-    )
-    block_table = _strided_last_dim(block_table)
-    packed_index_k = _strided_last_dim(packed_index_k)
+    inputs = {
+        "q": torch.empty((2, 2, 128), device=device, dtype=torch.bfloat16),
+        "weights": torch.empty((2, 2), device=device, dtype=torch.float32),
+        "index_k_cache": torch.empty((128, 132), device=device, dtype=torch.uint8),
+        "seq_lens": torch.tensor([64, 64], device=device, dtype=torch.int32),
+        "block_table": torch.zeros((2, 2), device=device, dtype=torch.int32),
+    }
+    tensor = inputs[invalid_input]
+    if invalid_kind == "strided":
+        inputs[invalid_input] = (
+            _strided_1d(tensor) if tensor.dim() == 1 else _strided_last_dim(tensor)
+        )
+        error = ValueError
+        match = "contiguous"
+    else:
+        inputs[invalid_input] = tensor.to(torch.int64)
+        error = TypeError
+        match = "int32"
 
-    topk_slots, topk_lens = gluon_dsa_decode_topk_fp8_gfx950(
-        q,
-        weights,
-        seq_lens,
-        block_table,
-        page_size=page_size,
-        topk=topk,
-        softmax_scale=softmax_scale,
-        q_len_per_req=1,
-        index_k_cache=packed_index_k,
-    )
-    expected_slots, expected_lens = _reference_decode_topk(
-        q,
-        weights,
-        index_k,
-        seq_lens,
-        block_table,
-        page_size=page_size,
-        topk=topk,
-        softmax_scale=softmax_scale,
-    )
+    with pytest.raises(error, match=match):
+        gluon_dsa_decode_topk_fp8_gfx950(
+            inputs["q"],
+            inputs["weights"],
+            inputs["seq_lens"],
+            inputs["block_table"],
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=128**-0.5,
+            q_len_per_req=1,
+            index_k_cache=inputs["index_k_cache"],
+        )
 
-    _assert_topk_matches(topk_slots, topk_lens, expected_slots, expected_lens)
+
+@pytest.mark.parametrize(
+    ("invalid_capability", "match"),
+    (
+        ("q_dtype", "BF16 q"),
+        ("weights_dtype", "FP32 weights"),
+        ("head_dim", "head_dim=128"),
+        ("page_size", "page_size=64"),
+        ("topk", "supports topk"),
+        ("q_len_per_req", "q_len_per_req"),
+    ),
+)
+def test_dsa_decode_topk_fp8_rejects_unsupported_capabilities(
+    invalid_capability: str,
+    match: str,
+) -> None:
+    q = torch.empty((2, 2, 128), device="cuda", dtype=torch.bfloat16)
+    weights = torch.empty((2, 2), device="cuda", dtype=torch.float32)
+    if invalid_capability == "q_dtype":
+        q = q.to(torch.float16)
+    elif invalid_capability == "weights_dtype":
+        weights = weights.to(torch.bfloat16)
+    elif invalid_capability == "head_dim":
+        q = torch.empty((2, 2, 64), device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises((TypeError, ValueError), match=match):
+        gluon_dsa_decode_topk_fp8_gfx950(
+            q,
+            weights,
+            torch.tensor([64, 64], device="cuda", dtype=torch.int32),
+            torch.zeros((2, 2), device="cuda", dtype=torch.int32),
+            page_size=32 if invalid_capability == "page_size" else 64,
+            topk=256 if invalid_capability == "topk" else 512,
+            softmax_scale=128**-0.5,
+            q_len_per_req=7 if invalid_capability == "q_len_per_req" else 1,
+            index_k_cache=torch.empty((128, 132), device="cuda", dtype=torch.uint8),
+        )
 
 
 @pytest.mark.parametrize(
@@ -746,56 +785,97 @@ def test_dsa_prefill_topk_fp8_glm52_cases(case: _TopKPrefillCase) -> None:
     _assert_topk_matches(workspace_indices, topk_lens, expected_indices, expected_lens)
 
 
-def test_dsa_prefill_topk_fp8_accepts_strided_inputs() -> None:
+@pytest.mark.parametrize(
+    ("invalid_input", "invalid_kind"),
+    (
+        ("q", "strided"),
+        ("weights", "strided"),
+        ("index_k_cache", "strided"),
+        ("kv_workspace_slots", "strided"),
+        ("row_starts", "strided"),
+        ("row_ends", "strided"),
+        ("kv_workspace_slots", "int32"),
+        ("row_starts", "int64"),
+        ("row_ends", "int64"),
+    ),
+)
+def test_dsa_prefill_topk_fp8_rejects_noncanonical_inputs(
+    invalid_input: str,
+    invalid_kind: str,
+) -> None:
     device = "cuda"
     page_size = 64
-    head_dim = 128
     topk = 512
-    softmax_scale = head_dim**-0.5
-    gen = _generator(device, 221)
-    kv_workspace_slots, row_starts, row_ends, _ = _make_prefill_workspace(
-        (640,), (2,), device=device
-    )
-    num_tokens = int(row_starts.numel())
-    num_slots = _round_up_to_page(int(kv_workspace_slots.numel()), page_size)
-    q = _strided_last_dim(
-        _randn_bf16((num_tokens, 1, head_dim), device=device, generator=gen)
-    )
-    weights = _strided_last_dim(
-        _normal_weights((num_tokens, 1), device=device, generator=gen)
-    )
-    packed_index_k, index_k = _pack_index_k_cache(
-        _randn_bf16((num_slots, head_dim), device=device, generator=gen),
-        page_size,
-    )
-    kv_workspace_slots = _strided_1d(kv_workspace_slots)
-    row_starts = _strided_1d(row_starts)
-    row_ends = _strided_1d(row_ends)
-    packed_index_k = _strided_last_dim(packed_index_k)
+    inputs = {
+        "q": torch.empty((2, 2, 128), device=device, dtype=torch.bfloat16),
+        "weights": torch.empty((2, 2), device=device, dtype=torch.float32),
+        "index_k_cache": torch.empty((128, 132), device=device, dtype=torch.uint8),
+        "kv_workspace_slots": torch.arange(128, device=device, dtype=torch.int64),
+        "row_starts": torch.tensor([0, 64], device=device, dtype=torch.int32),
+        "row_ends": torch.tensor([64, 128], device=device, dtype=torch.int32),
+    }
+    tensor = inputs[invalid_input]
+    if invalid_kind == "strided":
+        inputs[invalid_input] = (
+            _strided_1d(tensor) if tensor.dim() == 1 else _strided_last_dim(tensor)
+        )
+        error = ValueError
+        match = "contiguous"
+    else:
+        dtype = torch.int32 if invalid_kind == "int32" else torch.int64
+        inputs[invalid_input] = tensor.to(dtype)
+        error = TypeError
+        match = "must be int"
 
-    workspace_indices, topk_lens = gluon_dsa_prefill_topk_fp8_gfx950(
-        q,
-        weights,
-        kv_workspace_slots,
-        row_starts,
-        row_ends,
-        topk=topk,
-        softmax_scale=softmax_scale,
-        index_k_cache=packed_index_k,
-        page_size=page_size,
-    )
-    expected_indices, expected_lens = _reference_prefill_topk(
-        q,
-        weights,
-        index_k,
-        kv_workspace_slots,
-        row_starts,
-        row_ends,
-        topk=topk,
-        softmax_scale=softmax_scale,
-    )
+    with pytest.raises(error, match=match):
+        gluon_dsa_prefill_topk_fp8_gfx950(
+            inputs["q"],
+            inputs["weights"],
+            inputs["kv_workspace_slots"],
+            inputs["row_starts"],
+            inputs["row_ends"],
+            topk=topk,
+            softmax_scale=128**-0.5,
+            index_k_cache=inputs["index_k_cache"],
+            page_size=page_size,
+        )
 
-    _assert_topk_matches(workspace_indices, topk_lens, expected_indices, expected_lens)
+
+@pytest.mark.parametrize(
+    ("invalid_capability", "match"),
+    (
+        ("q_dtype", "BF16 q"),
+        ("weights_dtype", "FP32 weights"),
+        ("head_dim", "head_dim=128"),
+        ("page_size", "page_size=64"),
+        ("topk", "supports topk"),
+    ),
+)
+def test_dsa_prefill_topk_fp8_rejects_unsupported_capabilities(
+    invalid_capability: str,
+    match: str,
+) -> None:
+    q = torch.empty((2, 2, 128), device="cuda", dtype=torch.bfloat16)
+    weights = torch.empty((2, 2), device="cuda", dtype=torch.float32)
+    if invalid_capability == "q_dtype":
+        q = q.to(torch.float16)
+    elif invalid_capability == "weights_dtype":
+        weights = weights.to(torch.bfloat16)
+    elif invalid_capability == "head_dim":
+        q = torch.empty((2, 2, 64), device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises((TypeError, ValueError), match=match):
+        gluon_dsa_prefill_topk_fp8_gfx950(
+            q,
+            weights,
+            torch.arange(128, device="cuda", dtype=torch.int64),
+            torch.tensor([0, 64], device="cuda", dtype=torch.int32),
+            torch.tensor([64, 128], device="cuda", dtype=torch.int32),
+            topk=256 if invalid_capability == "topk" else 512,
+            softmax_scale=128**-0.5,
+            index_k_cache=torch.empty((128, 132), device="cuda", dtype=torch.uint8),
+            page_size=32 if invalid_capability == "page_size" else 64,
+        )
 
 
 def test_dsa_prefill_select_topk_keeps_late_values_above_threshold() -> None:

@@ -3019,25 +3019,24 @@ def _load_elems(block: int, num_warps: int) -> int:
     return max(1, triton.cdiv(int(block), 64 * int(num_warps)))
 
 
-def _contiguous(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor if tensor.is_contiguous() else tensor.contiguous()
+def _check_score_input_contract(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+) -> None:
+    if weights.device != q.device or index_k_cache.device != q.device:
+        raise ValueError("q, weights, and index_k_cache must be on the same device")
+    if not (
+        q.is_contiguous() and weights.is_contiguous() and index_k_cache.is_contiguous()
+    ):
+        raise ValueError("q, weights, and index_k_cache must be contiguous")
 
 
-def _to_contiguous(
-    tensor: torch.Tensor,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    tensor = tensor.to(device=device, dtype=dtype)
-    return _contiguous(tensor)
-
-
-def _validate_topk(topk: int) -> None:
-    if topk <= 0:
-        raise ValueError(f"topk must be positive, got {topk}")
-    if topk & (topk - 1):
-        raise ValueError(f"DSA Gluon top-k requires power-of-two topk, got {topk}")
+def _check_topk_contract(topk: int) -> None:
+    if topk not in (512, 1024, 2048):
+        raise ValueError(
+            f"DSA Gluon top-k supports topk=512, 1024, or 2048, got {topk}"
+        )
 
 
 def _use_radix_topk(cols: int) -> bool:
@@ -4190,12 +4189,15 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     del plan, seq_lens_2d
     topk = int(topk)
     q_len_per_req = int(q_len_per_req)
-    _validate_topk(topk)
-    if not 1 <= q_len_per_req <= 6:
-        raise ValueError(f"q_len_per_req must be in [1, 6], got {q_len_per_req}")
+    _check_topk_contract(topk)
+    if q_len_per_req not in (1, 2, 3, 4, 5, 6):
+        raise ValueError(
+            f"DSA Gluon top-k supports q_len_per_req=1..6, got {q_len_per_req}"
+        )
     if index_k_cache is None:
         raise RuntimeError("Gluon DSA paged top-k requires packed FP8 index_k_cache")
     row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
+    _check_score_input_contract(q, weights, index_k_cache)
     if seq_lens.dim() != 1:
         raise ValueError(
             f"seq_lens must be 1-D, got {tuple(seq_lens.shape)} for q={tuple(q.shape)}"
@@ -4212,6 +4214,12 @@ def gluon_dsa_decode_topk_fp8_gfx950(
             "block_table must have at least one row per request, got "
             f"block_table={tuple(block_table.shape)}, q={tuple(q.shape)}"
         )
+    if seq_lens.dtype != torch.int32 or block_table.dtype != torch.int32:
+        raise TypeError("seq_lens and block_table must be int32")
+    if seq_lens.device != q.device or block_table.device != q.device:
+        raise ValueError("decode metadata must be on the same device as q")
+    if not seq_lens.is_contiguous() or not block_table.is_contiguous():
+        raise ValueError("seq_lens and block_table must be contiguous")
     if q.shape[0] == 0:
         empty_out = (
             torch.empty((0, int(topk)), dtype=torch.int32, device=q.device)
@@ -4224,11 +4232,6 @@ def gluon_dsa_decode_topk_fp8_gfx950(
             else lens_out
         )
         return empty_out, empty_lens
-    q = _contiguous(q)
-    index_k_cache = _contiguous(index_k_cache)
-    weights = _contiguous(weights)
-    seq_lens = _to_contiguous(seq_lens, device=q.device, dtype=torch.int32)
-    block_table = _to_contiguous(block_table, device=q.device, dtype=torch.int32)
     max_seq_len = int(block_table.shape[1]) * int(page_size)
     if out is None:
         out = torch.empty((q.shape[0], topk), dtype=torch.int32, device=q.device)
@@ -4291,12 +4294,13 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del index_k_fp8, index_k_scale
     topk = int(topk)
-    _validate_topk(topk)
+    _check_topk_contract(topk)
     if index_k_cache is None or page_size is None:
         raise RuntimeError(
             "Gluon DSA top-k requires packed FP8 index_k_cache and page_size"
         )
     row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
+    _check_score_input_contract(q, weights, index_k_cache)
     if kv_workspace_slots.dim() != 1:
         raise ValueError(
             f"kv_workspace_slots must be 1-D, got {tuple(kv_workspace_slots.shape)}"
@@ -4307,20 +4311,32 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             f"row_starts={tuple(row_starts.shape)}, row_ends={tuple(row_ends.shape)}, "
             f"q={tuple(q.shape)}"
         )
+    if (
+        kv_workspace_slots.dtype != torch.int64
+        or row_starts.dtype != torch.int32
+        or row_ends.dtype != torch.int32
+    ):
+        raise TypeError(
+            "kv_workspace_slots must be int64 and row_starts/row_ends must be int32"
+        )
+    if (
+        kv_workspace_slots.device != q.device
+        or row_starts.device != q.device
+        or row_ends.device != q.device
+    ):
+        raise ValueError("prefill metadata must be on the same device as q")
+    if not (
+        kv_workspace_slots.is_contiguous()
+        and row_starts.is_contiguous()
+        and row_ends.is_contiguous()
+    ):
+        raise ValueError("prefill metadata must be contiguous")
     if out is None:
         out = torch.empty((q.shape[0], topk), dtype=torch.int32, device=q.device)
     if lens_out is None:
         lens_out = torch.empty((q.shape[0],), dtype=torch.int32, device=q.device)
     if q.shape[0] == 0:
         return out, lens_out
-    q = _contiguous(q)
-    index_k_cache = _contiguous(index_k_cache)
-    weights = _contiguous(weights)
-    kv_workspace_slots = _to_contiguous(
-        kv_workspace_slots, device=q.device, dtype=torch.int64
-    )
-    row_starts = _to_contiguous(row_starts, device=q.device, dtype=torch.int32)
-    row_ends = _to_contiguous(row_ends, device=q.device, dtype=torch.int32)
     seq_len_sum = int(kv_workspace_slots.numel())
     if seq_len_sum == 0:
         out.fill_(-1)
