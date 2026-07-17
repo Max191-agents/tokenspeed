@@ -53,6 +53,11 @@ def test_dsa_topk_has_no_custom_compiled_runner_cache() -> None:
     assert not any(hasattr(dsa_topk_gfx950, name) for name in removed_symbols)
 
 
+def test_dsa_topk_has_no_dedicated_trivial_specializations() -> None:
+    assert not hasattr(dsa_topk_gfx950, "_dsa_trivial_decode_topk2048_kernel")
+    assert not hasattr(dsa_topk_gfx950, "_dsa_trivial_prefill_topk2048_kernel")
+
+
 def test_dsa_manual_decode_config_source_contract() -> None:
     assert dsa_topk_gfx950._ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG == (8192, 8)
     assert dsa_topk_gfx950._ONEBLOCK_DECODE_SHORT_MANUAL_CONFIG == (8192, 8)
