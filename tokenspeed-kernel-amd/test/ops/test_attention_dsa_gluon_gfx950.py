@@ -1895,6 +1895,18 @@ def test_dsa_persistent_interleaved_mode_and_groups_are_constexpr() -> None:
     assert params["IS_DECODE"].is_constexpr
 
 
+def test_dsa_persistent_interleaved_decode_uses_one_sided_tile_masks() -> None:
+    helpers = (
+        dsa_topk_gfx950._persistent_interleaved_publish_histogram,
+        dsa_topk_gfx950._persistent_interleaved_emit_row,
+    )
+
+    for helper in helpers:
+        source = inspect.getsource(helper.fn)
+        assert source.count("valid = offsets < row_end") == 1
+        assert source.count("valid = (offsets >= row_start) & (offsets < row_end)") == 1
+
+
 @pytest.mark.parametrize(
     ("rows", "topk"),
     ((33, 512), (65, 1024), (129, 2048), (514, 2048)),

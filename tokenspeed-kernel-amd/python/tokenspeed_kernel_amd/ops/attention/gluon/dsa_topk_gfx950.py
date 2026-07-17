@@ -893,7 +893,10 @@ def _persistent_interleaved_publish_histogram(
                 ptr=row_logits,
                 offsets=offsets,
             )
-            valid = (offsets >= row_start) & (offsets < row_end)
+            if IS_DECODE:
+                valid = offsets < row_end
+            else:
+                valid = (offsets >= row_start) & (offsets < row_end)
             keys = _fp32_to_topk_key(values)
             if PASS_INDEX == 0:
                 prefix_match = valid
@@ -1076,7 +1079,10 @@ def _persistent_interleaved_emit_row(
                 ptr=row_logits,
                 offsets=offsets,
             )
-            valid = (offsets >= row_start) & (offsets < row_end)
+            if IS_DECODE:
+                valid = offsets < row_end
+            else:
+                valid = (offsets >= row_start) & (offsets < row_end)
             keys = _fp32_to_topk_key(values)
             truncated_keys = (keys >> threshold_shift) << threshold_shift
             greater = valid & (truncated_keys < threshold)
