@@ -68,6 +68,7 @@ def test_dsa_topk_has_no_superseded_decode_paths() -> None:
         "_dsa_persistent_decode_topk_heterogeneous",
         "_persistent_decode_split_plan",
         "_persistent_decode_heterogeneous_plan",
+        "_persistent_decode_interleaved_plan",
         "_persistent_decode_interleaved_current_groups_plan",
         "_dsa_decode_select_topk_kernel",
         "_dsa_prefill_select_topk_kernel",
@@ -1812,31 +1813,35 @@ def test_dsa_persistent_decode_handles_tail_ties_and_infinities() -> None:
 
 
 @pytest.mark.parametrize(
-    ("rows", "cols", "expected"),
+    ("rows", "cols", "topk", "expected"),
     (
-        (33, 90048, (32, 8, 32, 1, 8, 1)),
-        (36, 90048, (32, 8, 32, 4, 8, 4)),
-        (5, 1024 * 1024, (4, 64, 4, 1, 64, 1)),
-        (65, 512 * 1024, (64, 4, 64, 1, 32, 1)),
-        (129, 512 * 1024, (128, 2, 128, 1, 32, 1)),
-        (132, 512 * 1024, (128, 2, 128, 4, 32, 4)),
-        (128, 512 * 1024, (128, 2, 128, 0, 2, 0)),
-        (129, 1024 * 1024, (128, 2, 128, 1, 64, 1)),
-        (514, 1024 * 1024, (512, 2, 128, 2, 64, 2)),
+        (33, 90048, 2048, (32, 8, 32, 1, 8, 1)),
+        (36, 90048, 2048, (32, 8, 32, 4, 8, 4)),
+        (5, 1024 * 1024, 2048, (4, 64, 4, 1, 64, 1)),
+        (33, 512 * 1024, 512, (32, 8, 32, 1, 32, 1)),
+        (65, 512 * 1024, 1024, (64, 4, 64, 1, 32, 1)),
+        (129, 262208, 2048, (128, 2, 128, 1, 32, 1)),
+        (129, 512 * 1024, 2048, (128, 2, 128, 1, 32, 1)),
+        (132, 512 * 1024, 2048, (128, 2, 128, 4, 32, 4)),
+        (128, 512 * 1024, 2048, (128, 2, 128, 0, 2, 0)),
+        (192, 262208, 2048, (128, 2, 128, 64, 4, 64)),
+        (129, 1024 * 1024, 1024, (128, 2, 128, 1, 64, 1)),
+        (514, 1024 * 1024, 2048, (512, 2, 128, 2, 64, 2)),
     ),
 )
-def test_dsa_persistent_decode_interleaved_plan_reuses_resident_workgroups(
+def test_dsa_persistent_interleaved_plan_reuses_resident_workgroups(
     monkeypatch: pytest.MonkeyPatch,
     rows: int,
     cols: int,
+    topk: int,
     expected: tuple[int, int, int, int, int, int],
 ) -> None:
     monkeypatch.setattr(dsa_topk_gfx950, "_device_compute_units", lambda _: 256)
 
-    plan = dsa_topk_gfx950._persistent_decode_interleaved_plan(
+    plan = dsa_topk_gfx950._persistent_interleaved_plan(
         rows,
         cols,
-        2048,
+        topk,
         torch.device("cuda", 0),
     )
 
@@ -1861,13 +1866,13 @@ def test_dsa_persistent_decode_interleaved_plan_reuses_resident_workgroups(
     ("rows", "cols", "topk"),
     ((0, 90048, 2048), (1, 90000, 2048), (1, 90048, 256)),
 )
-def test_dsa_persistent_decode_interleaved_plan_rejects_unsupported_inputs(
+def test_dsa_persistent_interleaved_plan_rejects_unsupported_inputs(
     rows: int,
     cols: int,
     topk: int,
 ) -> None:
     assert (
-        dsa_topk_gfx950._persistent_decode_interleaved_plan(
+        dsa_topk_gfx950._persistent_interleaved_plan(
             rows,
             cols,
             topk,
@@ -1877,7 +1882,7 @@ def test_dsa_persistent_decode_interleaved_plan_rejects_unsupported_inputs(
     )
 
 
-def test_dsa_persistent_decode_interleaved_groups_are_constexpr() -> None:
+def test_dsa_persistent_interleaved_mode_and_groups_are_constexpr() -> None:
     params = {
         param.name: param
         for param in (
@@ -1887,6 +1892,178 @@ def test_dsa_persistent_decode_interleaved_groups_are_constexpr() -> None:
 
     assert params["MAIN_GROUPS_PER_ROW"].is_constexpr
     assert params["TAIL_GROUPS_PER_ROW"].is_constexpr
+    assert params["IS_DECODE"].is_constexpr
+
+
+@pytest.mark.parametrize(
+    ("rows", "topk"),
+    ((33, 512), (65, 1024), (129, 2048), (514, 2048)),
+)
+def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
+    rows: int,
+    topk: int,
+) -> None:
+    cols = 90048
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = 257 + row_ids % 113
+    row_ends = cols - (rows - 1 - row_ids) % 1021
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=8977 + rows + topk,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    for _ in range(2):
+        out.fill_(-7)
+        lens_out.fill_(-7)
+        dsa_topk_gfx950._dsa_persistent_prefill_topk_indices(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+        _assert_grouped_radix_topk(
+            logits,
+            out,
+            lens_out,
+            row_starts,
+            row_ends,
+            topk=topk,
+        )
+        workspace = dsa_topk_gfx950._persistent_topk_workspace(
+            rows,
+            logits.device,
+        )
+        _assert_persistent_workspace_layout(workspace, rows)
+        _assert_persistent_workspace_reset(workspace)
+
+
+def test_dsa_persistent_prefill_interleaved_respects_causal_ranges() -> None:
+    rows = 129
+    cols = 90048
+    topk = 512
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = 193 + row_ids % 97
+    row_lens = torch.full_like(row_starts, topk + 65)
+    row_lens[0] = 0
+    row_lens[1] = topk - 1
+    row_lens[2] = topk
+    row_lens[64] = topk - 1
+    row_lens[-1] = topk + 47
+    row_ends = row_starts + row_lens
+    logits = torch.full(
+        (rows, cols),
+        8.0,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    for row, (start, end) in enumerate(
+        zip(row_starts.cpu().tolist(), row_ends.cpu().tolist(), strict=True)
+    ):
+        if start != end:
+            logits[row, start:end] = torch.linspace(
+                -1.0,
+                1.0,
+                end - start,
+                device="cuda",
+            )
+    out = torch.full((rows, topk), -7, device="cuda", dtype=torch.int32)
+    lens_out = torch.full((rows,), -7, device="cuda", dtype=torch.int32)
+
+    dsa_topk_gfx950._dsa_persistent_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_grouped_radix_topk(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+    _assert_persistent_workspace_reset(workspace)
+
+
+@pytest.mark.parametrize("warm_workspace", (False, True), ids=("cold-key", "warm-key"))
+def test_dsa_persistent_prefill_interleaved_is_graph_capturable(
+    warm_workspace: bool,
+) -> None:
+    rows = 33
+    cols = 90048
+    topk = 512
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = 131 + row_ids * 7
+    row_ends = cols - (rows - 1 - row_ids) * 19
+    logits = _make_grouped_radix_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=8999,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    def invoke() -> None:
+        dsa_topk_gfx950._dsa_persistent_prefill_topk_indices(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+
+    invoke()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    device_index = logits.device.index
+    assert device_index is not None
+    workspace_key = (
+        device_index,
+        int(capture_stream.cuda_stream),
+        dsa_topk_gfx950._next_power_of_two(rows),
+    )
+    assert workspace_key not in dsa_topk_gfx950._persistent_topk_workspace_cache
+    if warm_workspace:
+        with torch.cuda.stream(capture_stream):
+            invoke()
+        capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        invoke()
+    capture_stream.synchronize()
+    graph_workspace = dsa_topk_gfx950._persistent_topk_workspace_cache[workspace_key]
+    _assert_persistent_workspace_layout(graph_workspace, rows)
+
+    for _ in range(2):
+        out.fill_(-7)
+        lens_out.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_grouped_radix_topk(
+            logits,
+            out,
+            lens_out,
+            row_starts,
+            row_ends,
+            topk=topk,
+        )
+        _assert_persistent_workspace_reset(graph_workspace)
 
 
 @pytest.mark.parametrize(

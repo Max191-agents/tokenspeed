@@ -685,16 +685,24 @@ def _dsa_persistent_radix_topk_row(
 
 
 @gluon.jit
-def _persistent_interleaved_decode_row_metadata(
+def _persistent_interleaved_row_metadata(
     row,
+    row_starts,
     row_ends,
     q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
 ):
-    req = row // q_len_per_req
-    q_offset = row - req * q_len_per_req
-    row_end = gl.load(row_ends + req).to(gl.int32) - (q_len_per_req - 1) + q_offset
-    row_end = gl.maximum(row_end, 0)
-    return req, row_end
+    if IS_DECODE:
+        req = row // q_len_per_req
+        q_offset = row - req * q_len_per_req
+        row_start = gl.full([], 0, gl.int32)
+        row_end = gl.load(row_ends + req).to(gl.int32) - (q_len_per_req - 1) + q_offset
+    else:
+        req = row
+        row_start = gl.load(row_starts + row).to(gl.int32)
+        row_end = gl.load(row_ends + row).to(gl.int32)
+    row_end = gl.maximum(row_end, row_start)
+    return req, row_start, row_end
 
 
 @gluon.jit
@@ -702,6 +710,7 @@ def _persistent_interleaved_initialize_row(
     row,
     group,
     block_table,
+    row_starts,
     row_ends,
     out,
     lens_out,
@@ -710,27 +719,33 @@ def _persistent_interleaved_initialize_row(
     block_table_cols,
     page_size: gl.constexpr,
     q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
     TOPK: gl.constexpr,
     output_layout: gl.constexpr,
 ):
-    req, row_end = _persistent_interleaved_decode_row_metadata(
+    req, row_start, row_end = _persistent_interleaved_row_metadata(
         row,
+        row_starts,
         row_ends,
         q_len_per_req,
+        IS_DECODE,
     )
-    selected_count = gl.minimum(row_end, TOPK)
+    row_len = row_end - row_start
+    selected_count = gl.minimum(row_len, TOPK)
     if group == 0:
         gl.store(lens_out + row, selected_count)
-        if row_end <= TOPK:
+        if row_len <= TOPK:
             output_offsets = gl.arange(0, TOPK, layout=output_layout)
-            valid = output_offsets < row_end
-            block_idx = output_offsets // page_size
-            physical_page = gl.load(
-                block_table + req * block_table_stride + block_idx,
-                mask=valid & (block_idx < block_table_cols),
-                other=0,
-            )
-            output_values = physical_page * page_size + output_offsets % page_size
+            valid = output_offsets < row_len
+            output_values = row_start + output_offsets
+            if IS_DECODE:
+                block_idx = output_values // page_size
+                physical_page = gl.load(
+                    block_table + req * block_table_stride + block_idx,
+                    mask=valid & (block_idx < block_table_cols),
+                    other=0,
+                )
+                output_values = physical_page * page_size + output_values % page_size
             gl.store(
                 out + row * out_stride + output_offsets,
                 gl.where(valid, output_values, -1),
@@ -820,6 +835,7 @@ def _persistent_interleaved_publish_histogram(
     histograms,
     pass_arrivals,
     pass_done,
+    row_starts,
     row_ends,
     logits_stride,
     n_cols,
@@ -830,16 +846,20 @@ def _persistent_interleaved_publish_histogram(
     hist_layout: gl.constexpr,
     group_layout: gl.constexpr,
     q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
     GROUPS_PER_ROW: gl.constexpr,
     TOPK: gl.constexpr,
     BLOCK_N: gl.constexpr,
     PASS_INDEX: gl.constexpr,
 ):
-    _, row_end = _persistent_interleaved_decode_row_metadata(
+    _, row_start, row_end = _persistent_interleaved_row_metadata(
         row,
+        row_starts,
         row_ends,
         q_len_per_req,
+        IS_DECODE,
     )
+    row_len = row_end - row_start
     state = pass_done + row * _PERSISTENT_PREFILL_COUNTER_STRIDE
     threshold = gl.full([], 0, gl.uint32)
     threshold_shift: gl.constexpr = max(32 - PASS_INDEX * 11, 10)
@@ -849,7 +869,7 @@ def _persistent_interleaved_publish_histogram(
             volatile=True,
         ).to(gl.uint32, bitcast=True)
 
-    if row_end > TOPK:
+    if row_len > TOPK:
         shared_histogram.store(histogram_zeros)
         gl.barrier()
         shift: gl.constexpr = max(21 - PASS_INDEX * 11, 0)
@@ -873,7 +893,7 @@ def _persistent_interleaved_publish_histogram(
                 ptr=row_logits,
                 offsets=offsets,
             )
-            valid = offsets < row_end
+            valid = (offsets >= row_start) & (offsets < row_end)
             keys = _fp32_to_topk_key(values)
             if PASS_INDEX == 0:
                 prefix_match = valid
@@ -893,7 +913,7 @@ def _persistent_interleaved_publish_histogram(
             _persistent_histogram_tail(
                 row_logits,
                 shared_histogram,
-                gl.full([], 0, gl.int32),
+                row_start,
                 row_end,
                 n_cols,
                 full_tiles,
@@ -947,18 +967,22 @@ def _persistent_interleaved_publish_histogram(
 def _persistent_interleaved_complete_pass(
     row,
     pass_done,
+    row_starts,
     row_ends,
     wait_offsets,
     q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
     TOPK: gl.constexpr,
     PASS_INDEX: gl.constexpr,
 ):
-    _, row_end = _persistent_interleaved_decode_row_metadata(
+    _, row_start, row_end = _persistent_interleaved_row_metadata(
         row,
+        row_starts,
         row_ends,
         q_len_per_req,
+        IS_DECODE,
     )
-    if row_end > TOPK:
+    if row_end - row_start > TOPK:
         state_ready = (
             pass_done
             + row * _PERSISTENT_PREFILL_COUNTER_STRIDE
@@ -989,6 +1013,7 @@ def _persistent_interleaved_emit_row(
     reset_arrivals,
     output_counters,
     block_table,
+    row_starts,
     row_ends,
     out,
     logits_stride,
@@ -1007,16 +1032,19 @@ def _persistent_interleaved_emit_row(
     output_counter_layout: gl.constexpr,
     page_size: gl.constexpr,
     q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
     GROUPS_PER_ROW: gl.constexpr,
     TOPK: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
-    req, row_end = _persistent_interleaved_decode_row_metadata(
+    req, row_start, row_end = _persistent_interleaved_row_metadata(
         row,
+        row_starts,
         row_ends,
         q_len_per_req,
+        IS_DECODE,
     )
-    if row_end > TOPK:
+    if row_end - row_start > TOPK:
         state = pass_done + row * _PERSISTENT_PREFILL_COUNTER_STRIDE
         threshold = gl.load(
             state + _PERSISTENT_INTERLEAVED_THRESHOLD,
@@ -1048,7 +1076,7 @@ def _persistent_interleaved_emit_row(
                 ptr=row_logits,
                 offsets=offsets,
             )
-            valid = offsets < row_end
+            valid = (offsets >= row_start) & (offsets < row_end)
             keys = _fp32_to_topk_key(values)
             truncated_keys = (keys >> threshold_shift) << threshold_shift
             greater = valid & (truncated_keys < threshold)
@@ -1080,7 +1108,7 @@ def _persistent_interleaved_emit_row(
                 shared_output_counters,
                 shared_greater_offsets,
                 shared_equal_offsets,
-                gl.full([], 0, gl.int32),
+                row_start,
                 row_end,
                 n_cols,
                 full_tiles,
@@ -1125,24 +1153,25 @@ def _persistent_interleaved_emit_row(
         equal_positions = equal_start + copy_offsets
         greater_write = (copy_offsets < local_greater) & (greater_positions < TOPK)
         equal_write = (copy_offsets < local_equal) & (equal_positions < remaining)
-        greater_block_idx = greater_values // page_size
-        greater_page = gl.load(
-            block_table + req * block_table_stride + greater_block_idx,
-            mask=(greater_block_idx >= 0)
-            & (greater_block_idx < block_table_cols)
-            & greater_write,
-            other=0,
-        )
-        greater_values = greater_page * page_size + greater_values % page_size
-        equal_block_idx = equal_values // page_size
-        equal_page = gl.load(
-            block_table + req * block_table_stride + equal_block_idx,
-            mask=(equal_block_idx >= 0)
-            & (equal_block_idx < block_table_cols)
-            & equal_write,
-            other=0,
-        )
-        equal_values = equal_page * page_size + equal_values % page_size
+        if IS_DECODE:
+            greater_block_idx = greater_values // page_size
+            greater_page = gl.load(
+                block_table + req * block_table_stride + greater_block_idx,
+                mask=(greater_block_idx >= 0)
+                & (greater_block_idx < block_table_cols)
+                & greater_write,
+                other=0,
+            )
+            greater_values = greater_page * page_size + greater_values % page_size
+            equal_block_idx = equal_values // page_size
+            equal_page = gl.load(
+                block_table + req * block_table_stride + equal_block_idx,
+                mask=(equal_block_idx >= 0)
+                & (equal_block_idx < block_table_cols)
+                & equal_write,
+                other=0,
+            )
+            equal_values = equal_page * page_size + equal_values % page_size
         gl.store(
             out + row * out_stride + greater_positions,
             greater_values,
@@ -1257,6 +1286,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
     reset_arrivals,
     output_counters,
     block_table,
+    row_starts,
     row_ends,
     out,
     lens_out,
@@ -1271,6 +1301,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
     tail_row_teams,
     page_size: gl.constexpr,
     q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
     MAIN_GROUPS_PER_ROW: gl.constexpr,
     TAIL_GROUPS_PER_ROW: gl.constexpr,
     TOPK: gl.constexpr,
@@ -1378,6 +1409,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                 main_row,
                 main_group,
                 block_table,
+                row_starts,
                 row_ends,
                 out,
                 lens_out,
@@ -1386,6 +1418,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                 block_table_cols,
                 page_size,
                 q_len_per_req,
+                IS_DECODE,
                 TOPK,
                 output_layout,
             )
@@ -1397,6 +1430,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                 main_rows + tail_row,
                 tail_group,
                 block_table,
+                row_starts,
                 row_ends,
                 out,
                 lens_out,
@@ -1405,6 +1439,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                 block_table_cols,
                 page_size,
                 q_len_per_req,
+                IS_DECODE,
                 TOPK,
                 output_layout,
             )
@@ -1421,6 +1456,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                     histograms,
                     pass_arrivals,
                     pass_done,
+                    row_starts,
                     row_ends,
                     logits_stride,
                     n_cols,
@@ -1431,6 +1467,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                     hist_layout,
                     group_layout,
                     q_len_per_req,
+                    IS_DECODE,
                     MAIN_GROUPS_PER_ROW,
                     TOPK,
                     BLOCK_N,
@@ -1447,6 +1484,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                     histograms,
                     pass_arrivals,
                     pass_done,
+                    row_starts,
                     row_ends,
                     logits_stride,
                     n_cols,
@@ -1457,6 +1495,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                     hist_layout,
                     group_layout,
                     q_len_per_req,
+                    IS_DECODE,
                     TAIL_GROUPS_PER_ROW,
                     TOPK,
                     BLOCK_N,
@@ -1470,9 +1509,11 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                 _persistent_interleaved_complete_pass(
                     main_row,
                     pass_done,
+                    row_starts,
                     row_ends,
                     wait_offsets,
                     q_len_per_req,
+                    IS_DECODE,
                     TOPK,
                     pass_index,
                 )
@@ -1483,9 +1524,11 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                 _persistent_interleaved_complete_pass(
                     main_rows + tail_row,
                     pass_done,
+                    row_starts,
                     row_ends,
                     wait_offsets,
                     q_len_per_req,
+                    IS_DECODE,
                     TOPK,
                     pass_index,
                 )
@@ -1504,6 +1547,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                 reset_arrivals,
                 output_counters,
                 block_table,
+                row_starts,
                 row_ends,
                 out,
                 logits_stride,
@@ -1522,6 +1566,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                 output_counter_layout,
                 page_size,
                 q_len_per_req,
+                IS_DECODE,
                 MAIN_GROUPS_PER_ROW,
                 TOPK,
                 BLOCK_N,
@@ -1540,6 +1585,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                 reset_arrivals,
                 output_counters,
                 block_table,
+                row_starts,
                 row_ends,
                 out,
                 logits_stride,
@@ -1558,6 +1604,7 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                 output_counter_layout,
                 page_size,
                 q_len_per_req,
+                IS_DECODE,
                 TAIL_GROUPS_PER_ROW,
                 TOPK,
                 BLOCK_N,
@@ -3536,7 +3583,7 @@ def _dsa_persistent_prefill_radix_topk(
     return out, lens_out
 
 
-def _persistent_decode_interleaved_plan(
+def _persistent_interleaved_plan(
     rows: int,
     cols: int,
     topk: int,
@@ -3591,25 +3638,29 @@ def _persistent_decode_interleaved_plan(
     )
 
 
-def _dsa_persistent_decode_topk_slots(
+def _dsa_persistent_interleaved_topk(
     logits: torch.Tensor,
     block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
     *,
+    block_table_stride: int,
+    block_table_cols: int,
     page_size: int,
     topk: int,
     q_len_per_req: int,
+    is_decode: bool,
     out: torch.Tensor,
     lens_out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    plan = _persistent_decode_interleaved_plan(
+    plan = _persistent_interleaved_plan(
         logits.shape[0],
         logits.shape[1],
         topk,
         logits.device,
     )
     if plan is None:
-        raise ValueError("persistent DSA decode requires a supported wide shape")
+        raise ValueError("persistent DSA top-k requires a supported wide shape")
     (
         main_rows,
         main_groups,
@@ -3634,13 +3685,14 @@ def _dsa_persistent_decode_topk_slots(
         reset_arrivals,
         output_counters,
         block_table,
-        seq_lens,
+        row_starts,
+        row_ends,
         out,
         lens_out,
         logits.stride(0),
-        block_table.stride(0),
+        block_table_stride,
         out.stride(0),
-        block_table_cols=block_table.shape[1],
+        block_table_cols=block_table_cols,
         n_cols=logits.shape[1],
         main_rows=main_rows,
         main_row_teams=main_row_teams,
@@ -3648,6 +3700,7 @@ def _dsa_persistent_decode_topk_slots(
         tail_row_teams=tail_row_teams,
         page_size=page_size,
         q_len_per_req=q_len_per_req,
+        IS_DECODE=is_decode,
         MAIN_GROUPS_PER_ROW=main_groups,
         TAIL_GROUPS_PER_ROW=tail_groups,
         TOPK=topk,
@@ -3655,6 +3708,58 @@ def _dsa_persistent_decode_topk_slots(
         num_warps=min(_PERSISTENT_PREFILL_NUM_WARPS, topk // 64),
     )
     return out, lens_out
+
+
+def _dsa_persistent_decode_topk_slots(
+    logits: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    q_len_per_req: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _dsa_persistent_interleaved_topk(
+        logits,
+        block_table,
+        seq_lens,
+        seq_lens,
+        block_table_stride=block_table.stride(0),
+        block_table_cols=block_table.shape[1],
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        is_decode=True,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def _dsa_persistent_prefill_topk_indices(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _dsa_persistent_interleaved_topk(
+        logits,
+        row_starts,
+        row_starts,
+        row_ends,
+        block_table_stride=0,
+        block_table_cols=0,
+        page_size=1,
+        topk=topk,
+        q_len_per_req=1,
+        is_decode=False,
+        out=out,
+        lens_out=lens_out,
+    )
 
 
 def _radix_groups_per_row(
