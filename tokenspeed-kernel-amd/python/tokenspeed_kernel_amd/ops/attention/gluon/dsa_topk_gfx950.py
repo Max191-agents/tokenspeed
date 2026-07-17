@@ -3033,11 +3033,15 @@ def _persistent_decode_groups(
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    tiles = triton.cdiv(int(cols), _PERSISTENT_PREFILL_BLOCK_N)
-    groups = min(
-        tiles,
-        _device_compute_units(device_index) // rows,
+    tile_groups = _next_power_of_two(
+        triton.cdiv(int(cols), _PERSISTENT_PREFILL_BLOCK_N)
     )
+    resident_groups = _device_compute_units(device_index) // rows
+    # Preserve the existing 2..8 residency variants, then quantize larger
+    # limits so batch-size changes cannot create unbounded JIT specializations.
+    if resident_groups > 8:
+        resident_groups = 1 << (resident_groups.bit_length() - 1)
+    groups = min(tile_groups, resident_groups)
     return groups if groups >= 2 else None
 
 
