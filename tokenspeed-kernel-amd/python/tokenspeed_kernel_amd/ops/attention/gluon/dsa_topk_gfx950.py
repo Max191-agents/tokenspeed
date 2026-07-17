@@ -62,8 +62,6 @@ _PERSISTENT_PREFILL_MIN_COLS = 128 * 1024
 _PERSISTENT_PREFILL_FOUR_GROUP_MIN_COLS = 256 * 1024
 _PERSISTENT_PREFILL_MIN_ROWS = 32
 _PERSISTENT_DECODE_MIN_COLS = 90000
-_PERSISTENT_DECODE_MAX_COLS = 256 * 1024
-_PERSISTENT_DECODE_MAX_GROUPS = 8
 _PERSISTENT_PREFILL_TOPK = 2048
 _PERSISTENT_PREFILL_BLOCK_N = 16384
 _PERSISTENT_PREFILL_NUM_WARPS = 16
@@ -3082,14 +3080,14 @@ def _persistent_decode_groups(
         rows <= 0
         or topk != _PERSISTENT_PREFILL_TOPK
         or cols <= _PERSISTENT_DECODE_MIN_COLS
-        or cols > _PERSISTENT_DECODE_MAX_COLS
     ):
         return None
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
+    tiles = triton.cdiv(int(cols), _PERSISTENT_PREFILL_BLOCK_N)
     groups = min(
-        _PERSISTENT_DECODE_MAX_GROUPS,
+        tiles,
         _device_compute_units(device_index) // rows,
     )
     return groups if groups >= 2 else None

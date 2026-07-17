@@ -1757,15 +1757,12 @@ def test_dsa_persistent_decode_groups_obey_residency_bound() -> None:
         is None
     )
     assert dsa_topk_gfx950._persistent_decode_groups(1, 90000, topk, device) is None
-    assert (
-        dsa_topk_gfx950._persistent_decode_groups(
-            1,
-            256 * 1024 + 1,
-            topk,
-            device,
-        )
-        is None
-    )
+    assert dsa_topk_gfx950._persistent_decode_groups(
+        1,
+        1024 * 1024,
+        topk,
+        device,
+    ) == min(64, compute_units)
 
 
 def test_dsa_persistent_decode_handles_tail_ties_and_infinities() -> None:
@@ -1804,7 +1801,7 @@ def test_dsa_persistent_decode_handles_tail_ties_and_infinities() -> None:
             topk,
             logits.device,
         )
-        == 8
+        == 10
     )
     dsa_topk_gfx950._dsa_decode_topk_slots(
         logits,
