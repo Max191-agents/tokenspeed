@@ -62,6 +62,7 @@ _PERSISTENT_PREFILL_MIN_COLS = 128 * 1024
 _PERSISTENT_PREFILL_FOUR_GROUP_MIN_COLS = 256 * 1024
 _PERSISTENT_PREFILL_MIN_ROWS = 32
 _PERSISTENT_DECODE_MIN_COLS = 90000
+_PERSISTENT_DECODE_SPLIT_GROUPS = (2, 4, 8, 16, 32, 64)
 _PERSISTENT_PREFILL_TOPK = 2048
 _PERSISTENT_PREFILL_BLOCK_N = 16384
 _PERSISTENT_PREFILL_NUM_WARPS = 16
@@ -729,6 +730,7 @@ def _dsa_persistent_radix_topk_row(
         "block_table_cols",
         "n_cols",
         "n_rows",
+        "row_offset",
     ),
 )
 def _dsa_persistent_radix_topk_kernel(
@@ -749,6 +751,7 @@ def _dsa_persistent_radix_topk_kernel(
     block_table_cols,
     n_cols,
     n_rows,
+    row_offset,
     page_size: gl.constexpr,
     q_len_per_req: gl.constexpr,
     IS_DECODE: gl.constexpr,
@@ -757,7 +760,7 @@ def _dsa_persistent_radix_topk_kernel(
     BLOCK_N: gl.constexpr,
 ):
     _dsa_persistent_radix_topk_row(
-        gl.program_id(0),
+        row_offset + gl.program_id(0),
         gl.program_id(1),
         logits,
         histograms,
@@ -791,6 +794,7 @@ def _dsa_persistent_radix_topk_kernel(
         "block_table_cols",
         "n_cols",
         "n_rows",
+        "row_offset",
     ),
 )
 def _dsa_persistent_radix_topk_row_pool_kernel(
@@ -811,6 +815,7 @@ def _dsa_persistent_radix_topk_row_pool_kernel(
     block_table_cols,
     n_cols,
     n_rows,
+    row_offset,
     page_size: gl.constexpr,
     q_len_per_req: gl.constexpr,
     IS_DECODE: gl.constexpr,
@@ -820,8 +825,9 @@ def _dsa_persistent_radix_topk_row_pool_kernel(
 ):
     row_team = gl.program_id(0)
     group = gl.program_id(1)
-    row = row_team
-    while row < n_rows:
+    local_row = row_team
+    while local_row < n_rows:
+        row = row_offset + local_row
         _dsa_persistent_radix_topk_row(
             row,
             group,
@@ -848,7 +854,7 @@ def _dsa_persistent_radix_topk_row_pool_kernel(
             TOPK,
             BLOCK_N,
         )
-        row += gl.num_programs(0)
+        local_row += gl.num_programs(0)
 
 
 @gluon.jit
@@ -3273,17 +3279,20 @@ def _dsa_persistent_radix_topk(
     topk: int,
     groups: int,
     row_teams: int | None = None,
+    row_offset: int = 0,
+    row_count: int | None = None,
     workspace: tuple[torch.Tensor, ...],
     out: torch.Tensor,
     lens_out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows, cols = logits.shape
+    active_rows = rows if row_count is None else row_count
     histograms, pass_arrivals, pass_done, reset_arrivals, output_counters = workspace
     block_table_stride = block_table.stride(0) if is_decode else 0
     block_table_cols = block_table.shape[1] if is_decode else 0
     if row_teams is None:
         kernel = _dsa_persistent_radix_topk_kernel
-        grid = (rows, groups)
+        grid = (active_rows, groups)
     else:
         kernel = _dsa_persistent_radix_topk_row_pool_kernel
         grid = (row_teams, groups)
@@ -3304,7 +3313,8 @@ def _dsa_persistent_radix_topk(
         out.stride(0),
         block_table_cols=block_table_cols,
         n_cols=cols,
-        n_rows=rows,
+        n_rows=active_rows,
+        row_offset=row_offset,
         page_size=page_size,
         q_len_per_req=q_len_per_req,
         IS_DECODE=is_decode,
@@ -3372,6 +3382,80 @@ def _dsa_persistent_decode_topk_slots(
         out=out,
         lens_out=lens_out,
     )
+
+
+def _persistent_decode_split_plan(
+    rows: int,
+    cols: int,
+    device: torch.device,
+) -> tuple[tuple[int, int, int, int], ...]:
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    compute_units = _device_compute_units(device_index)
+    width_groups = _next_power_of_two(
+        triton.cdiv(int(cols), _PERSISTENT_PREFILL_BLOCK_N)
+    )
+    candidates = tuple(
+        groups
+        for groups in _PERSISTENT_DECODE_SPLIT_GROUPS
+        if groups <= width_groups and groups <= compute_units
+    )
+
+    plan: list[tuple[int, int, int, int]] = []
+    row_offset = 0
+    remaining_rows = rows
+    while remaining_rows:
+        row_count = 1 << (remaining_rows.bit_length() - 1)
+        groups = min(
+            candidates,
+            key=lambda candidate: (
+                -candidate * min(row_count, compute_units // candidate),
+                candidate,
+            ),
+        )
+        row_teams = min(row_count, compute_units // groups)
+        plan.append((row_offset, row_count, groups, row_teams))
+        row_offset += row_count
+        remaining_rows -= row_count
+    return tuple(plan)
+
+
+def _dsa_persistent_decode_topk_split_rows(
+    logits: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    q_len_per_req: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    workspace = _persistent_topk_workspace(logits.shape[0], logits.device)
+    for row_offset, row_count, groups, row_teams in _persistent_decode_split_plan(
+        logits.shape[0],
+        logits.shape[1],
+        logits.device,
+    ):
+        _dsa_persistent_radix_topk(
+            logits,
+            block_table,
+            seq_lens,
+            seq_lens,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            is_decode=True,
+            topk=topk,
+            groups=groups,
+            row_teams=row_teams,
+            row_offset=row_offset,
+            row_count=row_count,
+            workspace=workspace,
+            out=out,
+            lens_out=lens_out,
+        )
+    return out, lens_out
 
 
 def _radix_groups_per_row(
