@@ -274,15 +274,10 @@ def _persistent_emit_tail(
     )
 
 
-@gluon.jit(
-    do_not_specialize=(
-        "logits_stride",
-        "block_table_stride",
-        "block_table_cols",
-        "n_cols",
-    ),
-)
-def _dsa_persistent_radix_topk_kernel(
+@gluon.jit
+def _dsa_persistent_radix_topk_row(
+    row,
+    group,
     logits,
     histograms,
     pass_arrivals,
@@ -306,8 +301,6 @@ def _dsa_persistent_radix_topk_kernel(
     TOPK: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
-    row = gl.program_id(0)
-    group = gl.program_id(1)
     value_layout: gl.constexpr = _vector_layout(
         BLOCK_N,
         gl.num_warps(),
@@ -383,7 +376,6 @@ def _dsa_persistent_radix_topk_kernel(
         gl.int32,
         [_PERSISTENT_PREFILL_NUM_BUCKETS],
         hist_shared_layout,
-        value=histogram_zeros,
     )
     compact_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[TOPK, 1]],
@@ -412,12 +404,16 @@ def _dsa_persistent_radix_topk_kernel(
             [0],
         )
     )
+    output_counter_zeros = gl.zeros([2], gl.int32, layout=output_counter_layout)
     shared_output_counters = gl.allocate_shared_memory(
         gl.int32,
         [2],
         output_counter_shared_layout,
-        value=gl.zeros([2], gl.int32, layout=output_counter_layout),
     )
+    # A resident workgroup can process multiple rows, so local state must be
+    # reinitialized for every row rather than only at kernel entry.
+    shared_histogram.store(histogram_zeros)
+    shared_output_counters.store(output_counter_zeros)
     gl.barrier()
 
     bucket_offsets = gl.arange(
@@ -724,6 +720,135 @@ def _dsa_persistent_radix_topk_kernel(
             reset_arrivals + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
             0,
         )
+
+
+@gluon.jit(
+    do_not_specialize=(
+        "logits_stride",
+        "block_table_stride",
+        "block_table_cols",
+        "n_cols",
+        "n_rows",
+    ),
+)
+def _dsa_persistent_radix_topk_kernel(
+    logits,
+    histograms,
+    pass_arrivals,
+    pass_done,
+    reset_arrivals,
+    output_counters,
+    block_table,
+    row_starts,
+    row_ends,
+    out,
+    lens_out,
+    logits_stride,
+    block_table_stride,
+    out_stride: gl.constexpr,
+    block_table_cols,
+    n_cols,
+    n_rows,
+    page_size: gl.constexpr,
+    q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
+    GROUPS_PER_ROW: gl.constexpr,
+    TOPK: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    _dsa_persistent_radix_topk_row(
+        gl.program_id(0),
+        gl.program_id(1),
+        logits,
+        histograms,
+        pass_arrivals,
+        pass_done,
+        reset_arrivals,
+        output_counters,
+        block_table,
+        row_starts,
+        row_ends,
+        out,
+        lens_out,
+        logits_stride,
+        block_table_stride,
+        out_stride,
+        block_table_cols,
+        n_cols,
+        page_size,
+        q_len_per_req,
+        IS_DECODE,
+        GROUPS_PER_ROW,
+        TOPK,
+        BLOCK_N,
+    )
+
+
+@gluon.jit(
+    do_not_specialize=(
+        "logits_stride",
+        "block_table_stride",
+        "block_table_cols",
+        "n_cols",
+        "n_rows",
+    ),
+)
+def _dsa_persistent_radix_topk_row_pool_kernel(
+    logits,
+    histograms,
+    pass_arrivals,
+    pass_done,
+    reset_arrivals,
+    output_counters,
+    block_table,
+    row_starts,
+    row_ends,
+    out,
+    lens_out,
+    logits_stride,
+    block_table_stride,
+    out_stride: gl.constexpr,
+    block_table_cols,
+    n_cols,
+    n_rows,
+    page_size: gl.constexpr,
+    q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
+    GROUPS_PER_ROW: gl.constexpr,
+    TOPK: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    row_team = gl.program_id(0)
+    group = gl.program_id(1)
+    row = row_team
+    while row < n_rows:
+        _dsa_persistent_radix_topk_row(
+            row,
+            group,
+            logits,
+            histograms,
+            pass_arrivals,
+            pass_done,
+            reset_arrivals,
+            output_counters,
+            block_table,
+            row_starts,
+            row_ends,
+            out,
+            lens_out,
+            logits_stride,
+            block_table_stride,
+            out_stride,
+            block_table_cols,
+            n_cols,
+            page_size,
+            q_len_per_req,
+            IS_DECODE,
+            GROUPS_PER_ROW,
+            TOPK,
+            BLOCK_N,
+        )
+        row += gl.num_programs(0)
 
 
 @gluon.jit
@@ -3147,6 +3272,7 @@ def _dsa_persistent_radix_topk(
     is_decode: bool,
     topk: int,
     groups: int,
+    row_teams: int | None = None,
     workspace: tuple[torch.Tensor, ...],
     out: torch.Tensor,
     lens_out: torch.Tensor,
@@ -3155,7 +3281,13 @@ def _dsa_persistent_radix_topk(
     histograms, pass_arrivals, pass_done, reset_arrivals, output_counters = workspace
     block_table_stride = block_table.stride(0) if is_decode else 0
     block_table_cols = block_table.shape[1] if is_decode else 0
-    _dsa_persistent_radix_topk_kernel[(rows, groups)](
+    if row_teams is None:
+        kernel = _dsa_persistent_radix_topk_kernel
+        grid = (rows, groups)
+    else:
+        kernel = _dsa_persistent_radix_topk_row_pool_kernel
+        grid = (row_teams, groups)
+    kernel[grid](
         logits,
         histograms,
         pass_arrivals,
@@ -3172,6 +3304,7 @@ def _dsa_persistent_radix_topk(
         out.stride(0),
         block_table_cols=block_table_cols,
         n_cols=cols,
+        n_rows=rows,
         page_size=page_size,
         q_len_per_req=q_len_per_req,
         IS_DECODE=is_decode,
@@ -3219,6 +3352,7 @@ def _dsa_persistent_decode_topk_slots(
     topk: int,
     q_len_per_req: int,
     groups: int,
+    row_teams: int | None = None,
     out: torch.Tensor,
     lens_out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -3233,6 +3367,7 @@ def _dsa_persistent_decode_topk_slots(
         is_decode=True,
         topk=topk,
         groups=groups,
+        row_teams=row_teams,
         workspace=workspace,
         out=out,
         lens_out=lens_out,

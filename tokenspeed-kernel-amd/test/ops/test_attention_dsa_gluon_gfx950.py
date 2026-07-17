@@ -1223,7 +1223,7 @@ def test_dsa_persistent_workspace_uses_one_monotonic_pass_arrival_per_row() -> N
 
 
 def test_dsa_persistent_pass_arrival_uses_monotonic_generations() -> None:
-    source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_kernel.fn)
+    source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_row.fn)
 
     assert "generation_last_arrival = (pass_index + 1) * GROUPS_PER_ROW - 1" in source
     assert "gl.atomic_xchg(" not in source
@@ -1853,8 +1853,64 @@ def test_dsa_persistent_decode_handles_tail_ties_and_infinities() -> None:
     _assert_persistent_workspace_reset(workspace)
 
 
+def test_dsa_persistent_decode_row_teams_reuse_workgroups() -> None:
+    page_size = 64
+    rows = 5
+    row_teams = 2
+    groups = 2
+    cols = 147493
+    topk = 2048
+    seq_lens = torch.tensor(
+        [1024, cols - 17, cols - 113, cols, 1536],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    generator = _generator("cuda", 8907)
+    logits = torch.randn(
+        (rows, cols),
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    )
+    block_table = _make_reversed_decode_block_table(rows, cols, page_size)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    for _ in range(2):
+        out.fill_(-7)
+        lens_out.fill_(-7)
+        dsa_topk_gfx950._dsa_persistent_decode_topk_slots(
+            logits,
+            block_table,
+            seq_lens,
+            page_size=page_size,
+            topk=topk,
+            q_len_per_req=1,
+            groups=groups,
+            row_teams=row_teams,
+            out=out,
+            lens_out=lens_out,
+        )
+        _assert_decode_topk_slots(
+            logits,
+            out,
+            lens_out,
+            seq_lens,
+            block_table,
+            page_size=page_size,
+            q_len_per_req=1,
+            topk=topk,
+        )
+        workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+        _assert_persistent_workspace_reset(workspace)
+
+
+@pytest.mark.parametrize("pooled", (False, True), ids=("one-team-per-row", "row-pool"))
 @pytest.mark.parametrize("warm_workspace", (False, True), ids=("cold-key", "warm-key"))
-def test_dsa_persistent_decode_is_graph_capturable(warm_workspace: bool) -> None:
+def test_dsa_persistent_decode_is_graph_capturable(
+    warm_workspace: bool,
+    pooled: bool,
+) -> None:
     page_size = 64
     q_len_per_req = 4
     requests = 2
@@ -1881,16 +1937,33 @@ def test_dsa_persistent_decode_is_graph_capturable(warm_workspace: bool) -> None
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_decode_topk_slots(
-        logits,
-        block_table,
-        seq_lens,
-        page_size=page_size,
-        topk=topk,
-        q_len_per_req=q_len_per_req,
-        out=out,
-        lens_out=lens_out,
-    )
+    def invoke() -> None:
+        if pooled:
+            dsa_topk_gfx950._dsa_persistent_decode_topk_slots(
+                logits,
+                block_table,
+                seq_lens,
+                page_size=page_size,
+                topk=topk,
+                q_len_per_req=q_len_per_req,
+                groups=2,
+                row_teams=2,
+                out=out,
+                lens_out=lens_out,
+            )
+        else:
+            dsa_topk_gfx950._dsa_decode_topk_slots(
+                logits,
+                block_table,
+                seq_lens,
+                page_size=page_size,
+                topk=topk,
+                q_len_per_req=q_len_per_req,
+                out=out,
+                lens_out=lens_out,
+            )
+
+    invoke()
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
     device_index = logits.device.index
@@ -1903,30 +1976,12 @@ def test_dsa_persistent_decode_is_graph_capturable(warm_workspace: bool) -> None
     assert workspace_key not in dsa_topk_gfx950._persistent_topk_workspace_cache
     if warm_workspace:
         with torch.cuda.stream(capture_stream):
-            dsa_topk_gfx950._dsa_decode_topk_slots(
-                logits,
-                block_table,
-                seq_lens,
-                page_size=page_size,
-                topk=topk,
-                q_len_per_req=q_len_per_req,
-                out=out,
-                lens_out=lens_out,
-            )
+            invoke()
         capture_stream.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
-        dsa_topk_gfx950._dsa_decode_topk_slots(
-            logits,
-            block_table,
-            seq_lens,
-            page_size=page_size,
-            topk=topk,
-            q_len_per_req=q_len_per_req,
-            out=out,
-            lens_out=lens_out,
-        )
+        invoke()
     capture_stream.synchronize()
     graph_workspace = dsa_topk_gfx950._persistent_topk_workspace_cache[workspace_key]
     _assert_persistent_workspace_layout(graph_workspace, rows)
