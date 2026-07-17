@@ -1154,6 +1154,7 @@ def test_dsa_persistent_pass_arrival_uses_monotonic_generations() -> None:
         (64, 262144, 4),
         (64, 524288, 4),
         (64, 1048576, 4),
+        (32, 1048577, 4),
     ),
 )
 def test_dsa_prefill_topk_dispatches_persistent_groups_across_rows(
@@ -1551,6 +1552,47 @@ def test_dsa_decode_topk_trivial_2048_maps_grouped_queries_to_physical_slots(
         expected[row, :candidate_len] = physical_pages * page_size + offsets % page_size
         expected_lens[row] = candidate_len
 
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    torch.testing.assert_close(lens_out, expected_lens, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("cols", (512, 1024, 2048))
+def test_dsa_prefill_topk_trivial_2048_maps_candidate_ranges(cols: int) -> None:
+    rows = 4
+    topk = 2048
+    row_starts = torch.tensor(
+        [0, 3, 17, cols // 2],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_ends = torch.tensor(
+        [cols, cols - 5, cols - 1, cols // 2],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    logits = torch.zeros((rows, cols), device="cuda", dtype=torch.float32)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    expected = torch.full_like(out, -1)
+    expected_lens = row_ends - row_starts
+    for row in range(rows):
+        count = int(expected_lens[row].item())
+        expected[row, :count] = torch.arange(
+            int(row_starts[row].item()),
+            int(row_ends[row].item()),
+            device="cuda",
+            dtype=torch.int32,
+        )
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
     torch.testing.assert_close(lens_out, expected_lens, rtol=0, atol=0)
 

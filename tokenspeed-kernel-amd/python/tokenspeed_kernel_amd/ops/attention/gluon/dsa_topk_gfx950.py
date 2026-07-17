@@ -60,7 +60,6 @@ _PREFILL_RUNTIME_RADIX_MAX_COLS = 196608
 _PREFILL_HIST_DERIVED_MIN_COLS = 524288
 _PERSISTENT_PREFILL_MIN_COLS = 128 * 1024
 _PERSISTENT_PREFILL_FOUR_GROUP_MIN_COLS = 256 * 1024
-_PERSISTENT_PREFILL_MAX_COLS = 1024 * 1024
 _PERSISTENT_PREFILL_MIN_ROWS = 32
 _PERSISTENT_DECODE_MIN_COLS = 90000
 _PERSISTENT_DECODE_MAX_COLS = 256 * 1024
@@ -1007,29 +1006,6 @@ def _dsa_trivial_decode_topk2048_kernel(
         other=0,
     ).to(gl.int32)
     indices = page * 64 + page_offsets
-    gl.store(
-        out + row * out_stride + offsets,
-        gl.where(valid, indices, -1),
-    )
-    gl.store(lens_out + row, gl.minimum(candidate_len, 2048).to(gl.int32))
-
-
-@gluon.jit
-def _dsa_trivial_prefill_topk2048_kernel(
-    row_starts,
-    row_ends,
-    out,
-    lens_out,
-    out_stride: gl.constexpr,
-):
-    row = gl.program_id(0)
-    layout: gl.constexpr = _vector_layout(2048, gl.num_warps(), 4)
-    offsets = gl.arange(0, 2048, layout=layout)
-    row_start = gl.load(row_starts + row).to(gl.int32)
-    row_end = gl.load(row_ends + row).to(gl.int32)
-    candidate_len = gl.maximum(row_end - row_start, 0)
-    valid = offsets < candidate_len
-    indices = row_start + offsets.to(gl.int32)
     gl.store(
         out + row * out_stride + offsets,
         gl.where(valid, indices, -1),
@@ -3083,7 +3059,6 @@ def _persistent_prefill_groups(
         rows < _PERSISTENT_PREFILL_MIN_ROWS
         or topk != _PERSISTENT_PREFILL_TOPK
         or cols < _PERSISTENT_PREFILL_MIN_COLS
-        or cols > _PERSISTENT_PREFILL_MAX_COLS
     ):
         return None
     device_index = device.index
@@ -4058,33 +4033,23 @@ def _dsa_prefill_topk_indices(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows, cols = logits.shape
     if cols <= topk:
-        if topk == 2048:
-            _dsa_trivial_prefill_topk2048_kernel[(rows,)](
-                row_starts,
-                row_ends,
-                out,
-                lens_out,
-                out.stride(0),
-                num_warps=8,
-            )
-        else:
-            _dsa_trivial_topk_kernel[(rows,)](
-                row_starts,
-                row_starts,
-                row_starts,
-                row_ends,
-                out,
-                lens_out,
-                0,
-                out.stride(0),
-                0,
-                page_size=1,
-                topk=topk,
-                q_len_per_req=1,
-                IS_DECODE=False,
-                TOPK_LOAD_ELEMS=_load_elems(topk, 8),
-                num_warps=8,
-            )
+        _dsa_trivial_topk_kernel[(rows,)](
+            row_starts,
+            row_starts,
+            row_starts,
+            row_ends,
+            out,
+            lens_out,
+            0,
+            out.stride(0),
+            0,
+            page_size=1,
+            topk=topk,
+            q_len_per_req=1,
+            IS_DECODE=False,
+            TOPK_LOAD_ELEMS=_load_elems(topk, 8),
+            num_warps=8,
+        )
         return out, lens_out
 
     persistent_groups = _persistent_prefill_groups(
