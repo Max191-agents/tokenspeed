@@ -90,19 +90,22 @@ def test_package_all_names_are_bound() -> None:
     assert missing == []
 
 
-def test_embedding_family_does_not_export_reference_implementations() -> None:
+def test_embedding_family_does_not_export_removed_specializations() -> None:
     embedding = importlib.import_module(
         "tokenspeed_numerics_input_generators.embedding"
     )
-    reference_names = {
+    removed_names = {
+        "MLARopeQuantizeFP8InputConfig",
+        "MLARopeQuantizeFP8Inputs",
+        "MLARopeQuantizeFP8InputValues",
         "MLARopeQuantizeFP8ReferenceValues",
         "mla_rope_quantize_fp8_reference",
         "rope_reference",
     }
 
-    assert reference_names.isdisjoint(embedding.__all__)
-    assert reference_names.isdisjoint(public.__all__)
-    for name in reference_names:
+    assert removed_names.isdisjoint(embedding.__all__)
+    assert removed_names.isdisjoint(public.__all__)
+    for name in removed_names:
         assert not hasattr(embedding, name)
         assert not hasattr(public, name)
 

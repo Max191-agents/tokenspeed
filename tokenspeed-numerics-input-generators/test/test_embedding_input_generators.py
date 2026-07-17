@@ -20,14 +20,28 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 import pytest
 import torch
 from tokenspeed_numerics_input_generators import (
-    MLARopeQuantizeFP8InputConfig,
-    MLARopeQuantizeFP8Inputs,
+    MLARopeInputConfig,
+    MLARopeInputs,
+    MLARopeInputValues,
     RopeInputConfig,
     RopeInputs,
 )
+
+
+def test_mla_rope_values_contain_only_operation_inputs() -> None:
+    assert tuple(field.name for field in fields(MLARopeInputValues)) == (
+        "q_rope",
+        "k_rope",
+        "q_nope",
+        "k_nope",
+        "cos_sin_cache",
+        "positions",
+    )
 
 
 def test_rope_inputs_generate_neox_full_head_values() -> None:
@@ -164,18 +178,16 @@ def test_rope_rejects_too_small_cache_for_fused_kv() -> None:
         )
 
 
-def test_mla_rope_quantize_fp8_inputs_generate_rank2_values() -> None:
-    config = MLARopeQuantizeFP8InputConfig(
+def test_mla_rope_inputs_generate_rank2_values() -> None:
+    config = MLARopeInputConfig(
         num_tokens=4,
         num_q_heads=3,
         qk_nope_head_dim=5,
         qk_rope_head_dim=8,
-        input_dtype=torch.bfloat16,
-        quant_scale_q=0.75,
-        quant_scale_kv=1.25,
+        dtype=torch.bfloat16,
         max_position=32,
     )
-    values = MLARopeQuantizeFP8Inputs(config).generate(
+    values = MLARopeInputs(config).generate(
         seed=31,
         metadata_seed=32,
         device="cpu",
@@ -185,30 +197,25 @@ def test_mla_rope_quantize_fp8_inputs_generate_rank2_values() -> None:
     assert values.q_nope.shape == (4, 3, 5)
     assert values.k_rope.shape == (4, 8)
     assert values.k_nope.shape == (4, 5)
-    assert values.q_rope_out.dtype == torch.float8_e4m3fn
-    assert values.k_nope_out.dtype == torch.float8_e4m3fn
-    assert values.q_rope_out.shape == values.q_rope.shape
-    assert values.k_rope_out.shape == values.k_rope.shape
-    assert values.q_nope_out.shape == values.q_nope.shape
-    assert values.k_nope_out.shape == values.k_nope.shape
-    assert values.quant_scale_q == 0.75
-    assert values.quant_scale_kv == 1.25
+    assert values.q_rope.dtype == torch.bfloat16
+    assert values.k_nope.dtype == torch.bfloat16
+    assert values.cos_sin_cache.shape == (32, 8)
+    assert values.positions.shape == (4,)
 
 
-def test_mla_rope_quantize_fp8_inputs_generate_rank3_values() -> None:
-    config = MLARopeQuantizeFP8InputConfig(
+def test_mla_rope_inputs_generate_rank3_values() -> None:
+    config = MLARopeInputConfig(
         num_tokens=3,
         num_q_heads=4,
         qk_nope_head_dim=6,
         qk_rope_head_dim=10,
-        input_dtype=torch.float16,
+        dtype=torch.float64,
         k_rank=3,
         num_kv_heads=2,
-        fp8_dtype=torch.float8_e5m2,
         is_neox=False,
         max_position=64,
     )
-    values = MLARopeQuantizeFP8Inputs(config).generate(
+    values = MLARopeInputs(config).generate(
         seed=33,
         metadata_seed=34,
         device="cpu",
@@ -216,21 +223,20 @@ def test_mla_rope_quantize_fp8_inputs_generate_rank3_values() -> None:
 
     assert values.k_rope.shape == (3, 2, 10)
     assert values.k_nope.shape == (3, 2, 6)
-    assert values.k_rope_out.dtype == torch.float8_e5m2
-    assert values.q_rope_out.shape == (3, 4, 10)
-    assert values.q_nope_out.shape == (3, 4, 6)
-    assert values.k_rope_out.shape == (3, 2, 10)
-    assert values.k_nope_out.shape == (3, 2, 6)
+    assert values.q_rope.shape == (3, 4, 10)
+    assert values.q_nope.shape == (3, 4, 6)
+    assert values.q_rope.dtype == torch.float64
+    assert values.k_nope.dtype == torch.float64
 
 
-def test_mla_rope_quantize_fp8_metadata_seed_controls_positions_only() -> None:
-    generator = MLARopeQuantizeFP8Inputs(
-        MLARopeQuantizeFP8InputConfig(
+def test_mla_rope_metadata_seed_controls_positions_only() -> None:
+    generator = MLARopeInputs(
+        MLARopeInputConfig(
             num_tokens=5,
             num_q_heads=2,
             qk_nope_head_dim=4,
             qk_rope_head_dim=8,
-            input_dtype=torch.float16,
+            dtype=torch.float16,
         )
     )
 
@@ -242,37 +248,55 @@ def test_mla_rope_quantize_fp8_metadata_seed_controls_positions_only() -> None:
     assert not torch.equal(values1.k_nope, values2.k_nope)
 
 
-def test_mla_rope_quantize_fp8_rejects_invalid_config() -> None:
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+    ],
+)
+def test_mla_rope_supports_float_dtypes(dtype: torch.dtype) -> None:
+    values = MLARopeInputs(
+        MLARopeInputConfig(
+            num_tokens=2,
+            num_q_heads=2,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=8,
+            dtype=dtype,
+        )
+    ).generate(seed=37, device="cpu")
+
+    assert values.q_rope.dtype == dtype
+    assert values.q_nope.dtype == dtype
+    assert values.k_rope.dtype == dtype
+    assert values.k_nope.dtype == dtype
+
+
+def test_mla_rope_rejects_invalid_config() -> None:
     with pytest.raises(ValueError, match="implicit shared KV head"):
-        MLARopeQuantizeFP8Inputs(
-            MLARopeQuantizeFP8InputConfig(
+        MLARopeInputs(
+            MLARopeInputConfig(
                 num_tokens=1,
                 num_q_heads=1,
                 qk_nope_head_dim=4,
                 qk_rope_head_dim=8,
-                input_dtype=torch.float16,
+                dtype=torch.float16,
                 k_rank=2,
                 num_kv_heads=2,
             )
         )
-    with pytest.raises(ValueError, match="quant_scale_q"):
-        MLARopeQuantizeFP8Inputs(
-            MLARopeQuantizeFP8InputConfig(
+    with pytest.raises(ValueError, match="dtype"):
+        MLARopeInputs(
+            MLARopeInputConfig(
                 num_tokens=1,
                 num_q_heads=1,
                 qk_nope_head_dim=4,
                 qk_rope_head_dim=8,
-                input_dtype=torch.float16,
-                quant_scale_q=0.0,
-            )
-        )
-    with pytest.raises(ValueError, match="input_dtype"):
-        MLARopeQuantizeFP8Inputs(
-            MLARopeQuantizeFP8InputConfig(
-                num_tokens=1,
-                num_q_heads=1,
-                qk_nope_head_dim=4,
-                qk_rope_head_dim=8,
-                input_dtype=torch.float32,
+                dtype=torch.int32,
             )
         )

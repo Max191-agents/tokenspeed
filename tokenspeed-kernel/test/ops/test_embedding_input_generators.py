@@ -30,8 +30,8 @@ from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
 from tokenspeed_kernel.ops.embedding.flashinfer import mla_rope_quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_numerics_input_generators import (
-    MLARopeQuantizeFP8InputConfig,
-    MLARopeQuantizeFP8Inputs,
+    MLARopeInputConfig,
+    MLARopeInputs,
     RopeInputConfig,
     RopeInputs,
 )
@@ -80,32 +80,40 @@ def test_mla_rope_quantize_fp8_reference(
     num_kv_heads: int,
     expected_key_shape: tuple[int, ...],
 ) -> None:
-    values = MLARopeQuantizeFP8Inputs(
-        MLARopeQuantizeFP8InputConfig(
-            num_tokens=4,
-            num_q_heads=3,
-            qk_nope_head_dim=5,
-            qk_rope_head_dim=8,
-            input_dtype=torch.bfloat16,
-            k_rank=k_rank,
-            num_kv_heads=num_kv_heads,
-            quant_scale_q=0.75,
-            quant_scale_kv=1.25,
-            max_position=32,
-        )
-    ).generate(seed=31, metadata_seed=32, device="cpu")
+    quant_scale_q = 0.75
+    quant_scale_kv = 1.25
+    fp8_dtype = torch.float8_e4m3fn
+    config = MLARopeInputConfig(
+        num_tokens=4,
+        num_q_heads=3,
+        qk_nope_head_dim=5,
+        qk_rope_head_dim=8,
+        dtype=torch.bfloat16,
+        k_rank=k_rank,
+        num_kv_heads=num_kv_heads,
+        max_position=32,
+    )
+    values = MLARopeInputs(config).generate(
+        seed=31,
+        metadata_seed=32,
+        device="cpu",
+    )
 
-    ref = mla_rope_quantize_fp8_reference(values)
+    ref = mla_rope_quantize_fp8_reference(
+        values,
+        fp8_dtype=fp8_dtype,
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
+        is_neox=config.is_neox,
+    )
 
     assert ref.query.shape == (4, 3, 13)
     assert ref.key.shape == expected_key_shape
-    assert ref.query.dtype == torch.float8_e4m3fn
-    assert ref.key.dtype == torch.float8_e4m3fn
+    assert ref.query.dtype == fp8_dtype
+    assert ref.key.dtype == fp8_dtype
     torch.testing.assert_close(
         ref.q_nope.view(torch.uint8),
-        (values.q_nope.float() * values.quant_scale_q)
-        .to(torch.float8_e4m3fn)
-        .view(torch.uint8),
+        (values.q_nope.float() * quant_scale_q).to(fp8_dtype).view(torch.uint8),
         atol=0,
         rtol=0,
     )
@@ -285,20 +293,34 @@ def test_rope_generator_runs_cuda_kernel_with_output_buffers(
     not platform.is_nvidia,
     reason="FlashInfer MLA RoPE FP8 quantization requires NVIDIA CUDA.",
 )
-def test_mla_rope_quantize_fp8_generator_runs_flashinfer_kernel(device: str) -> None:
-    values = MLARopeQuantizeFP8Inputs(
-        MLARopeQuantizeFP8InputConfig(
-            num_tokens=5,
-            num_q_heads=4,
-            qk_nope_head_dim=8,
-            qk_rope_head_dim=16,
-            input_dtype=torch.bfloat16,
-            quant_scale_q=1.0,
-            quant_scale_kv=0.75,
-            max_position=64,
-        )
-    ).generate(seed=77, metadata_seed=78, device=device)
-    expected = mla_rope_quantize_fp8_reference(values)
+def test_mla_rope_generator_adapts_to_flashinfer_fp8_kernel(device: str) -> None:
+    fp8_dtype = torch.float8_e4m3fn
+    quant_scale_q = 1.0
+    quant_scale_kv = 0.75
+    config = MLARopeInputConfig(
+        num_tokens=5,
+        num_q_heads=4,
+        qk_nope_head_dim=8,
+        qk_rope_head_dim=16,
+        dtype=torch.bfloat16,
+        max_position=64,
+    )
+    values = MLARopeInputs(config).generate(
+        seed=77,
+        metadata_seed=78,
+        device=device,
+    )
+    q_rope_out = torch.empty_like(values.q_rope, dtype=fp8_dtype)
+    k_rope_out = torch.empty_like(values.k_rope, dtype=fp8_dtype)
+    q_nope_out = torch.empty_like(values.q_nope, dtype=fp8_dtype)
+    k_nope_out = torch.empty_like(values.k_nope, dtype=fp8_dtype)
+    expected = mla_rope_quantize_fp8_reference(
+        values,
+        fp8_dtype=fp8_dtype,
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
+        is_neox=config.is_neox,
+    )
 
     try:
         mla_rope_quantize_fp8(
@@ -308,14 +330,14 @@ def test_mla_rope_quantize_fp8_generator_runs_flashinfer_kernel(device: str) -> 
             k_nope=values.k_nope,
             cos_sin_cache=values.cos_sin_cache,
             pos_ids=values.positions,
-            is_neox=values.is_neox,
-            quantize_dtype=values.fp8_dtype,
-            q_rope_out=values.q_rope_out,
-            k_rope_out=values.k_rope_out,
-            q_nope_out=values.q_nope_out,
-            k_nope_out=values.k_nope_out,
-            quant_scale_q=values.quant_scale_q,
-            quant_scale_kv=values.quant_scale_kv,
+            is_neox=config.is_neox,
+            quantize_dtype=fp8_dtype,
+            q_rope_out=q_rope_out,
+            k_rope_out=k_rope_out,
+            q_nope_out=q_nope_out,
+            k_nope_out=k_nope_out,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
             enable_pdl=False,
         )
     except RuntimeError as exc:
@@ -323,25 +345,25 @@ def test_mla_rope_quantize_fp8_generator_runs_flashinfer_kernel(device: str) -> 
     torch.cuda.synchronize()
 
     torch.testing.assert_close(
-        values.q_nope_out.view(torch.uint8),
+        q_nope_out.view(torch.uint8),
         expected.q_nope.view(torch.uint8),
         atol=0,
         rtol=0,
     )
     torch.testing.assert_close(
-        values.q_rope_out.view(torch.uint8),
+        q_rope_out.view(torch.uint8),
         expected.q_rope.view(torch.uint8),
         atol=0,
         rtol=0,
     )
     torch.testing.assert_close(
-        values.k_nope_out.view(torch.uint8),
+        k_nope_out.view(torch.uint8),
         expected.k_nope.view(torch.uint8),
         atol=0,
         rtol=0,
     )
     torch.testing.assert_close(
-        values.k_rope_out.view(torch.uint8),
+        k_rope_out.view(torch.uint8),
         expected.k_rope.view(torch.uint8),
         atol=0,
         rtol=0,

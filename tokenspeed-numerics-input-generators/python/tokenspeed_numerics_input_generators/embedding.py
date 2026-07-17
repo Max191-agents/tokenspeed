@@ -20,10 +20,10 @@
 
 """Embedding-family input generators for rotary positional embeddings.
 
-This family models position-dependent rotations over query/key tensors and
-MLA-style fused RoPE plus FP8 quantization. The generated values describe the
-mathematical tensor inputs and output buffers; backend-specific wrapper names
-or keyword conventions remain adapter concerns.
+This family models position-dependent rotations over query/key tensors,
+including decomposed MLA query/key slices. The generated values describe the
+mathematical inputs; output allocation, quantization, backend-specific wrapper
+names, and keyword conventions remain adapter concerns.
 """
 
 from __future__ import annotations
@@ -43,9 +43,9 @@ from tokenspeed_numerics_input_generators.core import (
 from tokenspeed_numerics_input_generators.rotary import build_rope_cos_sin_cache
 
 __all__ = [
-    "MLARopeQuantizeFP8InputConfig",
-    "MLARopeQuantizeFP8Inputs",
-    "MLARopeQuantizeFP8InputValues",
+    "MLARopeInputConfig",
+    "MLARopeInputs",
+    "MLARopeInputValues",
     "RopeFusedKVInputValues",
     "RopeInputConfig",
     "RopeInputValues",
@@ -59,6 +59,11 @@ _REGULAR_FLOAT_DTYPES = {
     torch.bfloat16,
     torch.float32,
     torch.float64,
+}
+_MLA_ROPE_DTYPES = _REGULAR_FLOAT_DTYPES | {
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+    torch.float8_e5m2,
 }
 
 
@@ -84,15 +89,13 @@ def _check_float_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
     return dtype
 
 
-def _check_fp16_or_bf16_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
-    if dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(f"{name} must be torch.float16 or torch.bfloat16, got {dtype}")
-    return dtype
-
-
-def _check_fp8_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
-    if dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-        raise ValueError(f"{name} must be an FP8 torch dtype, got {dtype}")
+def _check_mla_rope_dtype(name: str, dtype: torch.dtype) -> torch.dtype:
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"{name} must be a torch.dtype")
+    if dtype not in _MLA_ROPE_DTYPES:
+        raise ValueError(
+            f"{name} must be a supported floating torch dtype, got {dtype}"
+        )
     return dtype
 
 
@@ -183,12 +186,11 @@ class RopeInputValues:
 
 
 @dataclass
-class MLARopeQuantizeFP8InputValues:
-    """Generated values for fused RoPE plus FP8 quantization.
+class MLARopeInputValues:
+    """Generated values for rotary embedding over decomposed MLA Q/K.
 
     ``q_nope`` and ``k_nope`` are the non-rotary query/key slices. ``q_rope``
-    and ``k_rope`` are the position-encoded slices before rotation. The output
-    tensors are preallocated FP8 buffers for the mutating operation API.
+    and ``k_rope`` are the position-encoded slices before rotation.
     """
 
     q_rope: torch.Tensor
@@ -197,24 +199,16 @@ class MLARopeQuantizeFP8InputValues:
     k_nope: torch.Tensor
     cos_sin_cache: torch.Tensor
     positions: torch.Tensor
-    q_rope_out: torch.Tensor
-    k_rope_out: torch.Tensor
-    q_nope_out: torch.Tensor
-    k_nope_out: torch.Tensor
-    quant_scale_q: float
-    quant_scale_kv: float
-    is_neox: bool
-    fp8_dtype: torch.dtype
 
 
 @dataclass
-class MLARopeQuantizeFP8InputConfig:
-    """Initialization parameters for fused MLA RoPE + FP8 quantization.
+class MLARopeInputConfig:
+    """Initialization parameters for decomposed MLA rotary embedding inputs.
 
     The represented operation applies rotary embedding to the PE slices of
-    query/key tensors, scales the rotated PE slices and unrotated NOPE slices,
-    and casts the results to FP8. The K tensors may use the 2D MLA shape with a
-    shared key head, or the 3D GQA/MHA shape with an explicit KV-head axis.
+    query/key tensors while leaving the NOPE slices unchanged. The K tensors
+    may use the 2D MLA shape with a shared key head, or a 3D shape with an
+    explicit KV-head axis.
     """
 
     # Required: number of token rows. Zero is valid.
@@ -229,8 +223,8 @@ class MLARopeQuantizeFP8InputConfig:
     # Required: rotary query/key width. Must be positive and even.
     qk_rope_head_dim: int
 
-    # Required: generated dtype for Q/K inputs. FlashInfer supports fp16/bf16.
-    input_dtype: torch.dtype
+    # Required: generated dtype for all Q/K slices.
+    dtype: torch.dtype
 
     # Optional: K tensor rank. Rank-2 is the MLA shared-K shape; rank-3 has an
     # explicit KV-head axis.
@@ -239,15 +233,6 @@ class MLARopeQuantizeFP8InputConfig:
     # Optional: number of KV heads. Rank-2 uses the implicit shared KV head and
     # therefore requires this to remain 1.
     num_kv_heads: int = 1
-
-    # Optional: FP8 output dtype.
-    fp8_dtype: torch.dtype = torch.float8_e4m3fn
-
-    # Optional: query output multiplier before FP8 cast.
-    quant_scale_q: float = 1.0
-
-    # Optional: key output multiplier before FP8 cast.
-    quant_scale_kv: float = 1.0
 
     # Optional: number of rows in the generated RoPE cache.
     max_position: int = 1024
@@ -492,16 +477,16 @@ class RopeInputs(NumericsInputGenerator):
 
 
 @dataclass(init=False)
-class MLARopeQuantizeFP8Inputs(NumericsInputGenerator):
-    """Generator for fused MLA/GQA RoPE plus FP8 quantization inputs."""
+class MLARopeInputs(NumericsInputGenerator):
+    """Generator for rotary embedding over decomposed MLA Q/K inputs."""
 
-    config: MLARopeQuantizeFP8InputConfig
+    config: MLARopeInputConfig
     q_rope_input: TensorInput | None
     k_rope_input: TensorInput | None
     q_nope_input: TensorInput | None
     k_nope_input: TensorInput | None
 
-    def __init__(self, config: MLARopeQuantizeFP8InputConfig) -> None:
+    def __init__(self, config: MLARopeInputConfig) -> None:
         self.config = config
         self.q_rope_input = None
         self.k_rope_input = None
@@ -526,10 +511,7 @@ class MLARopeQuantizeFP8Inputs(NumericsInputGenerator):
             head_size=self.config.qk_rope_head_dim,
             rotary_dim=self.config.qk_rope_head_dim,
         )
-        self.config.input_dtype = _check_fp16_or_bf16_dtype(
-            "input_dtype", self.config.input_dtype
-        )
-        self.config.fp8_dtype = _check_fp8_dtype("fp8_dtype", self.config.fp8_dtype)
+        self.config.dtype = _check_mla_rope_dtype("dtype", self.config.dtype)
         if self.config.k_rank not in (2, 3):
             raise ValueError(f"k_rank must be 2 or 3, got {self.config.k_rank}")
         self.config.num_kv_heads = _check_positive(
@@ -548,17 +530,6 @@ class MLARopeQuantizeFP8Inputs(NumericsInputGenerator):
         self.config.position_dtype = _check_index_dtype(
             "position_dtype", self.config.position_dtype
         )
-        self.config.quant_scale_q = float(self.config.quant_scale_q)
-        self.config.quant_scale_kv = float(self.config.quant_scale_kv)
-        if self.config.quant_scale_q <= 0.0:
-            raise ValueError(
-                f"quant_scale_q must be positive, got {self.config.quant_scale_q}"
-            )
-        if self.config.quant_scale_kv <= 0.0:
-            raise ValueError(
-                f"quant_scale_kv must be positive, got {self.config.quant_scale_kv}"
-            )
-
         q_rope_shape = (
             self.config.num_tokens,
             self.config.num_q_heads,
@@ -592,22 +563,22 @@ class MLARopeQuantizeFP8Inputs(NumericsInputGenerator):
 
         self.q_rope_input = self.q_rope_input or TensorInput(
             q_rope_shape,
-            self.config.input_dtype,
+            self.config.dtype,
             device=self.config.device,
         )
         self.q_nope_input = self.q_nope_input or TensorInput(
             q_nope_shape,
-            self.config.input_dtype,
+            self.config.dtype,
             device=self.config.device,
         )
         self.k_rope_input = self.k_rope_input or TensorInput(
             k_rope_shape,
-            self.config.input_dtype,
+            self.config.dtype,
             device=self.config.device,
         )
         self.k_nope_input = self.k_nope_input or TensorInput(
             k_nope_shape,
-            self.config.input_dtype,
+            self.config.dtype,
             device=self.config.device,
         )
 
@@ -617,7 +588,7 @@ class MLARopeQuantizeFP8Inputs(NumericsInputGenerator):
         seed: int,
         metadata_seed: int | None = None,
         device: DeviceLike = None,
-    ) -> MLARopeQuantizeFP8InputValues:
+    ) -> MLARopeInputValues:
         self.__post_init__()
         if (
             self.q_rope_input is None
@@ -625,9 +596,7 @@ class MLARopeQuantizeFP8Inputs(NumericsInputGenerator):
             or self.q_nope_input is None
             or self.k_nope_input is None
         ):
-            raise ValueError(
-                "MLARopeQuantizeFP8Inputs child generators must be initialized"
-            )
+            raise ValueError("MLARopeInputs child generators must be initialized")
         target_device = _resolve_device(self.config.device, device)
         metadata_base_seed = seed if metadata_seed is None else metadata_seed
         q_rope = _require_tensor(
@@ -668,19 +637,11 @@ class MLARopeQuantizeFP8Inputs(NumericsInputGenerator):
             base=self.config.rope_base,
             device=target_device,
         )
-        return MLARopeQuantizeFP8InputValues(
+        return MLARopeInputValues(
             q_rope=q_rope,
             k_rope=k_rope,
             q_nope=q_nope,
             k_nope=k_nope,
             cos_sin_cache=cos_sin_cache.contiguous(),
             positions=positions.contiguous(),
-            q_rope_out=torch.empty_like(q_rope, dtype=self.config.fp8_dtype),
-            k_rope_out=torch.empty_like(k_rope, dtype=self.config.fp8_dtype),
-            q_nope_out=torch.empty_like(q_nope, dtype=self.config.fp8_dtype),
-            k_nope_out=torch.empty_like(k_nope, dtype=self.config.fp8_dtype),
-            quant_scale_q=self.config.quant_scale_q,
-            quant_scale_kv=self.config.quant_scale_kv,
-            is_neox=self.config.is_neox,
-            fp8_dtype=self.config.fp8_dtype,
         )

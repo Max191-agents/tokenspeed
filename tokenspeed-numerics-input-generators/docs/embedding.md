@@ -3,7 +3,7 @@
 The current TokenSpeed embedding family is rotary positional embedding (RoPE)
 over query and key heads. It is not a token-lookup embedding table generator.
 The generators therefore model Q/K tensors, position metadata, RoPE caches, and
-the MLA-style fused RoPE plus FP8 quantization path used before attention.
+decomposed MLA query/key slices used before attention.
 
 ## Operation Semantics
 
@@ -24,21 +24,22 @@ The generator can also produce optional output buffers. When output buffers are
 present, the operation writes rotated values there instead of mutating the
 corresponding input.
 
-### MLA RoPE FP8 Quantization
+### MLA RoPE
 
-`MLARopeQuantizeFP8Inputs` represents a fused operation over decomposed query
-and key tensors:
+`MLARopeInputs` generates decomposed query and key tensors for MLA-style rotary
+embedding:
 
 ```text
 q_rope_rot = rope(q_rope, positions, cos_sin_cache)
 k_rope_rot = rope(k_rope, positions, cos_sin_cache)
-q_nope_fp8 = fp8(q_nope * quant_scale_q)
-q_rope_fp8 = fp8(q_rope_rot * quant_scale_q)
-k_nope_fp8 = fp8(k_nope * quant_scale_kv)
-k_rope_fp8 = fp8(k_rope_rot * quant_scale_kv)
-query = concat(q_nope_fp8, q_rope_fp8, dim=-1)
-key = concat(k_nope_fp8, k_rope_fp8, dim=-1)
+query = concat(q_nope, q_rope_rot, dim=-1)
+key = concat(k_nope, k_rope_rot, dim=-1)
 ```
+
+The dtype of every generated Q/K slice is configured by `dtype`. The generator
+does not select an output dtype, quantize the slices, or allocate output
+buffers. Consumers that test a fused quantizing implementation provide those
+operation-specific values themselves.
 
 The query inputs are rank-3 tensors:
 
@@ -55,11 +56,6 @@ Rank-3 key tensors model explicit GQA/MHA KV heads:
 
 - `k_nope[num_tokens, num_kv_heads, qk_nope_head_dim]`
 - `k_rope[num_tokens, num_kv_heads, qk_rope_head_dim]`
-
-The generated output buffers have the same shapes as their corresponding input
-slices and FP8 dtype. Executing the represented operation produces the rotated,
-quantized slices; concatenating each NOPE/RoPE pair produces the full query or
-key tensor.
 
 ## Fused KV Writes
 
@@ -85,16 +81,14 @@ The generator rejects invalid RoPE inputs before values are returned:
 - input dtype must be a regular floating torch dtype
 - position and cache-location dtypes must be int32 or int64
 - fused KV cache size must be large enough for unique generated cache locations
-- MLA RoPE FP8 input dtype must be fp16 or bf16
-- MLA RoPE FP8 output dtype must be FP8 E4M3 or FP8 E5M2
-- MLA RoPE FP8 PE dimensions must be even and match between query and key
+- MLA RoPE Q/K dtype must be fp16, bf16, fp32, fp64, or a supported builtin
+  FP8 dtype
+- MLA RoPE PE dimensions must be even and match between query and key
 - rank-2 MLA key tensors use an implicit shared KV head
-- RoPE FP8 quantization scales must be positive
 
 Positions and cache locations are generated from `metadata_seed`, while query,
-key, value, and MLA RoPE FP8 tensors are generated from `seed`. This lets
-callers keep the same positional/cache metadata across different random tensor
-draws.
+key, value, and MLA RoPE tensors are generated from `seed`. This lets callers
+keep the same positional/cache metadata across different random tensor draws.
 
 ## TokenSpeed API Mapping
 
@@ -110,11 +104,11 @@ mode, layout, fused KV writes, and output buffers. Backend selection is an
 adapter concern; the generator only defines the operation-level Q/K tensors,
 positions, RoPE cache, and optional cache-write values.
 
-TokenSpeed's FlashInfer `mla_rope_quantize_fp8(...)` wrapper consumes the MLA
-RoPE FP8 values directly: the generated input slices, `cos_sin_cache`,
-`positions`, FP8 output buffers, layout flag, and quantization scales. The
-generator does not depend on FlashInfer; tests can adapt the values into that
-wrapper when the backend is available.
+TokenSpeed's FlashInfer `mla_rope_quantize_fp8(...)` wrapper consumes the input
+slices, `cos_sin_cache`, and `positions` from `MLARopeInputValues`. Its adapter
+selects the FP8 dtype and quantization scales and allocates the four FP8 output
+buffers. Those details belong to that fused kernel rather than the standalone
+MLA RoPE generator.
 
 Reference implementations are consumer concerns and are intentionally not
 part of the input-generator package. TokenSpeed keeps its RoPE references in

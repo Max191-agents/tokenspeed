@@ -28,7 +28,7 @@ from typing import Any
 import torch
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-from tokenspeed_numerics_input_generators import MLARopeQuantizeFP8InputValues
+from tokenspeed_numerics_input_generators import MLARopeInputValues
 
 
 def _check_rope_dims(*, head_size: int, rotary_dim: int) -> None:
@@ -166,7 +166,12 @@ class MLARopeQuantizeFP8ReferenceValues:
 
 
 def mla_rope_quantize_fp8_reference(
-    values: MLARopeQuantizeFP8InputValues,
+    values: MLARopeInputValues,
+    *,
+    fp8_dtype: torch.dtype,
+    quant_scale_q: float,
+    quant_scale_kv: float,
+    is_neox: bool,
 ) -> MLARopeQuantizeFP8ReferenceValues:
     """Return expected FP8 query/key outputs for fused MLA RoPE quantization."""
 
@@ -216,58 +221,35 @@ def mla_rope_quantize_fp8_reference(
             "q/k nope dimensions must match; got "
             f"{values.q_nope.shape[-1]} and {values.k_nope.shape[-1]}"
         )
-    if values.fp8_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-        raise ValueError(
-            f"fp8_dtype must be an FP8 torch dtype, got {values.fp8_dtype}"
-        )
-    for name, tensor, expected_shape in (
-        ("q_rope_out", values.q_rope_out, values.q_rope.shape),
-        ("k_rope_out", values.k_rope_out, values.k_rope.shape),
-        ("q_nope_out", values.q_nope_out, values.q_nope.shape),
-        ("k_nope_out", values.k_nope_out, values.k_nope.shape),
-    ):
-        if tuple(tensor.shape) != tuple(expected_shape):
-            raise ValueError(
-                f"{name} must have shape {tuple(expected_shape)}, "
-                f"got {tuple(tensor.shape)}"
-            )
-        if tensor.dtype != values.fp8_dtype:
-            raise ValueError(
-                f"{name} must have dtype {values.fp8_dtype}, got {tensor.dtype}"
-            )
+    if fp8_dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        raise ValueError(f"fp8_dtype must be an FP8 torch dtype, got {fp8_dtype}")
     if values.positions.dtype not in (torch.int32, torch.int64):
         raise ValueError(
             f"positions must be int32 or int64, got {values.positions.dtype}"
         )
-    if values.quant_scale_q <= 0.0:
-        raise ValueError(f"quant_scale_q must be positive, got {values.quant_scale_q}")
-    if values.quant_scale_kv <= 0.0:
-        raise ValueError(
-            f"quant_scale_kv must be positive, got {values.quant_scale_kv}"
-        )
+    quant_scale_q = float(quant_scale_q)
+    quant_scale_kv = float(quant_scale_kv)
+    if quant_scale_q <= 0.0:
+        raise ValueError(f"quant_scale_q must be positive, got {quant_scale_q}")
+    if quant_scale_kv <= 0.0:
+        raise ValueError(f"quant_scale_kv must be positive, got {quant_scale_kv}")
 
     q_rope = _apply_rope_to_pe_slice(
         values.q_rope,
         values.positions,
         values.cos_sin_cache,
-        is_neox=values.is_neox,
+        is_neox=is_neox,
     )
     k_rope = _apply_rope_to_pe_slice(
         values.k_rope,
         values.positions,
         values.cos_sin_cache,
-        is_neox=values.is_neox,
+        is_neox=is_neox,
     )
-    q_nope = (
-        (values.q_nope.float() * values.quant_scale_q).to(values.fp8_dtype).contiguous()
-    )
-    q_rope = (q_rope.float() * values.quant_scale_q).to(values.fp8_dtype).contiguous()
-    k_nope = (
-        (values.k_nope.float() * values.quant_scale_kv)
-        .to(values.fp8_dtype)
-        .contiguous()
-    )
-    k_rope = (k_rope.float() * values.quant_scale_kv).to(values.fp8_dtype).contiguous()
+    q_nope = (values.q_nope.float() * quant_scale_q).to(fp8_dtype).contiguous()
+    q_rope = (q_rope.float() * quant_scale_q).to(fp8_dtype).contiguous()
+    k_nope = (values.k_nope.float() * quant_scale_kv).to(fp8_dtype).contiguous()
+    k_rope = (k_rope.float() * quant_scale_kv).to(fp8_dtype).contiguous()
     return MLARopeQuantizeFP8ReferenceValues(
         query=torch.cat((q_nope, q_rope), dim=-1).contiguous(),
         key=torch.cat((k_nope, k_rope), dim=-1).contiguous(),
