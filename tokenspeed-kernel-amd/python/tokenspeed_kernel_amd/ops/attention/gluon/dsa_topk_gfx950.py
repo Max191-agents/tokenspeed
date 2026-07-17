@@ -857,6 +857,104 @@ def _dsa_persistent_radix_topk_row_pool_kernel(
         local_row += gl.num_programs(0)
 
 
+@gluon.jit(
+    do_not_specialize=(
+        "logits_stride",
+        "block_table_stride",
+        "block_table_cols",
+        "n_cols",
+        "main_rows",
+    ),
+)
+def _dsa_persistent_radix_topk_heterogeneous_kernel(
+    logits,
+    histograms,
+    pass_arrivals,
+    pass_done,
+    reset_arrivals,
+    output_counters,
+    block_table,
+    row_starts,
+    row_ends,
+    out,
+    lens_out,
+    logits_stride,
+    block_table_stride,
+    out_stride: gl.constexpr,
+    block_table_cols,
+    n_cols,
+    main_rows,
+    page_size: gl.constexpr,
+    q_len_per_req: gl.constexpr,
+    IS_DECODE: gl.constexpr,
+    MAIN_GROUPS_PER_ROW: gl.constexpr,
+    TAIL_GROUPS_PER_ROW: gl.constexpr,
+    TOPK: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+):
+    program = gl.program_id(0)
+    main_programs = main_rows * MAIN_GROUPS_PER_ROW
+    if program < main_programs:
+        row = program // MAIN_GROUPS_PER_ROW
+        group = program - row * MAIN_GROUPS_PER_ROW
+        _dsa_persistent_radix_topk_row(
+            row,
+            group,
+            logits,
+            histograms,
+            pass_arrivals,
+            pass_done,
+            reset_arrivals,
+            output_counters,
+            block_table,
+            row_starts,
+            row_ends,
+            out,
+            lens_out,
+            logits_stride,
+            block_table_stride,
+            out_stride,
+            block_table_cols,
+            n_cols,
+            page_size,
+            q_len_per_req,
+            IS_DECODE,
+            MAIN_GROUPS_PER_ROW,
+            TOPK,
+            BLOCK_N,
+        )
+    else:
+        tail_program = program - main_programs
+        tail_row = tail_program // TAIL_GROUPS_PER_ROW
+        group = tail_program - tail_row * TAIL_GROUPS_PER_ROW
+        _dsa_persistent_radix_topk_row(
+            main_rows + tail_row,
+            group,
+            logits,
+            histograms,
+            pass_arrivals,
+            pass_done,
+            reset_arrivals,
+            output_counters,
+            block_table,
+            row_starts,
+            row_ends,
+            out,
+            lens_out,
+            logits_stride,
+            block_table_stride,
+            out_stride,
+            block_table_cols,
+            n_cols,
+            page_size,
+            q_len_per_req,
+            IS_DECODE,
+            TAIL_GROUPS_PER_ROW,
+            TOPK,
+            BLOCK_N,
+        )
+
+
 @gluon.jit
 def _find_topk_threshold_key(
     values,
@@ -3455,6 +3553,85 @@ def _dsa_persistent_decode_topk_split_rows(
             out=out,
             lens_out=lens_out,
         )
+    return out, lens_out
+
+
+def _persistent_decode_heterogeneous_plan(
+    rows: int,
+    cols: int,
+    topk: int,
+    device: torch.device,
+) -> tuple[int, int, int, int] | None:
+    if rows <= 0 or rows & (rows - 1) == 0:
+        return None
+    main_groups = _persistent_decode_groups(rows, cols, topk, device)
+    if main_groups is None:
+        return None
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    compute_units = _device_compute_units(device_index)
+    main_rows = 1 << (rows.bit_length() - 1)
+    tail_rows = rows - main_rows
+    remaining_workgroups = compute_units - main_rows * main_groups
+    width_groups = _next_power_of_two(
+        triton.cdiv(int(cols), _PERSISTENT_PREFILL_BLOCK_N)
+    )
+    tail_resident_groups = remaining_workgroups // tail_rows
+    if tail_resident_groups > 8:
+        tail_resident_groups = 1 << (tail_resident_groups.bit_length() - 1)
+    tail_groups = min(width_groups, tail_resident_groups)
+    if tail_groups <= main_groups:
+        return None
+    return main_rows, main_groups, tail_rows, tail_groups
+
+
+def _dsa_persistent_decode_topk_heterogeneous(
+    logits: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    q_len_per_req: int,
+    main_rows: int,
+    main_groups: int,
+    tail_rows: int,
+    tail_groups: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    workspace = _persistent_topk_workspace(logits.shape[0], logits.device)
+    histograms, pass_arrivals, pass_done, reset_arrivals, output_counters = workspace
+    grid = (main_rows * main_groups + tail_rows * tail_groups,)
+    _dsa_persistent_radix_topk_heterogeneous_kernel[grid](
+        logits,
+        histograms,
+        pass_arrivals,
+        pass_done,
+        reset_arrivals,
+        output_counters,
+        block_table,
+        seq_lens,
+        seq_lens,
+        out,
+        lens_out,
+        logits.stride(0),
+        block_table.stride(0),
+        out.stride(0),
+        block_table_cols=block_table.shape[1],
+        n_cols=logits.shape[1],
+        main_rows=main_rows,
+        page_size=page_size,
+        q_len_per_req=q_len_per_req,
+        IS_DECODE=True,
+        MAIN_GROUPS_PER_ROW=main_groups,
+        TAIL_GROUPS_PER_ROW=tail_groups,
+        TOPK=topk,
+        BLOCK_N=_PERSISTENT_PREFILL_BLOCK_N,
+        num_warps=_PERSISTENT_PREFILL_NUM_WARPS,
+    )
     return out, lens_out
 
 

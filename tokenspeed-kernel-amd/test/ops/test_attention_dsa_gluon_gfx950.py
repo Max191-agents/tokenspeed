@@ -1942,6 +1942,213 @@ def test_dsa_persistent_decode_split_plan_fills_resident_workgroups(
 
 
 @pytest.mark.parametrize(
+    ("rows", "cols", "expected"),
+    (
+        (33, 90048, (32, 7, 1, 8)),
+        (36, 90048, (32, 7, 4, 8)),
+        (5, 90048, None),
+        (5, 1024 * 1024, (4, 32, 1, 64)),
+        (33, 1024 * 1024, (32, 7, 1, 32)),
+        (128, 512 * 1024, None),
+        (129, 512 * 1024, None),
+    ),
+)
+def test_dsa_persistent_decode_heterogeneous_plan_obeys_residency(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: int,
+    cols: int,
+    expected: tuple[int, int, int, int] | None,
+) -> None:
+    monkeypatch.setattr(dsa_topk_gfx950, "_device_compute_units", lambda _: 256)
+
+    plan = dsa_topk_gfx950._persistent_decode_heterogeneous_plan(
+        rows,
+        cols,
+        2048,
+        torch.device("cuda", 0),
+    )
+
+    assert plan == expected
+    if plan is not None:
+        main_rows, main_groups, tail_rows, tail_groups = plan
+        assert main_rows + tail_rows == rows
+        assert main_rows * main_groups + tail_rows * tail_groups <= 256
+
+
+def test_dsa_persistent_decode_heterogeneous_groups_are_constexpr() -> None:
+    params = {
+        param.name: param
+        for param in (
+            dsa_topk_gfx950._dsa_persistent_radix_topk_heterogeneous_kernel.params
+        )
+    }
+
+    assert params["MAIN_GROUPS_PER_ROW"].is_constexpr
+    assert params["TAIL_GROUPS_PER_ROW"].is_constexpr
+
+
+@pytest.mark.parametrize(
+    ("rows", "cols", "q_len_per_req", "final_seq_len"),
+    (
+        (33, 90048, 3, 2049),
+        (36, 90048, 4, 90031),
+        (5, 1024 * 1024, 1, 1024 * 1024 - 17),
+    ),
+)
+def test_dsa_persistent_decode_heterogeneous_repeat_and_reset(
+    rows: int,
+    cols: int,
+    q_len_per_req: int,
+    final_seq_len: int,
+) -> None:
+    page_size = 64
+    topk = 2048
+    requests = rows // q_len_per_req
+    request_ids = torch.arange(requests, device="cuda", dtype=torch.int32)
+    seq_lens = cols - (request_ids * 53 + 17) % 1024
+    seq_lens[-1] = final_seq_len
+    generator = _generator("cuda", 8937 + rows)
+    logits = torch.randn(
+        (rows, cols),
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    )
+    block_table = _make_reversed_decode_block_table(requests, cols, page_size)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    plan = dsa_topk_gfx950._persistent_decode_heterogeneous_plan(
+        rows,
+        cols,
+        topk,
+        logits.device,
+    )
+    assert plan is not None
+    main_rows, main_groups, tail_rows, tail_groups = plan
+
+    for _ in range(2):
+        out.fill_(-7)
+        lens_out.fill_(-7)
+        dsa_topk_gfx950._dsa_persistent_decode_topk_heterogeneous(
+            logits,
+            block_table,
+            seq_lens,
+            page_size=page_size,
+            topk=topk,
+            q_len_per_req=q_len_per_req,
+            main_rows=main_rows,
+            main_groups=main_groups,
+            tail_rows=tail_rows,
+            tail_groups=tail_groups,
+            out=out,
+            lens_out=lens_out,
+        )
+        _assert_decode_topk_slots(
+            logits,
+            out,
+            lens_out,
+            seq_lens,
+            block_table,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            topk=topk,
+        )
+        workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+        _assert_persistent_workspace_reset(workspace)
+
+
+@pytest.mark.parametrize("warm_workspace", (False, True), ids=("cold-key", "warm-key"))
+def test_dsa_persistent_decode_heterogeneous_is_graph_capturable(
+    warm_workspace: bool,
+) -> None:
+    page_size = 64
+    q_len_per_req = 3
+    requests = 11
+    rows = requests * q_len_per_req
+    cols = 90048
+    topk = 2048
+    request_ids = torch.arange(requests, device="cuda", dtype=torch.int32)
+    seq_lens = cols - (request_ids * 53 + 17) % 1024
+    seq_lens[-1] = 2049
+    generator = _generator("cuda", 8947)
+    logits = torch.randn(
+        (rows, cols),
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    )
+    block_table = _make_reversed_decode_block_table(requests, cols, page_size)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    plan = dsa_topk_gfx950._persistent_decode_heterogeneous_plan(
+        rows,
+        cols,
+        topk,
+        logits.device,
+    )
+    assert plan is not None
+    main_rows, main_groups, tail_rows, tail_groups = plan
+
+    def invoke() -> None:
+        dsa_topk_gfx950._dsa_persistent_decode_topk_heterogeneous(
+            logits,
+            block_table,
+            seq_lens,
+            page_size=page_size,
+            topk=topk,
+            q_len_per_req=q_len_per_req,
+            main_rows=main_rows,
+            main_groups=main_groups,
+            tail_rows=tail_rows,
+            tail_groups=tail_groups,
+            out=out,
+            lens_out=lens_out,
+        )
+
+    invoke()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    device_index = logits.device.index
+    assert device_index is not None
+    workspace_key = (
+        device_index,
+        int(capture_stream.cuda_stream),
+        dsa_topk_gfx950._next_power_of_two(rows),
+    )
+    assert workspace_key not in dsa_topk_gfx950._persistent_topk_workspace_cache
+    if warm_workspace:
+        with torch.cuda.stream(capture_stream):
+            invoke()
+        capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        invoke()
+    capture_stream.synchronize()
+    graph_workspace = dsa_topk_gfx950._persistent_topk_workspace_cache[workspace_key]
+    _assert_persistent_workspace_layout(graph_workspace, rows)
+    if warm_workspace:
+        _assert_persistent_workspace_reset(graph_workspace)
+
+    for _ in range(2):
+        out.fill_(-7)
+        lens_out.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_decode_topk_slots(
+            logits,
+            out,
+            lens_out,
+            seq_lens,
+            block_table,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            topk=topk,
+        )
+        _assert_persistent_workspace_reset(graph_workspace)
+
+
+@pytest.mark.parametrize(
     ("rows", "q_len_per_req"),
     ((129, 1), (132, 4)),
 )
