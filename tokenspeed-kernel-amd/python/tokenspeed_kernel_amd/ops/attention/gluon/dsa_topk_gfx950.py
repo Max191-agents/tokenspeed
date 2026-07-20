@@ -513,18 +513,19 @@ def _dsa_persistent_radix_topk_row(
         group_bucket = gl.where(select_low, bucket_low, bucket_high)
         group_selected_before = before_group + gl.where(select_low, 0, count_low)
         group_selected_count = gl.where(select_low, count_low, count_high)
-        selected_bucket = gl.sum(
-            gl.where(selected_group, group_bucket, 0),
+        # Exactly one pair is selected, and its first two fields are each 11 bits.
+        packed_selection = (
+            group_bucket.to(gl.uint64)
+            | (group_selected_before.to(gl.uint64) << 11)
+            | (group_selected_count.to(gl.uint64) << 22)
+        )
+        packed_selection = gl.sum(
+            gl.where(selected_group, packed_selection, 0),
             axis=0,
-        ).to(gl.int32)
-        selected_greater = gl.sum(
-            gl.where(selected_group, group_selected_before, 0),
-            axis=0,
-        ).to(gl.int32)
-        selected_bucket_count = gl.sum(
-            gl.where(selected_group, group_selected_count, 0),
-            axis=0,
-        ).to(gl.int32)
+        )
+        selected_bucket = (packed_selection & 0x7FF).to(gl.int32)
+        selected_greater = ((packed_selection >> 11) & 0x7FF).to(gl.int32)
+        selected_bucket_count = (packed_selection >> 22).to(gl.int32)
         threshold |= selected_bucket.to(gl.uint32) << shift
         threshold_shift = shift
         remaining -= selected_greater

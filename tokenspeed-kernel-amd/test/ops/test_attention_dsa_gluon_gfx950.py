@@ -1362,6 +1362,51 @@ def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
     )
 
 
+def test_dsa_persistent_prefill_handles_packed_selection_boundaries() -> None:
+    rows = 64
+    cols = 262144
+    topk = 2048
+    row_starts = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    row_ends = torch.full((rows,), cols, device="cuda", dtype=torch.int32)
+    logits = torch.full(
+        (rows, cols),
+        -float("inf"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    logits[:, : topk - 1] = float("inf")
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        == 4
+    )
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_topk_indices(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    assert bool(((out >= 0) & (out < topk - 1)).sum(dim=1).eq(topk - 1).all())
+
+
 def test_dsa_persistent_prefill_topk_handles_ragged_rows() -> None:
     rows = 64
     cols = 131072
