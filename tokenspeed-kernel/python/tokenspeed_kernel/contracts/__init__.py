@@ -18,33 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
-import pytest
-import torch
-from tokenspeed_kernel import hadamard_transform
-from tokenspeed_kernel.operation import OperationRegistry
-
-torch.manual_seed(42)
-
-
-@pytest.mark.parametrize("solution", ["triton", "fast_hadamard_transform"])
-def test_hadamard_transform(device: str, solution: str, require) -> None:
-    dtype = torch.bfloat16
-    require("transform", "hadamard_transform", solution, dtype, "x")
-
-    x = torch.randn((3, 5, 128), device=device, dtype=dtype)
-    scale = 128**-0.5
-
-    out = hadamard_transform(x, scale=scale, solution=solution)
-    schema = OperationRegistry.get().lookup("transform", "hadamard_transform")
-    expected = schema.reference(x, scale=scale)
-
-    assert out.shape == x.shape
-    assert out.dtype == x.dtype
-    torch.testing.assert_close(
-        out.float(),
-        expected.float(),
-        atol=2.0e-2,
-        rtol=2.0e-2,
-    )
+"""Backend-independent operation contracts."""
