@@ -77,13 +77,30 @@ def test_dsa_topk_has_no_superseded_decode_paths() -> None:
     assert not any(hasattr(dsa_topk_gfx950, name) for name in removed_symbols)
 
 
-def test_dsa_topk_has_no_superseded_grouped_prefill_path() -> None:
+def test_dsa_topk_has_no_superseded_staged_prefill_paths() -> None:
     removed_symbols = (
+        "_RADIX_TOPK_BLOCK_N",
+        "_PREFILL_RADIX_BITS",
+        "_PREFILL_RADIX_BUCKETS",
+        "_PREFILL_RADIX_SCHEDULE",
         "_PREFILL_RADIX_BLOCK_N",
         "_PREFILL_RADIX_HIST_TARGET_GROUPS_PER_CU",
+        "_PREFILL_RADIX_SCATTER_TARGET_GROUPS_PER_CU",
+        "_PREFILL_LOCAL_GROUP_PREFIX_MIN_COLS",
+        "_PREFILL_HIST_DERIVED_MIN_COLS",
+        "_fp32_to_ordered_key",
+        "_dsa_prefill_radix_init_kernel",
+        "_dsa_prefill_wide_radix_grouped_hist_kernel",
+        "_dsa_prefill_wide_radix_update_kernel",
+        "_dsa_prefill_derive_group_counts_from_hist_kernel",
         "_dsa_prefill_radix_scatter_kernel",
+        "_dsa_prefill_radix_group_count_kernel",
+        "_dsa_radix_group_prefix_kernel",
+        "_dsa_prefill_radix_deterministic_scatter_kernel",
+        "_radix_groups_per_row",
         "_run_prefill_wide_radix_prefix_passes",
         "_dsa_prefill_radix_topk",
+        "_dsa_prefill_hist_derived_radix_topk",
     )
 
     assert not any(hasattr(dsa_topk_gfx950, name) for name in removed_symbols)
@@ -1005,7 +1022,7 @@ def test_dsa_prefill_topk_oneblock_falls_back_for_large_tie_bucket() -> None:
     assert torch.unique(selected).numel() == topk
 
 
-def _make_grouped_radix_logits(
+def _make_topk_test_logits(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     *,
@@ -1039,7 +1056,7 @@ def _make_grouped_radix_logits(
     return logits
 
 
-def _assert_grouped_radix_topk(
+def _assert_topk_indices(
     logits: torch.Tensor,
     actual: torch.Tensor,
     actual_lens: torch.Tensor,
@@ -1187,7 +1204,7 @@ def test_dsa_prefill_topk_dispatches_persistent_groups_across_rows(
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 17
     row_ends = cols - (rows - 1 - row_ids) * 31
-    logits = _make_grouped_radix_logits(
+    logits = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -1212,7 +1229,7 @@ def test_dsa_prefill_topk_dispatches_persistent_groups_across_rows(
         lens_out=lens_out,
     )
 
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -1232,7 +1249,7 @@ def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 17
     row_ends = cols - (rows - 1 - row_ids) * 31
-    logits = _make_grouped_radix_logits(
+    logits = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -1249,7 +1266,7 @@ def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
         out=out,
         lens_out=lens_out,
     )
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -1268,7 +1285,7 @@ def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
         lens_out=lens_out,
     )
 
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -1316,7 +1333,7 @@ def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
         out=out,
         lens_out=lens_out,
     )
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -1335,7 +1352,7 @@ def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
         lens_out=lens_out,
     )
 
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -1352,7 +1369,7 @@ def test_dsa_persistent_prefill_topk_handles_ragged_rows() -> None:
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 17
     row_ends = cols - (rows - 1 - row_ids) * 31
-    logits = _make_grouped_radix_logits(
+    logits = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -1369,7 +1386,7 @@ def test_dsa_persistent_prefill_topk_handles_ragged_rows() -> None:
         out=out,
         lens_out=lens_out,
     )
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -1386,7 +1403,7 @@ def test_dsa_persistent_prefill_topk_handles_ragged_rows() -> None:
         lens_out=lens_out,
     )
 
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -1403,7 +1420,7 @@ def test_dsa_prefill_topk_90k_boundary_keeps_exact_values() -> None:
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 19
     row_ends = cols - (rows - 1 - row_ids) * 29
-    logits = _make_grouped_radix_logits(
+    logits = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -1421,7 +1438,7 @@ def test_dsa_prefill_topk_90k_boundary_keeps_exact_values() -> None:
         lens_out=lens_out,
     )
 
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -1488,7 +1505,7 @@ def test_dsa_decode_topk_dispatches_persistent_radix_for_batched_queries() -> No
         -1
     )
     row_starts = torch.zeros((rows,), device="cuda", dtype=torch.int32)
-    logits = _make_grouped_radix_logits(
+    logits = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -1513,7 +1530,7 @@ def test_dsa_decode_topk_dispatches_persistent_radix_for_batched_queries() -> No
         lens_out=lens_out,
     )
 
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -1634,7 +1651,7 @@ def test_dsa_decode_topk_maps_grouped_queries_to_physical_slots(
         -1
     )
     row_starts = torch.zeros((rows,), device="cuda", dtype=torch.int32)
-    logits = _make_grouped_radix_logits(
+    logits = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -1689,7 +1706,7 @@ def test_dsa_decode_topk_persistent_replaces_staged_wide(
         cols - (torch.arange(rows, device="cuda", dtype=torch.int32) * 53 + 17) % 1024
     )
     row_starts = torch.zeros((rows,), device="cuda", dtype=torch.int32)
-    logits = _make_grouped_radix_logits(
+    logits = _make_topk_test_logits(
         row_starts,
         seq_lens,
         cols=cols,
@@ -1927,6 +1944,9 @@ def test_dsa_persistent_interleaved_decode_uses_one_sided_tile_masks() -> None:
         (129, 90048, 2048),
         (514, 90048, 2048),
         (129, 262208, 2048),
+        (33, 512 * 1024, 512),
+        (65, 512 * 1024, 1024),
+        (129, 512 * 1024, 2048),
     ),
 )
 def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
@@ -1937,7 +1957,7 @@ def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = 257 + row_ids % 113
     row_ends = cols - (rows - 1 - row_ids) % 1021
-    logits = _make_grouped_radix_logits(
+    logits = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -1961,7 +1981,6 @@ def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
         <= cols
         <= dsa_topk_gfx950._PREFILL_RUNTIME_RADIX_MAX_COLS
     )
-    assert cols < dsa_topk_gfx950._PREFILL_HIST_DERIVED_MIN_COLS
     assert (
         dsa_topk_gfx950._persistent_interleaved_plan(
             rows,
@@ -1983,7 +2002,7 @@ def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
             out=out,
             lens_out=lens_out,
         )
-        _assert_grouped_radix_topk(
+        _assert_topk_indices(
             logits,
             out,
             lens_out,
@@ -2040,7 +2059,7 @@ def test_dsa_persistent_prefill_interleaved_respects_causal_ranges() -> None:
         lens_out=lens_out,
     )
 
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -2057,12 +2076,12 @@ def test_dsa_persistent_prefill_interleaved_is_graph_capturable(
     warm_workspace: bool,
 ) -> None:
     rows = 33
-    cols = 90048
+    cols = 512 * 1024
     topk = 512
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = 131 + row_ids * 7
     row_ends = cols - (rows - 1 - row_ids) * 19
-    logits = _make_grouped_radix_logits(
+    logits = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -2071,6 +2090,24 @@ def test_dsa_persistent_prefill_interleaved_is_graph_capturable(
     )
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        is None
+    )
+    assert (
+        dsa_topk_gfx950._persistent_interleaved_plan(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        is not None
+    )
 
     def invoke() -> None:
         dsa_topk_gfx950._dsa_prefill_topk_indices(
@@ -2110,7 +2147,7 @@ def test_dsa_persistent_prefill_interleaved_is_graph_capturable(
         lens_out.fill_(-7)
         graph.replay()
         torch.cuda.synchronize()
-        _assert_grouped_radix_topk(
+        _assert_topk_indices(
             logits,
             out,
             lens_out,
@@ -2313,14 +2350,14 @@ def test_dsa_persistent_decode_is_stream_local() -> None:
         -1
     )
     row_starts = torch.zeros_like(row_ends)
-    logits_a = _make_grouped_radix_logits(
+    logits_a = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
         topk=topk,
         seed=6907,
     )
-    logits_b = _make_grouped_radix_logits(
+    logits_b = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -2403,7 +2440,7 @@ def test_dsa_persistent_decode_is_stream_local() -> None:
     _assert_persistent_workspace_reset(workspace_b)
 
 
-def test_dsa_prefill_topk_hist_derived_handles_shifted_and_inf_rows() -> None:
+def test_dsa_persistent_prefill_interleaved_handles_shifted_and_inf_rows() -> None:
     rows = 4
     cols = 524288
     topk = 2048
@@ -2429,6 +2466,24 @@ def test_dsa_prefill_topk_hist_derived_handles_shifted_and_inf_rows() -> None:
     logits[2, row_starts[2] : row_starts[2] + 37] = float("inf")
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        is None
+    )
+    assert (
+        dsa_topk_gfx950._persistent_interleaved_plan(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        is not None
+    )
 
     dsa_topk_gfx950._dsa_prefill_topk_indices(
         logits,
@@ -2439,7 +2494,7 @@ def test_dsa_prefill_topk_hist_derived_handles_shifted_and_inf_rows() -> None:
         lens_out=lens_out,
     )
 
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -2447,6 +2502,9 @@ def test_dsa_prefill_topk_hist_derived_handles_shifted_and_inf_rows() -> None:
         row_ends,
         topk=topk,
     )
+    workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+    _assert_persistent_workspace_layout(workspace, rows)
+    _assert_persistent_workspace_reset(workspace)
 
 
 @pytest.mark.parametrize("cols", [131072, 262144], ids=["two-groups", "four-groups"])
@@ -2458,7 +2516,7 @@ def test_dsa_prefill_homogeneous_persistent_topk_is_graph_capturable(
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 11
     row_ends = cols - (rows - 1 - row_ids) * 19
-    logits = _make_grouped_radix_logits(
+    logits = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -2493,7 +2551,7 @@ def test_dsa_prefill_homogeneous_persistent_topk_is_graph_capturable(
     out.fill_(-7)
     graph.replay()
 
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -2510,14 +2568,14 @@ def test_dsa_prefill_homogeneous_persistent_topk_is_stream_local(cols: int) -> N
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 13
     row_ends = cols - (rows - 1 - row_ids) * 23
-    logits_a = _make_grouped_radix_logits(
+    logits_a = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
         topk=topk,
         seed=2907,
     )
-    logits_b = _make_grouped_radix_logits(
+    logits_b = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -2555,7 +2613,7 @@ def test_dsa_prefill_homogeneous_persistent_topk_is_stream_local(cols: int) -> N
     current_stream.wait_stream(stream_a)
     current_stream.wait_stream(stream_b)
 
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits_a,
         out_a,
         lens_a,
@@ -2563,7 +2621,7 @@ def test_dsa_prefill_homogeneous_persistent_topk_is_stream_local(cols: int) -> N
         row_ends,
         topk=topk,
     )
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits_b,
         out_b,
         lens_b,
@@ -2583,7 +2641,7 @@ def test_dsa_persistent_prefill_topk_is_graph_capturable(
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 11
     row_ends = cols - (rows - 1 - row_ids) * 19
-    logits = _make_grouped_radix_logits(
+    logits = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -2666,7 +2724,7 @@ def test_dsa_persistent_prefill_topk_is_graph_capturable(
     graph.replay()
     torch.cuda.synchronize()
 
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits,
         out,
         lens_out,
@@ -2684,14 +2742,14 @@ def test_dsa_persistent_prefill_topk_is_stream_local() -> None:
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 13
     row_ends = cols - (rows - 1 - row_ids) * 23
-    logits_a = _make_grouped_radix_logits(
+    logits_a = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
         topk=topk,
         seed=2907,
     )
-    logits_b = _make_grouped_radix_logits(
+    logits_b = _make_topk_test_logits(
         row_starts,
         row_ends,
         cols=cols,
@@ -2743,7 +2801,7 @@ def test_dsa_persistent_prefill_topk_is_stream_local() -> None:
     current_stream.wait_stream(stream_a)
     current_stream.wait_stream(stream_b)
 
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits_a,
         out_a,
         lens_a,
@@ -2751,7 +2809,7 @@ def test_dsa_persistent_prefill_topk_is_stream_local() -> None:
         row_ends,
         topk=topk,
     )
-    _assert_grouped_radix_topk(
+    _assert_topk_indices(
         logits_b,
         out_b,
         lens_b,
