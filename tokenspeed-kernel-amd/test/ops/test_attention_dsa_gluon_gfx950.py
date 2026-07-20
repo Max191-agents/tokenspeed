@@ -1183,6 +1183,17 @@ def test_dsa_persistent_pass_arrival_uses_monotonic_generations() -> None:
     assert source.count("pass_arrivals + row * _PERSISTENT_PREFILL_COUNTER_STRIDE") == 2
 
 
+def test_dsa_persistent_prefill_tail_is_compile_time_specialized() -> None:
+    row_source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_row.fn)
+    launch_source = inspect.getsource(
+        dsa_topk_gfx950._dsa_persistent_prefill_radix_topk
+    )
+
+    assert "HAS_TAIL: gl.constexpr" in row_source
+    assert row_source.count("if HAS_TAIL:") == 2
+    assert "HAS_TAIL=cols % _PERSISTENT_PREFILL_BLOCK_N != 0" in launch_source
+
+
 @pytest.mark.parametrize(
     ("rows", "cols", "expected_groups"),
     (

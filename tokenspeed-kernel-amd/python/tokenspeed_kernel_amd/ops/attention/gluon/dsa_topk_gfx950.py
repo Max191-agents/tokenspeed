@@ -281,6 +281,7 @@ def _dsa_persistent_radix_topk_row(
     GROUPS_PER_ROW: gl.constexpr,
     TOPK: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    HAS_TAIL: gl.constexpr,
 ):
     value_layout: gl.constexpr = _vector_layout(
         BLOCK_N,
@@ -435,22 +436,24 @@ def _dsa_persistent_radix_topk_row(
                 mask=prefix_match,
             )
 
-        if (tail_size != 0) & (group == tail_owner):
-            _persistent_histogram_tail(
-                row_logits,
-                shared_histogram,
-                row_start,
-                row_end,
-                n_cols,
-                full_tiles,
-                pass_index,
-                threshold_shift,
-                threshold,
-                shift,
-                bucket_mask,
-                BLOCK_N,
-                value_layout,
-            )
+        # Compile out the noinline tail call for aligned tensor widths.
+        if HAS_TAIL:
+            if group == tail_owner:
+                _persistent_histogram_tail(
+                    row_logits,
+                    shared_histogram,
+                    row_start,
+                    row_end,
+                    n_cols,
+                    full_tiles,
+                    pass_index,
+                    threshold_shift,
+                    threshold,
+                    shift,
+                    bucket_mask,
+                    BLOCK_N,
+                    value_layout,
+                )
 
         gl.barrier()
         local_counts = shared_histogram.load(hist_layout)
@@ -572,22 +575,23 @@ def _dsa_persistent_radix_topk_row(
             mask=equal & (reservation < TOPK),
         )
 
-    if (tail_size != 0) & (group == tail_owner):
-        _persistent_emit_tail(
-            row_logits,
-            shared_output_counters,
-            shared_greater_offsets,
-            shared_equal_offsets,
-            row_start,
-            row_end,
-            n_cols,
-            full_tiles,
-            threshold_shift,
-            threshold,
-            TOPK,
-            BLOCK_N,
-            value_layout,
-        )
+    if HAS_TAIL:
+        if group == tail_owner:
+            _persistent_emit_tail(
+                row_logits,
+                shared_output_counters,
+                shared_greater_offsets,
+                shared_equal_offsets,
+                row_start,
+                row_end,
+                n_cols,
+                full_tiles,
+                threshold_shift,
+                threshold,
+                TOPK,
+                BLOCK_N,
+                value_layout,
+            )
 
     gl.barrier()
     output_counter_offsets = gl.arange(0, 2, layout=output_counter_layout)
@@ -1234,6 +1238,7 @@ def _dsa_persistent_radix_topk_kernel(
     GROUPS_PER_ROW: gl.constexpr,
     TOPK: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    HAS_TAIL: gl.constexpr,
 ):
     _dsa_persistent_radix_topk_row(
         gl.program_id(0),
@@ -1254,6 +1259,7 @@ def _dsa_persistent_radix_topk_kernel(
         GROUPS_PER_ROW,
         TOPK,
         BLOCK_N,
+        HAS_TAIL,
     )
 
 
@@ -3066,6 +3072,7 @@ def _dsa_persistent_prefill_radix_topk(
         GROUPS_PER_ROW=groups,
         TOPK=topk,
         BLOCK_N=_PERSISTENT_PREFILL_BLOCK_N,
+        HAS_TAIL=cols % _PERSISTENT_PREFILL_BLOCK_N != 0,
         num_warps=_PERSISTENT_PREFILL_NUM_WARPS,
     )
     return out, lens_out
