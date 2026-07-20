@@ -357,7 +357,7 @@ def test_contract_package_publishes_complete_catalog() -> None:
         ("attention", "mla_prefill"): "MLA_PREFILL",
         ("embedding", "rope"): "ROPE",
         ("embedding", "rope_mla"): "ROPE_MLA",
-        ("quantization", "fp8"): "FP8",
+        ("quantization", "fp8"): "QUANTIZE_FP8",
         ("transform", "hadamard_transform"): "HADAMARD_TRANSFORM",
     }
     catalog = {schema.id: schema for schema in contracts.list_operation_schemas()}

@@ -29,7 +29,7 @@ from tokenspeed_kernel.operation import OperationSchema
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.signature import FormatSignature
 
-__all__ = ["FP8", "quantize_fp8_reference"]
+__all__ = ["QUANTIZE_FP8", "quantize_fp8_reference"]
 
 
 def _validate_signatures(signatures: frozenset[FormatSignature]) -> None:
@@ -101,7 +101,7 @@ def quantize_fp8_reference(
     return (values / scale_value).clamp(-finite_limit, finite_limit).to(output_dtype)
 
 
-FP8 = OperationSchema(
+QUANTIZE_FP8 = OperationSchema(
     family="quantization",
     mode="fp8",
     reference=quantize_fp8_reference,

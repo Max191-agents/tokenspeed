@@ -26,15 +26,15 @@ from tokenspeed_kernel.contracts.ops.attention import (
     MLA_PREFILL,
 )
 from tokenspeed_kernel.contracts.ops.embedding import ROPE, ROPE_MLA
-from tokenspeed_kernel.contracts.ops.quantization import FP8
+from tokenspeed_kernel.contracts.ops.quantization import QUANTIZE_FP8
 from tokenspeed_kernel.contracts.ops.transform import HADAMARD_TRANSFORM
 
 __all__ = [
     "ATTN_MERGE_STATE",
-    "FP8",
     "HADAMARD_TRANSFORM",
     "MHA_PREFILL",
     "MLA_PREFILL",
+    "QUANTIZE_FP8",
     "ROPE",
     "ROPE_MLA",
 ]

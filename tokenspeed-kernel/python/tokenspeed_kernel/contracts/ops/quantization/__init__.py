@@ -21,8 +21,8 @@
 """Quantization operation contracts."""
 
 from tokenspeed_kernel.contracts.ops.quantization.fp8 import (
-    FP8,
+    QUANTIZE_FP8,
     quantize_fp8_reference,
 )
 
-__all__ = ["FP8", "quantize_fp8_reference"]
+__all__ = ["QUANTIZE_FP8", "quantize_fp8_reference"]

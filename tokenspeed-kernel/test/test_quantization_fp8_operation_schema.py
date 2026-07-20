@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import pytest
 import tokenspeed_kernel.contracts.ops.quantization.fp8 as quantization_contract
 import torch
-from tokenspeed_kernel.contracts.ops.quantization.fp8 import FP8
+from tokenspeed_kernel.contracts.ops.quantization.fp8 import QUANTIZE_FP8
 from tokenspeed_kernel.operation import OperationRegistry
 from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
 from tokenspeed_kernel.signature import (
@@ -46,7 +46,7 @@ def _adapter(
     scale: float | torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor:
-    return FP8.reference(x, scale=scale, enable_pdl=enable_pdl)
+    return QUANTIZE_FP8.reference(x, scale=scale, enable_pdl=enable_pdl)
 
 
 @pytest.fixture
@@ -56,8 +56,8 @@ def e4m3_platform(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_schema_is_published_and_reference_is_not_selectable() -> None:
-    assert OperationRegistry.get().lookup("quantization", "fp8") is FP8
-    parameters = tuple(FP8.signature.parameters.values())
+    assert OperationRegistry.get().lookup("quantization", "fp8") is QUANTIZE_FP8
+    parameters = tuple(QUANTIZE_FP8.signature.parameters.values())
     assert [parameter.name for parameter in parameters] == [
         "x",
         "scale",
@@ -78,7 +78,7 @@ def test_reference_defines_saturating_cast_and_scale(e4m3_platform) -> None:
     )
     scale = torch.tensor([2.0], dtype=torch.float32)
 
-    actual = FP8.reference(x, scale=scale, enable_pdl=True)
+    actual = QUANTIZE_FP8.reference(x, scale=scale, enable_pdl=True)
     finite_limit = torch.finfo(torch.float8_e4m3fn).max
     expected = (
         (x.float() / 2.0).clamp(-finite_limit, finite_limit).to(torch.float8_e4m3fn)
@@ -92,7 +92,7 @@ def test_reference_defines_saturating_cast_and_scale(e4m3_platform) -> None:
 def test_reference_without_scale_is_a_saturating_fp8_cast(e4m3_platform) -> None:
     x = torch.tensor([[-1000.0, -1.0, 1.0, 1000.0]], dtype=torch.float32)
 
-    actual = FP8.reference(x)
+    actual = QUANTIZE_FP8.reference(x)
 
     expected = x.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
@@ -111,7 +111,7 @@ def test_reference_rejects_non_scalar_or_non_numeric_scale(
     error: str,
 ) -> None:
     with pytest.raises((TypeError, ValueError), match=error):
-        FP8.reference(torch.ones(2), scale=scale)
+        QUANTIZE_FP8.reference(torch.ones(2), scale=scale)
 
 
 def test_out_of_tree_registration_keeps_dtype_policy_in_kernel_claims(
@@ -176,10 +176,10 @@ def test_invalid_registration_claim_is_rejected(
 
 
 def test_builtin_registrations_satisfy_schema() -> None:
-    specs = KernelRegistry.get().get_for_operator(*FP8.id)
+    specs = KernelRegistry.get().get_for_operator(*QUANTIZE_FP8.id)
     assert specs
     for spec in specs:
-        FP8.validate_registration(
+        QUANTIZE_FP8.validate_registration(
             spec,
             KernelRegistry.get().get_impl(spec.name),
         )

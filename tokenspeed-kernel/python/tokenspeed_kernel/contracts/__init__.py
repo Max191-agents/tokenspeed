@@ -22,10 +22,10 @@
 
 from tokenspeed_kernel.contracts.ops import (
     ATTN_MERGE_STATE,
-    FP8,
     HADAMARD_TRANSFORM,
     MHA_PREFILL,
     MLA_PREFILL,
+    QUANTIZE_FP8,
     ROPE,
     ROPE_MLA,
 )
@@ -33,10 +33,10 @@ from tokenspeed_kernel.operation import OperationRegistry, OperationSchema
 
 __all__ = [
     "ATTN_MERGE_STATE",
-    "FP8",
     "HADAMARD_TRANSFORM",
     "MHA_PREFILL",
     "MLA_PREFILL",
+    "QUANTIZE_FP8",
     "ROPE",
     "ROPE_MLA",
     "get_operation_schema",
