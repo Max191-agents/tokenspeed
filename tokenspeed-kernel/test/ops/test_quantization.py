@@ -29,14 +29,22 @@ from tokenspeed_kernel import (
     quantize_mxfp8,
     quantize_nvfp4,
 )
+from tokenspeed_kernel.operation import OperationRegistry
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import current_platform
-
-FP8_E4M3_FNUZ_MAX = 240.0
 
 
 def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+def _quantize_fp8_reference(
+    x: torch.Tensor,
+    *,
+    scale: float | torch.Tensor | None = None,
+) -> torch.Tensor:
+    schema = OperationRegistry.get().lookup("quantization", "fp8")
+    return schema.reference(x, scale=scale)
 
 
 def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
@@ -84,8 +92,7 @@ def test_quantize_fp8_pure_cast_bf16(
     require("quantization", "fp8", solution, dtype, "x")
 
     x = torch.randn(shape, device=device, dtype=dtype) * 50
-    fp8 = current_platform().fp8e4m3fn
-    ref = x.to(fp8.dtype)
+    ref = _quantize_fp8_reference(x)
 
     out = quantize_fp8(x, solution=solution)
     torch.cuda.synchronize()
@@ -160,8 +167,7 @@ def test_quantize_fp8_strided_slice(
     v = kv[..., qk_nope:]
     assert not v.is_contiguous()
 
-    fp8 = current_platform().fp8e4m3fn
-    ref = v.to(fp8.dtype)
+    ref = _quantize_fp8_reference(v)
 
     out = quantize_fp8(v, solution=solution)
     torch.cuda.synchronize()
@@ -182,11 +188,7 @@ def test_quantize_fp8_scale_float(
     require("quantization", "fp8", solution, dtype, "x")
 
     x = torch.randn(2048, 512, device=device, dtype=dtype) * 100
-    fp8 = current_platform().fp8e4m3fn
-    inv_scale = 1.0 / scale
-    ref = (
-        (x.to(torch.float32) * inv_scale).clamp(min=fp8.min, max=fp8.max).to(fp8.dtype)
-    )
+    ref = _quantize_fp8_reference(x, scale=scale)
 
     out = quantize_fp8(x, scale=scale, solution=solution)
     torch.cuda.synchronize()
@@ -206,11 +208,7 @@ def test_quantize_fp8_scale_tensor(
 
     x = torch.randn(8, 2880, device=device, dtype=dtype) * 100
     scale = torch.tensor([0.125], device=device, dtype=torch.float32)
-    fp8 = current_platform().fp8e4m3fn
-    inv_scale = (1.0 / scale.to(torch.float32)).reshape(())
-    ref = (
-        (x.to(torch.float32) * inv_scale).clamp(min=fp8.min, max=fp8.max).to(fp8.dtype)
-    )
+    ref = _quantize_fp8_reference(x, scale=scale)
 
     out = quantize_fp8(x, scale=scale, solution=solution)
     torch.cuda.synchronize()
@@ -251,7 +249,7 @@ def test_pure_cast_e4m3fnuz(device: str) -> None:
     ``±240`` to match ``x.to(torch.float8_e4m3fnuz)``."""
     torch.manual_seed(0)
     x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 50
-    ref = x.to(torch.float8_e4m3fnuz)
+    ref = _quantize_fp8_reference(x)
     out = fp8_quantize(x, fp8_dtype=torch.float8_e4m3fnuz)
     torch.cuda.synchronize()
     assert out.dtype == torch.float8_e4m3fnuz
@@ -266,12 +264,7 @@ def test_pure_cast_e4m3fnuz(device: str) -> None:
 def test_scaled_cast_e4m3fnuz_matches_reference(device: str, scale: float) -> None:
     torch.manual_seed(0)
     x = torch.randn(2048, 512, device=device, dtype=torch.bfloat16) * 100
-    inv_scale = 1.0 / scale
-    ref = (
-        (x.to(torch.float32) * inv_scale)
-        .clamp(-FP8_E4M3_FNUZ_MAX, FP8_E4M3_FNUZ_MAX)
-        .to(torch.float8_e4m3fnuz)
-    )
+    ref = _quantize_fp8_reference(x, scale=scale)
     out = fp8_quantize(x, scale=scale, fp8_dtype=torch.float8_e4m3fnuz)
     torch.cuda.synchronize()
     assert _bitwise_equal(out, ref)
