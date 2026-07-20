@@ -27,7 +27,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             ("out_a", "out_b"), "dense", {torch.float16, torch.bfloat16}
         ),
         priority=Priority.SPECIALIZED + 2,
-        traits={},
+        traits={"head_dim": frozenset({64, 128, 256, 512})},
         tags={"throughput"},
     )
     def cuda_attn_merge_state(
