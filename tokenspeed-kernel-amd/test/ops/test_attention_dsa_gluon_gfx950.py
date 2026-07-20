@@ -106,15 +106,30 @@ def test_dsa_topk_has_no_superseded_staged_prefill_paths() -> None:
     assert not any(hasattr(dsa_topk_gfx950, name) for name in removed_symbols)
 
 
+def test_dsa_topk_has_no_runtime_radix_path() -> None:
+    removed_symbols = (
+        "_ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG",
+        "_rank_four_items_per_thread",
+        "_accumulate_runtime_radix_histogram_tile",
+        "_emit_runtime_radix_topk_tile",
+        "_emit_runtime_radix_topk_tile_deterministic",
+        "_dsa_runtime_radix_topk_kernel",
+    )
+
+    assert not any(hasattr(dsa_topk_gfx950, name) for name in removed_symbols)
+
+
 def test_dsa_manual_decode_config_source_contract() -> None:
-    assert dsa_topk_gfx950._ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG == (8192, 8)
     assert dsa_topk_gfx950._ONEBLOCK_DECODE_SHORT_MANUAL_CONFIG == (8192, 8)
     assert dsa_topk_gfx950._ONEBLOCK_DECODE_LONG_MANUAL_CONFIG == (8192, 4)
     assert dsa_topk_gfx950._ONEBLOCK_DECODE_SHORT_MANUAL_MAX_COLS == 65536
     assert dsa_topk_gfx950._ONEBLOCK_RADIX_SCHEDULE == (12, 12, 8)
     assert dsa_topk_gfx950._ONEBLOCK_PREFILL_RADIX_BLOCK_N == 4096
+    assert dsa_topk_gfx950._ONEBLOCK_PREFILL_COMPACT_FINAL_MIN_COLS == 16384
     assert dsa_topk_gfx950._ONEBLOCK_RADIX_MAX_COLS == 90000
-    assert dsa_topk_gfx950._ONEBLOCK_DECODE_RUNTIME_MAX_COLS == 256 * 1024
+    assert dsa_topk_gfx950._ONEBLOCK_DECODE_MAX_COLS == 256 * 1024
+    assert dsa_topk_gfx950._PREFILL_ONEBLOCK_RADIX_MIN_COLS == 98304
+    assert dsa_topk_gfx950._PREFILL_ONEBLOCK_RADIX_MAX_COLS == 196608
 
     params = {
         param.name: param
@@ -1547,6 +1562,63 @@ def test_dsa_prefill_topk_90k_boundary_keeps_exact_values() -> None:
     )
 
 
+@pytest.mark.parametrize("cols", (8192, 16384, 98304, 196608))
+def test_dsa_prefill_manual_oneblock_fallback_keeps_exact_values(cols: int) -> None:
+    rows = 4
+    topk = 2048
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = 257 + row_ids * 19
+    row_ends = cols - (rows - 1 - row_ids) * 29
+    logits = _make_topk_test_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=1567 + cols,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        is None
+    )
+    assert (
+        dsa_topk_gfx950._wide_oneblock_prefill_block_n(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        is None
+    )
+
+    for _ in range(2):
+        out.fill_(-7)
+        lens_out.fill_(-7)
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+        _assert_topk_indices(
+            logits,
+            out,
+            lens_out,
+            row_starts,
+            row_ends,
+            topk=topk,
+        )
+
+
 def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
     device = torch.device("cuda")
     compute_units = torch.cuda.get_device_properties(device).multi_processor_count
@@ -1783,6 +1855,57 @@ def test_dsa_decode_topk_maps_grouped_queries_to_physical_slots(
         block_table,
         page_size=page_size,
         q_len_per_req=q_len_per_req,
+        topk=topk,
+    )
+
+
+@pytest.mark.parametrize("topk", (512, 1024, 2048))
+def test_dsa_decode_manual_oneblock_fallback_keeps_exact_values(
+    monkeypatch: pytest.MonkeyPatch,
+    topk: int,
+) -> None:
+    rows = 1
+    cols = 131072
+    page_size = 64
+    seq_lens = torch.tensor([cols - 37], device="cuda", dtype=torch.int32)
+    row_starts = torch.zeros((rows,), device="cuda", dtype=torch.int32)
+    logits = _make_topk_test_logits(
+        row_starts,
+        seq_lens,
+        cols=cols,
+        topk=topk,
+        seed=2197 + topk,
+    )
+    block_table = _make_reversed_decode_block_table(rows, cols, page_size)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    monkeypatch.setattr(dsa_topk_gfx950, "_device_compute_units", lambda _: 1)
+
+    assert not dsa_topk_gfx950._use_persistent_decode(
+        rows,
+        cols,
+        topk,
+        logits.device,
+    )
+    dsa_topk_gfx950._dsa_decode_topk_slots(
+        logits,
+        block_table,
+        seq_lens,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=1,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_decode_topk_slots(
+        logits,
+        out,
+        lens_out,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        q_len_per_req=1,
         topk=topk,
     )
 
@@ -2081,9 +2204,9 @@ def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
     )
     assert cols > dsa_topk_gfx950._ONEBLOCK_RADIX_MAX_COLS
     assert not (
-        dsa_topk_gfx950._PREFILL_RUNTIME_RADIX_MIN_COLS
+        dsa_topk_gfx950._PREFILL_ONEBLOCK_RADIX_MIN_COLS
         <= cols
-        <= dsa_topk_gfx950._PREFILL_RUNTIME_RADIX_MAX_COLS
+        <= dsa_topk_gfx950._PREFILL_ONEBLOCK_RADIX_MAX_COLS
     )
     assert (
         dsa_topk_gfx950._persistent_interleaved_plan(
