@@ -3192,7 +3192,7 @@ def _dsa_persistent_interleaved_topk(
         TAIL_GROUPS_PER_ROW=tail_groups,
         TOPK=topk,
         BLOCK_N=_PERSISTENT_PREFILL_BLOCK_N,
-        num_warps=min(_PERSISTENT_PREFILL_NUM_WARPS, topk // 64),
+        num_warps=_PERSISTENT_PREFILL_NUM_WARPS,
     )
     return out, lens_out
 

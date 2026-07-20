@@ -1924,6 +1924,13 @@ def test_dsa_persistent_interleaved_mode_and_groups_are_constexpr() -> None:
     assert params["IS_DECODE"].is_constexpr
 
 
+def test_dsa_persistent_interleaved_launch_uses_full_warp_count() -> None:
+    source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_interleaved_topk)
+
+    assert dsa_topk_gfx950._PERSISTENT_PREFILL_NUM_WARPS == 16
+    assert "num_warps=_PERSISTENT_PREFILL_NUM_WARPS" in source
+
+
 def test_dsa_persistent_interleaved_decode_uses_one_sided_tile_masks() -> None:
     helpers = (
         dsa_topk_gfx950._persistent_interleaved_publish_histogram,
