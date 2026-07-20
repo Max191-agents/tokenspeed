@@ -41,6 +41,9 @@ _ONEBLOCK_DECODE_SHORT_MANUAL_CONFIG = (8192, 8)
 _ONEBLOCK_DECODE_LONG_MANUAL_CONFIG = (8192, 4)
 _ONEBLOCK_DECODE_SHORT_MANUAL_MAX_COLS = 65536
 _ONEBLOCK_PREFILL_RADIX_BLOCK_N = 4096
+_ONEBLOCK_PREFILL_WIDE_SHORT_BLOCK_N = 8192
+_ONEBLOCK_PREFILL_WIDE_LONG_BLOCK_N = 16384
+_ONEBLOCK_PREFILL_WIDE_LONG_MIN_COLS = 512 * 1024
 _ONEBLOCK_COMPACT_FINAL_BLOCK_N = 4096
 _ONEBLOCK_COMPACT_FINAL_MIN_COLS = 65536
 _ONEBLOCK_DECODE_RUNTIME_MAX_COLS = 256 * 1024
@@ -2929,6 +2932,32 @@ def _persistent_prefill_groups(
     return None
 
 
+def _wide_oneblock_prefill_block_n(
+    rows: int,
+    cols: int,
+    topk: int,
+    device: torch.device,
+) -> int | None:
+    if topk != _PERSISTENT_PREFILL_TOPK or cols <= _PREFILL_RUNTIME_RADIX_MAX_COLS:
+        return None
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    compute_units = _device_compute_units(device_index)
+    if rows <= compute_units // 2:
+        return None
+
+    # Just over one full device wave, the one-block grid leaves most compute
+    # units idle in its second wave. Persistent execution wins in that band.
+    second_wave_half_full = compute_units + triton.cdiv(compute_units, 2)
+    if compute_units < rows < second_wave_half_full:
+        return None
+
+    if cols < _ONEBLOCK_PREFILL_WIDE_LONG_MIN_COLS:
+        return _ONEBLOCK_PREFILL_WIDE_SHORT_BLOCK_N
+    return _ONEBLOCK_PREFILL_WIDE_LONG_BLOCK_N
+
+
 def _use_persistent_decode(
     rows: int,
     cols: int,
@@ -3364,6 +3393,47 @@ def _dsa_decode_topk_slots(
     return out, lens_out
 
 
+def _dsa_oneblock_manual_prefill_topk_indices(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    block_n: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = logits.shape[0]
+    _dsa_oneblock_manual_radix_topk_kernel[(rows,)](
+        logits,
+        row_starts,
+        row_starts,
+        row_starts,
+        row_ends,
+        out,
+        lens_out,
+        logits.stride(0),
+        0,
+        out.stride(0),
+        0,
+        page_size=1,
+        topk=topk,
+        q_len_per_req=1,
+        IS_DECODE=False,
+        RADIX0_BITS=_ONEBLOCK_RADIX_SCHEDULE[0],
+        RADIX1_BITS=_ONEBLOCK_RADIX_SCHEDULE[1],
+        RADIX2_BITS=_ONEBLOCK_RADIX_SCHEDULE[2],
+        MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
+        BLOCK_N=block_n,
+        LOAD_ELEMS=_load_elems(block_n, 16),
+        COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
+        USE_COMPACT_FINAL=True,
+        USE_RADIX_EARLY_STOP=False,
+        num_warps=16,
+    )
+    return out, lens_out
+
+
 def _dsa_prefill_topk_indices(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
@@ -3416,6 +3486,23 @@ def _dsa_prefill_topk_indices(
             lens_out=lens_out,
         )
 
+    wide_oneblock_block_n = _wide_oneblock_prefill_block_n(
+        rows,
+        cols,
+        topk,
+        logits.device,
+    )
+    if wide_oneblock_block_n is not None:
+        return _dsa_oneblock_manual_prefill_topk_indices(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            block_n=wide_oneblock_block_n,
+            out=out,
+            lens_out=lens_out,
+        )
+
     if cols <= _ONEBLOCK_RADIX_MAX_COLS:
         if cols < _ONEBLOCK_COMPACT_FINAL_MIN_COLS:
             _dsa_runtime_radix_topk_kernel[(rows,)](
@@ -3440,32 +3527,14 @@ def _dsa_prefill_topk_indices(
                 num_warps=16,
             )
         else:
-            _dsa_oneblock_manual_radix_topk_kernel[(rows,)](
+            return _dsa_oneblock_manual_prefill_topk_indices(
                 logits,
                 row_starts,
-                row_starts,
-                row_starts,
                 row_ends,
-                out,
-                lens_out,
-                logits.stride(0),
-                0,
-                out.stride(0),
-                0,
-                page_size=1,
                 topk=topk,
-                q_len_per_req=1,
-                IS_DECODE=False,
-                RADIX0_BITS=_ONEBLOCK_RADIX_SCHEDULE[0],
-                RADIX1_BITS=_ONEBLOCK_RADIX_SCHEDULE[1],
-                RADIX2_BITS=_ONEBLOCK_RADIX_SCHEDULE[2],
-                MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
-                BLOCK_N=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
-                LOAD_ELEMS=_load_elems(_ONEBLOCK_PREFILL_RADIX_BLOCK_N, 16),
-                COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
-                USE_COMPACT_FINAL=True,
-                USE_RADIX_EARLY_STOP=False,
-                num_warps=16,
+                block_n=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
+                out=out,
+                lens_out=lens_out,
             )
         return out, lens_out
 

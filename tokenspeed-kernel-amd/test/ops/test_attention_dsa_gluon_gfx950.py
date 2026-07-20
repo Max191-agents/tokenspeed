@@ -2049,10 +2049,8 @@ def test_dsa_persistent_interleaved_decode_uses_one_sided_tile_masks() -> None:
         (65, 90048, 1024),
         (129, 90048, 2048),
         (514, 90048, 2048),
-        (129, 262208, 2048),
         (33, 512 * 1024, 512),
         (65, 512 * 1024, 1024),
-        (129, 512 * 1024, 2048),
     ),
 )
 def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
@@ -2122,6 +2120,131 @@ def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
         )
         _assert_persistent_workspace_layout(workspace, rows)
         _assert_persistent_workspace_reset(workspace)
+
+
+@pytest.mark.parametrize(
+    ("rows", "cols", "topk", "expected_block_n"),
+    (
+        (128, 262208, 2048, None),
+        (129, 196608, 2048, None),
+        (129, 262208, 1024, None),
+        (129, 262208, 2048, 8192),
+        (129, 512 * 1024, 2048, 16384),
+        (256, 1024 * 1024, 2048, 16384),
+        (257, 1024 * 1024, 2048, None),
+        (383, 1024 * 1024, 2048, None),
+        (384, 1024 * 1024, 2048, 16384),
+        (514, 1024 * 1024, 2048, 16384),
+    ),
+)
+def test_dsa_wide_oneblock_prefill_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: int,
+    cols: int,
+    topk: int,
+    expected_block_n: int | None,
+) -> None:
+    monkeypatch.setattr(dsa_topk_gfx950, "_device_compute_units", lambda _: 256)
+
+    assert (
+        dsa_topk_gfx950._wide_oneblock_prefill_block_n(
+            rows,
+            cols,
+            topk,
+            torch.device("cuda:0"),
+        )
+        == expected_block_n
+    )
+
+
+@pytest.mark.parametrize(
+    ("cols", "expected_block_n"),
+    (
+        (262208, 8192),
+        (512 * 1024, 16384),
+    ),
+)
+def test_dsa_wide_oneblock_prefill_repeats_with_ragged_rows(
+    cols: int,
+    expected_block_n: int,
+) -> None:
+    rows = 129
+    topk = 2048
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = 257 + row_ids % 113
+    row_ends = cols - (rows - 1 - row_ids) % 1021
+    logits = _make_topk_test_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=11117 + cols,
+    )
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    assert (
+        dsa_topk_gfx950._wide_oneblock_prefill_block_n(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        == expected_block_n
+    )
+
+    for _ in range(2):
+        out.fill_(-7)
+        lens_out.fill_(-7)
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+        _assert_topk_indices(
+            logits,
+            out,
+            lens_out,
+            row_starts,
+            row_ends,
+            topk=topk,
+        )
+
+
+@pytest.mark.parametrize(
+    ("cols", "block_n"),
+    (
+        (262208, 8192),
+        (512 * 1024, 16384),
+    ),
+)
+def test_dsa_wide_oneblock_prefill_falls_back_for_large_tie_bucket(
+    cols: int,
+    block_n: int,
+) -> None:
+    topk = 2048
+    logits = torch.zeros((1, cols), device="cuda", dtype=torch.float32)
+    row_starts = torch.zeros((1,), device="cuda", dtype=torch.int32)
+    row_ends = torch.full((1,), cols, device="cuda", dtype=torch.int32)
+    out = torch.empty((1, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
+
+    dsa_topk_gfx950._dsa_oneblock_manual_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        block_n=block_n,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    selected = out[0]
+    torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
+    assert ((selected >= 0) & (selected < cols)).all()
+    assert torch.unique(selected).numel() == topk
 
 
 def test_dsa_persistent_prefill_interleaved_respects_causal_ranges() -> None:
