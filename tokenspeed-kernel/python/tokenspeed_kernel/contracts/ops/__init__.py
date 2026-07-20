@@ -18,18 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Backend-independent operation contracts."""
+"""Built-in operation contracts, organized by family and mode."""
 
-from tokenspeed_kernel.contracts.ops import (
+from tokenspeed_kernel.contracts.ops.attention import (
     ATTN_MERGE_STATE,
-    FP8,
-    HADAMARD_TRANSFORM,
     MHA_PREFILL,
     MLA_PREFILL,
-    ROPE,
-    ROPE_MLA,
 )
-from tokenspeed_kernel.operation import OperationRegistry, OperationSchema
+from tokenspeed_kernel.contracts.ops.embedding import ROPE, ROPE_MLA
+from tokenspeed_kernel.contracts.ops.quantization import FP8
+from tokenspeed_kernel.contracts.ops.transform import HADAMARD_TRANSFORM
 
 __all__ = [
     "ATTN_MERGE_STATE",
@@ -39,16 +37,4 @@ __all__ = [
     "MLA_PREFILL",
     "ROPE",
     "ROPE_MLA",
-    "get_operation_schema",
-    "list_operation_schemas",
 ]
-
-
-def get_operation_schema(family: str, mode: str) -> OperationSchema:
-    """Return the published contract for one family and mode."""
-    return OperationRegistry.get().lookup(family, mode)
-
-
-def list_operation_schemas() -> tuple[OperationSchema, ...]:
-    """Return every contract published by this package."""
-    return OperationRegistry.get().schemas()

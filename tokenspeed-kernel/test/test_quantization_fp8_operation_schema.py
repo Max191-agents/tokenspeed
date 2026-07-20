@@ -24,9 +24,9 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
-import tokenspeed_kernel.contracts.quantization as quantization_contract
+import tokenspeed_kernel.contracts.ops.quantization.fp8 as quantization_contract
 import torch
-from tokenspeed_kernel.contracts.quantization import FP8
+from tokenspeed_kernel.contracts.ops.quantization.fp8 import FP8
 from tokenspeed_kernel.operation import OperationRegistry
 from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
 from tokenspeed_kernel.signature import (

@@ -22,8 +22,7 @@ from __future__ import annotations
 
 import math
 
-import tokenspeed_kernel.contracts.attention  # noqa: F401
-import tokenspeed_kernel.contracts.mha  # noqa: F401
+import tokenspeed_kernel.contracts.ops.attention  # noqa: F401
 
 # Backend registration (side-effect imports, after contract publication)
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401

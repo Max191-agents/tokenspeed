@@ -20,7 +20,13 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -342,20 +348,77 @@ def test_registered_traits_are_copied(operation_catalog) -> None:
 
 
 def test_contract_package_publishes_complete_catalog() -> None:
-    from tokenspeed_kernel.contracts import (
-        get_operation_schema,
-        list_operation_schemas,
+    import tokenspeed_kernel.contracts as contracts
+    import tokenspeed_kernel.contracts.ops as ops_contracts
+
+    exports = {
+        ("attention", "attn_merge_state"): "ATTN_MERGE_STATE",
+        ("attention", "mha_prefill"): "MHA_PREFILL",
+        ("attention", "mla_prefill"): "MLA_PREFILL",
+        ("embedding", "rope"): "ROPE",
+        ("embedding", "rope_mla"): "ROPE_MLA",
+        ("quantization", "fp8"): "FP8",
+        ("transform", "hadamard_transform"): "HADAMARD_TRANSFORM",
+    }
+    catalog = {schema.id: schema for schema in contracts.list_operation_schemas()}
+
+    assert catalog.keys() == exports.keys()
+    for (family, mode), export in exports.items():
+        family_contracts = importlib.import_module(
+            f"tokenspeed_kernel.contracts.ops.{family}"
+        )
+        mode_contract = importlib.import_module(
+            f"tokenspeed_kernel.contracts.ops.{family}.{mode}"
+        )
+        schema = getattr(contracts, export)
+
+        assert getattr(ops_contracts, export) is schema
+        assert getattr(family_contracts, export) is schema
+        assert getattr(mode_contract, export) is schema
+        assert catalog[(family, mode)] is schema
+        assert contracts.get_operation_schema(family, mode) is schema
+
+
+def test_cold_tokenspeed_import_publishes_complete_contract_catalog() -> None:
+    expected = [
+        ["attention", "attn_merge_state"],
+        ["attention", "mha_prefill"],
+        ["attention", "mla_prefill"],
+        ["embedding", "rope"],
+        ["embedding", "rope_mla"],
+        ["quantization", "fp8"],
+        ["transform", "hadamard_transform"],
+    ]
+    script = (
+        "import json\n"
+        "import tokenspeed_kernel\n"
+        "from tokenspeed_kernel.contracts import list_operation_schemas\n"
+        "print(json.dumps(sorted(schema.id for schema in list_operation_schemas())))\n"
+    )
+    repository_root = Path(__file__).parents[2]
+    python_root = repository_root / "tokenspeed-kernel" / "python"
+    local_package_roots = [python_root]
+    amd_python_root = repository_root / "tokenspeed-kernel-amd" / "python"
+    if amd_python_root.is_dir():
+        local_package_roots.append(amd_python_root)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        path
+        for path in (
+            *(str(root) for root in local_package_roots),
+            env.get("PYTHONPATH"),
+        )
+        if path
     )
 
-    expected = {
-        ("attention", "attn_merge_state"),
-        ("attention", "mha_prefill"),
-        ("attention", "mla_prefill"),
-        ("embedding", "rope"),
-        ("embedding", "rope_mla"),
-        ("quantization", "fp8"),
-        ("transform", "hadamard_transform"),
-    }
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repository_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
 
-    assert expected <= {schema.id for schema in list_operation_schemas()}
-    assert get_operation_schema("embedding", "rope").id == ("embedding", "rope")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == expected

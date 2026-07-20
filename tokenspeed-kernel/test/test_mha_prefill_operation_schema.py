@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.contracts.mha import MHA_PREFILL
+from tokenspeed_kernel.contracts.ops.attention.mha_prefill import MHA_PREFILL
 from tokenspeed_kernel.operation import OperationRegistry
 from tokenspeed_kernel.registry import KernelRegistry, register_kernel
 from tokenspeed_kernel.signature import (

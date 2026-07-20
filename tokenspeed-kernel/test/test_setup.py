@@ -5,7 +5,20 @@ from pathlib import Path
 
 import setuptools
 
-SETUP_PY = Path(__file__).parents[1] / "python" / "setup.py"
+PYTHON_ROOT = Path(__file__).parents[1] / "python"
+SETUP_PY = PYTHON_ROOT / "setup.py"
+
+
+def test_find_packages_includes_contract_operation_packages() -> None:
+    packages = set(setuptools.find_packages(where=PYTHON_ROOT))
+
+    assert {
+        "tokenspeed_kernel.contracts.ops",
+        "tokenspeed_kernel.contracts.ops.attention",
+        "tokenspeed_kernel.contracts.ops.embedding",
+        "tokenspeed_kernel.contracts.ops.quantization",
+        "tokenspeed_kernel.contracts.ops.transform",
+    } <= packages
 
 
 def test_cuda_include_dirs_prefer_complete_toolkit_headers(

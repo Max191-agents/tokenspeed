@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.contracts.embedding import ROPE, ROPE_MLA
+from tokenspeed_kernel.contracts.ops.embedding.rope import ROPE
+from tokenspeed_kernel.contracts.ops.embedding.rope_mla import ROPE_MLA
 from tokenspeed_kernel.operation import OperationRegistry
 from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg, FusedSetKVBufferArg
 from tokenspeed_kernel.registry import KernelRegistry, register_kernel

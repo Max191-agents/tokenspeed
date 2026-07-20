@@ -372,7 +372,7 @@ __all__ = [
 
 
 # Backend registration (side-effect imports).
-import tokenspeed_kernel.contracts.embedding  # noqa: E402,F401
+import tokenspeed_kernel.contracts.ops.embedding  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.triton  # noqa: E402,F401

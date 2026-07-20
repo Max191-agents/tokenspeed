@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tokenspeed_kernel.contracts.ops.embedding.utils import _rotary_reference
 from tokenspeed_kernel.operation import OperationSchema
 from tokenspeed_kernel.signature import FormatSignature
 
@@ -33,12 +34,7 @@ if TYPE_CHECKING:
         FusedSetKVBufferArg,
     )
 
-__all__ = [
-    "ROPE",
-    "ROPE_MLA",
-    "rope_mla_reference",
-    "rope_reference",
-]
+__all__ = ["ROPE", "rope_reference"]
 
 
 _ROPE_BOOL_TRAITS = frozenset(
@@ -50,9 +46,6 @@ _ROPE_BOOL_TRAITS = frozenset(
         "has_q_out",
         "has_k_out",
     }
-)
-_ROPE_MLA_BOOL_TRAITS = frozenset(
-    {"is_neox", "has_scale_q_tensor", "has_scale_kv_tensor"}
 )
 
 
@@ -91,92 +84,6 @@ def _validate_rope_traits(traits: Mapping[str, frozenset[Any]]) -> None:
                 )
         elif any(type(value) is not bool for value in values):
             raise TypeError(f"embedding.rope trait {name!r} values must be bool")
-
-
-def _validate_rope_mla_signatures(signatures: frozenset[FormatSignature]) -> None:
-    roles = {"q_rope", "k_rope", "q_nope", "k_nope"}
-    if not signatures:
-        raise ValueError("embedding.rope_mla requires a format signature")
-    for signature in signatures:
-        if not isinstance(signature, FormatSignature):
-            raise TypeError("embedding.rope_mla signatures must be FormatSignature")
-        if {name for name, _ in signature.roles} != roles:
-            raise ValueError(
-                "embedding.rope_mla signatures require q_rope, k_rope, "
-                "q_nope, and k_nope roles"
-            )
-        formats = [signature.format_for(role) for role in roles]
-        if any(
-            tensor_format is None
-            or tensor_format.format != "dense"
-            or tensor_format.scale is not None
-            for tensor_format in formats
-        ):
-            raise ValueError("embedding.rope_mla roles must use unscaled dense formats")
-
-
-def _validate_rope_mla_traits(traits: Mapping[str, frozenset[Any]]) -> None:
-    unknown = set(traits) - ({"quantize_dtype"} | _ROPE_MLA_BOOL_TRAITS)
-    if unknown:
-        names = ", ".join(sorted(unknown))
-        raise ValueError(f"unknown embedding.rope_mla trait(s): {names}")
-    for name, values in traits.items():
-        if not isinstance(values, frozenset) or not values:
-            raise TypeError(
-                f"embedding.rope_mla trait {name!r} must be a non-empty frozenset"
-            )
-        if name == "quantize_dtype":
-            if any(
-                not isinstance(value, torch.dtype)
-                or not str(value).startswith("torch.float8_")
-                for value in values
-            ):
-                raise TypeError(
-                    "embedding.rope_mla quantize_dtype values must be FP8 dtypes"
-                )
-        elif any(type(value) is not bool for value in values):
-            raise TypeError(f"embedding.rope_mla trait {name!r} values must be bool")
-
-
-def _rotary_reference(
-    value: torch.Tensor,
-    positions: torch.Tensor,
-    head_size: int,
-    cos_sin_cache: torch.Tensor,
-    is_neox: bool,
-) -> torch.Tensor:
-    tokens = positions.numel()
-    rotary_dim = cos_sin_cache.shape[-1]
-    if positions.ndim != 1 or head_size <= 0:
-        raise ValueError("RoPE inputs do not match the packed token/head shape")
-    if positions.dtype not in (torch.int32, torch.int64):
-        raise TypeError("RoPE positions must use int32 or int64")
-    if positions.device != value.device or cos_sin_cache.device != value.device:
-        raise ValueError("RoPE inputs must be on the same device")
-    if tokens == 0:
-        return value.clone()
-    if value.numel() % (tokens * head_size) != 0:
-        raise ValueError("RoPE inputs do not match the packed token/head shape")
-    if rotary_dim % 2 or rotary_dim > head_size:
-        raise ValueError("RoPE rotary_dim must be even and no larger than head_size")
-
-    source = value.view(tokens, -1, head_size)
-    output = source.clone()
-    cos_sin = cos_sin_cache.index_select(0, positions.to(torch.int64)).float()
-    half = rotary_dim // 2
-    cos = cos_sin[:, None, :half]
-    sin = cos_sin[:, None, half:]
-    if is_neox:
-        first = source[..., :half].float()
-        second = source[..., half:rotary_dim].float()
-        output[..., :half] = first * cos - second * sin
-        output[..., half:rotary_dim] = second * cos + first * sin
-    else:
-        first = source[..., :rotary_dim:2].float()
-        second = source[..., 1:rotary_dim:2].float()
-        output[..., :rotary_dim:2] = first * cos - second * sin
-        output[..., 1:rotary_dim:2] = second * cos + first * sin
-    return output.reshape_as(value)
 
 
 def rope_reference(
@@ -249,56 +156,10 @@ def rope_reference(
     )
 
 
-def rope_mla_reference(
-    *,
-    positions: torch.Tensor,
-    q_rope: torch.Tensor,
-    k_rope: torch.Tensor,
-    q_nope: torch.Tensor,
-    k_nope: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    q_rope_out: torch.Tensor,
-    k_rope_out: torch.Tensor,
-    q_nope_out: torch.Tensor,
-    k_nope_out: torch.Tensor,
-    is_neox: bool = True,
-    quant_scale_q: float | torch.Tensor = 1.0,
-    quant_scale_kv: float | torch.Tensor = 1.0,
-    enable_pdl: bool = False,
-) -> None:
-    """Apply MLA RoPE and scale/cast each query and key output component."""
-    del enable_pdl
-    if q_rope.ndim != 3 or k_rope.ndim != 3:
-        raise ValueError("MLA RoPE inputs must have rank 3")
-    if q_rope.shape[0] != positions.numel() or k_rope.shape[0] != positions.numel():
-        raise ValueError("MLA RoPE inputs must match the position count")
-    if q_rope.shape[-1] != k_rope.shape[-1]:
-        raise ValueError("MLA query and key RoPE dimensions must match")
-    for scale in (quant_scale_q, quant_scale_kv):
-        if isinstance(scale, torch.Tensor) and scale.numel() != 1:
-            raise ValueError("MLA RoPE tensor scales must contain one value")
-
-    head_size = q_rope.shape[-1]
-    rotated_q = _rotary_reference(q_rope, positions, head_size, cos_sin_cache, is_neox)
-    rotated_k = _rotary_reference(k_rope, positions, head_size, cos_sin_cache, is_neox)
-    q_rope_out.copy_(rotated_q.float() * quant_scale_q)
-    k_rope_out.copy_(rotated_k.float() * quant_scale_kv)
-    q_nope_out.copy_(q_nope.float() * quant_scale_q)
-    k_nope_out.copy_(k_nope.float() * quant_scale_kv)
-
-
 ROPE = OperationSchema(
     family="embedding",
     mode="rope",
     reference=rope_reference,
     validate_signatures=_validate_rope_signatures,
     validate_traits=_validate_rope_traits,
-).publish()
-
-ROPE_MLA = OperationSchema(
-    family="embedding",
-    mode="rope_mla",
-    reference=rope_mla_reference,
-    validate_signatures=_validate_rope_mla_signatures,
-    validate_traits=_validate_rope_mla_traits,
 ).publish()

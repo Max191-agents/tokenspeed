@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.contracts.transform import HADAMARD_TRANSFORM
+from tokenspeed_kernel.contracts.ops.transform.hadamard_transform import (
+    HADAMARD_TRANSFORM,
+)
 from tokenspeed_kernel.operation import OperationRegistry
 from tokenspeed_kernel.registry import (
     KernelRegistry,
