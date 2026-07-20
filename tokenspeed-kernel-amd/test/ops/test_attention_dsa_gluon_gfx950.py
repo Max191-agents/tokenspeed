@@ -77,6 +77,18 @@ def test_dsa_topk_has_no_superseded_decode_paths() -> None:
     assert not any(hasattr(dsa_topk_gfx950, name) for name in removed_symbols)
 
 
+def test_dsa_topk_has_no_superseded_grouped_prefill_path() -> None:
+    removed_symbols = (
+        "_PREFILL_RADIX_BLOCK_N",
+        "_PREFILL_RADIX_HIST_TARGET_GROUPS_PER_CU",
+        "_dsa_prefill_radix_scatter_kernel",
+        "_run_prefill_wide_radix_prefix_passes",
+        "_dsa_prefill_radix_topk",
+    )
+
+    assert not any(hasattr(dsa_topk_gfx950, name) for name in removed_symbols)
+
+
 def test_dsa_manual_decode_config_source_contract() -> None:
     assert dsa_topk_gfx950._ONEBLOCK_DECODE_LONG_RUNTIME_CONFIG == (8192, 8)
     assert dsa_topk_gfx950._ONEBLOCK_DECODE_SHORT_MANUAL_CONFIG == (8192, 8)
@@ -1908,14 +1920,20 @@ def test_dsa_persistent_interleaved_decode_uses_one_sided_tile_masks() -> None:
 
 
 @pytest.mark.parametrize(
-    ("rows", "topk"),
-    ((33, 512), (65, 1024), (129, 2048), (514, 2048)),
+    ("rows", "cols", "topk"),
+    (
+        (33, 90048, 512),
+        (65, 90048, 1024),
+        (129, 90048, 2048),
+        (514, 90048, 2048),
+        (129, 262208, 2048),
+    ),
 )
 def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
     rows: int,
+    cols: int,
     topk: int,
 ) -> None:
-    cols = 90048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = 257 + row_ids % 113
     row_ends = cols - (rows - 1 - row_ids) % 1021
@@ -1928,11 +1946,36 @@ def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
     )
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        is None
+    )
+    assert cols > dsa_topk_gfx950._ONEBLOCK_RADIX_MAX_COLS
+    assert not (
+        dsa_topk_gfx950._PREFILL_RUNTIME_RADIX_MIN_COLS
+        <= cols
+        <= dsa_topk_gfx950._PREFILL_RUNTIME_RADIX_MAX_COLS
+    )
+    assert cols < dsa_topk_gfx950._PREFILL_HIST_DERIVED_MIN_COLS
+    assert (
+        dsa_topk_gfx950._persistent_interleaved_plan(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        is not None
+    )
 
     for _ in range(2):
         out.fill_(-7)
         lens_out.fill_(-7)
-        dsa_topk_gfx950._dsa_persistent_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
             logits,
             row_starts,
             row_ends,
@@ -1988,7 +2031,7 @@ def test_dsa_persistent_prefill_interleaved_respects_causal_ranges() -> None:
     out = torch.full((rows, topk), -7, device="cuda", dtype=torch.int32)
     lens_out = torch.full((rows,), -7, device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_persistent_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -2030,7 +2073,7 @@ def test_dsa_persistent_prefill_interleaved_is_graph_capturable(
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
     def invoke() -> None:
-        dsa_topk_gfx950._dsa_persistent_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
             logits,
             row_starts,
             row_ends,
@@ -2406,8 +2449,10 @@ def test_dsa_prefill_topk_hist_derived_handles_shifted_and_inf_rows() -> None:
     )
 
 
-@pytest.mark.parametrize("cols", [131072, 262144], ids=["runtime", "staged"])
-def test_dsa_prefill_grouped_radix_topk_is_graph_capturable(cols: int) -> None:
+@pytest.mark.parametrize("cols", [131072, 262144], ids=["two-groups", "four-groups"])
+def test_dsa_prefill_homogeneous_persistent_topk_is_graph_capturable(
+    cols: int,
+) -> None:
     rows = 64
     topk = 2048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
@@ -2458,8 +2503,8 @@ def test_dsa_prefill_grouped_radix_topk_is_graph_capturable(cols: int) -> None:
     )
 
 
-@pytest.mark.parametrize("cols", [131072, 262144], ids=["runtime", "staged"])
-def test_dsa_prefill_grouped_radix_topk_is_stream_local(cols: int) -> None:
+@pytest.mark.parametrize("cols", [131072, 262144], ids=["two-groups", "four-groups"])
+def test_dsa_prefill_homogeneous_persistent_topk_is_stream_local(cols: int) -> None:
     rows = 64
     topk = 2048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)

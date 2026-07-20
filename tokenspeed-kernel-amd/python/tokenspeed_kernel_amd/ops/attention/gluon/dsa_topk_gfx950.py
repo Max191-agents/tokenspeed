@@ -38,8 +38,6 @@ _RADIX_TOPK_BLOCK_N = 4096
 _PREFILL_RADIX_BITS = 11
 _PREFILL_RADIX_BUCKETS = 1 << _PREFILL_RADIX_BITS
 _PREFILL_RADIX_SCHEDULE = ((21, 11), (10, 11), (0, 10))
-_PREFILL_RADIX_BLOCK_N = 4096
-_PREFILL_RADIX_HIST_TARGET_GROUPS_PER_CU = 2
 _PREFILL_RADIX_SCATTER_TARGET_GROUPS_PER_CU = 2
 _PREFILL_LOCAL_GROUP_PREFIX_MIN_COLS = 262144
 _ONEBLOCK_RADIX_SCHEDULE = (12, 12, 8)
@@ -2895,7 +2893,6 @@ def _dsa_prefill_radix_init_kernel(
     lens_out,
     prefixes,
     remaining,
-    counters,
     out_stride: gl.constexpr,
     topk: gl.constexpr,
     TOPK_LOAD_ELEMS: gl.constexpr,
@@ -2910,8 +2907,6 @@ def _dsa_prefill_radix_init_kernel(
     gl.store(lens_out + row, lens)
     gl.store(prefixes + row, 0)
     gl.store(remaining + row, lens)
-    gl.store(counters + row * 2, 0)
-    gl.store(counters + row * 2 + 1, 0)
     gl.store(out + row * out_stride + top_offsets, -1, mask=top_offsets < topk)
     if candidate_len <= topk:
         valid = top_offsets < candidate_len
@@ -3087,74 +3082,6 @@ def _dsa_prefill_derive_group_counts_from_hist_kernel(
 
 
 @gluon.jit
-def _dsa_prefill_radix_scatter_kernel(
-    logits,
-    prefixes,
-    remaining,
-    counters,
-    row_starts,
-    row_ends,
-    out,
-    logits_stride: gl.constexpr,
-    out_stride: gl.constexpr,
-    n_cols: gl.constexpr,
-    topk: gl.constexpr,
-    tiles_per_row: gl.constexpr,
-    groups_per_row: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    LOAD_ELEMS: gl.constexpr,
-):
-    row = gl.program_id(0)
-    group = gl.program_id(1)
-    layout: gl.constexpr = _vector_layout(BLOCK_N, gl.num_warps(), LOAD_ELEMS)
-    row_start = gl.load(row_starts + row).to(gl.int32)
-    row_end = gl.load(row_ends + row).to(gl.int32)
-    if row_end - row_start <= topk:
-        return
-    threshold = gl.load(prefixes + row).to(gl.uint32)
-    keep_equal = gl.load(remaining + row).to(gl.int32)
-    count_greater = topk - keep_equal
-
-    for tile in range(group, tiles_per_row, groups_per_row):
-        offsets = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
-        mask = (offsets >= row_start) & (offsets < row_end) & (offsets < n_cols)
-        values = gl.load(
-            logits + row * logits_stride + offsets,
-            mask=mask,
-            other=-float("inf"),
-        )
-        keys = _fp32_to_ordered_key(values)
-        greater = mask & (keys > threshold)
-        equal = mask & (keys == threshold)
-
-        greater_i32 = greater.to(gl.int32)
-        equal_i32 = equal.to(gl.int32)
-        tile_greater = gl.sum(greater_i32, axis=0).to(gl.int32)
-        tile_equal = gl.sum(equal_i32, axis=0).to(gl.int32)
-        greater_start = gl.atomic_add(
-            counters + row * 2, tile_greater, sem="acq_rel", scope="gpu"
-        )
-        equal_start = gl.atomic_add(
-            counters + row * 2 + 1, tile_equal, sem="acq_rel", scope="gpu"
-        )
-
-        greater_pos = greater_start + gl.associative_scan(greater_i32, 0, _topk_add) - 1
-        equal_pos = (
-            count_greater
-            + equal_start
-            + gl.associative_scan(equal_i32, 0, _topk_add)
-            - 1
-        )
-        greater_write = greater & (greater_pos < topk)
-        equal_write = (
-            equal & (equal_pos < topk) & (equal_pos < count_greater + keep_equal)
-        )
-        local = offsets.to(gl.int32)
-        gl.store(out + row * out_stride + greater_pos, local, mask=greater_write)
-        gl.store(out + row * out_stride + equal_pos, local, mask=equal_write)
-
-
-@gluon.jit
 def _dsa_prefill_radix_group_count_kernel(
     logits,
     prefixes,
@@ -3168,7 +3095,6 @@ def _dsa_prefill_radix_group_count_kernel(
     row_groups_stride: gl.constexpr,
     group_stride: gl.constexpr,
     topk: gl.constexpr,
-    HIST_DERIVED_FIXUP_ONLY: gl.constexpr,
     BLOCK_N: gl.constexpr,
     LOAD_ELEMS: gl.constexpr,
 ):
@@ -3187,9 +3113,8 @@ def _dsa_prefill_radix_group_count_kernel(
         return
     vector_end = candidate_len & -4
     threshold = gl.load(prefixes + row).to(gl.uint32)
-    if HIST_DERIVED_FIXUP_ONLY:
-        if (row_start == 0) & (threshold != 0x007FFFFF):
-            return
+    if (row_start == 0) & (threshold != 0x007FFFFF):
+        return
     counts = gl.zeros([2], gl.int32, layout=count_layout)
 
     for tile in range(group, tiles_per_row, groups_per_row):
@@ -3783,201 +3708,6 @@ def _radix_groups_per_row(
     return min(int(tiles), max(1, triton.cdiv(target_groups, int(rows))))
 
 
-def _run_prefill_wide_radix_prefix_passes(
-    logits: torch.Tensor,
-    row_starts: torch.Tensor,
-    row_ends: torch.Tensor,
-    hist: torch.Tensor,
-    prefixes: torch.Tensor,
-    remaining: torch.Tensor,
-    *,
-    rows: int,
-    cols: int,
-    tiles: int,
-    groups: int,
-    row_groups_stride: int,
-    hist_group_stride: int,
-    block_n: int,
-    topk: int,
-) -> None:
-    for shift, radix_bits in _PREFILL_RADIX_SCHEDULE:
-        num_buckets = 1 << radix_bits
-        _dsa_prefill_wide_radix_grouped_hist_kernel[(rows, groups)](
-            logits,
-            prefixes,
-            row_starts,
-            row_ends,
-            hist,
-            logits.stride(0),
-            tiles_per_row=tiles,
-            groups_per_row=groups,
-            row_groups_stride=row_groups_stride,
-            hist_group_stride=hist_group_stride,
-            n_cols=cols,
-            shift=shift,
-            topk=topk,
-            RADIX_BITS=radix_bits,
-            NUM_BUCKETS=num_buckets,
-            BLOCK_N=block_n,
-            LOAD_ELEMS=_load_elems(block_n, 8),
-            num_warps=8,
-        )
-        _dsa_prefill_wide_radix_update_kernel[(rows,)](
-            prefixes,
-            remaining,
-            hist,
-            groups_per_row=groups,
-            row_groups_stride=row_groups_stride,
-            hist_group_stride=hist_group_stride,
-            RADIX_BITS=radix_bits,
-            NUM_BUCKETS=num_buckets,
-            LOAD_ELEMS=_load_elems(num_buckets, 8),
-            num_warps=8,
-        )
-
-
-def _dsa_prefill_radix_topk(
-    logits: torch.Tensor,
-    row_starts: torch.Tensor,
-    row_ends: torch.Tensor,
-    *,
-    topk: int,
-    out: torch.Tensor,
-    lens_out: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rows, cols = logits.shape
-    tiles = triton.cdiv(int(cols), _RADIX_TOPK_BLOCK_N)
-    groups = _radix_groups_per_row(
-        rows,
-        tiles,
-        logits.device,
-        target_groups_per_cu=_PREFILL_RADIX_SCATTER_TARGET_GROUPS_PER_CU,
-    )
-    hist_tiles = triton.cdiv(int(cols), _PREFILL_RADIX_BLOCK_N)
-    hist_groups = _radix_groups_per_row(
-        rows,
-        hist_tiles,
-        logits.device,
-        target_groups_per_cu=_PREFILL_RADIX_HIST_TARGET_GROUPS_PER_CU,
-    )
-    # The histogram and scatter grids share one scratch buffer with a common row stride.
-    workspace_groups = max(groups, hist_groups)
-    block_groups = triton.next_power_of_2(groups)
-    use_local_group_prefix = (
-        cols >= _PREFILL_LOCAL_GROUP_PREFIX_MIN_COLS and groups <= 8
-    )
-    hist_group_stride = _PREFILL_RADIX_BUCKETS
-    hist = torch.empty(
-        (rows, workspace_groups, hist_group_stride),
-        dtype=torch.int32,
-        device=logits.device,
-    )
-    prefixes = torch.empty((rows,), dtype=torch.int32, device=logits.device)
-    remaining = torch.empty((rows,), dtype=torch.int32, device=logits.device)
-    counters = torch.empty((rows, 2), dtype=torch.int32, device=logits.device)
-    _dsa_prefill_radix_init_kernel[(rows,)](
-        row_starts,
-        row_ends,
-        out,
-        lens_out,
-        prefixes,
-        remaining,
-        counters,
-        out.stride(0),
-        topk=topk,
-        TOPK_LOAD_ELEMS=_load_elems(topk, 8),
-        num_warps=8,
-    )
-    _run_prefill_wide_radix_prefix_passes(
-        logits,
-        row_starts,
-        row_ends,
-        hist,
-        prefixes,
-        remaining,
-        rows=rows,
-        cols=cols,
-        tiles=hist_tiles,
-        groups=hist_groups,
-        row_groups_stride=workspace_groups,
-        hist_group_stride=hist_group_stride,
-        block_n=_PREFILL_RADIX_BLOCK_N,
-        topk=topk,
-    )
-    if groups < tiles:
-        _dsa_prefill_radix_group_count_kernel[(rows, groups)](
-            logits,
-            prefixes,
-            row_starts,
-            row_ends,
-            hist,
-            logits.stride(0),
-            n_cols=cols,
-            tiles_per_row=tiles,
-            groups_per_row=groups,
-            row_groups_stride=workspace_groups,
-            group_stride=hist_group_stride,
-            topk=topk,
-            HIST_DERIVED_FIXUP_ONLY=False,
-            BLOCK_N=_RADIX_TOPK_BLOCK_N,
-            LOAD_ELEMS=_load_elems(_RADIX_TOPK_BLOCK_N, 8),
-            num_warps=8,
-        )
-        if not use_local_group_prefix:
-            _dsa_radix_group_prefix_kernel[(rows,)](
-                hist,
-                groups_per_row=groups,
-                row_groups_stride=workspace_groups,
-                group_stride=hist_group_stride,
-                BLOCK_GROUPS=block_groups,
-                LOAD_ELEMS=_load_elems(block_groups, 1),
-                num_warps=1,
-            )
-        _dsa_prefill_radix_deterministic_scatter_kernel[(rows, groups)](
-            logits,
-            prefixes,
-            remaining,
-            hist,
-            row_starts,
-            row_ends,
-            out,
-            logits.stride(0),
-            out.stride(0),
-            n_cols=cols,
-            topk=topk,
-            tiles_per_row=tiles,
-            groups_per_row=groups,
-            row_groups_stride=workspace_groups,
-            group_stride=hist_group_stride,
-            LOCAL_GROUP_PREFIX=use_local_group_prefix,
-            BLOCK_N=_RADIX_TOPK_BLOCK_N,
-            LOAD_ELEMS=_load_elems(_RADIX_TOPK_BLOCK_N, 8),
-            BLOCK_GROUPS=block_groups,
-            GROUP_LOAD_ELEMS=_load_elems(block_groups, 8),
-            num_warps=8,
-        )
-    else:
-        _dsa_prefill_radix_scatter_kernel[(rows, groups)](
-            logits,
-            prefixes,
-            remaining,
-            counters,
-            row_starts,
-            row_ends,
-            out,
-            logits.stride(0),
-            out.stride(0),
-            n_cols=cols,
-            topk=topk,
-            tiles_per_row=tiles,
-            groups_per_row=groups,
-            BLOCK_N=_RADIX_TOPK_BLOCK_N,
-            LOAD_ELEMS=_load_elems(_RADIX_TOPK_BLOCK_N, 8),
-            num_warps=8,
-        )
-    return out, lens_out
-
-
 def _dsa_prefill_hist_derived_radix_topk(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
@@ -4011,7 +3741,6 @@ def _dsa_prefill_hist_derived_radix_topk(
     )
     prefixes = torch.empty((rows,), dtype=torch.int32, device=logits.device)
     remaining = torch.empty((rows,), dtype=torch.int32, device=logits.device)
-    counters = torch.empty((rows, 2), dtype=torch.int32, device=logits.device)
 
     _dsa_prefill_radix_init_kernel[(rows,)](
         row_starts,
@@ -4020,7 +3749,6 @@ def _dsa_prefill_hist_derived_radix_topk(
         lens_out,
         prefixes,
         remaining,
-        counters,
         out.stride(0),
         topk=topk,
         TOPK_LOAD_ELEMS=_load_elems(topk, 8),
@@ -4086,7 +3814,6 @@ def _dsa_prefill_hist_derived_radix_topk(
         row_groups_stride=groups,
         group_stride=2,
         topk=topk,
-        HIST_DERIVED_FIXUP_ONLY=True,
         BLOCK_N=block_n,
         LOAD_ELEMS=_load_elems(block_n, 8),
         num_warps=8,
@@ -4375,7 +4102,7 @@ def _dsa_prefill_topk_indices(
             lens_out=lens_out,
         )
 
-    return _dsa_prefill_radix_topk(
+    return _dsa_persistent_prefill_topk_indices(
         logits,
         row_starts,
         row_ends,
