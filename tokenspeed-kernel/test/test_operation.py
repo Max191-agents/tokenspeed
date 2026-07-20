@@ -66,12 +66,12 @@ def _schema(
     )
 
 
-def test_schema_exposes_and_invokes_reference(operation_catalog) -> None:
+def test_schema_exposes_and_calls_reference(operation_catalog) -> None:
     schema = _schema().publish()
     tensor = torch.tensor([2.0])
 
     assert schema.signature == inspect.signature(_reference)
-    assert torch.equal(schema.invoke_reference(tensor, 3.0), torch.tensor([6.0]))
+    assert torch.equal(schema.reference(tensor, 3.0), torch.tensor([6.0]))
     assert OperationRegistry.get().lookup(*schema.id) is schema
     assert OperationRegistry.get().schemas() == (schema,)
     assert KernelRegistry.get().get_for_operator(*schema.id) == []
@@ -339,3 +339,23 @@ def test_registered_traits_are_copied(operation_catalog) -> None:
     spec = KernelRegistry.get().get_by_name("immutable_traits")
     assert spec is not None
     assert "typo" not in spec.traits
+
+
+def test_contract_package_publishes_complete_catalog() -> None:
+    from tokenspeed_kernel.contracts import (
+        get_operation_schema,
+        list_operation_schemas,
+    )
+
+    expected = {
+        ("attention", "attn_merge_state"),
+        ("attention", "mha_prefill"),
+        ("attention", "mla_prefill"),
+        ("embedding", "rope"),
+        ("embedding", "rope_mla"),
+        ("quantization", "fp8"),
+        ("transform", "hadamard_transform"),
+    }
+
+    assert expected <= {schema.id for schema in list_operation_schemas()}
+    assert get_operation_schema("embedding", "rope").id == ("embedding", "rope")

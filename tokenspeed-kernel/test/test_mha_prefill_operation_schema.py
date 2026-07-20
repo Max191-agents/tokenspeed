@@ -92,7 +92,7 @@ def test_reference_defines_causal_attention_and_sink_semantics() -> None:
     v = torch.tensor([[[2.0]], [[6.0]]])
     cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
 
-    output, lse = MHA_PREFILL.invoke_reference(
+    output, lse = MHA_PREFILL.reference(
         q=q,
         k=k,
         v=v,
@@ -112,7 +112,7 @@ def test_reference_requires_boundaries_to_cover_packed_inputs() -> None:
     cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
 
     with pytest.raises(ValueError, match="inconsistent packed sequence metadata"):
-        MHA_PREFILL.invoke_reference(
+        MHA_PREFILL.reference(
             q=q,
             k=q,
             v=q,

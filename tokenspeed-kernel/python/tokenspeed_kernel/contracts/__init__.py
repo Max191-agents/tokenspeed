@@ -19,3 +19,32 @@
 # SOFTWARE.
 
 """Backend-independent operation contracts."""
+
+from tokenspeed_kernel.contracts.attention import ATTN_MERGE_STATE, MLA_PREFILL
+from tokenspeed_kernel.contracts.embedding import ROPE, ROPE_MLA
+from tokenspeed_kernel.contracts.mha import MHA_PREFILL
+from tokenspeed_kernel.contracts.quantization import FP8
+from tokenspeed_kernel.contracts.transform import HADAMARD_TRANSFORM
+from tokenspeed_kernel.operation import OperationRegistry, OperationSchema
+
+__all__ = [
+    "ATTN_MERGE_STATE",
+    "FP8",
+    "HADAMARD_TRANSFORM",
+    "MHA_PREFILL",
+    "MLA_PREFILL",
+    "ROPE",
+    "ROPE_MLA",
+    "get_operation_schema",
+    "list_operation_schemas",
+]
+
+
+def get_operation_schema(family: str, mode: str) -> OperationSchema:
+    """Return the published contract for one family and mode."""
+    return OperationRegistry.get().lookup(family, mode)
+
+
+def list_operation_schemas() -> tuple[OperationSchema, ...]:
+    """Return every contract published by this package."""
+    return OperationRegistry.get().schemas()

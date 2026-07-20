@@ -69,7 +69,7 @@ def test_schema_is_published_and_reference_is_not_selectable() -> None:
 def test_reference_matches_butterfly_definition() -> None:
     x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
-    actual = HADAMARD_TRANSFORM.invoke_reference(x, scale=0.5)
+    actual = HADAMARD_TRANSFORM.reference(x, scale=0.5)
 
     expected = torch.tensor(
         [[3.0, -1.0, -2.0, 0.0], [11.0, -1.0, -2.0, 0.0]],
@@ -92,7 +92,7 @@ def test_reference_zero_pads_non_power_of_two_width() -> None:
     )
     padded = torch.nn.functional.pad(x, (0, transform_width - x.shape[-1]))
 
-    actual = HADAMARD_TRANSFORM.invoke_reference(x)
+    actual = HADAMARD_TRANSFORM.reference(x)
 
     expected = (padded @ matrix.T)[..., : x.shape[-1]]
     assert torch.equal(actual, expected)
@@ -101,7 +101,7 @@ def test_reference_zero_pads_non_power_of_two_width() -> None:
 def test_reference_preserves_float64_precision() -> None:
     x = torch.tensor([[1.0 + 2.0**-40, 1.0]], dtype=torch.float64)
 
-    actual = HADAMARD_TRANSFORM.invoke_reference(x)
+    actual = HADAMARD_TRANSFORM.reference(x)
 
     expected = torch.stack((x[..., 0] + x[..., 1], x[..., 0] - x[..., 1]), -1)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

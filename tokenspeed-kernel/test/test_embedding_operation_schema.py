@@ -137,7 +137,7 @@ def test_rope_reference_defines_layout_and_partial_rotation(is_neox, expected) -
     k = q.clone()
     q_out = torch.empty_like(q)
 
-    ROPE.invoke_reference(
+    ROPE.reference(
         positions=positions,
         q=q,
         k=k,
@@ -162,7 +162,7 @@ def test_rope_reference_defines_standard_fused_cache_write() -> None:
     k_buffer = torch.zeros((3, 4))
     v_buffer = torch.zeros_like(k_buffer)
 
-    ROPE.invoke_reference(
+    ROPE.reference(
         positions=positions,
         q=q,
         k=k,
@@ -191,7 +191,7 @@ def test_rope_reference_defines_mla_fused_cache_write() -> None:
     q_out = torch.empty_like(q)
     kv_buffer = torch.zeros((3, 6))
 
-    ROPE.invoke_reference(
+    ROPE.reference(
         positions=positions,
         q=q,
         k=k,
@@ -224,7 +224,7 @@ def test_rope_mla_reference_defines_scale_and_output_cast() -> None:
         for value in (q_rope, k_rope, q_nope, k_nope)
     ]
 
-    ROPE_MLA.invoke_reference(
+    ROPE_MLA.reference(
         positions=positions,
         q_rope=q_rope,
         k_rope=k_rope,

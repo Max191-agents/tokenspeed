@@ -33,8 +33,8 @@ errors are reported while the plugin loads, before the registry is modified.
 
 ## Example plugin
 
-A minimal out-of-tree package that contributes a custom decode-attention
-kernel for NVIDIA Hopper.
+A minimal out-of-tree package that contributes a custom FP8 quantization
+kernel for AMD GPUs.
 
 ```
 my-kernels-plugin/
@@ -48,7 +48,7 @@ my-kernels-plugin/
 ```python
 import torch
 
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.registry import register_kernel
 
@@ -57,20 +57,17 @@ def register() -> None:
     """Entry point invoked by tokenspeed_kernel.plugins.discover_plugins()."""
 
     @register_kernel(
-        "attention",
-        "decode",
+        "quantization",
+        "fp8",
         solution="my_custom",
-        signatures=format_signatures(
-            ("q", "k_cache", "v_cache"), "dense", {torch.bfloat16}
-        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={"has_scale": frozenset({True, False})},
         capability=CapabilityRequirement(
-            vendors=frozenset({"nvidia"}),
-            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"amd"}),
         ),
-        # Built-in FlashInfer decode is priority 18; pick 19 to win selection.
         priority=19,
     )
-    def my_custom_attn_decode(q, kv_cache, page_table, seq_lens, **kwargs):
+    def my_custom_quantize_fp8(x, *, scale=None, enable_pdl=False):
         ...
 ```
 
@@ -100,6 +97,20 @@ from tokenspeed_kernel.plugins import discover_plugins, list_plugins
 discover_plugins()
 print(list_plugins())  # -> [PluginInfo(name='my_plugin', ...)]
 ```
+
+Schema-backed operations expose their canonical callable signature through the
+contract catalog:
+
+```python
+from tokenspeed_kernel.contracts import get_operation_schema
+
+schema = get_operation_schema("quantization", "fp8")
+print(schema.signature)
+```
+
+Omitting an allowed trait from a registration means the kernel claims support
+for every requested value of that trait. Specialized kernels should declare
+their actual constraints.
 
 ## Host-application integration
 

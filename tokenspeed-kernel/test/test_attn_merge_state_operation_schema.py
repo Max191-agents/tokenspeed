@@ -96,7 +96,7 @@ def test_reference_defines_weighted_merge_and_inplace_semantics() -> None:
     lse_a = torch.tensor([[0.0]])
     lse_b = torch.tensor([[0.0]])
 
-    output, lse = ATTN_MERGE_STATE.invoke_reference(
+    output, lse = ATTN_MERGE_STATE.reference(
         out_a=out_a,
         lse_a=lse_a,
         out_b=out_b,
@@ -124,7 +124,7 @@ def test_reference_rejects_inputs_outside_the_shared_kernel_domain(invalid) -> N
         out_b = out_b.transpose(1, 2)
 
     with pytest.raises((TypeError, ValueError)):
-        ATTN_MERGE_STATE.invoke_reference(
+        ATTN_MERGE_STATE.reference(
             out_a=out_a,
             lse_a=lse_a,
             out_b=out_b,

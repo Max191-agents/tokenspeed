@@ -78,7 +78,7 @@ def test_reference_defines_saturating_cast_and_scale(e4m3_platform) -> None:
     )
     scale = torch.tensor([2.0], dtype=torch.float32)
 
-    actual = FP8.invoke_reference(x, scale=scale, enable_pdl=True)
+    actual = FP8.reference(x, scale=scale, enable_pdl=True)
     finite_limit = torch.finfo(torch.float8_e4m3fn).max
     expected = (
         (x.float() / 2.0).clamp(-finite_limit, finite_limit).to(torch.float8_e4m3fn)
@@ -92,7 +92,7 @@ def test_reference_defines_saturating_cast_and_scale(e4m3_platform) -> None:
 def test_reference_without_scale_is_a_saturating_fp8_cast(e4m3_platform) -> None:
     x = torch.tensor([[-1000.0, -1.0, 1.0, 1000.0]], dtype=torch.float32)
 
-    actual = FP8.invoke_reference(x)
+    actual = FP8.reference(x)
 
     expected = x.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
@@ -111,7 +111,7 @@ def test_reference_rejects_non_scalar_or_non_numeric_scale(
     error: str,
 ) -> None:
     with pytest.raises((TypeError, ValueError), match=error):
-        FP8.invoke_reference(torch.ones(2), scale=scale)
+        FP8.reference(torch.ones(2), scale=scale)
 
 
 def test_out_of_tree_registration_keeps_dtype_policy_in_kernel_claims(

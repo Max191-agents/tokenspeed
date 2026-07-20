@@ -168,11 +168,6 @@ class OperationSchema:
         self.validate_traits(spec.traits)
         _validate_implementation_abi(self.signature, implementation)
 
-    def invoke_reference(self, *args: Any, **kwargs: Any) -> Any:
-        """Call the semantic reference using its canonical signature."""
-        self.signature.bind(*args, **kwargs)
-        return self.reference(*args, **kwargs)
-
 
 class OperationRegistry:
     """Process-wide catalog of operation schemas, keyed by string identity."""
