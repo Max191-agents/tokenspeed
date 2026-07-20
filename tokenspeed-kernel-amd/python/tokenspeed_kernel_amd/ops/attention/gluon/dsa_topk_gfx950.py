@@ -394,10 +394,10 @@ def _dsa_persistent_radix_topk_row(
     threshold = gl.full([], 0, gl.uint32)
     threshold_shift = gl.full([], 32, gl.int32)
     remaining = gl.full([], TOPK, gl.int32)
-    done = gl.full([], False, gl.int1)
-    pass_index = gl.full([], 0, gl.int32)
 
-    while (pass_index < _PERSISTENT_PREFILL_NUM_PASSES) & ~done:
+    # Static passes avoid keeping the scan's lane masks live across the
+    # radix loop.
+    for pass_index in gl.static_range(_PERSISTENT_PREFILL_NUM_PASSES):
         if pass_index != 0:
             gl.barrier()
             shared_histogram.store(histogram_zeros)
@@ -532,8 +532,6 @@ def _dsa_persistent_radix_topk_row(
         threshold |= selected_bucket.to(gl.uint32) << shift
         threshold_shift = shift
         remaining -= selected_greater
-        done = selected_bucket_count == remaining
-        pass_index += 1
 
     for tile in range(group, full_tiles, GROUPS_PER_ROW):
         offsets = tile * BLOCK_N + gl.arange(

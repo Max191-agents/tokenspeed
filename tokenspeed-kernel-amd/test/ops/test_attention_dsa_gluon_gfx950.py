@@ -1194,6 +1194,13 @@ def test_dsa_persistent_prefill_tail_is_compile_time_specialized() -> None:
     assert "HAS_TAIL=cols % _PERSISTENT_PREFILL_BLOCK_N != 0" in launch_source
 
 
+def test_dsa_persistent_prefill_radix_passes_are_statically_unrolled() -> None:
+    source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_row.fn)
+
+    assert "for pass_index in gl.static_range(_PERSISTENT_PREFILL_NUM_PASSES)" in source
+    assert "while (pass_index < _PERSISTENT_PREFILL_NUM_PASSES)" not in source
+
+
 @pytest.mark.parametrize(
     ("rows", "cols", "expected_groups"),
     (
@@ -1416,6 +1423,42 @@ def test_dsa_persistent_prefill_handles_packed_selection_boundaries() -> None:
         topk=topk,
     )
     assert bool(((out >= 0) & (out < topk - 1)).sum(dim=1).eq(topk - 1).all())
+
+
+def test_dsa_persistent_prefill_static_passes_preserve_early_selection() -> None:
+    rows = 32
+    cols = 131072
+    topk = 2048
+    row_starts = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    row_ends = torch.full((rows,), cols, device="cuda", dtype=torch.int32)
+    logits = torch.full(
+        (rows, cols),
+        -float("inf"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    logits[:, :topk] = float("inf")
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_topk_indices(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    assert bool(((out >= 0) & (out < topk)).all())
 
 
 def test_dsa_persistent_prefill_topk_handles_ragged_rows() -> None:
