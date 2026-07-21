@@ -39,6 +39,68 @@ from tokenspeed_kernel_amd.ops.attention.gluon.dsa_topk_gfx950 import (  # noqa:
 torch.manual_seed(42)
 
 
+def _run_oneblock_prefill_topk_indices(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    block_n: int,
+    use_compact_final: bool = True,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    plan = dsa_topk_gfx950._TopKLaunchPlan(
+        "oneblock",
+        block_n=block_n,
+        load_elems=dsa_topk_gfx950._load_elems(block_n, 16),
+        use_compact_final=use_compact_final,
+    )
+    return dsa_topk_gfx950._dsa_oneblock_topk_indices(
+        logits,
+        row_starts,
+        row_starts,
+        row_starts,
+        row_ends,
+        block_table_stride=0,
+        block_table_cols=0,
+        page_size=1,
+        topk=topk,
+        q_len_per_req=1,
+        is_decode=False,
+        plan=plan,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+def _run_persistent_decode_topk_slots(
+    logits: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    q_len_per_req: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return dsa_topk_gfx950._dsa_persistent_interleaved_topk(
+        logits,
+        block_table,
+        seq_lens,
+        seq_lens,
+        block_table_stride=block_table.stride(0),
+        block_table_cols=block_table.shape[1],
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        is_decode=True,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
 @gluon.jit
 def _dsa_oneblock_scan_test_kernel(values, output):
     group_layout: gl.constexpr = _vector_layout(2048, gl.num_warps(), 2)
@@ -129,6 +191,11 @@ def test_dsa_topk_has_no_superseded_decode_paths() -> None:
         "_persistent_decode_interleaved_current_groups_plan",
         "_dsa_decode_select_topk_kernel",
         "_dsa_prefill_select_topk_kernel",
+        "_use_persistent_decode",
+        "_dsa_persistent_decode_topk_slots",
+        "_dsa_persistent_prefill_topk_indices",
+        "_dsa_oneblock_manual_prefill_topk_indices",
+        "_wide_oneblock_prefill_block_n",
     )
 
     assert not any(hasattr(dsa_topk_gfx950, name) for name in removed_symbols)
@@ -1350,7 +1417,7 @@ def test_dsa_persistent_prefill_rebases_shifted_live_ranges() -> None:
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             rows,
             cols,
             topk,
@@ -1385,9 +1452,6 @@ def test_dsa_persistent_prefill_rebases_shifted_live_ranges() -> None:
     ("rows", "cols", "expected_groups"),
     (
         (32, 131072, 2),
-        (64, 131072, 2),
-        (64, 147493, 2),
-        (64, 262144, 4),
         (64, 524288, 4),
         (64, 1048576, 4),
         (32, 1048577, 4),
@@ -1411,13 +1475,22 @@ def test_dsa_prefill_topk_dispatches_persistent_groups_across_rows(
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    groups = dsa_topk_gfx950._persistent_prefill_groups(
+    groups = dsa_topk_gfx950._homogeneous_persistent_groups(
         rows,
         cols,
         topk,
         logits.device,
     )
     assert groups == expected_groups
+    plan = dsa_topk_gfx950._dsa_topk_plan(
+        rows,
+        cols,
+        topk,
+        logits.device,
+        is_decode=False,
+    )
+    assert plan.kind == "persistent-homogeneous"
+    assert plan.groups_per_row == expected_groups
     dsa_topk_gfx950._dsa_prefill_topk_indices(
         logits,
         row_starts,
@@ -1441,7 +1514,7 @@ def test_dsa_prefill_topk_dispatches_persistent_groups_across_rows(
 
 
 def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
-    rows = 64
+    rows = 32
     cols = 262144
     topk = 2048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
@@ -1579,7 +1652,7 @@ def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             rows,
             cols,
             topk,
@@ -1625,7 +1698,7 @@ def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
 
 
 def test_dsa_persistent_prefill_handles_packed_selection_boundaries() -> None:
-    rows = 64
+    rows = 32
     cols = 262144
     topk = 2048
     row_starts = torch.zeros(rows, device="cuda", dtype=torch.int32)
@@ -1641,7 +1714,7 @@ def test_dsa_persistent_prefill_handles_packed_selection_boundaries() -> None:
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             rows,
             cols,
             topk,
@@ -1706,7 +1779,7 @@ def test_dsa_persistent_prefill_static_passes_preserve_early_selection() -> None
 
 
 def test_dsa_persistent_prefill_topk_handles_ragged_rows() -> None:
-    rows = 64
+    rows = 32
     cols = 131072
     topk = 2048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
@@ -1809,7 +1882,7 @@ def test_dsa_prefill_manual_oneblock_fallback_keeps_exact_values(cols: int) -> N
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             rows,
             cols,
             topk,
@@ -1857,7 +1930,7 @@ def test_dsa_prefill_manual_oneblock_handles_tile_pair_boundaries(
     out = torch.full((1, topk), -7, device="cuda", dtype=torch.int32)
     lens_out = torch.full((1,), -7, device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_oneblock_manual_prefill_topk_indices(
+    _run_oneblock_prefill_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1896,7 +1969,7 @@ def test_dsa_prefill_manual_oneblock_overwrites_trivial_and_selected_rows(
     out = torch.full((5, topk), -7, device="cuda", dtype=torch.int32)
     lens_out = torch.full((5,), -7, device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_oneblock_manual_prefill_topk_indices(
+    _run_oneblock_prefill_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1918,14 +1991,14 @@ def test_dsa_prefill_manual_oneblock_overwrites_trivial_and_selected_rows(
     assert not bool((out == -7).any())
 
 
-def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
+def test_dsa_homogeneous_persistent_groups_obey_residency_bound() -> None:
     device = torch.device("cuda")
     compute_units = torch.cuda.get_device_properties(device).multi_processor_count
     topk = 2048
     four_group_rows = compute_units // 4
 
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             four_group_rows,
             262144,
             topk,
@@ -1934,7 +2007,7 @@ def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
         == 4
     )
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             four_group_rows + 1,
             262144,
             topk,
@@ -1943,7 +2016,7 @@ def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
         == 2
     )
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             70,
             1901100,
             topk,
@@ -1952,7 +2025,7 @@ def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
         == compute_units // 70
     )
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             35,
             3749700,
             topk,
@@ -1961,7 +2034,7 @@ def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
         == compute_units // 35
     )
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             compute_units // 2 + 1,
             262144,
             topk,
@@ -1970,7 +2043,7 @@ def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
         is None
     )
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             dsa_topk_gfx950._PERSISTENT_PREFILL_MIN_ROWS - 1,
             131072,
             topk,
@@ -2198,11 +2271,15 @@ def test_dsa_decode_manual_oneblock_fallback_keeps_exact_values(
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
     monkeypatch.setattr(dsa_topk_gfx950, "_device_compute_units", lambda _: 1)
 
-    assert not dsa_topk_gfx950._use_persistent_decode(
-        rows,
-        cols,
-        topk,
-        logits.device,
+    assert (
+        dsa_topk_gfx950._dsa_topk_plan(
+            rows,
+            cols,
+            topk,
+            logits.device,
+            is_decode=True,
+        ).kind
+        == "oneblock"
     )
     dsa_topk_gfx950._dsa_decode_topk_slots(
         logits,
@@ -2232,7 +2309,6 @@ def test_dsa_decode_manual_oneblock_fallback_keeps_exact_values(
     (
         pytest.param(5, 512 * 1024, 512, id="topk512-tail"),
         pytest.param(3, 512 * 1024, 1024, id="topk1024-tail"),
-        pytest.param(129, 256 * 1024 + 64, 2048, id="high-row-tail"),
     ),
 )
 def test_dsa_decode_topk_persistent_replaces_staged_wide(
@@ -2256,11 +2332,15 @@ def test_dsa_decode_topk_persistent_replaces_staged_wide(
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    assert dsa_topk_gfx950._use_persistent_decode(
-        rows,
-        cols,
-        topk,
-        logits.device,
+    assert (
+        dsa_topk_gfx950._dsa_topk_plan(
+            rows,
+            cols,
+            topk,
+            logits.device,
+            is_decode=True,
+        ).kind
+        == "persistent-interleaved"
     )
     dsa_topk_gfx950._dsa_decode_topk_slots(
         logits,
@@ -2288,34 +2368,112 @@ def test_dsa_decode_topk_persistent_replaces_staged_wide(
 
 
 @pytest.mark.parametrize(
-    ("rows", "cols", "topk", "expected"),
+    ("rows", "cols", "topk", "decode_kind", "prefill_kind"),
     (
-        (1, 90000, 2048, False),
-        (1, 90001, 2048, True),
-        (128, 131072, 2048, True),
-        (129, 131072, 2048, False),
-        (1, 262144, 1024, False),
-        (1, 262145, 512, True),
-        (514, 1024 * 1024, 2048, True),
+        (1, 90000, 2048, "oneblock", "oneblock"),
+        (1, 90001, 2048, "persistent-interleaved", "oneblock"),
+        (19, 262144, 2048, "persistent-interleaved", "oneblock"),
+        (20, 262144, 2048, "oneblock", "oneblock"),
+        (31, 262144, 2048, "oneblock", "oneblock"),
+        (32, 262144, 2048, "persistent-interleaved", "persistent-homogeneous"),
+        (64, 262144, 2048, "oneblock", "oneblock"),
+        (128, 131072, 2048, "oneblock", "oneblock"),
+        (1, 262144, 1024, "oneblock", "persistent-interleaved"),
+        (
+            1,
+            262145,
+            512,
+            "persistent-interleaved",
+            "persistent-interleaved",
+        ),
+        (
+            128,
+            1024 * 1024,
+            2048,
+            "persistent-interleaved",
+            "persistent-homogeneous",
+        ),
+        (129, 1024 * 1024, 2048, "oneblock", "oneblock"),
     ),
 )
-def test_dsa_persistent_decode_preserves_oneblock_shape_boundary(
+def test_dsa_decode_and_prefill_share_row_parallelism_boundary(
     monkeypatch: pytest.MonkeyPatch,
     rows: int,
     cols: int,
     topk: int,
-    expected: bool,
+    decode_kind: str,
+    prefill_kind: str,
 ) -> None:
     monkeypatch.setattr(dsa_topk_gfx950, "_device_compute_units", lambda _: 256)
 
-    assert (
-        dsa_topk_gfx950._use_persistent_decode(
+    for is_decode, expected_kind in ((True, decode_kind), (False, prefill_kind)):
+        plan = dsa_topk_gfx950._dsa_topk_plan(
             rows,
             cols,
             topk,
             torch.device("cuda", 0),
+            is_decode=is_decode,
         )
-        is expected
+        assert plan.kind == expected_kind
+
+
+@pytest.mark.parametrize(
+    ("requests", "q_len_per_req"),
+    ((24, 1), (16, 4)),
+)
+def test_dsa_decode_high_row_oneblock_maps_logical_offsets_to_slots(
+    requests: int,
+    q_len_per_req: int,
+) -> None:
+    rows = requests * q_len_per_req
+    cols = 256 * 1024
+    page_size = 64
+    topk = 2048
+    seq_lens = cols - torch.arange(requests, device="cuda", dtype=torch.int32) * 977
+    q_offsets = torch.arange(q_len_per_req, device="cuda", dtype=torch.int32)
+    row_ends = (seq_lens[:, None] - (q_len_per_req - 1) + q_offsets[None, :]).reshape(
+        -1
+    )
+    row_starts = torch.zeros_like(row_ends)
+    logits = _make_topk_test_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=4219,
+    )
+    block_table = _make_reversed_decode_block_table(requests, cols, page_size)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    plan = dsa_topk_gfx950._dsa_topk_plan(
+        rows,
+        cols,
+        topk,
+        logits.device,
+        is_decode=True,
+    )
+    assert plan.kind == "oneblock"
+    dsa_topk_gfx950._dsa_decode_topk_slots(
+        logits,
+        block_table,
+        seq_lens,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_decode_topk_slots(
+        logits,
+        out,
+        lens_out,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        q_len_per_req=q_len_per_req,
+        topk=topk,
     )
 
 
@@ -2348,11 +2506,15 @@ def test_dsa_persistent_decode_handles_tail_ties_and_infinities() -> None:
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    assert dsa_topk_gfx950._use_persistent_decode(
-        rows,
-        cols,
-        topk,
-        logits.device,
+    assert (
+        dsa_topk_gfx950._dsa_topk_plan(
+            rows,
+            cols,
+            topk,
+            logits.device,
+            is_decode=True,
+        ).kind
+        == "persistent-interleaved"
     )
     dsa_topk_gfx950._dsa_decode_topk_slots(
         logits,
@@ -2531,7 +2693,7 @@ def test_dsa_persistent_interleaved_prefill_rebases_shifted_live_ranges() -> Non
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             rows,
             cols,
             topk,
@@ -2596,7 +2758,7 @@ def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             rows,
             cols,
             topk,
@@ -2648,80 +2810,55 @@ def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
 
 
 @pytest.mark.parametrize(
-    ("cols", "topk", "expected_block_n"),
+    ("cols", "topk", "expected_kind", "expected_block_n", "expected_compact"),
     (
-        (90001, 1024, None),
-        (90000, 2048, None),
-        (90001, 2048, 8192),
-        (98303, 2048, 8192),
-        (98304, 2048, None),
-        (196608, 2048, None),
-        (196609, 2048, 8192),
-        (512 * 1024 - 1, 2048, 8192),
-        (512 * 1024, 2048, 16384),
-        (1024 * 1024, 2048, 16384),
+        (90001, 1024, "persistent-interleaved", 0, False),
+        (90000, 2048, "oneblock", 4096, False),
+        (90001, 2048, "oneblock", 8192, True),
+        (98303, 2048, "oneblock", 8192, True),
+        (98304, 2048, "oneblock", 4096, True),
+        (196608, 2048, "oneblock", 4096, True),
+        (196609, 2048, "oneblock", 8192, True),
+        (512 * 1024 - 1, 2048, "oneblock", 8192, True),
+        (512 * 1024, 2048, "oneblock", 16384, True),
+        (1024 * 1024, 2048, "oneblock", 16384, True),
     ),
 )
-def test_dsa_wide_oneblock_prefill_dispatch(
+def test_dsa_prefill_launch_plan_boundaries(
     cols: int,
     topk: int,
-    expected_block_n: int | None,
+    expected_kind: str,
+    expected_block_n: int,
+    expected_compact: bool,
 ) -> None:
-    assert (
-        dsa_topk_gfx950._wide_oneblock_prefill_block_n(cols, topk) == expected_block_n
+    plan = dsa_topk_gfx950._dsa_topk_plan(
+        1,
+        cols,
+        topk,
+        torch.device("cuda", 0),
+        is_decode=False,
     )
+
+    assert plan.kind == expected_kind
+    assert plan.block_n == expected_block_n
+    assert plan.use_compact_final is expected_compact
 
 
 @pytest.mark.parametrize("cols", (8192, 16384, 90000))
 def test_dsa_short_oneblock_prefill_uses_early_stop(
-    monkeypatch: pytest.MonkeyPatch,
     cols: int,
 ) -> None:
-    rows = 1
-    topk = 2048
-    storage = torch.empty((1,), device="cuda", dtype=torch.float32)
-    logits = storage.as_strided((rows, cols), (0, 0))
-    row_starts = torch.empty((0,), device="cuda", dtype=torch.int32)
-    row_ends = torch.empty((0,), device="cuda", dtype=torch.int32)
-    out = torch.empty((0,), device="cuda", dtype=torch.int32)
-    lens_out = torch.empty((0,), device="cuda", dtype=torch.int32)
-    launches: list[tuple[int, int, bool]] = []
-
-    def launch_oneblock(
-        actual_logits: torch.Tensor,
-        actual_row_starts: torch.Tensor,
-        actual_row_ends: torch.Tensor,
-        *,
-        topk: int,
-        block_n: int,
-        use_compact_final: bool = True,
-        out: torch.Tensor,
-        lens_out: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert actual_logits is logits
-        assert actual_row_starts is row_starts
-        assert actual_row_ends is row_ends
-        launches.append((topk, block_n, use_compact_final))
-        return out, lens_out
-
-    monkeypatch.setattr(
-        dsa_topk_gfx950,
-        "_dsa_oneblock_manual_prefill_topk_indices",
-        launch_oneblock,
+    plan = dsa_topk_gfx950._dsa_topk_plan(
+        1,
+        cols,
+        2048,
+        torch.device("cuda", 0),
+        is_decode=False,
     )
 
-    returned = dsa_topk_gfx950._dsa_prefill_topk_indices(
-        logits,
-        row_starts,
-        row_ends,
-        topk=topk,
-        out=out,
-        lens_out=lens_out,
-    )
-
-    assert returned[0] is out
-    assert returned[1] is lens_out
-    assert launches == [(topk, dsa_topk_gfx950._ONEBLOCK_PREFILL_RADIX_BLOCK_N, False)]
+    assert plan.kind == "oneblock"
+    assert plan.block_n == dsa_topk_gfx950._ONEBLOCK_PREFILL_RADIX_BLOCK_N
+    assert not plan.use_compact_final
 
 
 @pytest.mark.parametrize(
@@ -2733,120 +2870,34 @@ def test_dsa_short_oneblock_prefill_uses_early_stop(
     ),
 )
 def test_dsa_prefill_topk_2048_interleaved_fallback_uses_wide_oneblock(
-    monkeypatch: pytest.MonkeyPatch,
     rows: int,
     cols: int,
 ) -> None:
-    topk = 2048
-    storage = torch.empty((1,), device="cuda", dtype=torch.float32)
-    logits = storage.as_strided((rows, cols), (0, 0))
-    row_starts = torch.empty((0,), device="cuda", dtype=torch.int32)
-    row_ends = torch.empty((0,), device="cuda", dtype=torch.int32)
-    out = torch.empty((0,), device="cuda", dtype=torch.int32)
-    lens_out = torch.empty((0,), device="cuda", dtype=torch.int32)
-    launches: list[tuple[int, int, int]] = []
-
-    def launch_wide(
-        actual_logits: torch.Tensor,
-        actual_row_starts: torch.Tensor,
-        actual_row_ends: torch.Tensor,
-        *,
-        topk: int,
-        block_n: int,
-        use_compact_final: bool = True,
-        out: torch.Tensor,
-        lens_out: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert actual_logits is logits
-        assert actual_row_starts is row_starts
-        assert actual_row_ends is row_ends
-        assert use_compact_final
-        launches.append((topk, block_n, actual_logits.shape[1]))
-        return out, lens_out
-
-    def reject_interleaved(*args: object, **kwargs: object) -> None:
-        pytest.fail("topk=2048 prefill fallback dispatched persistent interleaved")
-
-    monkeypatch.setattr(
-        dsa_topk_gfx950,
-        "_dsa_oneblock_manual_prefill_topk_indices",
-        launch_wide,
-    )
-    monkeypatch.setattr(
-        dsa_topk_gfx950,
-        "_dsa_persistent_prefill_topk_indices",
-        reject_interleaved,
+    plan = dsa_topk_gfx950._dsa_topk_plan(
+        rows,
+        cols,
+        2048,
+        torch.device("cuda", 0),
+        is_decode=False,
     )
 
-    returned = dsa_topk_gfx950._dsa_prefill_topk_indices(
-        logits,
-        row_starts,
-        row_ends,
-        topk=topk,
-        out=out,
-        lens_out=lens_out,
-    )
-
-    assert returned[0] is out
-    assert returned[1] is lens_out
-    assert launches == [(topk, 8192, cols)]
+    assert plan.kind == "oneblock"
+    assert plan.block_n == 8192
+    assert plan.use_compact_final
 
 
-def test_dsa_prefill_topk_1024_keeps_persistent_interleaved_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_dsa_prefill_topk_1024_keeps_persistent_interleaved_fallback() -> None:
     rows = 257
     cols = 196609
-    topk = 1024
-    storage = torch.empty((1,), device="cuda", dtype=torch.float32)
-    logits = storage.as_strided((rows, cols), (0, 0))
-    row_starts = torch.empty((0,), device="cuda", dtype=torch.int32)
-    row_ends = torch.empty((0,), device="cuda", dtype=torch.int32)
-    out = torch.empty((0,), device="cuda", dtype=torch.int32)
-    lens_out = torch.empty((0,), device="cuda", dtype=torch.int32)
-    launches: list[tuple[int, int]] = []
-
-    def reject_wide(*args: object, **kwargs: object) -> None:
-        pytest.fail("lower-topk prefill fallback dispatched wide one-block")
-
-    def launch_interleaved(
-        actual_logits: torch.Tensor,
-        actual_row_starts: torch.Tensor,
-        actual_row_ends: torch.Tensor,
-        *,
-        topk: int,
-        out: torch.Tensor,
-        lens_out: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert actual_logits is logits
-        assert actual_row_starts is row_starts
-        assert actual_row_ends is row_ends
-        launches.append((topk, actual_logits.shape[1]))
-        return out, lens_out
-
-    monkeypatch.setattr(
-        dsa_topk_gfx950,
-        "_dsa_oneblock_manual_prefill_topk_indices",
-        reject_wide,
-    )
-    monkeypatch.setattr(
-        dsa_topk_gfx950,
-        "_dsa_persistent_prefill_topk_indices",
-        launch_interleaved,
+    plan = dsa_topk_gfx950._dsa_topk_plan(
+        rows,
+        cols,
+        1024,
+        torch.device("cuda", 0),
+        is_decode=False,
     )
 
-    returned = dsa_topk_gfx950._dsa_prefill_topk_indices(
-        logits,
-        row_starts,
-        row_ends,
-        topk=topk,
-        out=out,
-        lens_out=lens_out,
-    )
-
-    assert returned[0] is out
-    assert returned[1] is lens_out
-    assert launches == [(topk, cols)]
+    assert plan.kind == "persistent-interleaved"
 
 
 @pytest.mark.parametrize(
@@ -2876,9 +2927,15 @@ def test_dsa_wide_oneblock_prefill_repeats_with_ragged_rows(
     )
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
-    assert (
-        dsa_topk_gfx950._wide_oneblock_prefill_block_n(cols, topk) == expected_block_n
+    plan = dsa_topk_gfx950._dsa_topk_plan(
+        rows,
+        cols,
+        topk,
+        logits.device,
+        is_decode=False,
     )
+    assert plan.kind == "oneblock"
+    assert plan.block_n == expected_block_n
 
     for _ in range(2):
         out.fill_(-7)
@@ -2919,7 +2976,7 @@ def test_dsa_wide_oneblock_prefill_falls_back_for_large_tie_bucket(
     out = torch.empty((1, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_oneblock_manual_prefill_topk_indices(
+    _run_oneblock_prefill_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -3008,7 +3065,7 @@ def test_dsa_persistent_prefill_interleaved_is_graph_capturable(
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             rows,
             cols,
             topk,
@@ -3111,7 +3168,7 @@ def test_dsa_persistent_decode_interleaved_repeat_and_reset(
     for _ in range(2):
         out.fill_(-7)
         lens_out.fill_(-7)
-        dsa_topk_gfx950._dsa_persistent_decode_topk_slots(
+        _run_persistent_decode_topk_slots(
             logits,
             block_table,
             seq_lens,
@@ -3146,7 +3203,7 @@ def test_dsa_persistent_decode_interleaved_refines_exact_first_pass_bucket() -> 
     block_table = _make_reversed_decode_block_table(rows, cols, page_size)
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
-    dsa_topk_gfx950._dsa_persistent_decode_topk_slots(
+    _run_persistent_decode_topk_slots(
         logits,
         block_table,
         seq_lens,
@@ -3179,7 +3236,7 @@ def test_dsa_persistent_decode_interleaved_is_graph_capturable(
     q_len_per_req = 3
     requests = 11
     rows = requests * q_len_per_req
-    cols = 90048
+    cols = 256 * 1024 + 64
     topk = 2048
     request_ids = torch.arange(requests, device="cuda", dtype=torch.int32)
     seq_lens = cols - (request_ids * 53 + 17) % 1024
@@ -3384,7 +3441,7 @@ def test_dsa_wide_oneblock_prefill_handles_shifted_and_inf_rows() -> None:
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
     assert (
-        dsa_topk_gfx950._persistent_prefill_groups(
+        dsa_topk_gfx950._homogeneous_persistent_groups(
             rows,
             cols,
             topk,
@@ -3392,7 +3449,15 @@ def test_dsa_wide_oneblock_prefill_handles_shifted_and_inf_rows() -> None:
         )
         is None
     )
-    assert dsa_topk_gfx950._wide_oneblock_prefill_block_n(cols, topk) == 16384
+    plan = dsa_topk_gfx950._dsa_topk_plan(
+        rows,
+        cols,
+        topk,
+        logits.device,
+        is_decode=False,
+    )
+    assert plan.kind == "oneblock"
+    assert plan.block_n == 16384
 
     dsa_topk_gfx950._dsa_prefill_topk_indices(
         logits,
@@ -3417,7 +3482,7 @@ def test_dsa_wide_oneblock_prefill_handles_shifted_and_inf_rows() -> None:
 def test_dsa_prefill_homogeneous_persistent_topk_is_graph_capturable(
     cols: int,
 ) -> None:
-    rows = 64
+    rows = 32
     topk = 2048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 11
@@ -3469,7 +3534,7 @@ def test_dsa_prefill_homogeneous_persistent_topk_is_graph_capturable(
 
 @pytest.mark.parametrize("cols", [131072, 262144], ids=["two-groups", "four-groups"])
 def test_dsa_prefill_homogeneous_persistent_topk_is_stream_local(cols: int) -> None:
-    rows = 64
+    rows = 32
     topk = 2048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 13
@@ -3542,7 +3607,7 @@ def test_dsa_persistent_prefill_topk_is_graph_capturable(
     warm_workspace: bool,
 ) -> None:
     rows = 64 if warm_workspace else 96
-    cols = 131072
+    cols = 512 * 1024
     topk = 2048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = row_ids * 11
@@ -3642,7 +3707,7 @@ def test_dsa_persistent_prefill_topk_is_graph_capturable(
 
 
 def test_dsa_persistent_prefill_topk_is_stream_local() -> None:
-    rows = 64
+    rows = 32
     cols = 131072
     topk = 2048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)

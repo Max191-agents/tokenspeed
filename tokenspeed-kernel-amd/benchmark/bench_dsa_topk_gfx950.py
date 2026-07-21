@@ -524,14 +524,16 @@ def _reset_prefill_outputs(state: PrefillState) -> None:
 
 def _decode_gluon_dispatch(state: DecodeState) -> dict[str, object]:
     case = state.case
-    if case.context_len <= TOPK:
-        return {"name": "trivial"}
-    if dsa_topk_gfx950._use_persistent_decode(
+    launch = dsa_topk_gfx950._dsa_topk_plan(
         case.rows,
         case.context_len,
         TOPK,
         state.logits.device,
-    ):
+        is_decode=True,
+    )
+    if launch.kind == "trivial":
+        return {"name": "trivial"}
+    if launch.kind == "persistent-interleaved":
         plan = dsa_topk_gfx950._persistent_interleaved_plan(
             case.rows,
             case.context_len,
@@ -547,26 +549,33 @@ def _prefill_gluon_dispatch(
     cols: int,
     device: torch.device,
 ) -> dict[str, object]:
-    if cols <= TOPK:
+    launch = dsa_topk_gfx950._dsa_topk_plan(
+        rows,
+        cols,
+        TOPK,
+        device,
+        is_decode=False,
+    )
+    if launch.kind == "trivial":
         return {"name": "trivial"}
-    groups = dsa_topk_gfx950._persistent_prefill_groups(rows, cols, TOPK, device)
-    if groups is not None:
-        return {"name": "persistent-prefill", "groups_per_row": groups}
-    wide_block_n = dsa_topk_gfx950._wide_oneblock_prefill_block_n(cols, TOPK)
-    if wide_block_n is not None:
+    if launch.kind == "persistent-homogeneous":
+        return {
+            "name": "persistent-prefill",
+            "groups_per_row": launch.groups_per_row,
+        }
+    if launch.kind == "persistent-interleaved":
+        return {"name": "persistent-interleaved-prefill"}
+    if launch.use_compact_final and launch.block_n in (
+        dsa_topk_gfx950._ONEBLOCK_PREFILL_WIDE_SHORT_BLOCK_N,
+        dsa_topk_gfx950._ONEBLOCK_PREFILL_WIDE_LONG_BLOCK_N,
+    ):
         return {
             "name": "oneblock-manual-compact-prefill",
-            "block_n": wide_block_n,
+            "block_n": launch.block_n,
         }
-    if cols <= dsa_topk_gfx950._ONEBLOCK_RADIX_MAX_COLS:
+    if not launch.use_compact_final:
         return {"name": "oneblock-manual-early-stop"}
-    if (
-        dsa_topk_gfx950._PREFILL_ONEBLOCK_RADIX_MIN_COLS
-        <= cols
-        <= dsa_topk_gfx950._PREFILL_ONEBLOCK_RADIX_MAX_COLS
-    ):
-        return {"name": "oneblock-manual-compact"}
-    return {"name": "persistent-interleaved-prefill"}
+    return {"name": "oneblock-manual-compact"}
 
 
 def _dispatch_groups(

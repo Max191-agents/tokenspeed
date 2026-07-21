@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from functools import cache
 from threading import Lock
+from typing import NamedTuple
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
@@ -46,6 +47,8 @@ _ONEBLOCK_PREFILL_WIDE_LONG_MIN_COLS = 512 * 1024
 _ONEBLOCK_COMPACT_FINAL_BLOCK_N = 4096
 _ONEBLOCK_DECODE_MAX_COLS = 256 * 1024
 _ONEBLOCK_RADIX_MAX_COLS = 90000
+_ONEBLOCK_PARALLEL_TAIL_MIN_ROWS = 20
+_ONEBLOCK_PARALLEL_MIN_ROWS = 64
 _PREFILL_ONEBLOCK_RADIX_MIN_COLS = 98304
 _PREFILL_ONEBLOCK_RADIX_MAX_COLS = 196608
 _PERSISTENT_PREFILL_MIN_COLS = 128 * 1024
@@ -2685,7 +2688,15 @@ def _device_compute_units(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _persistent_prefill_groups(
+class _TopKLaunchPlan(NamedTuple):
+    kind: str
+    groups_per_row: int = 0
+    block_n: int = 0
+    load_elems: int = 0
+    use_compact_final: bool = False
+
+
+def _homogeneous_persistent_groups(
     rows: int,
     cols: int,
     topk: int,
@@ -2711,46 +2722,99 @@ def _persistent_prefill_groups(
     return None
 
 
-def _wide_oneblock_prefill_block_n(
-    cols: int,
-    topk: int,
-) -> int | None:
-    if (
-        topk != _PERSISTENT_PREFILL_TOPK
-        or cols <= _ONEBLOCK_RADIX_MAX_COLS
-        or _PREFILL_ONEBLOCK_RADIX_MIN_COLS <= cols <= _PREFILL_ONEBLOCK_RADIX_MAX_COLS
-    ):
-        return None
-
-    if cols < _ONEBLOCK_PREFILL_WIDE_LONG_MIN_COLS:
-        return _ONEBLOCK_PREFILL_WIDE_SHORT_BLOCK_N
-    return _ONEBLOCK_PREFILL_WIDE_LONG_BLOCK_N
-
-
-def _use_persistent_decode(
+def _use_oneblock_for_row_parallelism(
     rows: int,
     cols: int,
     topk: int,
     device: torch.device,
 ) -> bool:
-    if rows <= 0 or topk not in (512, 1024, 2048):
+    if (
+        rows <= 0
+        or topk != _PERSISTENT_PREFILL_TOPK
+        or cols <= _ONEBLOCK_RADIX_MAX_COLS
+    ):
         return False
-    if cols > _ONEBLOCK_DECODE_MAX_COLS:
-        return True
-    if topk != _PERSISTENT_PREFILL_TOPK or cols <= _PERSISTENT_DECODE_MIN_COLS:
-        return False
+    if cols <= _ONEBLOCK_DECODE_MAX_COLS:
+        has_tail_rows = rows & (rows - 1) != 0
+        if rows >= _ONEBLOCK_PARALLEL_MIN_ROWS or (
+            rows >= _ONEBLOCK_PARALLEL_TAIL_MIN_ROWS and has_tail_rows
+        ):
+            return True
+
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    # Keep the exact shape boundary that previously selected a one-block
-    # kernel when the homogeneous persistent grid could not remain resident.
-    return _device_compute_units(device_index) // rows >= 2
+    return _device_compute_units(device_index) // rows < 2
 
 
 def _next_power_of_two(value: int) -> int:
     if value <= 1:
         return 1
     return 1 << (value - 1).bit_length()
+
+
+def _oneblock_launch_plan(cols: int, *, is_decode: bool) -> _TopKLaunchPlan:
+    if is_decode:
+        block_n, load_elems = (
+            _ONEBLOCK_DECODE_SHORT_MANUAL_CONFIG
+            if cols <= _ONEBLOCK_DECODE_SHORT_MANUAL_MAX_COLS
+            else _ONEBLOCK_DECODE_LONG_MANUAL_CONFIG
+        )
+        return _TopKLaunchPlan("oneblock", block_n=block_n, load_elems=load_elems)
+
+    if cols <= _ONEBLOCK_RADIX_MAX_COLS:
+        block_n = _ONEBLOCK_PREFILL_RADIX_BLOCK_N
+        use_compact_final = False
+    elif _PREFILL_ONEBLOCK_RADIX_MIN_COLS <= cols <= _PREFILL_ONEBLOCK_RADIX_MAX_COLS:
+        block_n = _ONEBLOCK_PREFILL_RADIX_BLOCK_N
+        use_compact_final = True
+    elif cols < _ONEBLOCK_PREFILL_WIDE_LONG_MIN_COLS:
+        block_n = _ONEBLOCK_PREFILL_WIDE_SHORT_BLOCK_N
+        use_compact_final = True
+    else:
+        block_n = _ONEBLOCK_PREFILL_WIDE_LONG_BLOCK_N
+        use_compact_final = True
+    return _TopKLaunchPlan(
+        "oneblock",
+        block_n=block_n,
+        load_elems=_load_elems(block_n, 16),
+        use_compact_final=use_compact_final,
+    )
+
+
+def _dsa_topk_plan(
+    rows: int,
+    cols: int,
+    topk: int,
+    device: torch.device,
+    *,
+    is_decode: bool,
+) -> _TopKLaunchPlan:
+    if cols <= topk:
+        return _TopKLaunchPlan("trivial")
+
+    if _use_oneblock_for_row_parallelism(rows, cols, topk, device):
+        return _oneblock_launch_plan(cols, is_decode=is_decode)
+
+    # The high-row crossover is shared. Below it, keep the tuned low-row
+    # persistent strategy for each API: interleaved for decode and homogeneous
+    # for prefill when enough rows are available.
+    if is_decode:
+        if cols > _ONEBLOCK_DECODE_MAX_COLS or (
+            topk == _PERSISTENT_PREFILL_TOPK and cols > _PERSISTENT_DECODE_MIN_COLS
+        ):
+            return _TopKLaunchPlan("persistent-interleaved")
+        return _oneblock_launch_plan(cols, is_decode=True)
+
+    groups = _homogeneous_persistent_groups(rows, cols, topk, device)
+    if groups is not None:
+        return _TopKLaunchPlan("persistent-homogeneous", groups_per_row=groups)
+    if topk == _PERSISTENT_PREFILL_TOPK or (
+        cols <= _ONEBLOCK_RADIX_MAX_COLS
+        or _PREFILL_ONEBLOCK_RADIX_MIN_COLS <= cols <= _PREFILL_ONEBLOCK_RADIX_MAX_COLS
+    ):
+        return _oneblock_launch_plan(cols, is_decode=False)
+    return _TopKLaunchPlan("persistent-interleaved")
 
 
 def _persistent_topk_workspace(
@@ -2999,53 +3063,139 @@ def _dsa_persistent_interleaved_topk(
     return out, lens_out
 
 
-def _dsa_persistent_decode_topk_slots(
+def _dsa_oneblock_topk_indices(
     logits: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
-    *,
-    page_size: int,
-    topk: int,
-    q_len_per_req: int,
-    out: torch.Tensor,
-    lens_out: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _dsa_persistent_interleaved_topk(
-        logits,
-        block_table,
-        seq_lens,
-        seq_lens,
-        block_table_stride=block_table.stride(0),
-        block_table_cols=block_table.shape[1],
-        page_size=page_size,
-        topk=topk,
-        q_len_per_req=q_len_per_req,
-        is_decode=True,
-        out=out,
-        lens_out=lens_out,
-    )
-
-
-def _dsa_persistent_prefill_topk_indices(
-    logits: torch.Tensor,
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     *,
+    block_table_stride: int,
+    block_table_cols: int,
+    page_size: int,
     topk: int,
+    q_len_per_req: int,
+    is_decode: bool,
+    plan: _TopKLaunchPlan,
     out: torch.Tensor,
     lens_out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _dsa_persistent_interleaved_topk(
+    _dsa_oneblock_manual_radix_topk_kernel[(logits.shape[0],)](
         logits,
-        row_starts,
+        block_table,
+        seq_lens,
         row_starts,
         row_ends,
-        block_table_stride=0,
-        block_table_cols=0,
-        page_size=1,
+        out,
+        lens_out,
+        logits.stride(0),
+        block_table_stride,
+        out.stride(0),
+        block_table_cols,
+        page_size=int(page_size),
         topk=topk,
-        q_len_per_req=1,
-        is_decode=False,
+        q_len_per_req=q_len_per_req,
+        IS_DECODE=is_decode,
+        RADIX0_BITS=_ONEBLOCK_RADIX_SCHEDULE[0],
+        RADIX1_BITS=_ONEBLOCK_RADIX_SCHEDULE[1],
+        RADIX2_BITS=_ONEBLOCK_RADIX_SCHEDULE[2],
+        MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
+        BLOCK_N=plan.block_n,
+        LOAD_ELEMS=plan.load_elems,
+        COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
+        USE_COMPACT_FINAL=plan.use_compact_final,
+        USE_RADIX_EARLY_STOP=not plan.use_compact_final,
+        num_warps=16,
+    )
+    return out, lens_out
+
+
+def _dsa_topk_indices(
+    logits: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    block_table_stride: int,
+    block_table_cols: int,
+    page_size: int,
+    topk: int,
+    q_len_per_req: int,
+    is_decode: bool,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, cols = logits.shape
+    plan = _dsa_topk_plan(
+        rows,
+        cols,
+        topk,
+        logits.device,
+        is_decode=is_decode,
+    )
+    if plan.kind == "trivial":
+        _dsa_trivial_topk_kernel[(rows,)](
+            block_table,
+            seq_lens,
+            row_starts,
+            row_ends,
+            out,
+            lens_out,
+            block_table_stride,
+            out.stride(0),
+            block_table_cols,
+            page_size=int(page_size),
+            topk=topk,
+            q_len_per_req=q_len_per_req,
+            IS_DECODE=is_decode,
+            TOPK_LOAD_ELEMS=_load_elems(topk, 8),
+            num_warps=8,
+        )
+        return out, lens_out
+
+    if plan.kind == "persistent-homogeneous":
+        workspace = _persistent_topk_workspace(rows, logits.device)
+        return _dsa_persistent_prefill_radix_topk(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            groups=plan.groups_per_row,
+            workspace=workspace,
+            out=out,
+            lens_out=lens_out,
+        )
+
+    if plan.kind == "persistent-interleaved":
+        return _dsa_persistent_interleaved_topk(
+            logits,
+            block_table,
+            row_starts,
+            row_ends,
+            block_table_stride=block_table_stride,
+            block_table_cols=block_table_cols,
+            page_size=page_size,
+            topk=topk,
+            q_len_per_req=q_len_per_req,
+            is_decode=is_decode,
+            out=out,
+            lens_out=lens_out,
+        )
+
+    return _dsa_oneblock_topk_indices(
+        logits,
+        block_table,
+        seq_lens,
+        row_starts,
+        row_ends,
+        block_table_stride=block_table_stride,
+        block_table_cols=block_table_cols,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        is_decode=is_decode,
+        plan=plan,
         out=out,
         lens_out=lens_out,
     )
@@ -3062,120 +3212,21 @@ def _dsa_decode_topk_slots(
     out: torch.Tensor,
     lens_out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rows, cols = logits.shape
-    if cols <= topk:
-        _dsa_trivial_topk_kernel[(rows,)](
-            block_table,
-            seq_lens,
-            seq_lens,
-            seq_lens,
-            out,
-            lens_out,
-            block_table.stride(0),
-            out.stride(0),
-            block_table.shape[1],
-            page_size=int(page_size),
-            topk=topk,
-            q_len_per_req=q_len_per_req,
-            IS_DECODE=True,
-            TOPK_LOAD_ELEMS=_load_elems(topk, 8),
-            num_warps=8,
-        )
-        return out, lens_out
-
-    if _use_persistent_decode(
-        rows,
-        cols,
-        topk,
-        logits.device,
-    ):
-        return _dsa_persistent_decode_topk_slots(
-            logits,
-            block_table,
-            seq_lens,
-            page_size=page_size,
-            topk=topk,
-            q_len_per_req=q_len_per_req,
-            out=out,
-            lens_out=lens_out,
-        )
-
-    manual_config = (
-        _ONEBLOCK_DECODE_SHORT_MANUAL_CONFIG
-        if cols <= _ONEBLOCK_DECODE_SHORT_MANUAL_MAX_COLS
-        else _ONEBLOCK_DECODE_LONG_MANUAL_CONFIG
-    )
-    block_n, load_elems = manual_config
-    _dsa_oneblock_manual_radix_topk_kernel[(rows,)](
+    return _dsa_topk_indices(
         logits,
         block_table,
         seq_lens,
         seq_lens,
         seq_lens,
-        out,
-        lens_out,
-        logits.stride(0),
-        block_table.stride(0),
-        out.stride(0),
-        block_table.shape[1],
-        page_size=int(page_size),
+        block_table_stride=block_table.stride(0),
+        block_table_cols=block_table.shape[1],
+        page_size=page_size,
         topk=topk,
         q_len_per_req=q_len_per_req,
-        IS_DECODE=True,
-        RADIX0_BITS=_ONEBLOCK_RADIX_SCHEDULE[0],
-        RADIX1_BITS=_ONEBLOCK_RADIX_SCHEDULE[1],
-        RADIX2_BITS=_ONEBLOCK_RADIX_SCHEDULE[2],
-        MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
-        BLOCK_N=block_n,
-        LOAD_ELEMS=load_elems,
-        COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
-        USE_COMPACT_FINAL=False,
-        USE_RADIX_EARLY_STOP=True,
-        num_warps=16,
+        is_decode=True,
+        out=out,
+        lens_out=lens_out,
     )
-    return out, lens_out
-
-
-def _dsa_oneblock_manual_prefill_topk_indices(
-    logits: torch.Tensor,
-    row_starts: torch.Tensor,
-    row_ends: torch.Tensor,
-    *,
-    topk: int,
-    block_n: int,
-    use_compact_final: bool = True,
-    out: torch.Tensor,
-    lens_out: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rows = logits.shape[0]
-    _dsa_oneblock_manual_radix_topk_kernel[(rows,)](
-        logits,
-        row_starts,
-        row_starts,
-        row_starts,
-        row_ends,
-        out,
-        lens_out,
-        logits.stride(0),
-        0,
-        out.stride(0),
-        0,
-        page_size=1,
-        topk=topk,
-        q_len_per_req=1,
-        IS_DECODE=False,
-        RADIX0_BITS=_ONEBLOCK_RADIX_SCHEDULE[0],
-        RADIX1_BITS=_ONEBLOCK_RADIX_SCHEDULE[1],
-        RADIX2_BITS=_ONEBLOCK_RADIX_SCHEDULE[2],
-        MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
-        BLOCK_N=block_n,
-        LOAD_ELEMS=_load_elems(block_n, 16),
-        COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
-        USE_COMPACT_FINAL=use_compact_final,
-        USE_RADIX_EARLY_STOP=not use_compact_final,
-        num_warps=16,
-    )
-    return out, lens_out
 
 
 def _dsa_prefill_topk_indices(
@@ -3187,92 +3238,18 @@ def _dsa_prefill_topk_indices(
     out: torch.Tensor,
     lens_out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rows, cols = logits.shape
-    if cols <= topk:
-        _dsa_trivial_topk_kernel[(rows,)](
-            row_starts,
-            row_starts,
-            row_starts,
-            row_ends,
-            out,
-            lens_out,
-            0,
-            out.stride(0),
-            0,
-            page_size=1,
-            topk=topk,
-            q_len_per_req=1,
-            IS_DECODE=False,
-            TOPK_LOAD_ELEMS=_load_elems(topk, 8),
-            num_warps=8,
-        )
-        return out, lens_out
-
-    persistent_groups = _persistent_prefill_groups(
-        rows,
-        cols,
-        topk,
-        logits.device,
-    )
-    if persistent_groups is not None:
-        workspace = _persistent_topk_workspace(
-            rows,
-            logits.device,
-        )
-        return _dsa_persistent_prefill_radix_topk(
-            logits,
-            row_starts,
-            row_ends,
-            topk=topk,
-            groups=persistent_groups,
-            workspace=workspace,
-            out=out,
-            lens_out=lens_out,
-        )
-
-    wide_oneblock_block_n = _wide_oneblock_prefill_block_n(
-        cols,
-        topk,
-    )
-    if wide_oneblock_block_n is not None:
-        return _dsa_oneblock_manual_prefill_topk_indices(
-            logits,
-            row_starts,
-            row_ends,
-            topk=topk,
-            block_n=wide_oneblock_block_n,
-            out=out,
-            lens_out=lens_out,
-        )
-
-    if cols <= _ONEBLOCK_RADIX_MAX_COLS:
-        return _dsa_oneblock_manual_prefill_topk_indices(
-            logits,
-            row_starts,
-            row_ends,
-            topk=topk,
-            block_n=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
-            use_compact_final=False,
-            out=out,
-            lens_out=lens_out,
-        )
-
-    if _PREFILL_ONEBLOCK_RADIX_MIN_COLS <= cols <= _PREFILL_ONEBLOCK_RADIX_MAX_COLS:
-        return _dsa_oneblock_manual_prefill_topk_indices(
-            logits,
-            row_starts,
-            row_ends,
-            topk=topk,
-            block_n=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
-            out=out,
-            lens_out=lens_out,
-        )
-
-    return _dsa_persistent_prefill_topk_indices(
+    return _dsa_topk_indices(
         logits,
         row_starts,
+        row_starts,
+        row_starts,
         row_ends,
+        block_table_stride=0,
+        block_table_cols=0,
+        page_size=1,
         topk=topk,
+        q_len_per_req=1,
+        is_decode=False,
         out=out,
         lens_out=lens_out,
     )
