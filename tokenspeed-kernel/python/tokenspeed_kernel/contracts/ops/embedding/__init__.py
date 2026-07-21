@@ -18,13 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Built-in operation contracts, organized by family and mode."""
+"""Embedding operation contracts."""
 
-from tokenspeed_kernel.contracts.ops.attention import (
-    ATTN_MERGE_STATE,
-    MHA_PREFILL,
-    MLA_PREFILL,
-)
-from tokenspeed_kernel.contracts.ops.embedding import ROPE
+from tokenspeed_kernel.contracts.ops.embedding.rope import ROPE, rope_reference
 
-__all__ = ["ATTN_MERGE_STATE", "MHA_PREFILL", "MLA_PREFILL", "ROPE"]
+__all__ = ["ROPE", "rope_reference"]

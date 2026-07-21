@@ -371,6 +371,9 @@ __all__ = [
 ]
 
 
+# Publish contracts before backend registration.
+import tokenspeed_kernel.contracts.ops.embedding  # noqa: E402,F401
+
 # Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401

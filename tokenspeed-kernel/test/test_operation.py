@@ -350,6 +350,7 @@ def test_contract_package_publishes_complete_catalog() -> None:
         ("attention", "attn_merge_state"): "ATTN_MERGE_STATE",
         ("attention", "mha_prefill"): "MHA_PREFILL",
         ("attention", "mla_prefill"): "MLA_PREFILL",
+        ("embedding", "rope"): "ROPE",
     }
     catalog = {schema.id: schema for schema in contracts.list_operation_schemas()}
 

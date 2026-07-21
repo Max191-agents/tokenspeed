@@ -22,11 +22,14 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.operation import OperationRegistry
 from tokenspeed_kernel.ops.embedding import (
     FusedSetKVBufferArg,
     apply_rope,
     apply_rope_mla,
 )
+
+_ROPE_REFERENCE = OperationRegistry.get().lookup("embedding", "rope").reference
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
@@ -62,25 +65,16 @@ def test_rope_neox_full_bf16(
     query = torch.randn(num_tokens, num_q_heads * head_size, device=device, dtype=dtype)
     key = torch.randn(num_tokens, num_k_heads * head_size, device=device, dtype=dtype)
 
-    # Reference (PyTorch).
-    cos_sin_ref = cos_sin_cache.index_select(0, positions)
-    cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
-    cos_ref = cos_ref.unsqueeze(-2).to(dtype)
-    sin_ref = sin_ref.unsqueeze(-2).to(dtype)
-
-    q_ref = query.clone().view(num_tokens, num_q_heads, head_size)
-    q1, q2 = torch.chunk(q_ref, 2, dim=-1)
-    q_out = torch.cat(
-        (q1 * cos_ref - q2 * sin_ref, q2 * cos_ref + q1 * sin_ref), dim=-1
+    q_ref = query.clone()
+    k_ref = key.clone()
+    _ROPE_REFERENCE(
+        positions=positions,
+        q=q_ref,
+        k=k_ref,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=True,
     )
-    q_ref = q_out.reshape(num_tokens, num_q_heads * head_size)
-
-    k_ref = key.clone().view(num_tokens, num_k_heads, head_size)
-    k1, k2 = torch.chunk(k_ref, 2, dim=-1)
-    k_out = torch.cat(
-        (k1 * cos_ref - k2 * sin_ref, k2 * cos_ref + k1 * sin_ref), dim=-1
-    )
-    k_ref = k_out.reshape(num_tokens, num_k_heads * head_size)
 
     apply_rope(
         positions=positions,
@@ -129,25 +123,16 @@ def test_rope_gptj_full_bf16(
     query = torch.randn(num_tokens, num_q_heads * head_size, device=device, dtype=dtype)
     key = torch.randn(num_tokens, num_k_heads * head_size, device=device, dtype=dtype)
 
-    cos_sin_ref = cos_sin_cache.index_select(0, positions)
-    cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
-    cos_ref = cos_ref.unsqueeze(-2).to(dtype)
-    sin_ref = sin_ref.unsqueeze(-2).to(dtype)
-
-    def _gptj_ref(x, num_heads):
-        x = x.view(num_tokens, num_heads, head_size)
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        o1 = x1 * cos_ref - x2 * sin_ref
-        o2 = x2 * cos_ref + x1 * sin_ref
-        return (
-            torch.stack((o1, o2), dim=-1)
-            .flatten(-2)
-            .reshape(num_tokens, num_heads * head_size)
-        )
-
-    q_ref = _gptj_ref(query.clone(), num_q_heads)
-    k_ref = _gptj_ref(key.clone(), num_k_heads)
+    q_ref = query.clone()
+    k_ref = key.clone()
+    _ROPE_REFERENCE(
+        positions=positions,
+        q=q_ref,
+        k=k_ref,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=False,
+    )
 
     apply_rope(
         positions=positions,
@@ -198,25 +183,16 @@ def test_rope_neox_partial_bf16(
     query_orig = query.clone()
     key_orig = key.clone()
 
-    cos_sin_ref = cos_sin_cache.index_select(0, positions)
-    cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
-    cos_ref = cos_ref.unsqueeze(-2).to(dtype)
-    sin_ref = sin_ref.unsqueeze(-2).to(dtype)
-
-    def _ref(x, num_heads):
-        x = x.view(num_tokens, num_heads, head_size)
-        rot = x[..., :rotary_dim]
-        rest = x[..., rotary_dim:]
-        r1, r2 = torch.chunk(rot, 2, dim=-1)
-        rot_out = torch.cat(
-            (r1 * cos_ref - r2 * sin_ref, r2 * cos_ref + r1 * sin_ref), dim=-1
-        )
-        return torch.cat((rot_out, rest), dim=-1).reshape(
-            num_tokens, num_heads * head_size
-        )
-
-    q_ref = _ref(query.clone(), num_q_heads)
-    k_ref = _ref(key.clone(), num_k_heads)
+    q_ref = query.clone()
+    k_ref = key.clone()
+    _ROPE_REFERENCE(
+        positions=positions,
+        q=q_ref,
+        k=k_ref,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=True,
+    )
 
     apply_rope(
         positions=positions,
@@ -271,20 +247,16 @@ def test_rope_single_token(
     query = torch.randn(num_tokens, num_q_heads * head_size, device=device, dtype=dtype)
     key = torch.randn(num_tokens, num_k_heads * head_size, device=device, dtype=dtype)
 
-    cos_sin_ref = cos_sin_cache.index_select(0, positions)
-    cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
-    cos_ref = cos_ref.unsqueeze(-2).to(dtype)
-    sin_ref = sin_ref.unsqueeze(-2).to(dtype)
-
-    def _ref(x, num_heads):
-        x = x.view(num_tokens, num_heads, head_size)
-        x1, x2 = torch.chunk(x, 2, dim=-1)
-        return torch.cat(
-            (x1 * cos_ref - x2 * sin_ref, x2 * cos_ref + x1 * sin_ref), dim=-1
-        ).reshape(num_tokens, num_heads * head_size)
-
-    q_ref = _ref(query.clone(), num_q_heads)
-    k_ref = _ref(key.clone(), num_k_heads)
+    q_ref = query.clone()
+    k_ref = key.clone()
+    _ROPE_REFERENCE(
+        positions=positions,
+        q=q_ref,
+        k=k_ref,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=True,
+    )
 
     apply_rope(
         positions=positions,
@@ -343,22 +315,16 @@ def test_rope_fused_set_kv_buffer(
     v_buffer = torch.zeros_like(k_buffer)
     q_rope_out = torch.empty_like(query)
 
-    cos_sin_ref = cos_sin_cache.index_select(0, positions)
-    cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
-    cos_ref = cos_ref.unsqueeze(-2).to(dtype)
-    sin_ref = sin_ref.unsqueeze(-2).to(dtype)
-
-    q_ref_view = query_orig.view(num_tokens, num_q_heads, head_size)
-    q1, q2 = torch.chunk(q_ref_view, 2, dim=-1)
-    q_ref = torch.cat(
-        (q1 * cos_ref - q2 * sin_ref, q2 * cos_ref + q1 * sin_ref), dim=-1
-    ).reshape(num_tokens, num_q_heads * head_size)
-
-    k_ref_view = key_orig.view(num_tokens, num_k_heads, head_size)
-    k1, k2 = torch.chunk(k_ref_view, 2, dim=-1)
-    k_ref = torch.cat(
-        (k1 * cos_ref - k2 * sin_ref, k2 * cos_ref + k1 * sin_ref), dim=-1
-    ).reshape(num_tokens, num_k_heads * head_size)
+    q_ref = query_orig.clone()
+    k_ref = key_orig.clone()
+    _ROPE_REFERENCE(
+        positions=positions,
+        q=q_ref,
+        k=k_ref,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=True,
+    )
 
     apply_rope(
         positions=positions,

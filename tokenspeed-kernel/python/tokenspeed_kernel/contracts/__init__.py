@@ -24,6 +24,7 @@ from tokenspeed_kernel.contracts.ops import (
     ATTN_MERGE_STATE,
     MHA_PREFILL,
     MLA_PREFILL,
+    ROPE,
 )
 from tokenspeed_kernel.operation import OperationRegistry, OperationSchema
 
@@ -31,6 +32,7 @@ __all__ = [
     "ATTN_MERGE_STATE",
     "MHA_PREFILL",
     "MLA_PREFILL",
+    "ROPE",
     "get_operation_schema",
     "list_operation_schemas",
 ]
