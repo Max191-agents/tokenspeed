@@ -1976,7 +1976,6 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         gl.int32,
         [MAX_BUCKETS],
         shared_layout,
-        value=histogram_zeros,
     )
     output_counter_count: gl.constexpr = 4 if USE_COMPACT_FINAL else 2
     output_counter_layout: gl.constexpr = _vector_layout(
@@ -1994,7 +1993,6 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         gl.int32,
         [output_counter_count],
         output_counter_shared_layout,
-        value=output_counter_zeros,
     )
     if USE_COMPACT_FINAL:
         compact_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
@@ -2012,8 +2010,6 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             [topk],
             compact_shared_layout,
         )
-    gl.barrier()
-
     if IS_DECODE:
         req = row // q_len_per_req
         q_offset = row - req * q_len_per_req
@@ -2030,7 +2026,6 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     selected_count = gl.minimum(candidate_len, topk).to(gl.int32)
     output_offsets = gl.arange(0, topk, layout=output_layout)
     gl.store(lens_out + row, selected_count)
-    gl.store(out + row * out_stride + output_offsets, -1)
 
     if candidate_len <= topk:
         valid = output_offsets < candidate_len
@@ -2051,6 +2046,10 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             gl.where(valid, indices, -1),
         )
         return
+
+    shared_histogram.store(histogram_zeros)
+    shared_output_counters.store(output_counter_zeros)
+    gl.barrier()
 
     candidate_logits = logits + row * logits_stride + candidate_start
     vector_end = candidate_len & -4

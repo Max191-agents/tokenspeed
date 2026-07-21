@@ -1609,6 +1609,46 @@ def test_dsa_prefill_manual_oneblock_fallback_keeps_exact_values(cols: int) -> N
         )
 
 
+@pytest.mark.parametrize("topk", (512, 1024, 2048))
+def test_dsa_prefill_manual_oneblock_overwrites_trivial_and_selected_rows(
+    topk: int,
+) -> None:
+    cols = 8192
+    row_starts = torch.tensor([0, 7, 17, 31, 53], device="cuda", dtype=torch.int32)
+    row_lens = torch.tensor(
+        [0, topk - 1, topk, topk + 1, cols - 53],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_ends = row_starts + row_lens
+    logits = torch.empty((5, cols), device="cuda", dtype=torch.float32).uniform_(
+        -1.0, 1.0, generator=_generator("cuda", 1612)
+    )
+    out = torch.full((5, topk), -7, device="cuda", dtype=torch.int32)
+    lens_out = torch.full((5,), -7, device="cuda", dtype=torch.int32)
+
+    dsa_topk_gfx950._dsa_oneblock_manual_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        block_n=dsa_topk_gfx950._ONEBLOCK_PREFILL_RADIX_BLOCK_N,
+        use_compact_final=False,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_topk_indices(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    assert not bool((out == -7).any())
+
+
 def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
     device = torch.device("cuda")
     compute_units = torch.cuda.get_device_properties(device).multi_processor_count
