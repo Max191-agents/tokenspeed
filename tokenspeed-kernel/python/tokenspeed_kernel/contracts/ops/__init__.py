@@ -20,6 +20,10 @@
 
 """Built-in operation contracts, organized by family and mode."""
 
-from tokenspeed_kernel.contracts.ops.attention import ATTN_MERGE_STATE, MHA_PREFILL
+from tokenspeed_kernel.contracts.ops.attention import (
+    ATTN_MERGE_STATE,
+    MHA_PREFILL,
+    MLA_PREFILL,
+)
 
-__all__ = ["ATTN_MERGE_STATE", "MHA_PREFILL"]
+__all__ = ["ATTN_MERGE_STATE", "MHA_PREFILL", "MLA_PREFILL"]

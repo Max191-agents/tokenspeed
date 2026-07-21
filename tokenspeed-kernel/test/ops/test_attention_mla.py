@@ -8,6 +8,7 @@ from tokenspeed_kernel import (
     mla_decode_with_kvcache,
     mla_prefill,
 )
+from tokenspeed_kernel.operation import OperationRegistry
 from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
@@ -71,32 +72,27 @@ def test_mla_prefill(
         solution=solution,
     )
 
-    refs = []
-    ref_lses = []
-    q_offset = 0
-    kv_offset = 0
-    for q_len, kv_len in zip(q_lens, kv_lens, strict=True):
-        q_i = q[q_offset : q_offset + q_len].float()
-        k_i = k[kv_offset : kv_offset + kv_len].float()
-        v_i = v[kv_offset : kv_offset + kv_len].float()
-        scores = torch.einsum("qhd,khd->hqk", q_i, k_i) * softmax_scale
-        if is_causal:
-            q_pos = torch.arange(q_len, device=device) + max(kv_len - q_len, 0)
-            k_pos = torch.arange(kv_len, device=device)
-            mask = q_pos[:, None] >= k_pos[None, :]
-            scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
-        probs = torch.softmax(scores, dim=-1)
-        refs.append(torch.einsum("hqk,khd->qhd", probs, v_i))
-        ref_lses.append(torch.logsumexp(scores, dim=-1).transpose(0, 1))
-        q_offset += q_len
-        kv_offset += kv_len
-    out_ref = torch.cat(refs, dim=0)
-    lse_ref = torch.cat(ref_lses, dim=0)
+    out_ref, lse_ref = (
+        OperationRegistry.get()
+        .lookup("attention", "mla_prefill")
+        .reference(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max(q_lens),
+            max_seqlen_kv=max(kv_lens),
+            softmax_scale=softmax_scale,
+            is_causal=is_causal,
+            return_lse=True,
+        )
+    )
 
     assert out.shape == (q.shape[0], q.shape[1], v.shape[-1])
     assert lse.shape == (q.shape[0], q.shape[1])
     out_tol = 1e-1 if dtype in _FP8_DTYPES else 8e-2
-    torch.testing.assert_close(out.float(), out_ref, rtol=out_tol, atol=out_tol)
+    torch.testing.assert_close(out.float(), out_ref.float(), rtol=out_tol, atol=out_tol)
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
