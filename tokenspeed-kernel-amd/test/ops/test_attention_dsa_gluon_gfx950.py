@@ -1276,6 +1276,19 @@ def test_dsa_persistent_pass_arrival_uses_monotonic_generations() -> None:
     assert "generation_last_arrival = (pass_index + 1) * GROUPS_PER_ROW - 1" in source
     assert "gl.atomic_xchg(" not in source
     assert source.count("pass_arrivals + row * _PERSISTENT_PREFILL_COUNTER_STRIDE") == 2
+    atomic_sections = (
+        ("old = gl.atomic_add(", "generation_last_arrival"),
+        ("greater_start = gl.atomic_add(", "equal_start = gl.atomic_add("),
+        ("equal_start = gl.atomic_add(", "copy_offsets = gl.arange("),
+        ("reset_old = gl.atomic_add(", "if reset_old == GROUPS_PER_ROW - 1:"),
+    )
+    for start, end in atomic_sections:
+        start_offset = source.index(start)
+        section = source[start_offset : source.index(end, start_offset)]
+        assert 'sem="relaxed"' in section
+    assert source.count('sem="relaxed"') == 5
+    assert source.count('sem="release"') == 1
+    assert 'sem="acq_rel"' not in source
 
 
 def test_dsa_persistent_prefill_tail_follows_live_row_length() -> None:
@@ -1478,6 +1491,70 @@ def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
         row_ends,
         topk=topk,
     )
+
+
+def test_dsa_persistent_prefill_relaxed_bookkeeping_reuses_workspace() -> None:
+    rows = 35
+    cols = 65573
+    topk = 2048
+    groups = 7
+    row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
+    row_starts = row_ids * 7
+    row_ends = cols - (rows - 1 - row_ids) * 11
+    logits = _make_topk_test_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+    )
+    repeats = 32
+    outputs = torch.empty(
+        (repeats, rows, topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    lens_outputs = torch.empty(
+        (repeats, rows),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+
+    for out, lens_out in zip(outputs, lens_outputs, strict=True):
+        out.fill_(-7)
+        lens_out.fill_(-7)
+        dsa_topk_gfx950._dsa_persistent_prefill_radix_topk(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            groups=groups,
+            workspace=workspace,
+            out=out,
+            lens_out=lens_out,
+        )
+
+    torch.testing.assert_close(
+        lens_outputs,
+        torch.full_like(lens_outputs, topk),
+    )
+    starts = row_starts[None, :, None]
+    ends = row_ends[None, :, None]
+    assert bool(((outputs >= starts) & (outputs < ends)).all())
+    sorted_outputs = torch.sort(outputs, dim=-1).values
+    assert bool((sorted_outputs[..., 1:] != sorted_outputs[..., :-1]).all())
+    selected_values = torch.gather(
+        logits.unsqueeze(0).expand(repeats, -1, -1),
+        2,
+        outputs.long(),
+    )
+    assert bool((selected_values >= 2.0).all())
+    greater_counts = (selected_values > 2.0).sum(dim=-1)
+    torch.testing.assert_close(
+        greater_counts,
+        torch.full_like(greater_counts, topk - 32),
+    )
+    _assert_persistent_workspace_reset(workspace)
 
 
 def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
@@ -1865,23 +1942,23 @@ def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
         )
         == 2
     )
-    assert dsa_topk_gfx950._persistent_prefill_groups(
-        70,
-        1901100,
-        topk,
-        device,
-    ) == min(
-        compute_units // 70,
-        dsa_topk_gfx950._PERSISTENT_PREFILL_LONG_MAX_GROUPS,
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            70,
+            1901100,
+            topk,
+            device,
+        )
+        == compute_units // 70
     )
-    assert dsa_topk_gfx950._persistent_prefill_groups(
-        35,
-        3749700,
-        topk,
-        device,
-    ) == min(
-        compute_units // 35,
-        dsa_topk_gfx950._PERSISTENT_PREFILL_LONG_MAX_GROUPS,
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            35,
+            3749700,
+            topk,
+            device,
+        )
+        == compute_units // 35
     )
     assert (
         dsa_topk_gfx950._persistent_prefill_groups(

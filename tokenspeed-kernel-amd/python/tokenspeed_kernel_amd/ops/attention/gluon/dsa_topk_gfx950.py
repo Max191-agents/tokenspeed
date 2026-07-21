@@ -51,7 +51,6 @@ _PREFILL_ONEBLOCK_RADIX_MAX_COLS = 196608
 _PERSISTENT_PREFILL_MIN_COLS = 128 * 1024
 _PERSISTENT_PREFILL_FOUR_GROUP_MIN_COLS = 256 * 1024
 _PERSISTENT_PREFILL_FILL_RESIDENCY_MIN_COLS = 1536 * 1024
-_PERSISTENT_PREFILL_LONG_MAX_GROUPS = 5
 _PERSISTENT_PREFILL_MIN_ROWS = 32
 _PERSISTENT_DECODE_MIN_COLS = 90000
 _PERSISTENT_DECODE_GROUP_CANDIDATES = (2, 4, 8, 16, 32, 64)
@@ -579,7 +578,9 @@ def _dsa_persistent_radix_topk_row(
         old = gl.atomic_add(
             row_pass_arrival,
             1,
-            sem="acq_rel",
+            # Match AITER's fence-free gfx950 arrival protocol after the
+            # workgroup barrier. Only pass_done publishes GPU-wide completion.
+            sem="relaxed",
             scope="gpu",
         )
         generation_last_arrival = (pass_index + 1) * GROUPS_PER_ROW - 1
@@ -714,13 +715,13 @@ def _dsa_persistent_radix_topk_row(
     greater_start = gl.atomic_add(
         output_counters + (row * 2) * _PERSISTENT_PREFILL_COUNTER_STRIDE,
         local_greater,
-        sem="acq_rel",
+        sem="relaxed",
         scope="gpu",
     )
     equal_start = gl.atomic_add(
         output_counters + (row * 2 + 1) * _PERSISTENT_PREFILL_COUNTER_STRIDE,
         local_equal,
-        sem="acq_rel",
+        sem="relaxed",
         scope="gpu",
     )
     copy_offsets = gl.arange(0, TOPK, layout=output_layout)
@@ -745,7 +746,7 @@ def _dsa_persistent_radix_topk_row(
     reset_old = gl.atomic_add(
         reset_arrivals + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
         1,
-        sem="acq_rel",
+        sem="relaxed",
         scope="gpu",
     )
     if reset_old == GROUPS_PER_ROW - 1:
@@ -2701,8 +2702,7 @@ def _persistent_prefill_groups(
         device_index = torch.cuda.current_device()
     max_groups = _device_compute_units(device_index) // rows
     if cols >= _PERSISTENT_PREFILL_FILL_RESIDENCY_MIN_COLS:
-        long_groups = min(max_groups, _PERSISTENT_PREFILL_LONG_MAX_GROUPS)
-        return long_groups if long_groups >= 2 else None
+        return max_groups if max_groups >= 2 else None
     target_groups = 2 if cols < _PERSISTENT_PREFILL_FOUR_GROUP_MIN_COLS else 4
     if max_groups >= target_groups:
         return target_groups
