@@ -1665,6 +1665,46 @@ def test_dsa_prefill_manual_oneblock_fallback_keeps_exact_values(cols: int) -> N
         )
 
 
+@pytest.mark.parametrize("candidate_len", (4095, 4096, 4097, 8191, 8192, 8193))
+def test_dsa_prefill_manual_oneblock_handles_tile_pair_boundaries(
+    candidate_len: int,
+) -> None:
+    topk = 2048
+    candidate_start = 193
+    cols = candidate_start + candidate_len + 64
+    row_starts = torch.tensor([candidate_start], device="cuda", dtype=torch.int32)
+    row_ends = row_starts + candidate_len
+    logits = _make_topk_test_logits(
+        row_starts,
+        row_ends,
+        cols=cols,
+        topk=topk,
+        seed=1601 + candidate_len,
+    )
+    out = torch.full((1, topk), -7, device="cuda", dtype=torch.int32)
+    lens_out = torch.full((1,), -7, device="cuda", dtype=torch.int32)
+
+    dsa_topk_gfx950._dsa_oneblock_manual_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        block_n=dsa_topk_gfx950._ONEBLOCK_PREFILL_RADIX_BLOCK_N,
+        use_compact_final=False,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    _assert_topk_indices(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+
+
 @pytest.mark.parametrize("topk", (512, 1024, 2048))
 def test_dsa_prefill_manual_oneblock_overwrites_trivial_and_selected_rows(
     topk: int,

@@ -1788,6 +1788,64 @@ def _accumulate_oneblock_histogram_tile(
 
 
 @gluon.jit
+def _accumulate_oneblock_histogram_tile_pair(
+    candidate_logits,
+    tile_start,
+    candidate_len,
+    vector_end,
+    prefix,
+    shared_histogram,
+    shift: gl.constexpr,
+    radix_bits: gl.constexpr,
+    value_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    FIRST_PASS: gl.constexpr,
+):
+    _, first_values, first_valid = _load_oneblock_tile(
+        candidate_logits,
+        tile_start,
+        candidate_len,
+        vector_end,
+        value_layout,
+        BLOCK_N,
+        False,
+    )
+    _, second_values, second_valid = _load_oneblock_tile(
+        candidate_logits,
+        tile_start + BLOCK_N,
+        candidate_len,
+        vector_end,
+        value_layout,
+        BLOCK_N,
+        False,
+    )
+    first_keys = _fp32_to_topk_key(first_values)
+    second_keys = _fp32_to_topk_key(second_values)
+    if FIRST_PASS:
+        first_match = first_valid
+        second_match = second_valid
+    else:
+        prefix_shift = shift + radix_bits
+        first_match = first_valid & ((first_keys >> prefix_shift) == prefix)
+        second_match = second_valid & ((second_keys >> prefix_shift) == prefix)
+    bucket_mask: gl.constexpr = (1 << radix_bits) - 1
+    first_buckets = (first_keys >> shift) & bucket_mask
+    second_buckets = (second_keys >> shift) & bucket_mask
+    pair_buckets = gl.join(first_buckets, second_buckets).reshape([2 * BLOCK_N])
+    pair_match = gl.join(first_match, second_match).reshape([2 * BLOCK_N])
+    pair_updates = gl.join(
+        gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+        gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+    ).reshape([2 * BLOCK_N])
+    shared_histogram.atomic_scatter_add(
+        pair_updates,
+        pair_buckets.to(gl.int32),
+        axis=0,
+        mask=pair_match,
+    )
+
+
+@gluon.jit
 def _emit_oneblock_topk_tile(
     candidate_logits,
     tile_start,
@@ -2271,21 +2329,53 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                         True,
                     )
         else:
-            for tile_start in range(0, full_end, BLOCK_N):
-                _accumulate_oneblock_histogram_tile(
-                    candidate_logits,
-                    tile_start,
-                    candidate_len,
-                    vector_end,
-                    prefix,
-                    shared_histogram,
-                    shift,
-                    radix_bits,
-                    value_layout,
-                    BLOCK_N,
-                    pass_index == 0,
-                    False,
-                )
+            if USE_RADIX_EARLY_STOP:
+                paired_end = candidate_len & -(2 * BLOCK_N)
+                for tile_start in range(0, paired_end, 2 * BLOCK_N):
+                    _accumulate_oneblock_histogram_tile_pair(
+                        candidate_logits,
+                        tile_start,
+                        candidate_len,
+                        vector_end,
+                        prefix,
+                        shared_histogram,
+                        shift,
+                        radix_bits,
+                        value_layout,
+                        BLOCK_N,
+                        pass_index == 0,
+                    )
+                for tile_start in range(paired_end, full_end, BLOCK_N):
+                    _accumulate_oneblock_histogram_tile(
+                        candidate_logits,
+                        tile_start,
+                        candidate_len,
+                        vector_end,
+                        prefix,
+                        shared_histogram,
+                        shift,
+                        radix_bits,
+                        value_layout,
+                        BLOCK_N,
+                        pass_index == 0,
+                        False,
+                    )
+            else:
+                for tile_start in range(0, full_end, BLOCK_N):
+                    _accumulate_oneblock_histogram_tile(
+                        candidate_logits,
+                        tile_start,
+                        candidate_len,
+                        vector_end,
+                        prefix,
+                        shared_histogram,
+                        shift,
+                        radix_bits,
+                        value_layout,
+                        BLOCK_N,
+                        pass_index == 0,
+                        False,
+                    )
             if full_end < candidate_len:
                 _accumulate_oneblock_histogram_tile(
                     candidate_logits,
