@@ -22,6 +22,7 @@ if not _is_gfx950():
     pytest.skip("AMD GFX950 is required for Gluon DSA tests", allow_module_level=True)
 
 
+from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.attention.gluon import dsa_topk_gfx950  # noqa: E402
 from tokenspeed_kernel_amd.ops.attention.gluon.dsa_gfx950 import (  # noqa: E402
     _trim_topk_slots_for_context,
@@ -29,11 +30,67 @@ from tokenspeed_kernel_amd.ops.attention.gluon.dsa_gfx950 import (  # noqa: E402
     gluon_dsa_prefill_gfx950,
 )
 from tokenspeed_kernel_amd.ops.attention.gluon.dsa_topk_gfx950 import (  # noqa: E402
+    _oneblock_group_cumulative,
+    _vector_layout,
     gluon_dsa_decode_topk_fp8_gfx950,
     gluon_dsa_prefill_topk_fp8_gfx950,
 )
 
 torch.manual_seed(42)
+
+
+@gluon.jit
+def _dsa_oneblock_scan_test_kernel(values, output):
+    group_layout: gl.constexpr = _vector_layout(2048, gl.num_warps(), 2)
+    thread_layout: gl.constexpr = _vector_layout(1024, gl.num_warps(), 1)
+    wave_layout: gl.constexpr = _vector_layout(gl.num_warps(), gl.num_warps(), 1)
+    shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[gl.num_warps(), 1]],
+        [gl.num_warps()],
+        [0],
+    )
+    shared_wave_prefixes = gl.allocate_shared_memory(
+        gl.int32,
+        [gl.num_warps()],
+        shared_layout,
+    )
+    offsets = gl.arange(0, 2048, layout=group_layout)
+    cumulative = _oneblock_group_cumulative(
+        gl.load(values + offsets),
+        shared_wave_prefixes,
+        group_layout,
+        thread_layout,
+        wave_layout,
+        1024,
+    )
+    gl.store(output + offsets, cumulative)
+
+
+def test_dsa_oneblock_scan_matches_cumulative_sum_across_boundaries() -> None:
+    generator = torch.Generator().manual_seed(17)
+    cases = [
+        torch.ones(2048, dtype=torch.int32),
+        torch.randint(0, 9, (2048,), dtype=torch.int32, generator=generator),
+    ]
+    for index in (31, 32, 63, 64, 127, 128, 1023, 1024):
+        values = torch.zeros(2048, dtype=torch.int32)
+        values[index] = 1
+        cases.append(values)
+
+    for host_values in cases:
+        values = host_values.cuda()
+        output = torch.empty_like(values)
+        _dsa_oneblock_scan_test_kernel[(1,)](
+            values,
+            output,
+            num_warps=16,
+        )
+        torch.testing.assert_close(
+            output.cpu(),
+            torch.cumsum(host_values, dim=0, dtype=torch.int32),
+            rtol=0,
+            atol=0,
+        )
 
 
 def test_dsa_topk_has_no_custom_compiled_runner_cache() -> None:
