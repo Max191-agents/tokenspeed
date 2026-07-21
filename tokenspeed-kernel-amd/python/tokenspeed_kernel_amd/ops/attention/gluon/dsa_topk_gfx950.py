@@ -104,123 +104,6 @@ def _topk_add(a, b):
 
 
 @gluon.jit
-def _dpp_wave64_inclusive_i32(value):
-    return gl.inline_asm_elementwise(
-        asm="""
-            v_mov_b32_e32 $0, $1
-            s_nop 1
-            v_add_u32_dpp $0, $0, $0 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1
-            s_nop 1
-            v_add_u32_dpp $0, $0, $0 row_shr:2 row_mask:0xf bank_mask:0xf bound_ctrl:1
-            s_nop 1
-            v_add_u32_dpp $0, $0, $0 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:1
-            s_nop 1
-            v_add_u32_dpp $0, $0, $0 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:1
-            s_nop 1
-            v_add_u32_dpp $0, $0, $0 row_bcast:15 row_mask:0xa bank_mask:0xf bound_ctrl:1
-            s_nop 1
-            v_add_u32_dpp $0, $0, $0 row_bcast:31 row_mask:0xc bank_mask:0xf bound_ctrl:1
-            s_nop 1
-        """,
-        constraints="=&v,v",
-        args=[value],
-        dtype=gl.int32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@gluon.jit
-def _dpp_row16_inclusive_i32(value):
-    return gl.inline_asm_elementwise(
-        asm="""
-            v_mov_b32_e32 $0, $1
-            s_nop 1
-            v_add_u32_dpp $0, $0, $0 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1
-            s_nop 1
-            v_add_u32_dpp $0, $0, $0 row_shr:2 row_mask:0xf bank_mask:0xf bound_ctrl:1
-            s_nop 1
-            v_add_u32_dpp $0, $0, $0 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:1
-            s_nop 1
-            v_add_u32_dpp $0, $0, $0 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:1
-            s_nop 1
-        """,
-        constraints="=&v,v",
-        args=[value],
-        dtype=gl.int32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@gluon.jit
-def _oneblock_group_cumulative(
-    group_counts,
-    shared_wave_prefixes,
-    group_layout: gl.constexpr,
-    thread_layout: gl.constexpr,
-    wave_prefix_layout: gl.constexpr,
-    THREADS: gl.constexpr,
-):
-    thread_pairs = group_counts.reshape([THREADS, 2])
-    thread_first, thread_second = gl.split(thread_pairs)
-    thread_first = gl.convert_layout(thread_first, thread_layout, assert_trivial=True)
-    thread_second = gl.convert_layout(thread_second, thread_layout, assert_trivial=True)
-
-    thread_end = _dpp_wave64_inclusive_i32(thread_first + thread_second)
-    thread_first_cumulative = thread_end - thread_second
-    thread_offsets = gl.arange(0, THREADS, layout=thread_layout)
-    wave_ids = thread_offsets // 64
-    shared_wave_prefixes.atomic_scatter_xchg(
-        thread_end,
-        wave_ids,
-        axis=0,
-        mask=(thread_offsets & 63) == 63,
-    )
-    gl.barrier()
-
-    wave_totals = shared_wave_prefixes.load(wave_prefix_layout)
-    wave_prefixes = _dpp_row16_inclusive_i32(wave_totals) - wave_totals
-    shared_wave_prefixes.store(wave_prefixes)
-    gl.barrier()
-
-    wave_prefix = shared_wave_prefixes.gather(wave_ids, axis=0)
-    cumulative = gl.join(
-        thread_first_cumulative + wave_prefix,
-        thread_end + wave_prefix,
-    ).reshape([2 * THREADS])
-    return gl.convert_layout(cumulative, group_layout, assert_trivial=True)
-
-
-@gluon.jit
-def _persistent_group_cumulative(
-    group_counts,
-    shared_wave_prefixes,
-    group_layout: gl.constexpr,
-    wave_prefix_layout: gl.constexpr,
-    THREADS: gl.constexpr,
-):
-    thread_end = _dpp_wave64_inclusive_i32(group_counts)
-    thread_offsets = gl.arange(0, THREADS, layout=group_layout)
-    wave_ids = thread_offsets // 64
-    shared_wave_prefixes.atomic_scatter_xchg(
-        thread_end,
-        wave_ids,
-        axis=0,
-        mask=(thread_offsets & 63) == 63,
-    )
-    gl.barrier()
-
-    wave_totals = shared_wave_prefixes.load(wave_prefix_layout)
-    wave_prefixes = _dpp_row16_inclusive_i32(wave_totals) - wave_totals
-    shared_wave_prefixes.store(wave_prefixes)
-    gl.barrier()
-
-    wave_prefix = shared_wave_prefixes.gather(wave_ids, axis=0)
-    return thread_end + wave_prefix
-
-
-@gluon.jit
 def _persistent_wait_until_at_least(address, target, thread_offset):
     return gl.inline_asm_elementwise(
         asm="""
@@ -439,21 +322,6 @@ def _dsa_persistent_radix_topk_kernel(
         [_PERSISTENT_PREFILL_NUM_BUCKETS],
         hist_shared_layout,
     )
-    wave_prefix_layout: gl.constexpr = _vector_layout(
-        gl.num_warps(),
-        gl.num_warps(),
-        1,
-    )
-    wave_prefix_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[gl.num_warps(), 1]],
-        [gl.num_warps()],
-        [0],
-    )
-    shared_wave_prefixes = gl.allocate_shared_memory(
-        gl.int32,
-        [gl.num_warps()],
-        wave_prefix_shared_layout,
-    )
     compact_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[TOPK, 1]],
         [TOPK],
@@ -615,13 +483,7 @@ def _dsa_persistent_radix_topk_kernel(
         count_low = gl.convert_layout(count_low, group_layout)
         count_high = gl.convert_layout(count_high, group_layout)
         group_counts = count_low + count_high
-        cumulative = _persistent_group_cumulative(
-            group_counts,
-            shared_wave_prefixes,
-            group_layout,
-            wave_prefix_layout,
-            _PERSISTENT_PREFILL_NUM_BUCKETS // 2,
-        )
+        cumulative = gl.associative_scan(group_counts, 0, _topk_add)
         before_group = cumulative - group_counts
         selected_group = (before_group < remaining) & (cumulative >= remaining)
         bucket_pairs = bucket_offsets.reshape([_PERSISTENT_PREFILL_NUM_BUCKETS // 2, 2])
@@ -631,12 +493,9 @@ def _dsa_persistent_radix_topk_kernel(
         select_low = before_group + count_low >= remaining
         group_bucket = gl.where(select_low, bucket_low, bucket_high)
         group_selected_before = before_group + gl.where(select_low, 0, count_low)
-        group_selected_count = gl.where(select_low, count_low, count_high)
-        # Exactly one pair is selected, and its first two fields are each 11 bits.
-        packed_selection = (
-            group_bucket.to(gl.uint64)
-            | (group_selected_before.to(gl.uint64) << 11)
-            | (group_selected_count.to(gl.uint64) << 22)
+        # Exactly one pair is selected, and both fields fit in 11 bits.
+        packed_selection = group_bucket.to(gl.uint32) | (
+            group_selected_before.to(gl.uint32) << 11
         )
         packed_selection = gl.sum(
             gl.where(selected_group, packed_selection, 0),
@@ -644,7 +503,6 @@ def _dsa_persistent_radix_topk_kernel(
         )
         selected_bucket = (packed_selection & 0x7FF).to(gl.int32)
         selected_greater = ((packed_selection >> 11) & 0x7FF).to(gl.int32)
-        selected_bucket_count = (packed_selection >> 22).to(gl.int32)
         threshold |= selected_bucket.to(gl.uint32) << shift
         threshold_shift = shift
         remaining -= selected_greater
@@ -2121,17 +1979,6 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         gl.num_warps(),
         triton.cdiv(MAX_BUCKETS // 2, 64 * gl.num_warps()),
     )
-    scan_thread_count: gl.constexpr = MAX_BUCKETS // 4
-    scan_thread_layout: gl.constexpr = _vector_layout(
-        scan_thread_count,
-        gl.num_warps(),
-        1,
-    )
-    wave_prefix_layout: gl.constexpr = _vector_layout(
-        gl.num_warps(),
-        gl.num_warps(),
-        1,
-    )
     output_layout: gl.constexpr = _vector_layout(
         topk,
         gl.num_warps(),
@@ -2153,16 +2000,6 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         gl.int32,
         [MAX_BUCKETS],
         shared_layout,
-    )
-    wave_prefix_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[gl.num_warps(), 1]],
-        [gl.num_warps()],
-        [0],
-    )
-    shared_wave_prefixes = gl.allocate_shared_memory(
-        gl.int32,
-        [gl.num_warps()],
-        wave_prefix_shared_layout,
     )
     output_counter_count: gl.constexpr = 4 if USE_COMPACT_FINAL else 2
     output_counter_layout: gl.constexpr = _vector_layout(
@@ -2419,14 +2256,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         count_low = gl.convert_layout(count_low, group_layout)
         count_high = gl.convert_layout(count_high, group_layout)
         group_counts = count_low + count_high
-        group_cumulative = _oneblock_group_cumulative(
-            group_counts,
-            shared_wave_prefixes,
-            group_layout,
-            scan_thread_layout,
-            wave_prefix_layout,
-            scan_thread_count,
-        )
+        group_cumulative = gl.associative_scan(group_counts, 0, _topk_add)
         group_greater = group_cumulative - group_counts
         selected_group = (group_greater < remaining) & (group_cumulative >= remaining)
         bucket_pairs = bucket_offsets.reshape([MAX_BUCKETS // 2, 2])
@@ -3041,6 +2871,10 @@ def _dsa_oneblock_topk_indices(
     out: torch.Tensor,
     lens_out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    device_index = logits.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    waves_per_eu = 8 if logits.shape[0] > _device_compute_units(device_index) else 0
     _dsa_oneblock_manual_radix_topk_kernel[(logits.shape[0],)](
         logits,
         block_table,
@@ -3067,6 +2901,8 @@ def _dsa_oneblock_topk_indices(
         USE_COMPACT_FINAL=plan.use_compact_final,
         USE_RADIX_EARLY_STOP=not plan.use_compact_final,
         num_warps=16,
+        # Preserve two resident workgroups only when the grid can use them.
+        waves_per_eu=waves_per_eu,
     )
     return out, lens_out
 
