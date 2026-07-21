@@ -18,21 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Built-in operation contracts, organized by family and mode."""
+"""Quantization operation contracts."""
 
-from tokenspeed_kernel.contracts.ops.attention import (
-    ATTN_MERGE_STATE,
-    MHA_PREFILL,
-    MLA_PREFILL,
+from tokenspeed_kernel.contracts.ops.quantization.fp8 import (
+    QUANTIZE_FP8,
+    quantize_fp8_reference,
 )
-from tokenspeed_kernel.contracts.ops.embedding import ROPE, ROPE_MLA
-from tokenspeed_kernel.contracts.ops.quantization import QUANTIZE_FP8
 
-__all__ = [
-    "ATTN_MERGE_STATE",
-    "MHA_PREFILL",
-    "MLA_PREFILL",
-    "QUANTIZE_FP8",
-    "ROPE",
-    "ROPE_MLA",
-]
+__all__ = ["QUANTIZE_FP8", "quantize_fp8_reference"]

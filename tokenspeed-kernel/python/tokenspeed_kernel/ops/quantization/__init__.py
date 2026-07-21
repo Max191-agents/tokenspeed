@@ -370,6 +370,9 @@ def quantize_mxfp4(
         )
 
 
+# Publish contracts before backend registration.
+import tokenspeed_kernel.contracts.ops.quantization  # noqa: E402,F401
+
 # Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.quantization.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.triton  # noqa: E402,F401
