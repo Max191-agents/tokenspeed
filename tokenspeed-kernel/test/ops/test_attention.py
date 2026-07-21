@@ -532,15 +532,16 @@ def test_attn_merge_state(
         solution=solution,
     )
 
-    lse_ref = torch.maximum(lse_a_ref_input, lse_b)
-    weight_a = torch.exp(lse_a_ref_input - lse_ref)
-    weight_b = torch.exp(lse_b - lse_ref)
-    denom = weight_a + weight_b
-    out_ref = (
-        out_a_ref_input.float() * weight_a[..., None]
-        + out_b.float() * weight_b[..., None]
-    ) / denom[..., None]
-    lse_ref = lse_ref + torch.log(denom)
+    out_ref, lse_ref = (
+        OperationRegistry.get()
+        .lookup("attention", "attn_merge_state")
+        .reference(
+            out_a=out_a_ref_input,
+            lse_a=lse_a_ref_input,
+            out_b=out_b,
+            lse_b=lse_b,
+        )
+    )
 
     if inplace:
         assert out.data_ptr() == out_a.data_ptr()
@@ -551,5 +552,5 @@ def test_attn_merge_state(
 
     assert out.shape == out_a.shape
     assert lse.shape == lse_a.shape
-    torch.testing.assert_close(out.float(), out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(out.float(), out_ref.float(), rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-5, atol=1e-5)

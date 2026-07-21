@@ -20,9 +20,18 @@
 
 """Attention operation contracts."""
 
+from tokenspeed_kernel.contracts.ops.attention.attn_merge_state import (
+    ATTN_MERGE_STATE,
+    attn_merge_state_reference,
+)
 from tokenspeed_kernel.contracts.ops.attention.mha_prefill import (
     MHA_PREFILL,
     mha_prefill_reference,
 )
 
-__all__ = ["MHA_PREFILL", "mha_prefill_reference"]
+__all__ = [
+    "ATTN_MERGE_STATE",
+    "MHA_PREFILL",
+    "attn_merge_state_reference",
+    "mha_prefill_reference",
+]

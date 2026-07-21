@@ -346,7 +346,10 @@ def test_contract_package_publishes_complete_catalog() -> None:
     import tokenspeed_kernel.contracts as contracts
     import tokenspeed_kernel.contracts.ops as ops_contracts
 
-    exports = {("attention", "mha_prefill"): "MHA_PREFILL"}
+    exports = {
+        ("attention", "attn_merge_state"): "ATTN_MERGE_STATE",
+        ("attention", "mha_prefill"): "MHA_PREFILL",
+    }
     catalog = {schema.id: schema for schema in contracts.list_operation_schemas()}
 
     assert catalog.keys() == exports.keys()
