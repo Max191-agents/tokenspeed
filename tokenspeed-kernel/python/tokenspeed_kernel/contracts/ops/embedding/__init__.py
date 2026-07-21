@@ -21,5 +21,9 @@
 """Embedding operation contracts."""
 
 from tokenspeed_kernel.contracts.ops.embedding.rope import ROPE, rope_reference
+from tokenspeed_kernel.contracts.ops.embedding.rope_mla import (
+    ROPE_MLA,
+    rope_mla_reference,
+)
 
-__all__ = ["ROPE", "rope_reference"]
+__all__ = ["ROPE", "ROPE_MLA", "rope_mla_reference", "rope_reference"]

@@ -25,6 +25,7 @@ from tokenspeed_kernel.contracts.ops import (
     MHA_PREFILL,
     MLA_PREFILL,
     ROPE,
+    ROPE_MLA,
 )
 from tokenspeed_kernel.operation import OperationRegistry, OperationSchema
 
@@ -33,6 +34,7 @@ __all__ = [
     "MHA_PREFILL",
     "MLA_PREFILL",
     "ROPE",
+    "ROPE_MLA",
     "get_operation_schema",
     "list_operation_schemas",
 ]

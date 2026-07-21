@@ -25,6 +25,6 @@ from tokenspeed_kernel.contracts.ops.attention import (
     MHA_PREFILL,
     MLA_PREFILL,
 )
-from tokenspeed_kernel.contracts.ops.embedding import ROPE
+from tokenspeed_kernel.contracts.ops.embedding import ROPE, ROPE_MLA
 
-__all__ = ["ATTN_MERGE_STATE", "MHA_PREFILL", "MLA_PREFILL", "ROPE"]
+__all__ = ["ATTN_MERGE_STATE", "MHA_PREFILL", "MLA_PREFILL", "ROPE", "ROPE_MLA"]

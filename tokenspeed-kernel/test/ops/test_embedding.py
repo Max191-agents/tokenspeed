@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.embedding import (
 )
 
 _ROPE_REFERENCE = OperationRegistry.get().lookup("embedding", "rope").reference
+_ROPE_MLA_REFERENCE = OperationRegistry.get().lookup("embedding", "rope_mla").reference
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
@@ -451,28 +452,6 @@ def test_rope_mla_quantize(
     positions = torch.randint(
         0, max_position, (num_tokens,), device=device, dtype=torch.int64
     )
-    cos, sin = cos_sin_cache.index_select(0, positions).chunk(2, dim=-1)
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
-    rope_ref = lambda x: (
-        torch.cat(
-            (
-                torch.chunk(x.float(), 2, dim=-1)[0] * cos
-                - torch.chunk(x.float(), 2, dim=-1)[1] * sin,
-                torch.chunk(x.float(), 2, dim=-1)[1] * cos
-                + torch.chunk(x.float(), 2, dim=-1)[0] * sin,
-            ),
-            dim=-1,
-        )
-        if is_neox
-        else torch.stack(
-            (
-                x.float()[..., ::2] * cos - x.float()[..., 1::2] * sin,
-                x.float()[..., 1::2] * cos + x.float()[..., ::2] * sin,
-            ),
-            dim=-1,
-        ).flatten(-2)
-    ).to(x.dtype)
     q_rope = torch.randn(num_tokens, num_heads, rope_dim, device=device, dtype=dtype)
     k_rope = torch.randn(num_tokens, num_heads, rope_dim, device=device, dtype=dtype)
     q_nope = torch.randn(num_tokens, num_heads, nope_dim, device=device, dtype=dtype)
@@ -494,16 +473,27 @@ def test_rope_mla_quantize(
         solution=solution,
     )
 
-    q_rope_ref = rope_ref(q_rope)
-    k_rope_ref = rope_ref(k_rope)
-    q_ref = torch.cat(
-        (q_nope.float() * quant_scale_q, q_rope_ref.float() * quant_scale_q),
-        dim=-1,
-    ).to(torch.float8_e4m3fn)
-    k_ref = torch.cat(
-        (k_nope.float() * quant_scale_kv, k_rope_ref.float() * quant_scale_kv),
-        dim=-1,
-    ).to(torch.float8_e4m3fn)
+    reference_outputs = [
+        torch.empty(value.shape, device=device, dtype=torch.float8_e4m3fn)
+        for value in (q_rope, k_rope, q_nope, k_nope)
+    ]
+    _ROPE_MLA_REFERENCE(
+        positions=positions,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        q_nope=q_nope,
+        k_nope=k_nope,
+        cos_sin_cache=cos_sin_cache,
+        q_rope_out=reference_outputs[0],
+        k_rope_out=reference_outputs[1],
+        q_nope_out=reference_outputs[2],
+        k_nope_out=reference_outputs[3],
+        is_neox=is_neox,
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
+    )
+    q_ref = torch.cat((reference_outputs[2], reference_outputs[0]), dim=-1)
+    k_ref = torch.cat((reference_outputs[3], reference_outputs[1]), dim=-1)
 
     assert query_fp8.shape == q_ref.shape
     assert key_fp8.shape == k_ref.shape
