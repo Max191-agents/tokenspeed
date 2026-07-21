@@ -44,7 +44,6 @@ _ONEBLOCK_PREFILL_WIDE_SHORT_BLOCK_N = 8192
 _ONEBLOCK_PREFILL_WIDE_LONG_BLOCK_N = 16384
 _ONEBLOCK_PREFILL_WIDE_LONG_MIN_COLS = 512 * 1024
 _ONEBLOCK_COMPACT_FINAL_BLOCK_N = 4096
-_ONEBLOCK_PREFILL_COMPACT_FINAL_MIN_COLS = 16384
 _ONEBLOCK_DECODE_MAX_COLS = 256 * 1024
 _ONEBLOCK_RADIX_MAX_COLS = 90000
 _PREFILL_ONEBLOCK_RADIX_MIN_COLS = 98304
@@ -2979,7 +2978,7 @@ def _dsa_prefill_topk_indices(
             row_ends,
             topk=topk,
             block_n=_ONEBLOCK_PREFILL_RADIX_BLOCK_N,
-            use_compact_final=cols >= _ONEBLOCK_PREFILL_COMPACT_FINAL_MIN_COLS,
+            use_compact_final=False,
             out=out,
             lens_out=lens_out,
         )

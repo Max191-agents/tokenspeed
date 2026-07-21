@@ -125,7 +125,6 @@ def test_dsa_manual_decode_config_source_contract() -> None:
     assert dsa_topk_gfx950._ONEBLOCK_DECODE_SHORT_MANUAL_MAX_COLS == 65536
     assert dsa_topk_gfx950._ONEBLOCK_RADIX_SCHEDULE == (12, 12, 8)
     assert dsa_topk_gfx950._ONEBLOCK_PREFILL_RADIX_BLOCK_N == 4096
-    assert dsa_topk_gfx950._ONEBLOCK_PREFILL_COMPACT_FINAL_MIN_COLS == 16384
     assert dsa_topk_gfx950._ONEBLOCK_RADIX_MAX_COLS == 90000
     assert dsa_topk_gfx950._ONEBLOCK_DECODE_MAX_COLS == 256 * 1024
     assert dsa_topk_gfx950._PREFILL_ONEBLOCK_RADIX_MIN_COLS == 98304
@@ -2296,6 +2295,58 @@ def test_dsa_wide_oneblock_prefill_dispatch(
     assert (
         dsa_topk_gfx950._wide_oneblock_prefill_block_n(cols, topk) == expected_block_n
     )
+
+
+@pytest.mark.parametrize("cols", (8192, 16384, 90000))
+def test_dsa_short_oneblock_prefill_uses_early_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    cols: int,
+) -> None:
+    rows = 1
+    topk = 2048
+    storage = torch.empty((1,), device="cuda", dtype=torch.float32)
+    logits = storage.as_strided((rows, cols), (0, 0))
+    row_starts = torch.empty((0,), device="cuda", dtype=torch.int32)
+    row_ends = torch.empty((0,), device="cuda", dtype=torch.int32)
+    out = torch.empty((0,), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((0,), device="cuda", dtype=torch.int32)
+    launches: list[tuple[int, int, bool]] = []
+
+    def launch_oneblock(
+        actual_logits: torch.Tensor,
+        actual_row_starts: torch.Tensor,
+        actual_row_ends: torch.Tensor,
+        *,
+        topk: int,
+        block_n: int,
+        use_compact_final: bool = True,
+        out: torch.Tensor,
+        lens_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert actual_logits is logits
+        assert actual_row_starts is row_starts
+        assert actual_row_ends is row_ends
+        launches.append((topk, block_n, use_compact_final))
+        return out, lens_out
+
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_dsa_oneblock_manual_prefill_topk_indices",
+        launch_oneblock,
+    )
+
+    returned = dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    assert returned[0] is out
+    assert returned[1] is lens_out
+    assert launches == [(topk, dsa_topk_gfx950._ONEBLOCK_PREFILL_RADIX_BLOCK_N, False)]
 
 
 @pytest.mark.parametrize(

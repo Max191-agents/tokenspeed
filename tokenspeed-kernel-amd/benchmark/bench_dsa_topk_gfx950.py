@@ -559,9 +559,7 @@ def _prefill_gluon_dispatch(
             "block_n": wide_block_n,
         }
     if cols <= dsa_topk_gfx950._ONEBLOCK_RADIX_MAX_COLS:
-        if cols < dsa_topk_gfx950._ONEBLOCK_PREFILL_COMPACT_FINAL_MIN_COLS:
-            return {"name": "oneblock-manual-early-stop"}
-        return {"name": "oneblock-manual-compact"}
+        return {"name": "oneblock-manual-early-stop"}
     if (
         dsa_topk_gfx950._PREFILL_ONEBLOCK_RADIX_MIN_COLS
         <= cols
