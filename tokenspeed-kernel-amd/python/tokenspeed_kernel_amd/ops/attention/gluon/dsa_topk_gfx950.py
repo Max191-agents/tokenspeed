@@ -2211,20 +2211,31 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         group_selected_greater = group_greater + gl.where(select_low, 0, count_low)
         if pass_index == 1 and (USE_COMPACT_FINAL or USE_RADIX_EARLY_STOP):
             group_selected_count = gl.where(select_low, count_low, count_high)
-        selected_bucket = gl.sum(gl.where(selected_group, group_bucket, 0), axis=0).to(
-            gl.int32
-        )
-        selected_greater = gl.sum(
-            gl.where(selected_group, group_selected_greater, 0), axis=0
-        ).to(gl.int32)
-        if pass_index == 1 and (USE_COMPACT_FINAL or USE_RADIX_EARLY_STOP):
-            selected_bucket_count = gl.sum(
-                gl.where(selected_group, group_selected_count, 0), axis=0
-            ).to(gl.int32)
+        # Only one group is selected, so packed sums publish all fields in one reduction.
+        if pass_index == 1 and USE_COMPACT_FINAL:
+            packed_selection = (
+                group_bucket.to(gl.uint64)
+                | (group_selected_greater.to(gl.uint64) << 12)
+                | (group_selected_count.to(gl.uint64) << 23)
+            )
+            selected = gl.sum(gl.where(selected_group, packed_selection, 0), axis=0)
+            selected_bucket_count = (selected >> 23).to(gl.int32)
+        else:
+            packed_selection = group_bucket.to(gl.uint32) | (
+                group_selected_greater.to(gl.uint32) << 12
+            )
+            if pass_index == 1 and USE_RADIX_EARLY_STOP:
+                selected_bucket_complete = group_selected_count == (
+                    remaining - group_selected_greater
+                )
+                packed_selection |= selected_bucket_complete.to(gl.uint32) << 23
+            selected = gl.sum(gl.where(selected_group, packed_selection, 0), axis=0)
+        selected_bucket = (selected & 0xFFF).to(gl.int32)
+        selected_greater = ((selected >> 12) & 0x7FF).to(gl.int32)
         prefix = (prefix << radix_bits) | selected_bucket.to(gl.uint32)
         remaining -= selected_greater
         if USE_RADIX_EARLY_STOP and pass_index == 1:
-            if selected_bucket_count == remaining:
+            if ((selected >> 23) & 1) != 0:
                 count_greater = selected_count - remaining
                 emit_full_end = candidate_len & -BLOCK_N
                 for tile_start in range(0, emit_full_end, BLOCK_N):
