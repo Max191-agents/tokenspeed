@@ -229,22 +229,24 @@ def _persistent_histogram_tail(
     BLOCK_N: gl.constexpr,
     value_layout: gl.constexpr,
 ):
-    offsets = full_tiles * BLOCK_N + gl.arange(
+    local_offsets = full_tiles * BLOCK_N + gl.arange(
         0,
         BLOCK_N,
         layout=value_layout,
     )
-    offsets = gl.max_contiguous(
-        gl.multiple_of(offsets.to(gl.int32), 4),
+    local_offsets = gl.max_contiguous(
+        gl.multiple_of(local_offsets.to(gl.int32), 4),
         4,
     )
+    offsets = row_start + local_offsets
+    row_len = row_end - row_start
+    valid = (local_offsets < row_len) & (offsets < n_cols)
     values = gl.amd.cdna4.buffer_load(
         ptr=row_logits,
         offsets=offsets,
-        mask=offsets < n_cols,
+        mask=valid,
         other=-float("inf"),
     )
-    valid = (offsets >= row_start) & (offsets < row_end) & (offsets < n_cols)
     keys = _fp32_to_topk_key(values)
     if pass_index == 0:
         prefix_match = valid
@@ -277,22 +279,24 @@ def _persistent_emit_tail(
     BLOCK_N: gl.constexpr,
     value_layout: gl.constexpr,
 ):
-    offsets = full_tiles * BLOCK_N + gl.arange(
+    local_offsets = full_tiles * BLOCK_N + gl.arange(
         0,
         BLOCK_N,
         layout=value_layout,
     )
-    offsets = gl.max_contiguous(
-        gl.multiple_of(offsets.to(gl.int32), 4),
+    local_offsets = gl.max_contiguous(
+        gl.multiple_of(local_offsets.to(gl.int32), 4),
         4,
     )
+    offsets = row_start + local_offsets
+    row_len = row_end - row_start
+    valid = (local_offsets < row_len) & (offsets < n_cols)
     values = gl.amd.cdna4.buffer_load(
         ptr=row_logits,
         offsets=offsets,
-        mask=offsets < n_cols,
+        mask=valid,
         other=-float("inf"),
     )
-    valid = (offsets >= row_start) & (offsets < row_end) & (offsets < n_cols)
     keys = _fp32_to_topk_key(values)
     truncated_keys = (keys >> threshold_shift) << threshold_shift
     greater = valid & (truncated_keys < threshold)
@@ -335,11 +339,9 @@ def _dsa_persistent_radix_topk_row(
     lens_out,
     logits_stride,
     out_stride: gl.constexpr,
-    n_cols,
     GROUPS_PER_ROW: gl.constexpr,
     TOPK: gl.constexpr,
     BLOCK_N: gl.constexpr,
-    HAS_TAIL: gl.constexpr,
 ):
     value_layout: gl.constexpr = _vector_layout(
         BLOCK_N,
@@ -446,8 +448,8 @@ def _dsa_persistent_radix_topk_row(
         layout=hist_layout,
     )
     row_logits = logits + row * logits_stride
-    full_tiles = n_cols // BLOCK_N
-    tail_size = n_cols - full_tiles * BLOCK_N
+    full_tiles = row_len // BLOCK_N
+    tail_size = row_len - full_tiles * BLOCK_N
     tail_owner = full_tiles % GROUPS_PER_ROW
     threshold = gl.full([], 0, gl.uint32)
     threshold_shift = gl.full([], 32, gl.int32)
@@ -474,18 +476,18 @@ def _dsa_persistent_radix_topk_row(
                 gl.multiple_of(offsets.to(gl.int32), 4),
                 4,
             )
+            offsets = row_start + offsets
             values = gl.amd.cdna4.buffer_load(
                 ptr=row_logits,
                 offsets=offsets,
             )
-            valid = (offsets >= row_start) & (offsets < row_end)
             keys = _fp32_to_topk_key(values)
             if pass_index == 0:
-                prefix_match = valid
+                prefix_match = gl.full([BLOCK_N], True, gl.int1, layout=value_layout)
             else:
-                prefix_match = valid & (
-                    ((keys >> threshold_shift) << threshold_shift) == threshold
-                )
+                prefix_match = (
+                    (keys >> threshold_shift) << threshold_shift
+                ) == threshold
             buckets = (keys >> shift) & bucket_mask
             shared_histogram.atomic_scatter_add(
                 gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
@@ -494,24 +496,22 @@ def _dsa_persistent_radix_topk_row(
                 mask=prefix_match,
             )
 
-        # Compile out the noinline tail call for aligned tensor widths.
-        if HAS_TAIL:
-            if group == tail_owner:
-                _persistent_histogram_tail(
-                    row_logits,
-                    shared_histogram,
-                    row_start,
-                    row_end,
-                    n_cols,
-                    full_tiles,
-                    pass_index,
-                    threshold_shift,
-                    threshold,
-                    shift,
-                    bucket_mask,
-                    BLOCK_N,
-                    value_layout,
-                )
+        if (tail_size != 0) & (group == tail_owner):
+            _persistent_histogram_tail(
+                row_logits,
+                shared_histogram,
+                row_start,
+                row_end,
+                row_end,
+                full_tiles,
+                pass_index,
+                threshold_shift,
+                threshold,
+                shift,
+                bucket_mask,
+                BLOCK_N,
+                value_layout,
+            )
 
         gl.barrier()
         local_counts = shared_histogram.load(hist_layout)
@@ -601,15 +601,15 @@ def _dsa_persistent_radix_topk_row(
             gl.multiple_of(offsets.to(gl.int32), 4),
             4,
         )
+        offsets = row_start + offsets
         values = gl.amd.cdna4.buffer_load(
             ptr=row_logits,
             offsets=offsets,
         )
-        valid = (offsets >= row_start) & (offsets < row_end)
         keys = _fp32_to_topk_key(values)
         truncated_keys = (keys >> threshold_shift) << threshold_shift
-        greater = valid & (truncated_keys < threshold)
-        equal = valid & (truncated_keys == threshold)
+        greater = truncated_keys < threshold
+        equal = truncated_keys == threshold
         reservation_mask = greater | equal
         reservation_counter = gl.where(greater, 0, 1).to(gl.int32)
         reservation = shared_output_counters.atomic_scatter_add(
@@ -631,23 +631,22 @@ def _dsa_persistent_radix_topk_row(
             mask=equal & (reservation < TOPK),
         )
 
-    if HAS_TAIL:
-        if group == tail_owner:
-            _persistent_emit_tail(
-                row_logits,
-                shared_output_counters,
-                shared_greater_offsets,
-                shared_equal_offsets,
-                row_start,
-                row_end,
-                n_cols,
-                full_tiles,
-                threshold_shift,
-                threshold,
-                TOPK,
-                BLOCK_N,
-                value_layout,
-            )
+    if (tail_size != 0) & (group == tail_owner):
+        _persistent_emit_tail(
+            row_logits,
+            shared_output_counters,
+            shared_greater_offsets,
+            shared_equal_offsets,
+            row_start,
+            row_end,
+            row_end,
+            full_tiles,
+            threshold_shift,
+            threshold,
+            TOPK,
+            BLOCK_N,
+            value_layout,
+        )
 
     gl.barrier()
     output_counter_offsets = gl.arange(0, 2, layout=output_counter_layout)
@@ -920,8 +919,11 @@ def _persistent_interleaved_publish_histogram(
         shift: gl.constexpr = max(21 - PASS_INDEX * 11, 0)
         bucket_mask: gl.constexpr = 0x3FF if PASS_INDEX == 2 else 0x7FF
         row_logits = logits + row * logits_stride
-        full_tiles = n_cols // BLOCK_N
-        tail_size = n_cols - full_tiles * BLOCK_N
+        traversal_cols = n_cols
+        if not IS_DECODE:
+            traversal_cols = row_len
+        full_tiles = traversal_cols // BLOCK_N
+        tail_size = traversal_cols - full_tiles * BLOCK_N
         tail_owner = full_tiles % GROUPS_PER_ROW
 
         for tile in range(group, full_tiles, GROUPS_PER_ROW):
@@ -934,6 +936,8 @@ def _persistent_interleaved_publish_histogram(
                 gl.multiple_of(offsets.to(gl.int32), 4),
                 4,
             )
+            if not IS_DECODE:
+                offsets = row_start + offsets
             values = gl.amd.cdna4.buffer_load(
                 ptr=row_logits,
                 offsets=offsets,
@@ -941,7 +945,7 @@ def _persistent_interleaved_publish_histogram(
             if IS_DECODE:
                 valid = offsets < row_end
             else:
-                valid = (offsets >= row_start) & (offsets < row_end)
+                valid = gl.full([BLOCK_N], True, gl.int1, layout=value_layout)
             keys = _fp32_to_topk_key(values)
             if PASS_INDEX == 0:
                 prefix_match = valid
@@ -1092,7 +1096,8 @@ def _persistent_interleaved_emit_row(
         q_len_per_req,
         IS_DECODE,
     )
-    if row_end - row_start > TOPK:
+    row_len = row_end - row_start
+    if row_len > TOPK:
         state = pass_done + row * _PERSISTENT_PREFILL_COUNTER_STRIDE
         threshold = gl.load(
             state + _PERSISTENT_INTERLEAVED_THRESHOLD,
@@ -1106,8 +1111,11 @@ def _persistent_interleaved_emit_row(
         shared_output_counters.store(output_counter_zeros)
         gl.barrier()
         row_logits = logits + row * logits_stride
-        full_tiles = n_cols // BLOCK_N
-        tail_size = n_cols - full_tiles * BLOCK_N
+        traversal_cols = n_cols
+        if not IS_DECODE:
+            traversal_cols = row_len
+        full_tiles = traversal_cols // BLOCK_N
+        tail_size = traversal_cols - full_tiles * BLOCK_N
         tail_owner = full_tiles % GROUPS_PER_ROW
 
         for tile in range(group, full_tiles, GROUPS_PER_ROW):
@@ -1120,6 +1128,8 @@ def _persistent_interleaved_emit_row(
                 gl.multiple_of(offsets.to(gl.int32), 4),
                 4,
             )
+            if not IS_DECODE:
+                offsets = row_start + offsets
             values = gl.amd.cdna4.buffer_load(
                 ptr=row_logits,
                 offsets=offsets,
@@ -1127,7 +1137,7 @@ def _persistent_interleaved_emit_row(
             if IS_DECODE:
                 valid = offsets < row_end
             else:
-                valid = (offsets >= row_start) & (offsets < row_end)
+                valid = gl.full([BLOCK_N], True, gl.int1, layout=value_layout)
             keys = _fp32_to_topk_key(values)
             truncated_keys = (keys >> threshold_shift) << threshold_shift
             greater = valid & (truncated_keys < threshold)
@@ -1272,10 +1282,7 @@ def _persistent_interleaved_emit_row(
 
 
 @gluon.jit(
-    do_not_specialize=(
-        "logits_stride",
-        "n_cols",
-    ),
+    do_not_specialize=("logits_stride",),
 )
 def _dsa_persistent_radix_topk_kernel(
     logits,
@@ -1290,11 +1297,9 @@ def _dsa_persistent_radix_topk_kernel(
     lens_out,
     logits_stride,
     out_stride: gl.constexpr,
-    n_cols,
     GROUPS_PER_ROW: gl.constexpr,
     TOPK: gl.constexpr,
     BLOCK_N: gl.constexpr,
-    HAS_TAIL: gl.constexpr,
 ):
     _dsa_persistent_radix_topk_row(
         gl.program_id(0),
@@ -1311,11 +1316,9 @@ def _dsa_persistent_radix_topk_kernel(
         lens_out,
         logits_stride,
         out_stride,
-        n_cols,
         GROUPS_PER_ROW,
         TOPK,
         BLOCK_N,
-        HAS_TAIL,
     )
 
 
@@ -2791,7 +2794,7 @@ def _dsa_persistent_prefill_radix_topk(
     out: torch.Tensor,
     lens_out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rows, cols = logits.shape
+    rows = logits.shape[0]
     histograms, pass_arrivals, pass_done, reset_arrivals, output_counters = workspace
     _dsa_persistent_radix_topk_kernel[(rows, groups)](
         logits,
@@ -2806,11 +2809,9 @@ def _dsa_persistent_prefill_radix_topk(
         lens_out,
         logits.stride(0),
         out.stride(0),
-        n_cols=cols,
         GROUPS_PER_ROW=groups,
         TOPK=topk,
         BLOCK_N=_PERSISTENT_PREFILL_BLOCK_N,
-        HAS_TAIL=cols % _PERSISTENT_PREFILL_BLOCK_N != 0,
         num_warps=_PERSISTENT_PREFILL_NUM_WARPS,
     )
     return out, lens_out

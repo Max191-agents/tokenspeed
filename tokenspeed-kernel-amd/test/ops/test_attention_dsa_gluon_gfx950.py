@@ -1156,6 +1156,30 @@ def _assert_topk_indices(
         assert bool((actual[row, count:] == -1).all())
 
 
+def _make_shifted_live_range_logits(
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    cols: int,
+) -> torch.Tensor:
+    logits = torch.full(
+        (row_starts.numel(), cols),
+        float("inf"),
+        device=row_starts.device,
+        dtype=torch.float32,
+    )
+    for row, (start, end) in enumerate(
+        zip(row_starts.cpu().tolist(), row_ends.cpu().tolist(), strict=True)
+    ):
+        logits[row, start:end] = torch.linspace(
+            -1.0,
+            1.0,
+            end - start,
+            device=logits.device,
+        )
+    return logits
+
+
 def _make_reversed_decode_block_table(
     requests: int,
     cols: int,
@@ -1254,15 +1278,16 @@ def test_dsa_persistent_pass_arrival_uses_monotonic_generations() -> None:
     assert source.count("pass_arrivals + row * _PERSISTENT_PREFILL_COUNTER_STRIDE") == 2
 
 
-def test_dsa_persistent_prefill_tail_is_compile_time_specialized() -> None:
+def test_dsa_persistent_prefill_tail_follows_live_row_length() -> None:
     row_source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_row.fn)
     launch_source = inspect.getsource(
         dsa_topk_gfx950._dsa_persistent_prefill_radix_topk
     )
 
-    assert "HAS_TAIL: gl.constexpr" in row_source
-    assert row_source.count("if HAS_TAIL:") == 2
-    assert "HAS_TAIL=cols % _PERSISTENT_PREFILL_BLOCK_N != 0" in launch_source
+    assert "HAS_TAIL" not in row_source
+    assert "full_tiles = row_len // BLOCK_N" in row_source
+    assert row_source.count("if (tail_size != 0) & (group == tail_owner):") == 2
+    assert "HAS_TAIL=" not in launch_source
 
 
 def test_dsa_persistent_prefill_radix_passes_are_statically_unrolled() -> None:
@@ -1270,6 +1295,67 @@ def test_dsa_persistent_prefill_radix_passes_are_statically_unrolled() -> None:
 
     assert "for pass_index in gl.static_range(_PERSISTENT_PREFILL_NUM_PASSES)" in source
     assert "while (pass_index < _PERSISTENT_PREFILL_NUM_PASSES)" not in source
+
+
+def test_dsa_persistent_prefill_rebases_shifted_live_ranges() -> None:
+    rows = 32
+    cols = 262157
+    topk = 2048
+    patterns = (
+        (0, 16384),
+        (1, 16383),
+        (16384, 16385),
+        (16385, 16383),
+        (65536, 32768),
+        (65537, 32767),
+        (32767, 32769),
+        (32768, 32769),
+    )
+    row_starts = torch.tensor(
+        [patterns[row % len(patterns)][0] for row in range(rows)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_lens = torch.tensor(
+        [patterns[row % len(patterns)][1] for row in range(rows)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_ends = row_starts + row_lens
+    logits = _make_shifted_live_range_logits(row_starts, row_ends, cols=cols)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        == 4
+    )
+    for _ in range(2):
+        out.fill_(-7)
+        lens_out.fill_(-7)
+        dsa_topk_gfx950._dsa_prefill_topk_indices(
+            logits,
+            row_starts,
+            row_ends,
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+        _assert_topk_indices(
+            logits,
+            out,
+            lens_out,
+            row_starts,
+            row_ends,
+            topk=topk,
+        )
+        workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+        _assert_persistent_workspace_reset(workspace)
 
 
 @pytest.mark.parametrize(
@@ -2279,7 +2365,7 @@ def test_dsa_persistent_interleaved_launch_uses_full_warp_count() -> None:
     assert "num_warps=_PERSISTENT_PREFILL_NUM_WARPS" in source
 
 
-def test_dsa_persistent_interleaved_decode_uses_one_sided_tile_masks() -> None:
+def test_dsa_persistent_interleaved_rebases_prefill_only() -> None:
     helpers = (
         dsa_topk_gfx950._persistent_interleaved_publish_histogram,
         dsa_topk_gfx950._persistent_interleaved_emit_row,
@@ -2288,7 +2374,80 @@ def test_dsa_persistent_interleaved_decode_uses_one_sided_tile_masks() -> None:
     for helper in helpers:
         source = inspect.getsource(helper.fn)
         assert source.count("valid = offsets < row_end") == 1
-        assert source.count("valid = (offsets >= row_start) & (offsets < row_end)") == 1
+        assert source.count("if not IS_DECODE:") == 2
+        assert source.count("offsets = row_start + offsets") == 1
+        assert source.count("traversal_cols = row_len") == 1
+        assert source.count("valid = gl.full(") == 1
+
+
+def test_dsa_persistent_interleaved_prefill_rebases_shifted_live_ranges() -> None:
+    rows = 129
+    cols = 262157
+    topk = 1024
+    patterns = (
+        (0, 16384),
+        (1, 16383),
+        (16384, 16385),
+        (16385, 16383),
+        (65536, 32768),
+        (65537, 32767),
+        (32767, 32769),
+        (32768, 32769),
+    )
+    row_starts = torch.tensor(
+        [patterns[row % len(patterns)][0] for row in range(rows)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_lens = torch.tensor(
+        [patterns[row % len(patterns)][1] for row in range(rows)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    row_starts[-1] = 65537
+    row_lens[-1] = 32767
+    row_ends = row_starts + row_lens
+    logits = _make_shifted_live_range_logits(row_starts, row_ends, cols=cols)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    assert (
+        dsa_topk_gfx950._persistent_prefill_groups(
+            rows,
+            cols,
+            topk,
+            logits.device,
+        )
+        is None
+    )
+    plan = dsa_topk_gfx950._persistent_interleaved_plan(
+        rows,
+        cols,
+        topk,
+        logits.device,
+    )
+    assert plan is not None
+    assert plan[0] == 128
+    assert plan[3] == 1
+
+    dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+    _assert_topk_indices(
+        logits,
+        out,
+        lens_out,
+        row_starts,
+        row_ends,
+        topk=topk,
+    )
+    workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
+    _assert_persistent_workspace_reset(workspace)
 
 
 @pytest.mark.parametrize(
