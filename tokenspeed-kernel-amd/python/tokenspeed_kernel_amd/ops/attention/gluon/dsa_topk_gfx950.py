@@ -2438,24 +2438,14 @@ def _persistent_prefill_groups(
 
 
 def _wide_oneblock_prefill_block_n(
-    rows: int,
     cols: int,
     topk: int,
-    device: torch.device,
 ) -> int | None:
-    if topk != _PERSISTENT_PREFILL_TOPK or cols <= _PREFILL_ONEBLOCK_RADIX_MAX_COLS:
-        return None
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    compute_units = _device_compute_units(device_index)
-    if rows <= compute_units // 2:
-        return None
-
-    # Just over one full device wave, the one-block grid leaves most compute
-    # units idle in its second wave. Persistent execution wins in that band.
-    second_wave_half_full = compute_units + triton.cdiv(compute_units, 2)
-    if compute_units < rows < second_wave_half_full:
+    if (
+        topk != _PERSISTENT_PREFILL_TOPK
+        or cols <= _ONEBLOCK_RADIX_MAX_COLS
+        or _PREFILL_ONEBLOCK_RADIX_MIN_COLS <= cols <= _PREFILL_ONEBLOCK_RADIX_MAX_COLS
+    ):
         return None
 
     if cols < _ONEBLOCK_PREFILL_WIDE_LONG_MIN_COLS:
@@ -2969,10 +2959,8 @@ def _dsa_prefill_topk_indices(
         )
 
     wide_oneblock_block_n = _wide_oneblock_prefill_block_n(
-        rows,
         cols,
         topk,
-        logits.device,
     )
     if wide_oneblock_block_n is not None:
         return _dsa_oneblock_manual_prefill_topk_indices(

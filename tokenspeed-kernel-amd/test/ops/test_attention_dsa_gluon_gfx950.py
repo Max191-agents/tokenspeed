@@ -1588,16 +1588,6 @@ def test_dsa_prefill_manual_oneblock_fallback_keeps_exact_values(cols: int) -> N
         )
         is None
     )
-    assert (
-        dsa_topk_gfx950._wide_oneblock_prefill_block_n(
-            rows,
-            cols,
-            topk,
-            logits.device,
-        )
-        is None
-    )
-
     for _ in range(2):
         out.fill_(-7)
         lens_out.fill_(-7)
@@ -2170,8 +2160,6 @@ def test_dsa_persistent_interleaved_decode_uses_one_sided_tile_masks() -> None:
     (
         (33, 90048, 512),
         (65, 90048, 1024),
-        (129, 90048, 2048),
-        (514, 90048, 2048),
         (33, 512 * 1024, 512),
         (65, 512 * 1024, 1024),
     ),
@@ -2246,52 +2234,169 @@ def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
 
 
 @pytest.mark.parametrize(
-    ("rows", "cols", "topk", "expected_block_n"),
+    ("cols", "topk", "expected_block_n"),
     (
-        (128, 262208, 2048, None),
-        (129, 196608, 2048, None),
-        (129, 262208, 1024, None),
-        (129, 262208, 2048, 8192),
-        (129, 512 * 1024, 2048, 16384),
-        (256, 1024 * 1024, 2048, 16384),
-        (257, 1024 * 1024, 2048, None),
-        (383, 1024 * 1024, 2048, None),
-        (384, 1024 * 1024, 2048, 16384),
-        (514, 1024 * 1024, 2048, 16384),
+        (90001, 1024, None),
+        (90000, 2048, None),
+        (90001, 2048, 8192),
+        (98303, 2048, 8192),
+        (98304, 2048, None),
+        (196608, 2048, None),
+        (196609, 2048, 8192),
+        (512 * 1024 - 1, 2048, 8192),
+        (512 * 1024, 2048, 16384),
+        (1024 * 1024, 2048, 16384),
     ),
 )
 def test_dsa_wide_oneblock_prefill_dispatch(
-    monkeypatch: pytest.MonkeyPatch,
-    rows: int,
     cols: int,
     topk: int,
     expected_block_n: int | None,
 ) -> None:
-    monkeypatch.setattr(dsa_topk_gfx950, "_device_compute_units", lambda _: 256)
-
     assert (
-        dsa_topk_gfx950._wide_oneblock_prefill_block_n(
-            rows,
-            cols,
-            topk,
-            torch.device("cuda:0"),
-        )
-        == expected_block_n
+        dsa_topk_gfx950._wide_oneblock_prefill_block_n(cols, topk) == expected_block_n
     )
 
 
 @pytest.mark.parametrize(
-    ("cols", "expected_block_n"),
+    ("rows", "cols"),
     (
-        (262208, 8192),
-        (512 * 1024, 16384),
+        (64, 90001),
+        (257, 196609),
+        (383, 262145),
+    ),
+)
+def test_dsa_prefill_topk_2048_interleaved_fallback_uses_wide_oneblock(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: int,
+    cols: int,
+) -> None:
+    topk = 2048
+    storage = torch.empty((1,), device="cuda", dtype=torch.float32)
+    logits = storage.as_strided((rows, cols), (0, 0))
+    row_starts = torch.empty((0,), device="cuda", dtype=torch.int32)
+    row_ends = torch.empty((0,), device="cuda", dtype=torch.int32)
+    out = torch.empty((0,), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((0,), device="cuda", dtype=torch.int32)
+    launches: list[tuple[int, int, int]] = []
+
+    def launch_wide(
+        actual_logits: torch.Tensor,
+        actual_row_starts: torch.Tensor,
+        actual_row_ends: torch.Tensor,
+        *,
+        topk: int,
+        block_n: int,
+        use_compact_final: bool = True,
+        out: torch.Tensor,
+        lens_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert actual_logits is logits
+        assert actual_row_starts is row_starts
+        assert actual_row_ends is row_ends
+        assert use_compact_final
+        launches.append((topk, block_n, actual_logits.shape[1]))
+        return out, lens_out
+
+    def reject_interleaved(*args: object, **kwargs: object) -> None:
+        pytest.fail("topk=2048 prefill fallback dispatched persistent interleaved")
+
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_dsa_oneblock_manual_prefill_topk_indices",
+        launch_wide,
+    )
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_dsa_persistent_prefill_topk_indices",
+        reject_interleaved,
+    )
+
+    returned = dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    assert returned[0] is out
+    assert returned[1] is lens_out
+    assert launches == [(topk, 8192, cols)]
+
+
+def test_dsa_prefill_topk_1024_keeps_persistent_interleaved_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = 257
+    cols = 196609
+    topk = 1024
+    storage = torch.empty((1,), device="cuda", dtype=torch.float32)
+    logits = storage.as_strided((rows, cols), (0, 0))
+    row_starts = torch.empty((0,), device="cuda", dtype=torch.int32)
+    row_ends = torch.empty((0,), device="cuda", dtype=torch.int32)
+    out = torch.empty((0,), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((0,), device="cuda", dtype=torch.int32)
+    launches: list[tuple[int, int]] = []
+
+    def reject_wide(*args: object, **kwargs: object) -> None:
+        pytest.fail("lower-topk prefill fallback dispatched wide one-block")
+
+    def launch_interleaved(
+        actual_logits: torch.Tensor,
+        actual_row_starts: torch.Tensor,
+        actual_row_ends: torch.Tensor,
+        *,
+        topk: int,
+        out: torch.Tensor,
+        lens_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert actual_logits is logits
+        assert actual_row_starts is row_starts
+        assert actual_row_ends is row_ends
+        launches.append((topk, actual_logits.shape[1]))
+        return out, lens_out
+
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_dsa_oneblock_manual_prefill_topk_indices",
+        reject_wide,
+    )
+    monkeypatch.setattr(
+        dsa_topk_gfx950,
+        "_dsa_persistent_prefill_topk_indices",
+        launch_interleaved,
+    )
+
+    returned = dsa_topk_gfx950._dsa_prefill_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    assert returned[0] is out
+    assert returned[1] is lens_out
+    assert launches == [(topk, cols)]
+
+
+@pytest.mark.parametrize(
+    ("rows", "cols", "expected_block_n"),
+    (
+        (129, 90048, 8192),
+        (514, 90048, 8192),
+        (129, 262208, 8192),
+        (129, 512 * 1024, 16384),
     ),
 )
 def test_dsa_wide_oneblock_prefill_repeats_with_ragged_rows(
+    rows: int,
     cols: int,
     expected_block_n: int,
 ) -> None:
-    rows = 129
     topk = 2048
     row_ids = torch.arange(rows, device="cuda", dtype=torch.int32)
     row_starts = 257 + row_ids % 113
@@ -2306,13 +2411,7 @@ def test_dsa_wide_oneblock_prefill_repeats_with_ragged_rows(
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
     assert (
-        dsa_topk_gfx950._wide_oneblock_prefill_block_n(
-            rows,
-            cols,
-            topk,
-            logits.device,
-        )
-        == expected_block_n
+        dsa_topk_gfx950._wide_oneblock_prefill_block_n(cols, topk) == expected_block_n
     )
 
     for _ in range(2):
@@ -2792,7 +2891,7 @@ def test_dsa_persistent_decode_is_stream_local() -> None:
     _assert_persistent_workspace_reset(workspace_b)
 
 
-def test_dsa_persistent_prefill_interleaved_handles_shifted_and_inf_rows() -> None:
+def test_dsa_wide_oneblock_prefill_handles_shifted_and_inf_rows() -> None:
     rows = 4
     cols = 524288
     topk = 2048
@@ -2827,15 +2926,7 @@ def test_dsa_persistent_prefill_interleaved_handles_shifted_and_inf_rows() -> No
         )
         is None
     )
-    assert (
-        dsa_topk_gfx950._persistent_interleaved_plan(
-            rows,
-            cols,
-            topk,
-            logits.device,
-        )
-        is not None
-    )
+    assert dsa_topk_gfx950._wide_oneblock_prefill_block_n(cols, topk) == 16384
 
     dsa_topk_gfx950._dsa_prefill_topk_indices(
         logits,
@@ -2854,9 +2945,6 @@ def test_dsa_persistent_prefill_interleaved_handles_shifted_and_inf_rows() -> No
         row_ends,
         topk=topk,
     )
-    workspace = dsa_topk_gfx950._persistent_topk_workspace(rows, logits.device)
-    _assert_persistent_workspace_layout(workspace, rows)
-    _assert_persistent_workspace_reset(workspace)
 
 
 @pytest.mark.parametrize("cols", [131072, 262144], ids=["two-groups", "four-groups"])
