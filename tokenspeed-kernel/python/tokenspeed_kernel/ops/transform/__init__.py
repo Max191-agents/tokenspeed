@@ -20,7 +20,9 @@
 
 from __future__ import annotations
 
-# Backend registration (side-effect imports)
+import tokenspeed_kernel.contracts.ops.transform  # noqa: F401
+
+# Backend registration (side-effect imports, after contract publication)
 import tokenspeed_kernel.ops.transform.faster_hadamard_transform  # noqa: F401
 import tokenspeed_kernel.ops.transform.triton  # noqa: F401
 import torch

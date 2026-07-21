@@ -22,6 +22,7 @@
 
 from tokenspeed_kernel.contracts.ops import (
     ATTN_MERGE_STATE,
+    HADAMARD_TRANSFORM,
     MHA_PREFILL,
     MLA_PREFILL,
     QUANTIZE_FP8,
@@ -32,6 +33,7 @@ from tokenspeed_kernel.operation import OperationRegistry, OperationSchema
 
 __all__ = [
     "ATTN_MERGE_STATE",
+    "HADAMARD_TRANSFORM",
     "MHA_PREFILL",
     "MLA_PREFILL",
     "QUANTIZE_FP8",

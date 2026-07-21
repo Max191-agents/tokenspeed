@@ -18,23 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Built-in operation contracts, organized by family and mode."""
+"""Transform operation contracts."""
 
-from tokenspeed_kernel.contracts.ops.attention import (
-    ATTN_MERGE_STATE,
-    MHA_PREFILL,
-    MLA_PREFILL,
+from tokenspeed_kernel.contracts.ops.transform.hadamard_transform import (
+    HADAMARD_TRANSFORM,
+    hadamard_transform_reference,
 )
-from tokenspeed_kernel.contracts.ops.embedding import ROPE, ROPE_MLA
-from tokenspeed_kernel.contracts.ops.quantization import QUANTIZE_FP8
-from tokenspeed_kernel.contracts.ops.transform import HADAMARD_TRANSFORM
 
-__all__ = [
-    "ATTN_MERGE_STATE",
-    "HADAMARD_TRANSFORM",
-    "MHA_PREFILL",
-    "MLA_PREFILL",
-    "QUANTIZE_FP8",
-    "ROPE",
-    "ROPE_MLA",
-]
+__all__ = ["HADAMARD_TRANSFORM", "hadamard_transform_reference"]

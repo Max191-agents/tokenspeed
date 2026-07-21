@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import hadamard_transform
+from tokenspeed_kernel.operation import OperationRegistry
 
 torch.manual_seed(42)
 
@@ -36,25 +37,14 @@ def test_hadamard_transform(device: str, solution: str, require) -> None:
     scale = 128**-0.5
 
     out = hadamard_transform(x, scale=scale, solution=solution)
-
-    expected = x.float().reshape(-1, x.shape[-1])
-    h = 1
-    while h < expected.shape[-1]:
-        expected_3d = expected.reshape(
-            expected.shape[0], expected.shape[1] // (2 * h), 2 * h
-        )
-        left = expected_3d[..., :h]
-        right = expected_3d[..., h : 2 * h]
-        combined = torch.cat((left + right, left - right), dim=-1)
-        expected = combined.reshape_as(expected)
-        h *= 2
-    expected = expected.reshape_as(x) * scale
+    schema = OperationRegistry.get().lookup("transform", "hadamard_transform")
+    expected = schema.reference(x, scale=scale)
 
     assert out.shape == x.shape
     assert out.dtype == x.dtype
     torch.testing.assert_close(
         out.float(),
-        expected.to(dtype).float(),
+        expected.float(),
         atol=2.0e-2,
         rtol=2.0e-2,
     )
