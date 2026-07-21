@@ -356,10 +356,10 @@ def _persistent_emit_tail(
     )
 
 
-@gluon.jit
-def _dsa_persistent_radix_topk_row(
-    row,
-    group,
+@gluon.jit(
+    do_not_specialize=("logits_stride",),
+)
+def _dsa_persistent_radix_topk_kernel(
     logits,
     histograms,
     pass_arrivals,
@@ -376,6 +376,8 @@ def _dsa_persistent_radix_topk_row(
     TOPK: gl.constexpr,
     BLOCK_N: gl.constexpr,
 ):
+    row = gl.program_id(0)
+    group = gl.program_id(1)
     value_layout: gl.constexpr = _vector_layout(
         BLOCK_N,
         gl.num_warps(),
@@ -1335,47 +1337,6 @@ def _persistent_interleaved_emit_row(
                 0,
             )
         gl.barrier()
-
-
-@gluon.jit(
-    do_not_specialize=("logits_stride",),
-)
-def _dsa_persistent_radix_topk_kernel(
-    logits,
-    histograms,
-    pass_arrivals,
-    pass_done,
-    reset_arrivals,
-    output_counters,
-    row_starts,
-    row_ends,
-    out,
-    lens_out,
-    logits_stride,
-    out_stride: gl.constexpr,
-    GROUPS_PER_ROW: gl.constexpr,
-    TOPK: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-):
-    _dsa_persistent_radix_topk_row(
-        gl.program_id(0),
-        gl.program_id(1),
-        logits,
-        histograms,
-        pass_arrivals,
-        pass_done,
-        reset_arrivals,
-        output_counters,
-        row_starts,
-        row_ends,
-        out,
-        lens_out,
-        logits_stride,
-        out_stride,
-        GROUPS_PER_ROW,
-        TOPK,
-        BLOCK_N,
-    )
 
 
 @gluon.jit(
@@ -3112,20 +3073,27 @@ def _dsa_oneblock_topk_indices(
 
 def _dsa_topk_indices(
     logits: torch.Tensor,
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     *,
-    block_table_stride: int,
-    block_table_cols: int,
-    page_size: int,
     topk: int,
-    q_len_per_req: int,
-    is_decode: bool,
     out: torch.Tensor,
     lens_out: torch.Tensor,
+    block_table: torch.Tensor | None = None,
+    page_size: int = 1,
+    q_len_per_req: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    seq_lens = row_starts
+    if block_table is None:
+        is_decode = False
+        block_table = row_starts
+        block_table_stride = 0
+        block_table_cols = 0
+    else:
+        is_decode = True
+        block_table_stride = block_table.stride(0)
+        block_table_cols = block_table.shape[1]
+
     rows, cols = logits.shape
     plan = _dsa_topk_plan(
         rows,
@@ -3196,60 +3164,6 @@ def _dsa_topk_indices(
         q_len_per_req=q_len_per_req,
         is_decode=is_decode,
         plan=plan,
-        out=out,
-        lens_out=lens_out,
-    )
-
-
-def _dsa_decode_topk_slots(
-    logits: torch.Tensor,
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    *,
-    page_size: int,
-    topk: int,
-    q_len_per_req: int,
-    out: torch.Tensor,
-    lens_out: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _dsa_topk_indices(
-        logits,
-        block_table,
-        seq_lens,
-        seq_lens,
-        seq_lens,
-        block_table_stride=block_table.stride(0),
-        block_table_cols=block_table.shape[1],
-        page_size=page_size,
-        topk=topk,
-        q_len_per_req=q_len_per_req,
-        is_decode=True,
-        out=out,
-        lens_out=lens_out,
-    )
-
-
-def _dsa_prefill_topk_indices(
-    logits: torch.Tensor,
-    row_starts: torch.Tensor,
-    row_ends: torch.Tensor,
-    *,
-    topk: int,
-    out: torch.Tensor,
-    lens_out: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _dsa_topk_indices(
-        logits,
-        row_starts,
-        row_starts,
-        row_starts,
-        row_ends,
-        block_table_stride=0,
-        block_table_cols=0,
-        page_size=1,
-        topk=topk,
-        q_len_per_req=1,
-        is_decode=False,
         out=out,
         lens_out=lens_out,
     )
@@ -3348,10 +3262,11 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         BLOCK_D=128,
         num_warps=4,
     )
-    return _dsa_decode_topk_slots(
+    return _dsa_topk_indices(
         logits,
-        block_table,
         seq_lens,
+        seq_lens,
+        block_table=block_table,
         page_size=int(page_size),
         topk=topk,
         q_len_per_req=q_len_per_req,
@@ -3461,7 +3376,7 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             BLOCK_D=128,
             num_warps=4,
         )
-        _dsa_prefill_topk_indices(
+        _dsa_topk_indices(
             logits,
             row_starts[start:end],
             row_ends[start:end],

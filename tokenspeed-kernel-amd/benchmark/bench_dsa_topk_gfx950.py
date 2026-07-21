@@ -178,10 +178,11 @@ def _build_prefill_state(case: PrefillCase) -> PrefillState:
 
 def _invoke_decode_gluon(state: DecodeState) -> None:
     case = state.case
-    dsa_topk_gfx950._dsa_decode_topk_slots(
+    dsa_topk_gfx950._dsa_topk_indices(
         state.logits,
-        state.block_table,
         state.seq_lens,
+        state.seq_lens,
+        block_table=state.block_table,
         page_size=PAGE_SIZE,
         topk=TOPK,
         q_len_per_req=case.q_len_per_req,
@@ -224,7 +225,7 @@ def _invoke_decode_aiter_contract(state: DecodeState, ops: AiterOps) -> None:
 def _invoke_prefill_gluon(state: PrefillState) -> None:
     for start, end in state.launches:
         rows = end - start
-        dsa_topk_gfx950._dsa_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_topk_indices(
             state.logits[:rows],
             state.row_starts[start:end],
             state.row_ends[start:end],

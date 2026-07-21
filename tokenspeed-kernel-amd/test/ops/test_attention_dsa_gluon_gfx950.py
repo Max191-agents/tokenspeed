@@ -195,6 +195,9 @@ def test_dsa_topk_has_no_superseded_decode_paths() -> None:
         "_dsa_persistent_decode_topk_slots",
         "_dsa_persistent_prefill_topk_indices",
         "_dsa_oneblock_manual_prefill_topk_indices",
+        "_dsa_decode_topk_slots",
+        "_dsa_prefill_topk_indices",
+        "_dsa_persistent_radix_topk_row",
         "_wide_oneblock_prefill_block_n",
     )
 
@@ -1145,7 +1148,7 @@ def test_dsa_prefill_topk_oneblock_falls_back_for_large_tie_bucket() -> None:
     out = torch.empty((1, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1338,7 +1341,7 @@ def test_dsa_persistent_workspace_uses_one_monotonic_pass_arrival_per_row() -> N
 
 
 def test_dsa_persistent_pass_arrival_uses_monotonic_generations() -> None:
-    source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_row.fn)
+    source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_kernel.fn)
 
     assert "generation_last_arrival = (pass_index + 1) * GROUPS_PER_ROW - 1" in source
     assert "gl.atomic_xchg(" not in source
@@ -1359,7 +1362,7 @@ def test_dsa_persistent_pass_arrival_uses_monotonic_generations() -> None:
 
 
 def test_dsa_persistent_prefill_tail_follows_live_row_length() -> None:
-    row_source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_row.fn)
+    row_source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_kernel.fn)
     launch_source = inspect.getsource(
         dsa_topk_gfx950._dsa_persistent_prefill_radix_topk
     )
@@ -1371,14 +1374,14 @@ def test_dsa_persistent_prefill_tail_follows_live_row_length() -> None:
 
 
 def test_dsa_persistent_prefill_radix_passes_are_statically_unrolled() -> None:
-    source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_row.fn)
+    source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_kernel.fn)
 
     assert "for pass_index in gl.static_range(_PERSISTENT_PREFILL_NUM_PASSES)" in source
     assert "while (pass_index < _PERSISTENT_PREFILL_NUM_PASSES)" not in source
 
 
 def test_dsa_persistent_prefill_uses_wave_prefix_histogram_scan() -> None:
-    row_source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_row.fn)
+    row_source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_kernel.fn)
     scan_source = inspect.getsource(dsa_topk_gfx950._persistent_group_cumulative.fn)
 
     assert "_persistent_group_cumulative(" in row_source
@@ -1428,7 +1431,7 @@ def test_dsa_persistent_prefill_rebases_shifted_live_ranges() -> None:
     for _ in range(2):
         out.fill_(-7)
         lens_out.fill_(-7)
-        dsa_topk_gfx950._dsa_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_topk_indices(
             logits,
             row_starts,
             row_ends,
@@ -1491,7 +1494,7 @@ def test_dsa_prefill_topk_dispatches_persistent_groups_across_rows(
     )
     assert plan.kind == "persistent-homogeneous"
     assert plan.groups_per_row == expected_groups
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1529,7 +1532,7 @@ def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1547,7 +1550,7 @@ def test_dsa_persistent_prefill_topk_repeats_across_rows() -> None:
     )
     out.fill_(-1)
     lens_out.fill_(-1)
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1660,7 +1663,7 @@ def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
         )
         == 2
     )
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1678,7 +1681,7 @@ def test_dsa_persistent_prefill_handles_oversized_ties_and_infinities() -> None:
     )
     out.fill_(-1)
     lens_out.fill_(-1)
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1722,7 +1725,7 @@ def test_dsa_persistent_prefill_handles_packed_selection_boundaries() -> None:
         )
         == 4
     )
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1758,7 +1761,7 @@ def test_dsa_persistent_prefill_static_passes_preserve_early_selection() -> None
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1794,7 +1797,7 @@ def test_dsa_persistent_prefill_topk_handles_ragged_rows() -> None:
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1810,7 +1813,7 @@ def test_dsa_persistent_prefill_topk_handles_ragged_rows() -> None:
         row_ends,
         topk=topk,
     )
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1845,7 +1848,7 @@ def test_dsa_prefill_topk_90k_boundary_keeps_exact_values() -> None:
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -1893,7 +1896,7 @@ def test_dsa_prefill_manual_oneblock_fallback_keeps_exact_values(cols: int) -> N
     for _ in range(2):
         out.fill_(-7)
         lens_out.fill_(-7)
-        dsa_topk_gfx950._dsa_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_topk_indices(
             logits,
             row_starts,
             row_ends,
@@ -2080,10 +2083,11 @@ def test_dsa_decode_topk_dispatches_persistent_radix_for_batched_queries() -> No
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_decode_topk_slots(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
-        block_table,
         seq_lens,
+        seq_lens,
+        block_table=block_table,
         page_size=page_size,
         topk=topk,
         q_len_per_req=q_len_per_req,
@@ -2128,10 +2132,11 @@ def test_dsa_decode_topk_trivial_2048_maps_grouped_queries_to_physical_slots(
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_decode_topk_slots(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
-        block_table,
         seq_lens,
+        seq_lens,
+        block_table=block_table,
         page_size=page_size,
         topk=topk,
         q_len_per_req=q_len_per_req,
@@ -2171,7 +2176,7 @@ def test_dsa_prefill_topk_trivial_2048_maps_candidate_ranges(cols: int) -> None:
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -2226,10 +2231,11 @@ def test_dsa_decode_topk_maps_grouped_queries_to_physical_slots(
     out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_decode_topk_slots(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
-        block_table,
         seq_lens,
+        seq_lens,
+        block_table=block_table,
         page_size=page_size,
         topk=topk,
         q_len_per_req=q_len_per_req,
@@ -2281,10 +2287,11 @@ def test_dsa_decode_manual_oneblock_fallback_keeps_exact_values(
         ).kind
         == "oneblock"
     )
-    dsa_topk_gfx950._dsa_decode_topk_slots(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
-        block_table,
         seq_lens,
+        seq_lens,
+        block_table=block_table,
         page_size=page_size,
         topk=topk,
         q_len_per_req=1,
@@ -2342,10 +2349,11 @@ def test_dsa_decode_topk_persistent_replaces_staged_wide(
         ).kind
         == "persistent-interleaved"
     )
-    dsa_topk_gfx950._dsa_decode_topk_slots(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
-        block_table,
         seq_lens,
+        seq_lens,
+        block_table=block_table,
         page_size=page_size,
         topk=topk,
         q_len_per_req=1,
@@ -2454,10 +2462,11 @@ def test_dsa_decode_high_row_oneblock_maps_logical_offsets_to_slots(
         is_decode=True,
     )
     assert plan.kind == "oneblock"
-    dsa_topk_gfx950._dsa_decode_topk_slots(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
-        block_table,
         seq_lens,
+        seq_lens,
+        block_table=block_table,
         page_size=page_size,
         topk=topk,
         q_len_per_req=q_len_per_req,
@@ -2516,10 +2525,11 @@ def test_dsa_persistent_decode_handles_tail_ties_and_infinities() -> None:
         ).kind
         == "persistent-interleaved"
     )
-    dsa_topk_gfx950._dsa_decode_topk_slots(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
-        block_table,
         seq_lens,
+        seq_lens,
+        block_table=block_table,
         page_size=page_size,
         topk=topk,
         q_len_per_req=q_len_per_req,
@@ -2711,7 +2721,7 @@ def test_dsa_persistent_interleaved_prefill_rebases_shifted_live_ranges() -> Non
     assert plan[0] == 128
     assert plan[3] == 1
 
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -2785,7 +2795,7 @@ def test_dsa_persistent_prefill_interleaved_repeat_and_reset(
     for _ in range(2):
         out.fill_(-7)
         lens_out.fill_(-7)
-        dsa_topk_gfx950._dsa_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_topk_indices(
             logits,
             row_starts,
             row_ends,
@@ -2940,7 +2950,7 @@ def test_dsa_wide_oneblock_prefill_repeats_with_ragged_rows(
     for _ in range(2):
         out.fill_(-7)
         lens_out.fill_(-7)
-        dsa_topk_gfx950._dsa_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_topk_indices(
             logits,
             row_starts,
             row_ends,
@@ -3024,7 +3034,7 @@ def test_dsa_persistent_prefill_interleaved_respects_causal_ranges() -> None:
     out = torch.full((rows, topk), -7, device="cuda", dtype=torch.int32)
     lens_out = torch.full((rows,), -7, device="cuda", dtype=torch.int32)
 
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -3084,7 +3094,7 @@ def test_dsa_persistent_prefill_interleaved_is_graph_capturable(
     )
 
     def invoke() -> None:
-        dsa_topk_gfx950._dsa_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_topk_indices(
             logits,
             row_starts,
             row_ends,
@@ -3253,10 +3263,11 @@ def test_dsa_persistent_decode_interleaved_is_graph_capturable(
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
     def invoke() -> None:
-        dsa_topk_gfx950._dsa_decode_topk_slots(
+        dsa_topk_gfx950._dsa_topk_indices(
             logits,
-            block_table,
             seq_lens,
+            seq_lens,
+            block_table=block_table,
             page_size=page_size,
             topk=topk,
             q_len_per_req=q_len_per_req,
@@ -3355,10 +3366,11 @@ def test_dsa_persistent_decode_is_stream_local() -> None:
             logits_a.device,
         )
         for _ in range(3):
-            dsa_topk_gfx950._dsa_decode_topk_slots(
+            dsa_topk_gfx950._dsa_topk_indices(
                 logits_a,
-                block_table,
                 seq_lens,
+                seq_lens,
+                block_table=block_table,
                 page_size=page_size,
                 topk=topk,
                 q_len_per_req=q_len_per_req,
@@ -3371,10 +3383,11 @@ def test_dsa_persistent_decode_is_stream_local() -> None:
             logits_b.device,
         )
         for _ in range(3):
-            dsa_topk_gfx950._dsa_decode_topk_slots(
+            dsa_topk_gfx950._dsa_topk_indices(
                 logits_b,
-                block_table,
                 seq_lens,
+                seq_lens,
+                block_table=block_table,
                 page_size=page_size,
                 topk=topk,
                 q_len_per_req=q_len_per_req,
@@ -3459,7 +3472,7 @@ def test_dsa_wide_oneblock_prefill_handles_shifted_and_inf_rows() -> None:
     assert plan.kind == "oneblock"
     assert plan.block_n == 16384
 
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -3499,7 +3512,7 @@ def test_dsa_prefill_homogeneous_persistent_topk_is_graph_capturable(
     side_stream = torch.cuda.Stream()
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
-        dsa_topk_gfx950._dsa_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_topk_indices(
             logits,
             row_starts,
             row_ends,
@@ -3511,7 +3524,7 @@ def test_dsa_prefill_homogeneous_persistent_topk_is_graph_capturable(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        dsa_topk_gfx950._dsa_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_topk_indices(
             logits,
             row_starts,
             row_ends,
@@ -3564,7 +3577,7 @@ def test_dsa_prefill_homogeneous_persistent_topk_is_stream_local(cols: int) -> N
     stream_a.wait_stream(current_stream)
     stream_b.wait_stream(current_stream)
     with torch.cuda.stream(stream_a):
-        dsa_topk_gfx950._dsa_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_topk_indices(
             logits_a,
             row_starts,
             row_ends,
@@ -3573,7 +3586,7 @@ def test_dsa_prefill_homogeneous_persistent_topk_is_stream_local(cols: int) -> N
             lens_out=lens_a,
         )
     with torch.cuda.stream(stream_b):
-        dsa_topk_gfx950._dsa_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_topk_indices(
             logits_b,
             row_starts,
             row_ends,
@@ -3622,7 +3635,7 @@ def test_dsa_persistent_prefill_topk_is_graph_capturable(
     lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
 
     # Compile before capture without populating the capture stream's cache key.
-    dsa_topk_gfx950._dsa_prefill_topk_indices(
+    dsa_topk_gfx950._dsa_topk_indices(
         logits,
         row_starts,
         row_ends,
@@ -3643,7 +3656,7 @@ def test_dsa_persistent_prefill_topk_is_graph_capturable(
     assert workspace_key not in dsa_topk_gfx950._persistent_topk_workspace_cache
     if warm_workspace:
         with torch.cuda.stream(capture_stream):
-            dsa_topk_gfx950._dsa_prefill_topk_indices(
+            dsa_topk_gfx950._dsa_topk_indices(
                 logits,
                 row_starts,
                 row_ends,
@@ -3656,7 +3669,7 @@ def test_dsa_persistent_prefill_topk_is_graph_capturable(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
-        dsa_topk_gfx950._dsa_prefill_topk_indices(
+        dsa_topk_gfx950._dsa_topk_indices(
             logits,
             row_starts,
             row_ends,
@@ -3743,7 +3756,7 @@ def test_dsa_persistent_prefill_topk_is_stream_local() -> None:
             logits_a.device,
         )
         for _ in range(3):
-            dsa_topk_gfx950._dsa_prefill_topk_indices(
+            dsa_topk_gfx950._dsa_topk_indices(
                 logits_a,
                 row_starts,
                 row_ends,
@@ -3757,7 +3770,7 @@ def test_dsa_persistent_prefill_topk_is_stream_local() -> None:
             logits_b.device,
         )
         for _ in range(3):
-            dsa_topk_gfx950._dsa_prefill_topk_indices(
+            dsa_topk_gfx950._dsa_topk_indices(
                 logits_b,
                 row_starts,
                 row_ends,
