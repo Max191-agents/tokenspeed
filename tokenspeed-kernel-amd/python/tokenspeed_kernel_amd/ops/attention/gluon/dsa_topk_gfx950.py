@@ -103,32 +103,6 @@ def _topk_add(a, b):
     return a + b
 
 
-@gluon.jit
-def _persistent_wait_until_at_least(address, target, thread_offset):
-    return gl.inline_asm_elementwise(
-        asm="""
-            v_cmp_eq_u32_e32 vcc, 0, $4
-            s_and_saveexec_b64 $0, vcc
-            s_cbranch_execz 2f
-        1:
-            flat_load_dword $1, $2 sc0 sc1
-            s_waitcnt vmcnt(0) lgkmcnt(0)
-            buffer_inv sc0 sc1
-            v_cmp_ge_u32_e32 vcc, $1, $3
-            s_cbranch_vccnz 2f
-            s_sleep 1
-            s_branch 1b
-        2:
-            s_or_b64 exec, exec, $0
-        """,
-        constraints="=&s,=&v,v,v,v",
-        args=[address, target, thread_offset],
-        dtype=(gl.int64, gl.int32),
-        is_pure=False,
-        pack=1,
-    )
-
-
 @gluon.jit(noinline=True)
 def _persistent_histogram_tail(
     row_logits,
@@ -300,13 +274,6 @@ def _dsa_persistent_radix_topk_kernel(
         gl.num_warps(),
         (_PERSISTENT_PREFILL_NUM_BUCKETS // 2) // (64 * gl.num_warps()),
     )
-    wait_threads: gl.constexpr = 64 * gl.num_warps()
-    wait_layout: gl.constexpr = _vector_layout(
-        wait_threads,
-        gl.num_warps(),
-        1,
-    )
-    wait_offsets = gl.arange(0, wait_threads, layout=wait_layout)
     hist_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[_PERSISTENT_PREFILL_NUM_BUCKETS, 1]],
         [_PERSISTENT_PREFILL_NUM_BUCKETS],
@@ -466,13 +433,14 @@ def _dsa_persistent_radix_topk_kernel(
                 sem="release",
                 scope="gpu",
             )
+            gl.barrier()
         else:
-            _persistent_wait_until_at_least(
+            gl.atomic_poll(
                 pass_done + row * _PERSISTENT_PREFILL_COUNTER_STRIDE,
                 pass_index + 1,
-                wait_offsets,
+                sem="acquire",
+                scope="gpu",
             )
-        gl.barrier()
 
         total_counts = gl.load(
             row_histogram + bucket_offsets,
@@ -937,7 +905,6 @@ def _persistent_interleaved_complete_pass(
     pass_done,
     row_starts,
     row_ends,
-    wait_offsets,
     q_len_per_req: gl.constexpr,
     IS_DECODE: gl.constexpr,
     TOPK: gl.constexpr,
@@ -956,18 +923,12 @@ def _persistent_interleaved_complete_pass(
             + row * _PERSISTENT_PREFILL_COUNTER_STRIDE
             + _PERSISTENT_INTERLEAVED_STATE_READY
         )
-        _persistent_wait_until_at_least(
+        gl.atomic_poll(
             state_ready,
             PASS_INDEX + 1,
-            wait_offsets,
-        )
-        gl.atomic_add(
-            state_ready,
-            0,
             sem="acquire",
             scope="gpu",
         )
-        gl.barrier()
 
 
 @gluon.jit
@@ -1258,13 +1219,6 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
         gl.num_warps(),
         (_PERSISTENT_PREFILL_NUM_BUCKETS // 2) // (64 * gl.num_warps()),
     )
-    wait_threads: gl.constexpr = 64 * gl.num_warps()
-    wait_layout: gl.constexpr = _vector_layout(
-        wait_threads,
-        gl.num_warps(),
-        1,
-    )
-    wait_offsets = gl.arange(0, wait_threads, layout=wait_layout)
     hist_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[_PERSISTENT_PREFILL_NUM_BUCKETS, 1]],
         [_PERSISTENT_PREFILL_NUM_BUCKETS],
@@ -1442,7 +1396,6 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                     pass_done,
                     row_starts,
                     row_ends,
-                    wait_offsets,
                     q_len_per_req,
                     IS_DECODE,
                     TOPK,
@@ -1457,7 +1410,6 @@ def _dsa_persistent_radix_topk_interleaved_kernel(
                     pass_done,
                     row_starts,
                     row_ends,
-                    wait_offsets,
                     q_len_per_req,
                     IS_DECODE,
                     TOPK,

@@ -1304,6 +1304,24 @@ def test_dsa_persistent_pass_arrival_uses_monotonic_generations() -> None:
     assert 'sem="acq_rel"' not in source
 
 
+def test_dsa_persistent_generation_waits_use_gluon_atomic_poll() -> None:
+    homogeneous_source = inspect.getsource(
+        dsa_topk_gfx950._dsa_persistent_radix_topk_kernel.fn
+    )
+    interleaved_source = inspect.getsource(
+        dsa_topk_gfx950._persistent_interleaved_complete_pass.fn
+    )
+    module_source = inspect.getsource(dsa_topk_gfx950)
+
+    for source in (homogeneous_source, interleaved_source):
+        assert source.count("gl.atomic_poll(") == 1
+        assert 'sem="acquire"' in source
+        assert 'scope="gpu"' in source
+    assert "_persistent_wait_until_at_least" not in module_source
+    assert "inline_asm_elementwise" not in module_source
+    assert "gl.atomic_add(\n            state_ready,\n            0," not in interleaved_source
+
+
 def test_dsa_persistent_prefill_tail_follows_live_row_length() -> None:
     row_source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_kernel.fn)
     launch_source = inspect.getsource(
