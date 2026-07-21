@@ -56,7 +56,8 @@ _PERSISTENT_PREFILL_MIN_ROWS = 32
 _PERSISTENT_DECODE_MIN_COLS = 90000
 _PERSISTENT_DECODE_GROUP_CANDIDATES = (2, 4, 8, 16, 32, 64)
 _PERSISTENT_PREFILL_TOPK = 2048
-_PERSISTENT_PREFILL_BLOCK_N = 16384
+_PERSISTENT_PREFILL_BLOCK_N = 8192
+_PERSISTENT_INTERLEAVED_BLOCK_N = 16384
 _PERSISTENT_PREFILL_NUM_WARPS = 16
 _PERSISTENT_PREFILL_NUM_BUCKETS = gl.constexpr(1 << 11)
 _PERSISTENT_PREFILL_NUM_PASSES = gl.constexpr(3)
@@ -2888,7 +2889,7 @@ def _persistent_interleaved_plan(
         device_index = torch.cuda.current_device()
     compute_units = _device_compute_units(device_index)
     width_groups = _next_power_of_two(
-        triton.cdiv(int(cols), _PERSISTENT_PREFILL_BLOCK_N)
+        triton.cdiv(int(cols), _PERSISTENT_INTERLEAVED_BLOCK_N)
     )
 
     def cohort_config(row_count: int, workgroup_limit: int) -> tuple[int, int]:
@@ -2992,7 +2993,7 @@ def _dsa_persistent_interleaved_topk(
         MAIN_GROUPS_PER_ROW=main_groups,
         TAIL_GROUPS_PER_ROW=tail_groups,
         TOPK=topk,
-        BLOCK_N=_PERSISTENT_PREFILL_BLOCK_N,
+        BLOCK_N=_PERSISTENT_INTERLEAVED_BLOCK_N,
         num_warps=_PERSISTENT_PREFILL_NUM_WARPS,
     )
     return out, lens_out

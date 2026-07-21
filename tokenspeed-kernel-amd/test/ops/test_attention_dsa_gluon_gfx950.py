@@ -2393,6 +2393,20 @@ def test_dsa_persistent_interleaved_launch_uses_full_warp_count() -> None:
     assert "num_warps=_PERSISTENT_PREFILL_NUM_WARPS" in source
 
 
+def test_dsa_persistent_launches_use_independent_block_sizes() -> None:
+    prefill_source = inspect.getsource(
+        dsa_topk_gfx950._dsa_persistent_prefill_radix_topk
+    )
+    interleaved_source = inspect.getsource(
+        dsa_topk_gfx950._dsa_persistent_interleaved_topk
+    )
+
+    assert dsa_topk_gfx950._PERSISTENT_PREFILL_BLOCK_N == 8192
+    assert dsa_topk_gfx950._PERSISTENT_INTERLEAVED_BLOCK_N == 16384
+    assert "BLOCK_N=_PERSISTENT_PREFILL_BLOCK_N" in prefill_source
+    assert "BLOCK_N=_PERSISTENT_INTERLEAVED_BLOCK_N" in interleaved_source
+
+
 def test_dsa_persistent_interleaved_rebases_prefill_only() -> None:
     helpers = (
         dsa_topk_gfx950._persistent_interleaved_publish_histogram,
