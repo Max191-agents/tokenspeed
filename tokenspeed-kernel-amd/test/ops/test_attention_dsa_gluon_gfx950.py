@@ -1297,6 +1297,16 @@ def test_dsa_persistent_prefill_radix_passes_are_statically_unrolled() -> None:
     assert "while (pass_index < _PERSISTENT_PREFILL_NUM_PASSES)" not in source
 
 
+def test_dsa_persistent_prefill_uses_wave_prefix_histogram_scan() -> None:
+    row_source = inspect.getsource(dsa_topk_gfx950._dsa_persistent_radix_topk_row.fn)
+    scan_source = inspect.getsource(dsa_topk_gfx950._persistent_group_cumulative.fn)
+
+    assert "_persistent_group_cumulative(" in row_source
+    assert "gl.associative_scan(" not in row_source
+    assert "_dpp_wave64_inclusive_i32(group_counts)" in scan_source
+    assert "_dpp_row16_inclusive_i32(wave_totals)" in scan_source
+
+
 def test_dsa_persistent_prefill_rebases_shifted_live_ranges() -> None:
     rows = 32
     cols = 262157
@@ -1854,6 +1864,24 @@ def test_dsa_persistent_prefill_groups_obey_residency_bound() -> None:
             device,
         )
         == 2
+    )
+    assert dsa_topk_gfx950._persistent_prefill_groups(
+        70,
+        1901100,
+        topk,
+        device,
+    ) == min(
+        compute_units // 70,
+        dsa_topk_gfx950._PERSISTENT_PREFILL_LONG_MAX_GROUPS,
+    )
+    assert dsa_topk_gfx950._persistent_prefill_groups(
+        35,
+        3749700,
+        topk,
+        device,
+    ) == min(
+        compute_units // 35,
+        dsa_topk_gfx950._PERSISTENT_PREFILL_LONG_MAX_GROUPS,
     )
     assert (
         dsa_topk_gfx950._persistent_prefill_groups(

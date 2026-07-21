@@ -50,6 +50,8 @@ _PREFILL_ONEBLOCK_RADIX_MIN_COLS = 98304
 _PREFILL_ONEBLOCK_RADIX_MAX_COLS = 196608
 _PERSISTENT_PREFILL_MIN_COLS = 128 * 1024
 _PERSISTENT_PREFILL_FOUR_GROUP_MIN_COLS = 256 * 1024
+_PERSISTENT_PREFILL_FILL_RESIDENCY_MIN_COLS = 1536 * 1024
+_PERSISTENT_PREFILL_LONG_MAX_GROUPS = 5
 _PERSISTENT_PREFILL_MIN_ROWS = 32
 _PERSISTENT_DECODE_MIN_COLS = 90000
 _PERSISTENT_DECODE_GROUP_CANDIDATES = (2, 4, 8, 16, 32, 64)
@@ -185,6 +187,34 @@ def _oneblock_group_cumulative(
         thread_end + wave_prefix,
     ).reshape([2 * THREADS])
     return gl.convert_layout(cumulative, group_layout, assert_trivial=True)
+
+
+@gluon.jit
+def _persistent_group_cumulative(
+    group_counts,
+    shared_wave_prefixes,
+    group_layout: gl.constexpr,
+    wave_prefix_layout: gl.constexpr,
+    THREADS: gl.constexpr,
+):
+    thread_end = _dpp_wave64_inclusive_i32(group_counts)
+    thread_offsets = gl.arange(0, THREADS, layout=group_layout)
+    wave_ids = thread_offsets // 64
+    shared_wave_prefixes.atomic_scatter_xchg(
+        thread_end,
+        wave_ids,
+        axis=0,
+        mask=(thread_offsets & 63) == 63,
+    )
+    gl.barrier()
+
+    wave_totals = shared_wave_prefixes.load(wave_prefix_layout)
+    wave_prefixes = _dpp_row16_inclusive_i32(wave_totals) - wave_totals
+    shared_wave_prefixes.store(wave_prefixes)
+    gl.barrier()
+
+    wave_prefix = shared_wave_prefixes.gather(wave_ids, axis=0)
+    return thread_end + wave_prefix
 
 
 @gluon.jit
@@ -404,6 +434,21 @@ def _dsa_persistent_radix_topk_row(
         [_PERSISTENT_PREFILL_NUM_BUCKETS],
         hist_shared_layout,
     )
+    wave_prefix_layout: gl.constexpr = _vector_layout(
+        gl.num_warps(),
+        gl.num_warps(),
+        1,
+    )
+    wave_prefix_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[gl.num_warps(), 1]],
+        [gl.num_warps()],
+        [0],
+    )
+    shared_wave_prefixes = gl.allocate_shared_memory(
+        gl.int32,
+        [gl.num_warps()],
+        wave_prefix_shared_layout,
+    )
     compact_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[TOPK, 1]],
         [TOPK],
@@ -563,7 +608,13 @@ def _dsa_persistent_radix_topk_row(
         count_low = gl.convert_layout(count_low, group_layout)
         count_high = gl.convert_layout(count_high, group_layout)
         group_counts = count_low + count_high
-        cumulative = gl.associative_scan(group_counts, 0, _topk_add)
+        cumulative = _persistent_group_cumulative(
+            group_counts,
+            shared_wave_prefixes,
+            group_layout,
+            wave_prefix_layout,
+            _PERSISTENT_PREFILL_NUM_BUCKETS // 2,
+        )
         before_group = cumulative - group_counts
         selected_group = (before_group < remaining) & (cumulative >= remaining)
         bucket_pairs = bucket_offsets.reshape([_PERSISTENT_PREFILL_NUM_BUCKETS // 2, 2])
@@ -2648,6 +2699,9 @@ def _persistent_prefill_groups(
     if device_index is None:
         device_index = torch.cuda.current_device()
     max_groups = _device_compute_units(device_index) // rows
+    if cols >= _PERSISTENT_PREFILL_FILL_RESIDENCY_MIN_COLS:
+        long_groups = min(max_groups, _PERSISTENT_PREFILL_LONG_MAX_GROUPS)
+        return long_groups if long_groups >= 2 else None
     target_groups = 2 if cols < _PERSISTENT_PREFILL_FOUR_GROUP_MIN_COLS else 4
     if max_groups >= target_groups:
         return target_groups
