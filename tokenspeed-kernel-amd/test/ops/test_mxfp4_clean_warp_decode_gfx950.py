@@ -1493,6 +1493,299 @@ def test_kernel_routing_decode_reaches_route_owned_up_to_decode_max_m(
     assert captured["allow_generic_fallback"] is True
 
 
+@pytest.mark.parametrize("num_tokens", [9, 16, 33, 64])
+def test_package_stage1_token_order_scale_matches_sorted_scale(
+    num_tokens: int,
+):
+    """Stage 1 must produce the same result without a scale-gather launch."""
+    from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.moe_sorting import (
+        gluon_moe_sorting,
+    )
+    from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.prefill_stage1 import (
+        invoke_gluon_mxfp4_moe_stage1,
+    )
+    from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.scale import (
+        gather_package_cdna4_scale,
+    )
+
+    hidden_size = 1024
+    intermediate_size = 512
+    num_experts = 32
+    topk = 8
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(20260724 + num_tokens)
+    hidden = torch.randn(
+        (num_tokens, hidden_size),
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    router = torch.randn(
+        (num_tokens, num_experts),
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    topk_weights, topk_ids = torch.topk(
+        torch.softmax(router.float(), dim=-1),
+        topk,
+    )
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+    topk_weights = topk_weights.to(torch.float32).contiguous()
+    w13, w13_scale, w2, w2_scale = _make_weights(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    layer = _make_preprocessed_layer(
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    sorted_ids, _, sorted_expert_ids, num_valid_ids, _ = gluon_moe_sorting(
+        topk_ids,
+        topk_weights,
+        num_experts,
+        hidden_size,
+        torch.bfloat16,
+        128,
+    )
+    q_hidden, q_hidden_scale = fused_mxfp_gfx950._quantize_mxfp4_activation(hidden)
+    sorted_scale = gather_package_cdna4_scale(
+        q_hidden_scale,
+        sorted_ids,
+        source_rows=num_tokens,
+        cols=hidden_size,
+        top_k=topk,
+        flatten_topk=False,
+    )
+    package_w13 = layer.w13_weight_triton_tensor.gluon_package_prefill_weight.view(
+        torch.uint8
+    )
+    package_w13_scale = layer.w13_weight_triton_tensor.gluon_package_prefill_scale.view(
+        torch.uint8
+    )
+    expected = torch.empty(
+        (num_tokens, topk, intermediate_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    actual = torch.empty_like(expected)
+
+    common_args = (
+        q_hidden,
+        package_w13,
+        None,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+    )
+    common_kwargs = {
+        "topk": topk,
+        "w1_scale": package_w13_scale,
+        "sorted_weights": None,
+        "b_preshuffled": True,
+        "b_gdot128": True,
+    }
+    invoke_gluon_mxfp4_moe_stage1(
+        *common_args,
+        expected,
+        a1_scale=sorted_scale,
+        **common_kwargs,
+    )
+    invoke_gluon_mxfp4_moe_stage1(
+        *common_args,
+        actual,
+        a1_scale=q_hidden_scale,
+        a1_scale_is_sorted=False,
+        **common_kwargs,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_package_stage1_token_order_scale_tracks_routes_during_graph_replay():
+    """Graph replay must use the current route to address token-order scales."""
+    from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.moe_sorting import (
+        gluon_moe_sorting,
+    )
+    from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.prefill_stage1 import (
+        invoke_gluon_mxfp4_moe_stage1,
+    )
+
+    num_tokens = 16
+    hidden_size = 1024
+    intermediate_size = 512
+    num_experts = 32
+    topk = 8
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(20260726)
+    row_scale = torch.arange(
+        1, num_tokens + 1, device=device, dtype=torch.float32
+    ).unsqueeze(1)
+    hidden_a = (
+        torch.randn(
+            (num_tokens, hidden_size),
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * row_scale
+    ).to(torch.bfloat16)
+    hidden_b = (
+        torch.randn(
+            (num_tokens, hidden_size),
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * row_scale.flip(0)
+    ).to(torch.bfloat16)
+    token = torch.arange(num_tokens, device=device, dtype=torch.int32).unsqueeze(1)
+    slot = torch.arange(topk, device=device, dtype=torch.int32).unsqueeze(0)
+    topk_ids_a = ((token + slot) % num_experts).contiguous()
+    topk_ids_b = ((token * 5 + slot * 3 + 7) % num_experts).contiguous()
+    topk_weights = torch.full(
+        (num_tokens, topk), 1.0 / topk, device=device, dtype=torch.float32
+    )
+
+    def sort_routes(topk_ids):
+        sorted_ids, _, sorted_expert_ids, num_valid_ids, _ = gluon_moe_sorting(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            hidden_size,
+            torch.bfloat16,
+            128,
+        )
+        return sorted_ids, sorted_expert_ids, num_valid_ids
+
+    route_a = sort_routes(topk_ids_a)
+    route_b = sort_routes(topk_ids_b)
+    q_hidden_a, q_scale_a = fused_mxfp_gfx950._quantize_mxfp4_activation(hidden_a)
+    q_hidden_b, q_scale_b = fused_mxfp_gfx950._quantize_mxfp4_activation(hidden_b)
+    w13, w13_scale, w2, w2_scale = _make_weights(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    layer = _make_preprocessed_layer(
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    package_w13 = layer.w13_weight_triton_tensor.gluon_package_prefill_weight.view(
+        torch.uint8
+    )
+    package_scale = layer.w13_weight_triton_tensor.gluon_package_prefill_scale.view(
+        torch.uint8
+    )
+    captured_q_hidden = q_hidden_a.clone()
+    captured_q_scale = q_scale_a.clone()
+    captured_route = tuple(value.clone() for value in route_a)
+    actual = torch.empty(
+        (num_tokens, topk, intermediate_size),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    expected = torch.empty_like(actual)
+
+    def run_stage1(q_hidden, q_scale, route, out):
+        invoke_gluon_mxfp4_moe_stage1(
+            q_hidden,
+            package_w13,
+            None,
+            *route,
+            out,
+            topk,
+            w1_scale=package_scale,
+            a1_scale=q_scale,
+            sorted_weights=None,
+            b_preshuffled=True,
+            b_gdot128=True,
+            a1_scale_is_sorted=False,
+        )
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        run_stage1(captured_q_hidden, captured_q_scale, captured_route, actual)
+    torch.cuda.current_stream().wait_stream(side)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_stage1(captured_q_hidden, captured_q_scale, captured_route, actual)
+
+    captured_q_hidden.copy_(q_hidden_b)
+    captured_q_scale.copy_(q_scale_b)
+    for captured, updated in zip(captured_route, route_b, strict=True):
+        captured.copy_(updated)
+    run_stage1(q_hidden_b, q_scale_b, route_b, expected)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert not torch.equal(q_scale_a, q_scale_b)
+    assert not torch.equal(route_a[0], route_b[0])
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_package_stage1_rejects_partial_k_tile():
+    from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.prefill_stage1 import (
+        invoke_gluon_mxfp4_moe_stage1,
+    )
+
+    device = "cuda"
+    num_tokens = 16
+    hidden_size = 288
+    intermediate_size = 128
+    num_experts = 1
+    topk = 1
+    k_scale = hidden_size // 32
+
+    with pytest.raises(ValueError, match="K divisible.*256"):
+        invoke_gluon_mxfp4_moe_stage1(
+            torch.empty(
+                (num_tokens, hidden_size // 2), device=device, dtype=torch.uint8
+            ),
+            torch.empty(
+                (num_experts, 2 * intermediate_size, hidden_size // 2),
+                device=device,
+                dtype=torch.uint8,
+            ),
+            None,
+            torch.empty((128,), device=device, dtype=torch.int32),
+            torch.empty((1,), device=device, dtype=torch.int32),
+            torch.empty((2,), device=device, dtype=torch.int32),
+            torch.empty(
+                (num_tokens, topk, intermediate_size),
+                device=device,
+                dtype=torch.bfloat16,
+            ),
+            topk,
+            w1_scale=torch.empty(
+                (num_experts, 2 * intermediate_size, k_scale),
+                device=device,
+                dtype=torch.uint8,
+            ),
+            a1_scale=torch.empty((128, k_scale), device=device, dtype=torch.uint8),
+            b_preshuffled=True,
+            b_gdot128=True,
+        )
+
+
 @pytest.mark.parametrize("num_tokens", [16, 64, 256])
 def test_package_prefill_stage2_bm128_matches_ragged_reference(
     num_tokens: int,

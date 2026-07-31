@@ -27,8 +27,9 @@ parameters and byte permutation:
   (``mxfp4_gfx950_preprocess._swizzle_mxfp4`` via
   :func:`swizzle_cdna4_mxfp4_scale`).
 * A-scales (activations): emitted in token order by the MXFP4 activation
-  quantizer and re-gathered into sorted-route order by
-  ``gluon_a4w4_gfx950.scale.gather_package_cdna4_scale``.
+  quantizer. Package stage 1 can address that layout directly; stage 2 uses
+  ``gluon_a4w4_gfx950.scale.gather_package_cdna4_scale`` to produce
+  sorted-route order.
 * Consumers: the package stage kernels (``prefill_stage1/2``,
   ``decode_stage1/2``) address the scales with the matching CDNA4 MFMA scale
   layout (``gl.amd.cdna4.get_mfma_scale_layout``).

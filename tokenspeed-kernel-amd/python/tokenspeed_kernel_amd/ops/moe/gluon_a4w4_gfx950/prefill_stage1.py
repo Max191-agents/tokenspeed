@@ -36,9 +36,10 @@ Kernel shape:
   warps_per_cta = [1, 4]. ``BLOCK_M`` rows split into 4 quarters of
   ``GROUP_MFMA_M = 32`` so each K-tile fires 4 (quarter) x 2 (gate/up)
   = 8 ``mfma_scaled`` instructions on the production K = 7168 shape.
-  K-loop pipelining: 2-slot LDS ping-pong for A data and A scale, and
-  2-slot VGPR ping-pong for B data and B scale; B[k+1] is issued at
-  the top of tile k so its VMEM latency hides behind tile k's MFMAs.
+  K-loop pipelining: 2-slot LDS ping-pong for A data, direct-to-VGPR A
+  scale loads, and 2-slot VGPR ping-pong for B data and B scale; B[k+1]
+  is issued at the top of tile k so its VMEM latency hides behind tile
+  k's MFMAs.
 
 B-data is consumed in a (16, 16)-tile layout so each MFMA fetches its
 tile with a single 128-bit ``buffer_load``. The byte at logical
@@ -59,7 +60,9 @@ plain B, or skips it when ``b_preshuffled=True``.
 Layout contract:
   hidden_states  (M_padded, K_packed)        uint8, fp4x2 packed
   w1             (E, 2 * I_r, K_packed)      uint8, (16, 16) shuffled
-  a1_scale       (M_padded_aligned, K // 32) uint8, e8m0
+  a1_scale       uint8, e8m0 in one of two CDNA4 layouts:
+                   sorted-route rows: (M_padded_aligned, K // 32)
+                   token rows: ((K // 32)_pad * 32, M_pad // 32)
   w1_scale       (E, 2 * I_r, K // 32)       uint8, e8m0 (shuffled)
   out            (EM, I_r) or (token_num, topk, I_r)  bf16
   sorted_token_ids    (EM,)             int32; low 24 bits = token_id
@@ -119,21 +122,57 @@ def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:
 def _load_a_scale_vgpr(
     a_scales_ptr,
     a_scale_base_offsets,
-    GROUP_IDX: gl.constexpr,
     tile_k,
-    group_stride,
     A_SCALE_K_STEP: gl.constexpr,
+    mask=None,
 ):
     # Direct-to-VGPR A-scale load in the same CDNA4-swizzled scale contract
-    # used by decode. ``a_scale_base_offsets`` is group-0, current pid_m,
-    # [GROUP_MFMA_M, BLOCK_K_SCALE] in the native MFMA scale layout. Each
-    # successive 32-row group advances the row block by stride_npad * 32.
+    # used by decode. ``a_scale_base_offsets`` addresses one 32-row group in
+    # the native MFMA scale layout. Token-order inputs mask sorted padding and
+    # use the neutral E8M0 byte for those lanes.
+    offsets = a_scale_base_offsets + tile_k * A_SCALE_K_STEP
+    if mask is None:
+        return gl.amd.cdna4.buffer_load(ptr=a_scales_ptr, offsets=offsets)
     return gl.amd.cdna4.buffer_load(
-        ptr=a_scales_ptr,
-        offsets=(
-            a_scale_base_offsets + GROUP_IDX * group_stride + tile_k * A_SCALE_K_STEP
-        ),
+        ptr=a_scales_ptr, offsets=offsets, mask=mask, other=127
     )
+
+
+@gluon.jit
+def _token_order_a_scale_offsets(
+    sorted_token_ids_ptr,
+    pid_m,
+    EM,
+    num_tokens,
+    stride_scale_mblock,
+    m_scale_layout: gl.constexpr,
+    k_scale_layout: gl.constexpr,
+    GROUP_IDX: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K_SCALE: gl.constexpr,
+):
+    sorted_row = (
+        pid_m * BLOCK_M
+        + GROUP_IDX * GROUP_M
+        + gl.arange(0, GROUP_M, layout=m_scale_layout)
+    )
+    packed_token = gl.load(
+        sorted_token_ids_ptr + sorted_row,
+        mask=sorted_row < EM,
+        other=num_tokens,
+    )
+    token_row = packed_token & 0xFFFFFF
+    valid = token_row < num_tokens
+    token_row = gl.where(valid, token_row, 0).to(gl.uint32)
+    m_part = (
+        (token_row // 32) * stride_scale_mblock
+        + (token_row % 16) * 4
+        + ((token_row % 32) // 16)
+    )[:, None]
+    k_scale = gl.arange(0, BLOCK_K_SCALE, layout=k_scale_layout).to(gl.uint32)
+    k_part = ((k_scale % 4) * 64 + ((k_scale % 8) // 4) * 2)[None, :]
+    return m_part + k_part, valid[:, None]
 
 
 @gluon.jit
@@ -144,8 +183,7 @@ def _prefetch_a_data_lds(
     a_data_k_off,
     mask=None,
 ):
-    # A_scale path is sorted-padded so the wave-uniform K-step
-    # is enough; the A data path is per-token-gathered, so callers plumb
+    # A data is gathered by source token, so callers plumb
     # ``mask=token_mask[:, None]`` here to zero-fill padded sorted slots.
     cdna4_async_copy.buffer_load_to_shared(
         smem_a_tile,
@@ -306,9 +344,10 @@ def gluon_mxfp4_moe_stage1_kernel(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
+    A_SCALE_TOKEN_ORDER: gl.constexpr,
 ):
-    """Stage 1 kernel: per-token A gather + 4-deep A LDS ring + 4-deep
-    A_scale LDS ring + per-quarter MFMA K-loop with fused SwiGLU.
+    """Stage 1 kernel: per-token A gather, 2-slot A-data LDS ping-pong,
+    direct-to-VGPR A scales, and a per-quarter MFMA K-loop with fused SwiGLU.
 
     Tile config (fixed): ``128 x 128 x 256`` (M x N x K), ``num_warps=4``,
     ``warps_per_cta=[1, 4]``. MFMA target:
@@ -322,13 +361,10 @@ def gluon_mxfp4_moe_stage1_kernel(
     Each K tile fires EIGHT ``mfma_scaled`` calls (4 quarters x 2 accs);
     the four quarter-pairs share ``cur_b_gate`` / ``cur_b_up`` /
     ``b_scale_gate`` / ``b_scale_up`` loaded inline at the tile head
-    (4 buffer_loads per tile). The 4x unroll matches the 4-deep A LDS
-    ring depth, so each Python iter of the steady-state body cycles the
-    ring back to its starting state. The K-loop opens with a 3-tile
-    prologue (3 ``buffer_load_to_shared`` for A data + 3 for A_scale,
-    each followed by ``commit_group``) and closes with a 3-tile drain
-    epilogue (``wait_group(2)``, ``wait_group(1)``, ``wait_group(0)``).
-    Mirrors dense reference lines 376 to 1305.
+    (4 buffer_loads per tile). The 2x unroll cycles the two A-data LDS
+    slots back to their starting state. The K-loop opens by prefetching
+    A[0], overlaps each following A-data prefetch with the current tile,
+    and handles the final tile in the drain.
 
     Epilogue: ``silu(gate_acc_groupX) * up_acc_groupX`` for X in 0..3,
     cast to bf16, stored at sorted-row positions over ``BLOCK_N`` cols
@@ -473,41 +509,94 @@ def gluon_mxfp4_moe_stage1_kernel(
     offs_ak = gl.arange(0, BLOCK_K_PACKED, layout=k_layout)
     offs_a = a_row[:, None].to(gl.int64) * stride_am + offs_ak[None, :] * stride_ak
 
-    # ---- A_scale gather offsets ----------------------------------------
-    # The scale tensor is laid out by the upstream sort kernel as::
-    #
-    #     addr = (x/32) * scaleN_pad * 32
-    #          + (y/8)  * 256
-    #          + (y%4)  * 64
-    #          + (x%16) * 4
-    #          + ((y%8)/4) * 2          (y-half bit  -> +2)
-    #          + ((x%32)/16) * 1        (x-half bit  -> +1)
-    #
-    # ``x`` is the sorted-padded row index and ``y`` is the K-group
-    # lane. Note the half-bit ordering: m at +1, y at +2 -- the
-    # opposite convention from some dense-GEMM scale layouts.
-    #
-    # Row index: scales are written at the SORTED-PADDED slot, NOT at
-    # the source ``token_id``, so we index directly by
-    # ``pid_m * BLOCK_M + arange`` (no ``gl.load(sorted_token_ids)`` /
-    # ``& 0xFFFFFF`` here).
-    # Direct-to-VGPR A-scale: build group-0 offsets in the same native MFMA
-    # scale layout decode uses for direct scale loads. Other 32-row groups are
-    # reached by adding ``stride_se_n_pad * 32`` per group.
+    # ---- A_scale offsets ------------------------------------------------
+    # CDNA4 scale offsets factor into a 32-row block, an 8-group K block,
+    # and the two half-selection bits. Sorted-order inputs advance by a
+    # contiguous 32-row block for each MFMA group. Token-order inputs derive
+    # each group's source row from ``sorted_token_ids`` and mask padding.
     m_scale_layout: gl.constexpr = gl.SliceLayout(1, a_scale_group_layout)
     k_scale_layout: gl.constexpr = gl.SliceLayout(0, a_scale_group_layout)
-    a_scale_rows = (
-        pid_m * BLOCK_M + gl.arange(0, GROUP_MFMA_M, layout=m_scale_layout)
-    ).to(gl.uint32)
-    a_m_part = (
-        (a_scale_rows // 32) * (stride_se_n_pad * 32)
-        + (a_scale_rows % 16) * 4
-        + ((a_scale_rows % 32) // 16)
-    )[:, None]
-    a_k_lanes = gl.arange(0, BLOCK_K_SCALE, layout=k_scale_layout).to(gl.uint32)
-    a_k_lane = ((a_k_lanes % 4) * 64 + ((a_k_lanes % 8) // 4) * 2)[None, :]
-    a_scale_base_offsets = a_m_part + a_k_lane
-    a_scale_group_stride = stride_se_n_pad * 32
+    if A_SCALE_TOKEN_ORDER:
+        a_scale_base_offsets_group0, a_scale_valid_group0 = (
+            _token_order_a_scale_offsets(
+                sorted_token_ids_ptr,
+                pid_m,
+                EM,
+                num_tokens,
+                stride_ase_k,
+                m_scale_layout,
+                k_scale_layout,
+                GROUP_IDX=0,
+                GROUP_M=GROUP_MFMA_M,
+                BLOCK_M=BLOCK_M,
+                BLOCK_K_SCALE=BLOCK_K_SCALE,
+            )
+        )
+        a_scale_base_offsets_group1, a_scale_valid_group1 = (
+            _token_order_a_scale_offsets(
+                sorted_token_ids_ptr,
+                pid_m,
+                EM,
+                num_tokens,
+                stride_ase_k,
+                m_scale_layout,
+                k_scale_layout,
+                GROUP_IDX=1,
+                GROUP_M=GROUP_MFMA_M,
+                BLOCK_M=BLOCK_M,
+                BLOCK_K_SCALE=BLOCK_K_SCALE,
+            )
+        )
+        a_scale_base_offsets_group2, a_scale_valid_group2 = (
+            _token_order_a_scale_offsets(
+                sorted_token_ids_ptr,
+                pid_m,
+                EM,
+                num_tokens,
+                stride_ase_k,
+                m_scale_layout,
+                k_scale_layout,
+                GROUP_IDX=2,
+                GROUP_M=GROUP_MFMA_M,
+                BLOCK_M=BLOCK_M,
+                BLOCK_K_SCALE=BLOCK_K_SCALE,
+            )
+        )
+        a_scale_base_offsets_group3, a_scale_valid_group3 = (
+            _token_order_a_scale_offsets(
+                sorted_token_ids_ptr,
+                pid_m,
+                EM,
+                num_tokens,
+                stride_ase_k,
+                m_scale_layout,
+                k_scale_layout,
+                GROUP_IDX=3,
+                GROUP_M=GROUP_MFMA_M,
+                BLOCK_M=BLOCK_M,
+                BLOCK_K_SCALE=BLOCK_K_SCALE,
+            )
+        )
+    else:
+        a_scale_rows = (
+            pid_m * BLOCK_M + gl.arange(0, GROUP_MFMA_M, layout=m_scale_layout)
+        ).to(gl.uint32)
+        a_m_part = (
+            (a_scale_rows // 32) * (stride_se_n_pad * 32)
+            + (a_scale_rows % 16) * 4
+            + ((a_scale_rows % 32) // 16)
+        )[:, None]
+        a_k_lanes = gl.arange(0, BLOCK_K_SCALE, layout=k_scale_layout).to(gl.uint32)
+        a_k_lane = ((a_k_lanes % 4) * 64 + ((a_k_lanes % 8) // 4) * 2)[None, :]
+        a_scale_base_offsets_group0 = a_m_part + a_k_lane
+        a_scale_group_stride = stride_se_n_pad * 32
+        a_scale_base_offsets_group1 = a_scale_base_offsets_group0 + a_scale_group_stride
+        a_scale_base_offsets_group2 = a_scale_base_offsets_group1 + a_scale_group_stride
+        a_scale_base_offsets_group3 = a_scale_base_offsets_group2 + a_scale_group_stride
+        a_scale_valid_group0 = None
+        a_scale_valid_group1 = None
+        a_scale_valid_group2 = None
+        a_scale_valid_group3 = None
 
     # ---- B data offsets (gate + up halves; preshuffle-B closed form) ---
     # B is in the (16, 16) MFMA-tile layout described in the module
@@ -696,11 +785,10 @@ def gluon_mxfp4_moe_stage1_kernel(
     )
     a_scale_group0 = _load_a_scale_vgpr(
         a_scales_ptr,
-        a_scale_base_offsets,
-        GROUP0_IDX,
+        a_scale_base_offsets_group0,
         0,
-        a_scale_group_stride,
         A_SCALE_K_STEP,
+        mask=a_scale_valid_group0,
     )
     cur_a_group1 = _read_a_lds_group(
         smem_a_slot0,
@@ -710,11 +798,10 @@ def gluon_mxfp4_moe_stage1_kernel(
     )
     a_scale_group1 = _load_a_scale_vgpr(
         a_scales_ptr,
-        a_scale_base_offsets,
-        GROUP1_IDX,
+        a_scale_base_offsets_group1,
         0,
-        a_scale_group_stride,
         A_SCALE_K_STEP,
+        mask=a_scale_valid_group1,
     )
 
     # ---- 8 per-quarter accumulators (gate + up x 4 quarters) ----------
@@ -828,11 +915,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
         a_scale_group2 = _load_a_scale_vgpr(
             a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP2_IDX,
+            a_scale_base_offsets_group2,
             tile0_k,
-            a_scale_group_stride,
             A_SCALE_K_STEP,
+            mask=a_scale_valid_group2,
         )
         cur_a_group3 = _read_a_lds_group(
             smem_a_slot0,
@@ -842,11 +928,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
         a_scale_group3 = _load_a_scale_vgpr(
             a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP3_IDX,
+            a_scale_base_offsets_group3,
             tile0_k,
-            a_scale_group_stride,
             A_SCALE_K_STEP,
+            mask=a_scale_valid_group3,
         )
 
         cdna4_async_copy.commit_group()
@@ -893,11 +978,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
         a_scale_group0 = _load_a_scale_vgpr(
             a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP0_IDX,
+            a_scale_base_offsets_group0,
             tile0_k + 1,
-            a_scale_group_stride,
             A_SCALE_K_STEP,
+            mask=a_scale_valid_group0,
         )
         cur_a_group1 = _read_a_lds_group(
             smem_a_slot1,
@@ -907,11 +991,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
         a_scale_group1 = _load_a_scale_vgpr(
             a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP1_IDX,
+            a_scale_base_offsets_group1,
             tile0_k + 1,
-            a_scale_group_stride,
             A_SCALE_K_STEP,
+            mask=a_scale_valid_group1,
         )
 
         # Swap B: next -> current.
@@ -991,11 +1074,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
         a_scale_group2 = _load_a_scale_vgpr(
             a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP2_IDX,
+            a_scale_base_offsets_group2,
             tile1_k,
-            a_scale_group_stride,
             A_SCALE_K_STEP,
+            mask=a_scale_valid_group2,
         )
         cur_a_group3 = _read_a_lds_group(
             smem_a_slot0,
@@ -1005,11 +1087,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
         a_scale_group3 = _load_a_scale_vgpr(
             a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP3_IDX,
+            a_scale_base_offsets_group3,
             tile1_k,
-            a_scale_group_stride,
             A_SCALE_K_STEP,
+            mask=a_scale_valid_group3,
         )
 
         cdna4_async_copy.commit_group()
@@ -1053,11 +1134,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
         a_scale_group0 = _load_a_scale_vgpr(
             a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP0_IDX,
+            a_scale_base_offsets_group0,
             tile1_k + 1,
-            a_scale_group_stride,
             A_SCALE_K_STEP,
+            mask=a_scale_valid_group0,
         )
         cur_a_group1 = _read_a_lds_group(
             smem_a_slot1,
@@ -1067,11 +1147,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
         a_scale_group1 = _load_a_scale_vgpr(
             a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP1_IDX,
+            a_scale_base_offsets_group1,
             tile1_k + 1,
-            a_scale_group_stride,
             A_SCALE_K_STEP,
+            mask=a_scale_valid_group1,
         )
 
         cur_b_gate = next_b_gate
@@ -1150,11 +1229,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
         a_scale_group2 = _load_a_scale_vgpr(
             a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP2_IDX,
+            a_scale_base_offsets_group2,
             pk,
-            a_scale_group_stride,
             A_SCALE_K_STEP,
+            mask=a_scale_valid_group2,
         )
         cur_a_group3 = _read_a_lds_group(
             smem_a_slot0,
@@ -1164,11 +1242,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
         a_scale_group3 = _load_a_scale_vgpr(
             a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP3_IDX,
+            a_scale_base_offsets_group3,
             pk,
-            a_scale_group_stride,
             A_SCALE_K_STEP,
+            mask=a_scale_valid_group3,
         )
 
         cdna4_async_copy.commit_group()
@@ -1212,11 +1289,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
         a_scale_group0 = _load_a_scale_vgpr(
             a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP0_IDX,
+            a_scale_base_offsets_group0,
             pk + 1,
-            a_scale_group_stride,
             A_SCALE_K_STEP,
+            mask=a_scale_valid_group0,
         )
         cur_a_group1 = _read_a_lds_group(
             smem_a_slot1,
@@ -1226,11 +1302,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         )
         a_scale_group1 = _load_a_scale_vgpr(
             a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP1_IDX,
+            a_scale_base_offsets_group1,
             pk + 1,
-            a_scale_group_stride,
             A_SCALE_K_STEP,
+            mask=a_scale_valid_group1,
         )
 
         cur_b_gate = next_b_gate
@@ -1250,11 +1325,10 @@ def gluon_mxfp4_moe_stage1_kernel(
     )
     a_scale_group2 = _load_a_scale_vgpr(
         a_scales_ptr,
-        a_scale_base_offsets,
-        GROUP2_IDX,
+        a_scale_base_offsets_group2,
         num_k_iter - 1,
-        a_scale_group_stride,
         A_SCALE_K_STEP,
+        mask=a_scale_valid_group2,
     )
     cur_a_group3 = _read_a_lds_group(
         smem_a_slot0,
@@ -1264,11 +1338,10 @@ def gluon_mxfp4_moe_stage1_kernel(
     )
     a_scale_group3 = _load_a_scale_vgpr(
         a_scales_ptr,
-        a_scale_base_offsets,
-        GROUP3_IDX,
+        a_scale_base_offsets_group3,
         num_k_iter - 1,
-        a_scale_group_stride,
         A_SCALE_K_STEP,
+        mask=a_scale_valid_group3,
     )
 
     gate_acc_group0 = _compute_mxfp4_group(
@@ -1466,6 +1539,7 @@ def invoke_gluon_mxfp4_moe_stage1(
     swiglu_alpha: float = 1.0,
     swiglu_limit: float = 0.0,
     swiglu_beta: float = 0.0,
+    a1_scale_is_sorted: bool = True,
 ):
     """Host-side launcher for Gluon MXFP4 MoE stage 1.
 
@@ -1496,6 +1570,11 @@ def invoke_gluon_mxfp4_moe_stage1(
     Accepted-but-ignored, kept for signature compatibility with
     upstream dispatchers: ``kernelName``, ``block_m`` (kernel hardcodes
     128), ``w2``, ``use_non_temporal_load``.
+
+    ``a1_scale_is_sorted=True`` accepts the stage kernel's sorted-route
+    scale layout. Set it to ``False`` for the token-order CDNA4 scale layout
+    emitted by the activation quantizer; the kernel then follows
+    ``sorted_token_ids`` while loading each scale.
     """
     # Step 1: validate inputs and reject unsupported modes.
     del quant_type, activation  # only per-1x32 MXFP4 + SwiGLU is implemented
@@ -1556,6 +1635,11 @@ def invoke_gluon_mxfp4_moe_stage1(
         f"w1 K-packed dim ({D_packed_w}) must match hidden_states K-packed "
         f"dim ({D_packed})"
     )
+    if K % 256 != 0:
+        raise ValueError(
+            "invoke_gluon_mxfp4_moe_stage1 requires K divisible by the "
+            f"256-element K tile, got K={K}"
+        )
     assert two_Ir % 2 == 0, f"w1.shape[1] (= 2*I_r) must be even, got {two_Ir}"
     I_r = two_Ir // 2
     N = 2 * I_r
@@ -1581,10 +1665,31 @@ def invoke_gluon_mxfp4_moe_stage1(
             f"got shape {tuple(out.shape)}"
         )
     K_scale = K // 32
-    assert a1_scale.dim() == 2 and a1_scale.shape[1] == K_scale, (
-        f"a1_scale.shape {tuple(a1_scale.shape)} must be "
-        f"(M_padded_aligned, K // 32 = {K_scale})"
-    )
+    if a1_scale_is_sorted:
+        assert a1_scale.dim() == 2 and a1_scale.shape[1] == K_scale, (
+            f"sorted a1_scale.shape {tuple(a1_scale.shape)} must be "
+            f"(M_padded_aligned, K // 32 = {K_scale})"
+        )
+    else:
+        assert a1_scale.dim() == 2 and a1_scale.stride(0) == 1, (
+            "token-order a1_scale must be a rank-2 CDNA4 scale tensor with "
+            f"stride(0) == 1, got shape={tuple(a1_scale.shape)}, "
+            f"stride={a1_scale.stride()}"
+        )
+        assert a1_scale.shape[0] >= K_scale * 32, (
+            "token-order a1_scale first dimension must cover K // 32 scale "
+            f"bytes across a 32-row block, got {a1_scale.shape[0]} < "
+            f"{K_scale * 32}"
+        )
+        assert a1_scale.stride(1) >= K_scale * 32, (
+            "token-order a1_scale row-block stride must cover K // 32 scale "
+            f"bytes across a 32-row block, got {a1_scale.stride(1)} < "
+            f"{K_scale * 32}"
+        )
+        assert a1_scale.shape[1] * 32 >= M_padded, (
+            "token-order a1_scale second dimension must cover all activation "
+            f"rows, got {a1_scale.shape[1] * 32} < {M_padded}"
+        )
     assert w1_scale.shape == (E_w, N, K_scale), (
         f"w1_scale.shape {tuple(w1_scale.shape)} must be (E, N, K//32) = "
         f"({E_w}, {N}, {K_scale})"
@@ -1626,7 +1731,7 @@ def invoke_gluon_mxfp4_moe_stage1(
     stride_bse_e = w1_scale.stride(0)
     stride_bse_n = w1_scale.stride(1)
     stride_bse_k = w1_scale.stride(2)
-    stride_se_n_pad = a1_scale.shape[1]
+    stride_se_n_pad = K_scale
     K_packed_total = K // 2
 
     # Step 4: launch the GEMM. One CTA per (M-tile, N-tile); the per-CTA
@@ -1671,6 +1776,7 @@ def invoke_gluon_mxfp4_moe_stage1(
         SWIGLU_ALPHA=float(swiglu_alpha),
         SWIGLU_LIMIT=float(swiglu_limit),
         SWIGLU_BETA=float(swiglu_beta),
+        A_SCALE_TOKEN_ORDER=not a1_scale_is_sorted,
         num_warps=NUM_WARPS,
     )
     return out

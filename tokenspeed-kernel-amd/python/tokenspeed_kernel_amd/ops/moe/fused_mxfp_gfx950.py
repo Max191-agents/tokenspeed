@@ -8383,17 +8383,9 @@ def _maybe_gluon_package_mxfp4_prefill(
         )
     )
 
-    # Stage 1: quantize the hidden state, gather its scale into sorted-route
-    # order, and run the package gate/up MFMA with fused SwiGLU.
+    # Stage 1 follows the sorted routes while reading the quantizer's
+    # token-order activation and scale tensors.
     q_hidden, q_hidden_scale = _quantize_mxfp4_activation(hidden_states)
-    stage1_scale = gather_package_cdna4_scale(
-        q_hidden_scale,
-        sorted_ids,
-        source_rows=n_tokens,
-        cols=hidden_dim,
-        top_k=top_k,
-        flatten_topk=False,
-    )
     inter = torch.empty(
         (n_tokens, top_k, inter_dim),
         dtype=torch.bfloat16,
@@ -8409,13 +8401,14 @@ def _maybe_gluon_package_mxfp4_prefill(
         inter,
         top_k,
         w1_scale=package_w13_scale.view(torch.uint8),
-        a1_scale=stage1_scale,
+        a1_scale=q_hidden_scale,
         sorted_weights=None,
         b_preshuffled=True,
         b_gdot128=True,
         swiglu_alpha=float(swiglu_alpha),
         swiglu_limit=float(swiglu_limit),
         swiglu_beta=float(swiglu_beta),
+        a1_scale_is_sorted=False,
     )
     inter_flat = inter.view(n_tokens * top_k, inter_dim)
 
