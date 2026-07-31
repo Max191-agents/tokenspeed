@@ -1340,6 +1340,18 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
 # ---------------------------------------------------------------------------
 
 
+@gluon.constexpr_function
+def _stage2_reduce_layout(block_m: int, num_warps: int):
+    threads_m = min(block_m, 16)
+    threads_n = 64 // threads_m
+    return gl.BlockedLayout(
+        size_per_thread=[1, 8],
+        threads_per_warp=[threads_m, threads_n],
+        warps_per_cta=[1, num_warps],
+        order=[1, 0],
+    )
+
+
 @gluon.jit
 def gluon_mxfp4_moe_stage2_reduce_kernel(
     partials_ptr,  # bf16, shape [token_num, topk, N], contiguous
@@ -1371,13 +1383,7 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    # Plain blocked layout for the bf16 tile. 1 wave / CTA, NUM_WARPS=1.
-    blk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[16, 4],
-        warps_per_cta=[1, 1],
-        order=[1, 0],
-    )
+    blk: gl.constexpr = _stage2_reduce_layout(BLOCK_M, NUM_WARPS)
     rm_layout: gl.constexpr = gl.SliceLayout(1, blk)
     cn_layout: gl.constexpr = gl.SliceLayout(0, blk)
     offs_m = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=rm_layout)
@@ -1401,6 +1407,19 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
         + offs_n[None, :].to(gl.int64) * stride_on
     )
     gl.store(out_ptrs, acc.to(out_ptr.type.element_ty), mask=m_mask)
+
+
+def _select_stage2_reduce_launch(
+    token_num: int, n_cols: int, topk: int
+) -> tuple[int, int, int]:
+    """Return ``(BLOCK_M, BLOCK_N, NUM_WARPS)`` for stage-2 reduction."""
+    if (token_num, n_cols, topk) == (16, 7168, 8):
+        # Kimi speculative decode produces 16 output rows. Four rows per CTA
+        # and two waves across N keep all lanes active while preserving the
+        # fixed top-k accumulation order.
+        return 4, 256, 2
+    block_m = 16 if token_num >= 4096 else 32
+    return block_m, 256, 1
 
 
 # ---------------------------------------------------------------------------
@@ -1723,12 +1742,11 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
 
     if _use_reduce:
         # Step 6: reduce. Sum partials[token, :, n] over the topk dim
-        # (fp32 accumulate, bf16 output) into `out`. Tile (32, 256),
-        # 1 wave/CTA.
-        BLOCK_M_R = 16 if token_num >= 4096 else 32
-        BLOCK_N_R = 256
-        NUM_WARPS_R = 1
-        rgrid = (triton.cdiv(token_num, BLOCK_M_R) * triton.cdiv(N, BLOCK_N_R),)
+        # (fp32 accumulate, bf16 output) into `out`.
+        block_m_r, block_n_r, num_warps_r = _select_stage2_reduce_launch(
+            token_num, N, topk
+        )
+        rgrid = (triton.cdiv(token_num, block_m_r) * triton.cdiv(N, block_n_r),)
         gluon_mxfp4_moe_stage2_reduce_kernel[rgrid](
             partials,
             out,
@@ -1740,11 +1758,11 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
             partials.stride(2),
             out.stride(0),
             out.stride(1),
-            BLOCK_M=BLOCK_M_R,
-            BLOCK_N=BLOCK_N_R,
+            BLOCK_M=block_m_r,
+            BLOCK_N=block_n_r,
             TOP_K=topk,
-            NUM_WARPS=NUM_WARPS_R,
-            num_warps=NUM_WARPS_R,
+            NUM_WARPS=num_warps_r,
+            num_warps=num_warps_r,
         )
     if _USES_FP32_ATOMIC is None:
         _record_atomic_lowering()
