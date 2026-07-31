@@ -26,6 +26,11 @@ from typing import Any, Optional
 
 import torch
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon, tl, triton
+from tokenspeed_kernel_amd.ops.moe.mxfp4_gluon_quantization import (
+    _mxfp4_quantize_layout,
+    _mxfp4_quantize_tile,
+    _mxfp4_store_cdna4_scale,
+)
 from tokenspeed_kernel_amd.ops.moe.utils import (
     FnSpecs,
     FusedActivation,
@@ -355,13 +360,7 @@ def _load_layout(
 def _swiglu_split_layout(
     block_m: int, block_n_full: int, num_warps: int
 ) -> gl.constexpr:
-    THREADS_PER_WARP = 64  # CDNA4 wavefront size.
-    return gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[4, THREADS_PER_WARP // 4],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0],
-    )
+    return _mxfp4_quantize_layout(block_m, block_n_full, num_warps)
 
 
 @gluon.jit
@@ -386,92 +385,6 @@ def _swiglu_reduce(
         linear = gl.clamp(linear, -limit, limit)
     s = gate / (1.0 + gl.exp(-alpha * gate))
     return s * (linear + beta)
-
-
-@gluon.jit
-def _mxfp4_quantize_tile(out):
-    max_normal: gl.constexpr = 6.0
-    min_normal: gl.constexpr = 1.0
-    BLOCK_M: gl.constexpr = out.shape[0]
-    OUT_BLOCK_N: gl.constexpr = out.shape[1]
-    Q_GROUPS: gl.constexpr = OUT_BLOCK_N // 32
-    gl.static_assert(OUT_BLOCK_N % 32 == 0)
-
-    vals = out.to(gl.bfloat16).to(gl.float32).reshape((BLOCK_M, Q_GROUPS, 32))
-    raw_abs = vals.to(gl.uint32, bitcast=True) & 0x7FFFFFFF
-    abs_vals = raw_abs.to(gl.float32, bitcast=True)
-    amax = gl.max(abs_vals, axis=2, keep_dims=True)
-    amax_bits = amax.to(gl.uint32, bitcast=True)
-    rounded_bits = (amax_bits + 0x200000) & 0x7F800000
-    exp_biased = (rounded_bits >> 23).to(gl.int32)
-    scale_i = gl.minimum(gl.maximum(exp_biased - 2, 0), 254)
-    scale_byte = scale_i.to(gl.uint8).reshape((BLOCK_M, Q_GROUPS))
-
-    inv_scale_bits = ((254 - scale_i) << 23).to(gl.uint32)
-    inv_scale = inv_scale_bits.to(gl.float32, bitcast=True)
-    qx = vals * inv_scale
-    qx_bits = qx.to(gl.uint32, bitcast=True)
-
-    sign = qx_bits & 0x80000000
-    qx_mag = qx_bits ^ sign
-    qx_fp32 = qx_mag.to(gl.float32, bitcast=True)
-    saturate_mask = qx_fp32 >= max_normal
-    denormal_mask = (not saturate_mask) & (qx_fp32 < min_normal)
-    normal_mask = not (saturate_mask | denormal_mask)
-
-    denorm_mask_int: gl.constexpr = ((127 - 1) + (23 - 1) + 1) << 23
-    denorm_mask_float: gl.constexpr = gl.cast(denorm_mask_int, gl.float32, bitcast=True)
-    denormal_x = qx_fp32 + denorm_mask_float
-    denormal_x = denormal_x.to(gl.uint32, bitcast=True)
-    denormal_x -= denorm_mask_int
-    denormal_x = denormal_x.to(gl.uint8)
-
-    normal_x = qx_mag
-    mant_odd = (normal_x >> (23 - 1)) & 1
-    normal_x += 0xC11FFFFF
-    normal_x += mant_odd
-    normal_x = normal_x >> (23 - 1)
-    normal_x = normal_x.to(gl.uint8)
-
-    e2m1 = gl.full(vals.shape, 0x7, gl.uint8, layout=vals.type.layout)
-    e2m1 = gl.where(normal_mask, normal_x, e2m1)
-    e2m1 = gl.where(denormal_mask, denormal_x, e2m1)
-    sign_lp = (sign >> (23 + 8 - 1 - 2)).to(gl.uint8)
-    e2m1 = e2m1 | sign_lp
-    e2m1 = e2m1.reshape((BLOCK_M, Q_GROUPS, 16, 2))
-    evens, odds = gl.split(e2m1)
-    packed = evens | (odds << 4)
-    return packed, scale_byte
-
-
-@gluon.jit
-def _mxfp4_store_cdna4_scale(
-    scale_ptr,
-    scale_byte,
-    scale_m,
-    scale_k,
-    stride_kswizzled,
-    stride_mblock,
-    mask,
-    M_SWIZZLE: gl.constexpr,
-    K_SWIZZLE: gl.constexpr,
-):
-    m_in_block = scale_m % M_SWIZZLE
-    m_hi = m_in_block // 16
-    m_lo = m_in_block % 16
-    k_block = scale_k // K_SWIZZLE
-    k_in_block = scale_k % K_SWIZZLE
-    k_hi = k_in_block // 4
-    k_lo = k_in_block % 4
-    swizzled_k = (((k_block * 4 + k_lo) * 16 + m_lo) * 2 + k_hi) * 2 + m_hi
-    m_block = scale_m // M_SWIZZLE
-    gl.store(
-        scale_ptr
-        + swizzled_k.to(gl.int64) * stride_kswizzled
-        + m_block.to(gl.int64) * stride_mblock,
-        scale_byte,
-        mask=mask,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -8350,6 +8263,7 @@ def _maybe_gluon_package_mxfp4_prefill(
         or int(package_w13.shape[2]) * 2 != hidden_dim
         or int(package_w2.shape[1]) != hidden_dim
         or int(package_w2.shape[2]) * 2 != inter_dim
+        or inter_dim % 256 != 0
     ):
         return None
 
@@ -8361,9 +8275,6 @@ def _maybe_gluon_package_mxfp4_prefill(
     )
     from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.prefill_stage2 import (
         invoke_gluon_mxfp4_moe_stage2_1x2,
-    )
-    from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.scale import (
-        gather_package_cdna4_scale,
     )
 
     sort_block_m = 128
@@ -8386,9 +8297,15 @@ def _maybe_gluon_package_mxfp4_prefill(
     # Stage 1 follows the sorted routes while reading the quantizer's
     # token-order activation and scale tensors.
     q_hidden, q_hidden_scale = _quantize_mxfp4_activation(hidden_states)
-    inter = torch.empty(
-        (n_tokens, top_k, inter_dim),
-        dtype=torch.bfloat16,
+    q_inter = torch.empty(
+        (n_tokens * top_k, inter_dim // 2),
+        dtype=torch.uint8,
+        device=hidden_states.device,
+    )
+    stage2_scale_rows = (int(sorted_ids.shape[0]) + 31) // 32 * 32
+    stage2_scale = torch.empty(
+        (stage2_scale_rows, inter_dim // MXFP4_BLOCK),
+        dtype=torch.uint8,
         device=hidden_states.device,
     )
     invoke_gluon_mxfp4_moe_stage1(
@@ -8398,7 +8315,7 @@ def _maybe_gluon_package_mxfp4_prefill(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        inter,
+        q_inter,
         top_k,
         w1_scale=package_w13_scale.view(torch.uint8),
         a1_scale=q_hidden_scale,
@@ -8409,10 +8326,9 @@ def _maybe_gluon_package_mxfp4_prefill(
         swiglu_limit=float(swiglu_limit),
         swiglu_beta=float(swiglu_beta),
         a1_scale_is_sorted=False,
+        dst_type=torch.uint8,
+        out_scale=stage2_scale,
     )
-    inter_flat = inter.view(n_tokens * top_k, inter_dim)
-
-    q_inter, q_inter_scale = _quantize_mxfp4_activation(inter_flat)
 
     # Stage 2 down-projection block size. A smaller block reduces per-expert
     # 128-row sort padding (top-8 over 384 experts), but on gfx950 the
@@ -8430,14 +8346,6 @@ def _maybe_gluon_package_mxfp4_prefill(
     s2_sorted_expert_ids = sorted_expert_ids
     s2_num_valid_ids = num_valid_ids
 
-    stage2_scale = gather_package_cdna4_scale(
-        q_inter_scale,
-        s2_sorted_ids,
-        source_rows=n_tokens * top_k,
-        cols=inter_dim,
-        top_k=top_k,
-        flatten_topk=True,
-    )
     invoke_gluon_mxfp4_moe_stage2_1x2(
         q_inter,
         None,

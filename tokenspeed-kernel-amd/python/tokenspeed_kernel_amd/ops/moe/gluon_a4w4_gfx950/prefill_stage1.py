@@ -64,7 +64,9 @@ Layout contract:
                    sorted-route rows: (M_padded_aligned, K // 32)
                    token rows: ((K // 32)_pad * 32, M_pad // 32)
   w1_scale       (E, 2 * I_r, K // 32)       uint8, e8m0 (shuffled)
-  out            (EM, I_r) or (token_num, topk, I_r)  bf16
+  out            (EM, I_r) or (token_num, topk, I_r)  bf16, or
+                 (token_num * topk, I_r // 2)          uint8 E2M1
+  out_scale      (EM_aligned, I_r // 32)               uint8 E8M0
   sorted_token_ids    (EM,)             int32; low 24 bits = token_id
   sorted_expert_ids   (EM // BLOCK_M,)  int32; -1 marks a padding block
   sorted_weights      (EM,)             fp32  (REQUIRED to be empty here;
@@ -80,10 +82,17 @@ from __future__ import annotations
 from typing import Optional  # noqa: F401  (kept for downstream type hints)
 
 import torch
-import triton
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
+from tokenspeed_kernel_amd._triton import (
+    cdna4_async_copy,
+    gl,
+    gluon,
+    triton,
+)
+from tokenspeed_kernel_amd.ops.moe.mxfp4_gluon_quantization import (
+    _mxfp4_quantize_layout,
+    _mxfp4_quantize_tile,
+    _mxfp4_store_cdna4_scale,
+)
 
 
 def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:
@@ -124,6 +133,7 @@ def _load_a_scale_vgpr(
     a_scale_base_offsets,
     tile_k,
     A_SCALE_K_STEP: gl.constexpr,
+    MASKED: gl.constexpr,
     mask=None,
 ):
     # Direct-to-VGPR A-scale load in the same CDNA4-swizzled scale contract
@@ -131,11 +141,11 @@ def _load_a_scale_vgpr(
     # the native MFMA scale layout. Token-order inputs mask sorted padding and
     # use the neutral E8M0 byte for those lanes.
     offsets = a_scale_base_offsets + tile_k * A_SCALE_K_STEP
-    if mask is None:
-        return gl.amd.cdna4.buffer_load(ptr=a_scales_ptr, offsets=offsets)
-    return gl.amd.cdna4.buffer_load(
-        ptr=a_scales_ptr, offsets=offsets, mask=mask, other=127
-    )
+    if MASKED:
+        return gl.amd.cdna4.buffer_load(
+            ptr=a_scales_ptr, offsets=offsets, mask=mask, other=127
+        )
+    return gl.amd.cdna4.buffer_load(ptr=a_scales_ptr, offsets=offsets)
 
 
 @gluon.jit
@@ -261,9 +271,59 @@ def _compute_mxfp4_group(cur_a, a_scale, cur_b, b_scale, acc):
 
 
 @gluon.jit
+def _store_neutral_mxfp4_scale_group(
+    c_scale_ptr,
+    pid_m,
+    pid_n,
+    EM,
+    stride_cscale_kswizzled,
+    stride_cscale_mblock,
+    GROUP_IDX: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    I_r: gl.constexpr,
+):
+    """Write neutral E8M0 scales for one fully padded 32-row group."""
+    num_scale_values: gl.constexpr = GROUP_M * (BLOCK_N // 32)
+    num_threads: gl.constexpr = 64 * gl.num_warps()
+    scale_layout: gl.constexpr = gl.BlockedLayout(
+        [1],
+        [64],
+        [gl.num_warps()],
+        [0],
+    )
+    # Use one logical value per hardware thread, then select the first 128
+    # threads. Giving a 128-element tensor to this four-wave layout would
+    # replicate every element across two threads and produce duplicate stores.
+    linear = gl.arange(0, num_threads, layout=scale_layout)
+    store_mask = linear < num_scale_values
+    scale_m = pid_m * BLOCK_M + GROUP_IDX * GROUP_M + linear // (BLOCK_N // 32)
+    scale_k = pid_n * (BLOCK_N // 32) + linear % (BLOCK_N // 32)
+    neutral = gl.full(
+        [num_threads],
+        127,
+        gl.uint8,
+        layout=scale_layout,
+    )
+    _mxfp4_store_cdna4_scale(
+        c_scale_ptr,
+        neutral,
+        scale_m,
+        scale_k,
+        stride_cscale_kswizzled,
+        stride_cscale_mblock,
+        store_mask & (scale_m < EM) & (scale_k < I_r // 32),
+        M_SWIZZLE=32,
+        K_SWIZZLE=8,
+    )
+
+
+@gluon.jit
 def _store_swiglu_tile_group(
     acc_swiglu,
     c_ptr,
+    c_scale_ptr,
     sorted_token_ids_ptr,
     pid_m,
     pid_n,
@@ -272,36 +332,129 @@ def _store_swiglu_tile_group(
     top_k,
     stride_cm,
     stride_cn,
+    stride_cscale_kswizzled,
+    stride_cscale_mblock,
     mfma_layout: gl.constexpr,
     GROUP_IDX: gl.constexpr,
     GROUP_M: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     I_r: gl.constexpr,
+    QUANTIZE_OUT: gl.constexpr,
 ):
-    c_val = acc_swiglu.to(c_ptr.type.element_ty)
-    cm_layout: gl.constexpr = gl.SliceLayout(1, mfma_layout)
-    cn_layout: gl.constexpr = gl.SliceLayout(0, mfma_layout)
-    offs_cm = (
-        pid_m * BLOCK_M + GROUP_IDX * GROUP_M + gl.arange(0, GROUP_M, layout=cm_layout)
-    )
-    offs_cn = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=cn_layout)
-    offs_token_cm = gl.load(
-        sorted_token_ids_ptr + offs_cm,
-        mask=offs_cm < EM,
-        other=num_tokens,
-    )
-    token_id_cm = offs_token_cm & 0xFFFFFF
-    topk_id_cm = offs_token_cm >> 24
-    dst_row_cm = token_id_cm * top_k + topk_id_cm
-    c_ptrs = (
-        c_ptr
-        + dst_row_cm[:, None].to(gl.int64) * stride_cm
-        + offs_cn[None, :].to(gl.int64) * stride_cn
-    )
-    token_mask_cm = token_id_cm < num_tokens
-    c_mask = token_mask_cm[:, None] & (offs_cn[None, :] < I_r)
-    gl.store(c_ptrs, c_val, mask=c_mask)
+    if QUANTIZE_OUT:
+        group_start = pid_m * BLOCK_M + GROUP_IDX * GROUP_M
+        first_token = gl.load(
+            sorted_token_ids_ptr + group_start,
+            mask=group_start < EM,
+            other=num_tokens,
+        )
+        # Sorting packs valid routes first within each expert block. A padding
+        # sentinel in the first row therefore means the whole 32-row group is
+        # padding. Avoid converting that group's accumulator while still
+        # initializing every scale byte consumed by stage 2.
+        if (first_token & 0xFFFFFF) < num_tokens:
+            quant_layout: gl.constexpr = _mxfp4_quantize_layout(
+                GROUP_M,
+                BLOCK_N,
+                gl.num_warps(),
+                warps_along_n=True,
+            )
+            quant_tile = gl.convert_layout(acc_swiglu, quant_layout)
+            packed, scale_byte = _mxfp4_quantize_tile(quant_tile)
+
+            packed = packed.reshape((GROUP_M, BLOCK_N // 2))
+            pack_layout: gl.constexpr = packed.type.layout
+            pack_m_layout: gl.constexpr = gl.SliceLayout(1, pack_layout)
+            pack_n_layout: gl.constexpr = gl.SliceLayout(0, pack_layout)
+            local_pack_m = gl.arange(0, GROUP_M, layout=pack_m_layout)
+            sorted_pack_m = group_start + local_pack_m
+            packed_token = gl.load(
+                sorted_token_ids_ptr + sorted_pack_m,
+                mask=sorted_pack_m < EM,
+                other=num_tokens,
+            )
+            token_id = packed_token & 0xFFFFFF
+            topk_id = packed_token >> 24
+            dst_row = token_id * top_k + topk_id
+            packed_col = pid_n * (BLOCK_N // 2) + gl.arange(
+                0, BLOCK_N // 2, layout=pack_n_layout
+            )
+            gl.store(
+                c_ptr
+                + dst_row[:, None].to(gl.int64) * stride_cm
+                + packed_col[None, :].to(gl.int64) * stride_cn,
+                packed,
+                mask=(token_id[:, None] < num_tokens)
+                & (packed_col[None, :] < I_r // 2),
+            )
+
+            scale_layout: gl.constexpr = scale_byte.type.layout
+            scale_m_layout: gl.constexpr = gl.SliceLayout(1, scale_layout)
+            scale_k_layout: gl.constexpr = gl.SliceLayout(0, scale_layout)
+            local_scale_m = gl.arange(0, GROUP_M, layout=scale_m_layout)
+            sorted_scale_m = group_start + local_scale_m
+            scale_token = gl.convert_layout(packed_token, scale_m_layout)
+            scale_valid = (scale_token & 0xFFFFFF) < num_tokens
+            scale_byte = gl.where(
+                scale_valid[:, None],
+                scale_byte,
+                gl.full(scale_byte.shape, 127, gl.uint8, layout=scale_layout),
+            )
+            scale_k = pid_n * (BLOCK_N // 32) + gl.arange(
+                0, BLOCK_N // 32, layout=scale_k_layout
+            )
+            _mxfp4_store_cdna4_scale(
+                c_scale_ptr,
+                scale_byte,
+                sorted_scale_m[:, None],
+                scale_k[None, :],
+                stride_cscale_kswizzled,
+                stride_cscale_mblock,
+                (sorted_scale_m[:, None] < EM) & (scale_k[None, :] < I_r // 32),
+                M_SWIZZLE=32,
+                K_SWIZZLE=8,
+            )
+        else:
+            _store_neutral_mxfp4_scale_group(
+                c_scale_ptr,
+                pid_m,
+                pid_n,
+                EM,
+                stride_cscale_kswizzled,
+                stride_cscale_mblock,
+                GROUP_IDX,
+                GROUP_M,
+                BLOCK_M,
+                BLOCK_N,
+                I_r,
+            )
+    else:
+        c_val = acc_swiglu.to(c_ptr.type.element_ty)
+        cm_layout: gl.constexpr = gl.SliceLayout(1, mfma_layout)
+        cn_layout: gl.constexpr = gl.SliceLayout(0, mfma_layout)
+        offs_cm = (
+            pid_m * BLOCK_M
+            + GROUP_IDX * GROUP_M
+            + gl.arange(0, GROUP_M, layout=cm_layout)
+        )
+        offs_cn = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=cn_layout)
+        offs_token_cm = gl.load(
+            sorted_token_ids_ptr + offs_cm,
+            mask=offs_cm < EM,
+            other=num_tokens,
+        )
+        token_id_cm = offs_token_cm & 0xFFFFFF
+        topk_id_cm = offs_token_cm >> 24
+        dst_row_cm = token_id_cm * top_k + topk_id_cm
+        c_ptrs = (
+            c_ptr
+            + dst_row_cm[:, None].to(gl.int64) * stride_cm
+            + offs_cn[None, :].to(gl.int64) * stride_cn
+        )
+        token_mask_cm = token_id_cm < num_tokens
+        c_mask = token_mask_cm[:, None] & (offs_cn[None, :] < I_r)
+        gl.store(c_ptrs, c_val, mask=c_mask)
 
 
 @gluon.jit
@@ -309,6 +462,7 @@ def gluon_mxfp4_moe_stage1_kernel(
     a_ptr,
     b_ptr,
     c_ptr,
+    c_scale_ptr,
     a_scales_ptr,
     b_scales_ptr,
     sorted_token_ids_ptr,
@@ -327,6 +481,8 @@ def gluon_mxfp4_moe_stage1_kernel(
     stride_bk,
     stride_cm,
     stride_cn,
+    stride_cscale_kswizzled,
+    stride_cscale_mblock,
     stride_ase_m,
     stride_ase_k,
     stride_bse_e,
@@ -345,6 +501,7 @@ def gluon_mxfp4_moe_stage1_kernel(
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
     A_SCALE_TOKEN_ORDER: gl.constexpr,
+    QUANTIZE_OUT: gl.constexpr,
 ):
     """Stage 1 kernel: per-token A gather, 2-slot A-data LDS ping-pong,
     direct-to-VGPR A scales, and a per-quarter MFMA K-loop with fused SwiGLU.
@@ -366,9 +523,10 @@ def gluon_mxfp4_moe_stage1_kernel(
     A[0], overlaps each following A-data prefetch with the current tile,
     and handles the final tile in the drain.
 
-    Epilogue: ``silu(gate_acc_groupX) * up_acc_groupX`` for X in 0..3,
-    cast to bf16, stored at sorted-row positions over ``BLOCK_N`` cols
-    starting at ``pid_n * BLOCK_N`` of the ``[EM, I_r]`` output buffer.
+    Epilogue: ``silu(gate_acc_groupX) * up_acc_groupX`` for X in 0..3.
+    The BF16 mode stores token-slot rows directly. The quantized mode rounds
+    through BF16, then writes packed E2M1 in token-slot order and E8M0 scales
+    in sorted-route CDNA4 order.
     """
 
     gl.static_assert(BLOCK_M == 128, "stage1 kernel requires BLOCK_M=128")
@@ -788,6 +946,7 @@ def gluon_mxfp4_moe_stage1_kernel(
         a_scale_base_offsets_group0,
         0,
         A_SCALE_K_STEP,
+        MASKED=A_SCALE_TOKEN_ORDER,
         mask=a_scale_valid_group0,
     )
     cur_a_group1 = _read_a_lds_group(
@@ -801,6 +960,7 @@ def gluon_mxfp4_moe_stage1_kernel(
         a_scale_base_offsets_group1,
         0,
         A_SCALE_K_STEP,
+        MASKED=A_SCALE_TOKEN_ORDER,
         mask=a_scale_valid_group1,
     )
 
@@ -918,6 +1078,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             a_scale_base_offsets_group2,
             tile0_k,
             A_SCALE_K_STEP,
+            MASKED=A_SCALE_TOKEN_ORDER,
             mask=a_scale_valid_group2,
         )
         cur_a_group3 = _read_a_lds_group(
@@ -931,6 +1092,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             a_scale_base_offsets_group3,
             tile0_k,
             A_SCALE_K_STEP,
+            MASKED=A_SCALE_TOKEN_ORDER,
             mask=a_scale_valid_group3,
         )
 
@@ -981,6 +1143,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             a_scale_base_offsets_group0,
             tile0_k + 1,
             A_SCALE_K_STEP,
+            MASKED=A_SCALE_TOKEN_ORDER,
             mask=a_scale_valid_group0,
         )
         cur_a_group1 = _read_a_lds_group(
@@ -994,6 +1157,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             a_scale_base_offsets_group1,
             tile0_k + 1,
             A_SCALE_K_STEP,
+            MASKED=A_SCALE_TOKEN_ORDER,
             mask=a_scale_valid_group1,
         )
 
@@ -1077,6 +1241,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             a_scale_base_offsets_group2,
             tile1_k,
             A_SCALE_K_STEP,
+            MASKED=A_SCALE_TOKEN_ORDER,
             mask=a_scale_valid_group2,
         )
         cur_a_group3 = _read_a_lds_group(
@@ -1090,6 +1255,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             a_scale_base_offsets_group3,
             tile1_k,
             A_SCALE_K_STEP,
+            MASKED=A_SCALE_TOKEN_ORDER,
             mask=a_scale_valid_group3,
         )
 
@@ -1137,6 +1303,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             a_scale_base_offsets_group0,
             tile1_k + 1,
             A_SCALE_K_STEP,
+            MASKED=A_SCALE_TOKEN_ORDER,
             mask=a_scale_valid_group0,
         )
         cur_a_group1 = _read_a_lds_group(
@@ -1150,6 +1317,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             a_scale_base_offsets_group1,
             tile1_k + 1,
             A_SCALE_K_STEP,
+            MASKED=A_SCALE_TOKEN_ORDER,
             mask=a_scale_valid_group1,
         )
 
@@ -1232,6 +1400,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             a_scale_base_offsets_group2,
             pk,
             A_SCALE_K_STEP,
+            MASKED=A_SCALE_TOKEN_ORDER,
             mask=a_scale_valid_group2,
         )
         cur_a_group3 = _read_a_lds_group(
@@ -1245,6 +1414,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             a_scale_base_offsets_group3,
             pk,
             A_SCALE_K_STEP,
+            MASKED=A_SCALE_TOKEN_ORDER,
             mask=a_scale_valid_group3,
         )
 
@@ -1292,6 +1462,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             a_scale_base_offsets_group0,
             pk + 1,
             A_SCALE_K_STEP,
+            MASKED=A_SCALE_TOKEN_ORDER,
             mask=a_scale_valid_group0,
         )
         cur_a_group1 = _read_a_lds_group(
@@ -1305,6 +1476,7 @@ def gluon_mxfp4_moe_stage1_kernel(
             a_scale_base_offsets_group1,
             pk + 1,
             A_SCALE_K_STEP,
+            MASKED=A_SCALE_TOKEN_ORDER,
             mask=a_scale_valid_group1,
         )
 
@@ -1328,6 +1500,7 @@ def gluon_mxfp4_moe_stage1_kernel(
         a_scale_base_offsets_group2,
         num_k_iter - 1,
         A_SCALE_K_STEP,
+        MASKED=A_SCALE_TOKEN_ORDER,
         mask=a_scale_valid_group2,
     )
     cur_a_group3 = _read_a_lds_group(
@@ -1341,6 +1514,7 @@ def gluon_mxfp4_moe_stage1_kernel(
         a_scale_base_offsets_group3,
         num_k_iter - 1,
         A_SCALE_K_STEP,
+        MASKED=A_SCALE_TOKEN_ORDER,
         mask=a_scale_valid_group3,
     )
 
@@ -1402,16 +1576,12 @@ def gluon_mxfp4_moe_stage1_kernel(
     )
 
     # ---- SwiGLU epilogue ------------------------------------------------
-    # Per-quarter SwiGLU.  The historical path is plain
-    # ``silu(gate) * up`` and is represented by
-    # ``alpha=1, limit=0, beta=0``.  Kimi uses the parameterized
-    # form ``gate * sigmoid(alpha * gate) * (clamp(up) + beta)`` with
-    # optional gate/up clamping.
-    # ``gl.sigmoid`` is not in the Gluon language module today, so we
-    # build sigmoid from ``gl.exp``. Each quarter's fp32 result casts to
-    # bf16 inside ``_store_swiglu_tile_group`` and lands at
-    # ``dst_row = token_id * top_k + topk_id`` decoded from the
-    # bit-packed ``sorted_token_ids[m]``; padding rows are mask-rejected.
+    # Per-quarter parameterized SwiGLU:
+    # ``gate * sigmoid(alpha * gate) * (clamp(up) + beta)`` with optional
+    # gate/up clamping. ``alpha=1, limit=0, beta=0`` implements plain
+    # ``silu(gate) * up``. ``gl.sigmoid`` is not in the Gluon language
+    # module, so build sigmoid from ``gl.exp``. The store helper emits either
+    # BF16 or BF16-rounded packed E2M1 and rejects padding rows.
     if SWIGLU_LIMIT > 0.0:
         gate_acc_group0 = gl.minimum(gate_acc_group0, SWIGLU_LIMIT)
         gate_acc_group1 = gl.minimum(gate_acc_group1, SWIGLU_LIMIT)
@@ -1444,6 +1614,7 @@ def gluon_mxfp4_moe_stage1_kernel(
     _store_swiglu_tile_group(
         acc_swiglu_group0,
         c_ptr,
+        c_scale_ptr,
         sorted_token_ids_ptr,
         pid_m,
         pid_n,
@@ -1452,16 +1623,20 @@ def gluon_mxfp4_moe_stage1_kernel(
         top_k,
         stride_cm,
         stride_cn,
+        stride_cscale_kswizzled,
+        stride_cscale_mblock,
         mfma_layout,
         GROUP0_IDX,
         GROUP_MFMA_M,
         BLOCK_M,
         BLOCK_N,
         I_r,
+        QUANTIZE_OUT,
     )
     _store_swiglu_tile_group(
         acc_swiglu_group1,
         c_ptr,
+        c_scale_ptr,
         sorted_token_ids_ptr,
         pid_m,
         pid_n,
@@ -1470,16 +1645,20 @@ def gluon_mxfp4_moe_stage1_kernel(
         top_k,
         stride_cm,
         stride_cn,
+        stride_cscale_kswizzled,
+        stride_cscale_mblock,
         mfma_layout,
         GROUP1_IDX,
         GROUP_MFMA_M,
         BLOCK_M,
         BLOCK_N,
         I_r,
+        QUANTIZE_OUT,
     )
     _store_swiglu_tile_group(
         acc_swiglu_group2,
         c_ptr,
+        c_scale_ptr,
         sorted_token_ids_ptr,
         pid_m,
         pid_n,
@@ -1488,16 +1667,20 @@ def gluon_mxfp4_moe_stage1_kernel(
         top_k,
         stride_cm,
         stride_cn,
+        stride_cscale_kswizzled,
+        stride_cscale_mblock,
         mfma_layout,
         GROUP2_IDX,
         GROUP_MFMA_M,
         BLOCK_M,
         BLOCK_N,
         I_r,
+        QUANTIZE_OUT,
     )
     _store_swiglu_tile_group(
         acc_swiglu_group3,
         c_ptr,
+        c_scale_ptr,
         sorted_token_ids_ptr,
         pid_m,
         pid_n,
@@ -1506,12 +1689,15 @@ def gluon_mxfp4_moe_stage1_kernel(
         top_k,
         stride_cm,
         stride_cn,
+        stride_cscale_kswizzled,
+        stride_cscale_mblock,
         mfma_layout,
         GROUP3_IDX,
         GROUP_MFMA_M,
         BLOCK_M,
         BLOCK_N,
         I_r,
+        QUANTIZE_OUT,
     )
 
 
@@ -1540,6 +1726,7 @@ def invoke_gluon_mxfp4_moe_stage1(
     swiglu_limit: float = 0.0,
     swiglu_beta: float = 0.0,
     a1_scale_is_sorted: bool = True,
+    out_scale: torch.Tensor | None = None,
 ):
     """Host-side launcher for Gluon MXFP4 MoE stage 1.
 
@@ -1565,7 +1752,12 @@ def invoke_gluon_mxfp4_moe_stage1(
     Unsupported (raises ``NotImplementedError``):
       ``quant_type != per_1x32``, ``activation != Silu``,
       ``splitk not in {0, 1, None}``, non-empty ``sorted_weights``,
-      ``dst_type != bfloat16``.
+      or a ``dst_type`` that does not match the output storage type.
+
+    Passing ``out_scale`` selects the quantized epilogue. In that mode ``out``
+    receives packed E2M1 in token-slot order and ``out_scale`` receives E8M0
+    bytes in sorted-route CDNA4 order. Consequently, ``dst_type`` is
+    ``torch.uint8`` in quantized mode and ``torch.bfloat16`` otherwise.
 
     Accepted-but-ignored, kept for signature compatibility with
     upstream dispatchers: ``kernelName``, ``block_m`` (kernel hardcodes
@@ -1589,10 +1781,12 @@ def invoke_gluon_mxfp4_moe_stage1(
             "sorted_weights tensor) is not implemented; pass None or a "
             "0-element placeholder"
         )
-    if dst_type is not None and dst_type != torch.bfloat16:
+    quantize_out = out_scale is not None
+    expected_dst_type = torch.uint8 if quantize_out else torch.bfloat16
+    if dst_type is not None and dst_type != expected_dst_type:
         raise NotImplementedError(
-            "invoke_gluon_mxfp4_moe_stage1: only dst_type=torch.bfloat16 is "
-            f"supported, got dst_type={dst_type!r}"
+            "invoke_gluon_mxfp4_moe_stage1: dst_type must match the output "
+            f"storage type {expected_dst_type}, got dst_type={dst_type!r}"
         )
     del kernelName, block_m, use_non_temporal_load, w2
 
@@ -1613,7 +1807,6 @@ def invoke_gluon_mxfp4_moe_stage1(
         "a1_scale must be a uint8 e8m0 tensor, got "
         f"{None if a1_scale is None else a1_scale.dtype}"
     )
-    assert out.dtype == torch.bfloat16, f"out must be bfloat16, got {out.dtype}"
     assert (
         sorted_token_ids.dtype == torch.int32
     ), f"sorted_token_ids must be int32, got {sorted_token_ids.dtype}"
@@ -1644,26 +1837,53 @@ def invoke_gluon_mxfp4_moe_stage1(
     I_r = two_Ir // 2
     N = 2 * I_r
     EM = sorted_token_ids.shape[0]
-    if out.dim() == 3:
-        token_num, top_k_dim, I_r_dim = out.shape
-        assert top_k_dim == topk, f"out top_k mismatch: {top_k_dim} vs topk={topk}"
-        assert I_r_dim == I_r, f"out I_r mismatch: {I_r_dim} vs {I_r}"
-        assert out.is_contiguous(), (
-            "3-D out tensor must be contiguous so .view(token_num*topk, I_r) "
-            "shares memory with the original; got non-contiguous out"
+    if quantize_out:
+        assert I_r % 256 == 0, (
+            "quantized out I_r must be divisible by 256 for the CDNA4 "
+            f"K-scale swizzle, got {I_r}"
         )
-        out_2d = out.view(token_num * topk, I_r)
-    elif out.dim() == 2:
-        out_2d = out
-        assert out.shape[0] >= EM, f"out 2-D first dim {out.shape[0]} < EM={EM}"
         assert (
-            out.shape[1] == I_r
-        ), f"out 2-D second dim {out.shape[1]} must equal I_r={I_r}"
-    else:
-        raise NotImplementedError(
-            "out must be 2-D (EM, I_r) or 3-D (token_num, topk, I_r); "
-            f"got shape {tuple(out.shape)}"
+            out.dtype == torch.uint8
+        ), f"quantized out must be packed fp4x2 (uint8), got {out.dtype}"
+        assert out.shape == (M_padded * topk, I_r // 2), (
+            f"quantized out shape {tuple(out.shape)} must be "
+            f"({M_padded * topk}, {I_r // 2})"
         )
+        assert out.is_contiguous(), "quantized out must be contiguous"
+        assert (
+            out_scale.dtype == torch.uint8
+        ), f"out_scale must be uint8, got {out_scale.dtype}"
+        assert out_scale.shape[0] >= EM and out_scale.shape[0] % 32 == 0, (
+            f"out_scale row count {out_scale.shape[0]} must cover EM={EM} "
+            "and be divisible by 32"
+        )
+        assert (
+            out_scale.shape[1] == I_r // 32
+        ), f"out_scale column count {out_scale.shape[1]} must be {I_r // 32}"
+        assert out_scale.is_contiguous(), "out_scale must be contiguous"
+        out_2d = out
+    else:
+        assert out.dtype == torch.bfloat16, f"out must be bfloat16, got {out.dtype}"
+        if out.dim() == 3:
+            token_num, top_k_dim, I_r_dim = out.shape
+            assert top_k_dim == topk, f"out top_k mismatch: {top_k_dim} vs topk={topk}"
+            assert I_r_dim == I_r, f"out I_r mismatch: {I_r_dim} vs {I_r}"
+            assert out.is_contiguous(), (
+                "3-D out tensor must be contiguous so .view(token_num*topk, I_r) "
+                "shares memory with the input tensor; got non-contiguous out"
+            )
+            out_2d = out.view(token_num * topk, I_r)
+        elif out.dim() == 2:
+            out_2d = out
+            assert out.shape[0] >= EM, f"out 2-D first dim {out.shape[0]} < EM={EM}"
+            assert (
+                out.shape[1] == I_r
+            ), f"out 2-D second dim {out.shape[1]} must equal I_r={I_r}"
+        else:
+            raise NotImplementedError(
+                "out must be 2-D (EM, I_r) or 3-D (token_num, topk, I_r); "
+                f"got shape {tuple(out.shape)}"
+            )
     K_scale = K // 32
     if a1_scale_is_sorted:
         assert a1_scale.dim() == 2 and a1_scale.shape[1] == K_scale, (
@@ -1726,6 +1946,14 @@ def invoke_gluon_mxfp4_moe_stage1(
     stride_bk = w1.stride(2)
     stride_cm = out_2d.stride(0)
     stride_cn = out_2d.stride(1)
+    if quantize_out:
+        out_scale_ptr = out_scale
+        stride_cscale_kswizzled = 1
+        stride_cscale_mblock = out_scale.stride(0) * 32
+    else:
+        out_scale_ptr = out_2d
+        stride_cscale_kswizzled = 0
+        stride_cscale_mblock = 0
     stride_ase_m = a1_scale.stride(0)
     stride_ase_k = a1_scale.stride(1)
     stride_bse_e = w1_scale.stride(0)
@@ -1741,6 +1969,7 @@ def invoke_gluon_mxfp4_moe_stage1(
         hidden_states,
         w1,
         out_2d,
+        out_scale_ptr,
         a1_scale,
         w1_scale,
         sorted_token_ids,
@@ -1759,6 +1988,8 @@ def invoke_gluon_mxfp4_moe_stage1(
         stride_bk,
         stride_cm,
         stride_cn,
+        stride_cscale_kswizzled,
+        stride_cscale_mblock,
         stride_ase_m,
         stride_ase_k,
         stride_bse_e,
@@ -1777,6 +2008,7 @@ def invoke_gluon_mxfp4_moe_stage1(
         SWIGLU_LIMIT=float(swiglu_limit),
         SWIGLU_BETA=float(swiglu_beta),
         A_SCALE_TOKEN_ORDER=not a1_scale_is_sorted,
+        QUANTIZE_OUT=quantize_out,
         num_warps=NUM_WARPS,
     )
     return out
