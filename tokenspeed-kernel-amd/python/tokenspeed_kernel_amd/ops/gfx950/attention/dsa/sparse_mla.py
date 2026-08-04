@@ -1921,6 +1921,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     if index_k_cache is None:
         raise RuntimeError("Gluon DSA paged top-k requires packed FP8 index_k_cache")
     row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
+    weights = weights.contiguous()
     _check_score_input_contract(q, weights, index_k_cache)
     if seq_lens.dim() != 1:
         raise ValueError(
@@ -2025,6 +2026,7 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             "Gluon DSA top-k requires packed FP8 index_k_cache and page_size"
         )
     row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
+    weights = weights.contiguous()
     _check_score_input_contract(q, weights, index_k_cache)
     if kv_workspace_slots.dim() != 1:
         raise ValueError(

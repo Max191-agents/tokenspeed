@@ -237,8 +237,10 @@ def _check_packed_fp8_inputs(
 ) -> int:
     if q.dtype != torch.bfloat16:
         raise TypeError(f"DSA Gluon top-k expects BF16 q, got {q.dtype}")
-    if weights.dtype != torch.float32:
-        raise TypeError(f"DSA Gluon top-k expects FP32 weights, got {weights.dtype}")
+    if weights.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(
+            f"DSA Gluon top-k expects BF16 or FP32 weights, got {weights.dtype}"
+        )
     if q.dim() != 3:
         raise ValueError(f"q must be [tokens, heads, dim], got {tuple(q.shape)}")
     if weights.shape != q.shape[:2]:

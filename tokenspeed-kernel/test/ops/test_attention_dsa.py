@@ -34,6 +34,9 @@ from tokenspeed_kernel import (
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
 )
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import clear_config_overrides, select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 torch.manual_seed(42)
 
@@ -72,6 +75,41 @@ def _pack_index_k_cache(
     fp8_view.copy_(x_fp8.reshape(num_pages, page_size, head_dim))
     scale_view.copy_(scale.reshape(num_pages, page_size, num_groups))
     return packed, (x_fp8.float() * scale).reshape_as(index_k)
+
+
+@pytest.mark.parametrize("mode", ("dsa_decode_topk", "dsa_prefill_topk"))
+@pytest.mark.parametrize("weights_dtype", (torch.float32, torch.bfloat16))
+def test_dsa_topk_prefers_gluon_when_available(
+    mode: str, weights_dtype: torch.dtype, require, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    require("attention", mode, "gluon", torch.bfloat16, "q")
+    require("attention", mode, "triton", torch.bfloat16, "q")
+
+    monkeypatch.delenv(
+        f"TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_{mode.upper()}", raising=False
+    )
+    clear_config_overrides()
+    KernelRegistry.get().clear_cache()
+
+    traits = {
+        "head_dim": 128,
+        "topk": 2048,
+        "page_size": 64,
+        "index_k_format": "fp8_scaled",
+    }
+    if mode == "dsa_decode_topk":
+        traits["q_len_per_req"] = 4
+    selected = select_kernel(
+        "attention",
+        mode,
+        format_signature(
+            q=dense_tensor_format(torch.bfloat16),
+            weights=dense_tensor_format(weights_dtype),
+        ),
+        traits=traits,
+    )
+
+    assert selected.name == f"gluon_{mode}_fp8_gfx950"
 
 
 def test_dsa_decode_topk_fp8(device: str, require) -> None:

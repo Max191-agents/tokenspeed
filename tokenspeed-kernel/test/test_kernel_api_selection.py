@@ -1105,7 +1105,7 @@ def _attention_dsa_prefill_fp8_dense() -> object:
 
 def _attention_dsa_decode_topk() -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
-    weights = torch.empty((2, 2), dtype=torch.float32)
+    weights = torch.empty((2, 2), dtype=torch.bfloat16)
     index_k = torch.zeros((128, 132), dtype=torch.uint8)
     seq_lens = torch.tensor([64, 64], dtype=torch.int32)
     block_table = torch.zeros((2, 1), dtype=torch.int32)
@@ -1128,7 +1128,7 @@ def _attention_dsa_prefill_topk(
     override: str | None = None,
 ) -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
-    weights = torch.empty((2, 2), dtype=torch.float32)
+    weights = torch.empty((2, 2), dtype=torch.bfloat16)
     index_k = torch.zeros((128, 132), dtype=torch.uint8)
     kv_workspace_slots = torch.arange(64, dtype=torch.int64)
     row_starts = torch.tensor([0, 8], dtype=torch.int32)
