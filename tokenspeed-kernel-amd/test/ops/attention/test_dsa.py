@@ -996,15 +996,26 @@ def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
         pytest.param(torch.float8_e4m3fn, id="q_fp8"),
     ],
 )
-def test_dsa_dense_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
+@pytest.mark.parametrize(
+    "kv_lora_rank",
+    [
+        pytest.param(128, id="rank_128"),
+        pytest.param(512, id="rank_512"),
+    ],
+)
+def test_dsa_dense_kvcache(
+    mode: str,
+    api,
+    q_dtype: torch.dtype,
+    kv_lora_rank: int,
+) -> None:
     device = "cuda"
     tokens = 3
     num_heads = 2
     num_slots = 16
     topk = 512
-    kv_lora_rank = 128
     qk_rope_head_dim = 64
-    qk_nope_head_dim = 128
+    qk_nope_head_dim = 192 if kv_lora_rank == 512 else 128
     softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
     q_bf16 = torch.randn(
         tokens,
@@ -1043,6 +1054,70 @@ def test_dsa_dense_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
         q,
         dequant_latent,
         dequant_rope,
+        topk_slots,
+        topk_lens,
+        softmax_scale,
+    )
+    assert out.shape == (tokens, num_heads, kv_lora_rank)
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize(
+    "api",
+    [
+        pytest.param(gluon_dsa_decode_gfx950, id="decode"),
+        pytest.param(gluon_dsa_prefill_gfx950, id="prefill"),
+    ],
+)
+def test_dsa_dense_fp8_glm52_production_shape(api) -> None:
+    device = "cuda"
+    tokens = 4
+    num_heads = 16
+    num_slots = 2112
+    topk = 2048
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 192
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    gen = _generator(device, 401)
+
+    q = _randn_bf16(
+        (tokens, num_heads, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=gen,
+    ).to(torch.float8_e4m3fn)
+    kv_cache = _randn_bf16(
+        (num_slots, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=gen,
+    ).to(torch.float8_e4m3fn)
+    topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
+    topk_lens = torch.tensor([4, 512, 1024, 2048], device=device, dtype=torch.int32)
+    for token, count in enumerate(topk_lens.tolist()):
+        topk_slots[token, :count] = torch.randperm(
+            num_slots, device=device, generator=gen, dtype=torch.int32
+        )[:count]
+
+    out = api(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=num_slots,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=64,
+        q_len_per_req=4 if api is gluon_dsa_decode_gfx950 else 1,
+    )
+
+    ref = _dsa_reference(
+        q,
+        kv_cache[:, :kv_lora_rank],
+        kv_cache[:, kv_lora_rank:],
         topk_slots,
         topk_lens,
         softmax_scale,

@@ -34,8 +34,101 @@ from tokenspeed_kernel import (
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
 )
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import clear_config_overrides, select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 torch.manual_seed(42)
+
+
+@pytest.mark.parametrize(
+    ("qk_nope_head_dim", "kv_lora_rank", "kv_cache", "sparse_kv_cache"),
+    [
+        pytest.param(128, 128, True, False, id="dense-rank128"),
+        pytest.param(192, 512, False, True, id="sparse-rank512"),
+    ],
+)
+def test_dsa_fp8_decode_keeps_generic_gluon_coverage(
+    require,
+    monkeypatch: pytest.MonkeyPatch,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    kv_cache: bool,
+    sparse_kv_cache: bool,
+) -> None:
+    require("attention", "dsa_decode", "gluon", torch.float8_e4m3fn, "q")
+    require("attention", "dsa_decode", "triton", torch.float8_e4m3fn, "q")
+
+    monkeypatch.delenv("TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_DECODE", raising=False)
+    clear_config_overrides()
+    KernelRegistry.get().clear_cache()
+
+    selected = select_kernel(
+        "attention",
+        "dsa_decode",
+        format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
+        traits={
+            "page_size": 64,
+            "q_len_per_req": 4,
+            "qk_nope_head_dim": qk_nope_head_dim,
+            "kv_lora_rank": kv_lora_rank,
+            "qk_rope_head_dim": 64,
+            "topk": 2048,
+            "kv_cache_available": kv_cache,
+            "sparse_kv_cache_available": sparse_kv_cache,
+            "topk_layout": "global_slots",
+            "support_logit_cap": False,
+            "return_lse": False,
+        },
+    )
+
+    assert selected.name == "gluon_dsa_decode_gfx950"
+
+
+@pytest.mark.parametrize(
+    ("operation", "q_len_per_req", "expected"),
+    [
+        pytest.param("dsa_decode", 4, "gluon_dsa_decode_fp8_dense_gfx950", id="decode"),
+        pytest.param(
+            "dsa_prefill", 1, "gluon_dsa_prefill_fp8_dense_gfx950", id="prefill"
+        ),
+    ],
+)
+def test_dsa_fp8_dense_rank512_prefers_gluon_when_available(
+    require,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    q_len_per_req: int,
+    expected: str,
+) -> None:
+    require("attention", operation, "gluon", torch.float8_e4m3fn, "q")
+    require("attention", operation, "triton", torch.float8_e4m3fn, "q")
+
+    env_name = f"TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_{operation.upper()}"
+    monkeypatch.delenv(env_name, raising=False)
+    clear_config_overrides()
+    KernelRegistry.get().clear_cache()
+
+    selected = select_kernel(
+        "attention",
+        operation,
+        format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
+        traits={
+            "page_size": 64,
+            "q_len_per_req": q_len_per_req,
+            "qk_nope_head_dim": 192,
+            "kv_lora_rank": 512,
+            "qk_rope_head_dim": 64,
+            "topk": 2048,
+            "kv_cache_available": True,
+            "sparse_kv_cache_available": False,
+            "topk_layout": "global_slots",
+            "support_logit_cap": False,
+            "return_lse": False,
+        },
+    )
+
+    assert selected.name == expected
 
 
 def _pack_index_k_cache(
