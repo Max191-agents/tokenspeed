@@ -37,6 +37,82 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # noqa:
 torch.manual_seed(42)
 
 
+class _NoContiguousCallTensor(torch.Tensor):
+    @staticmethod
+    def __new__(cls, tensor: torch.Tensor) -> "_NoContiguousCallTensor":
+        return torch.Tensor._make_subclass(cls, tensor, tensor.requires_grad)
+
+    def contiguous(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("contiguous weights should not be copied")
+
+
+class _FakeLaunchKernel:
+    def __init__(self) -> None:
+        self.weights: list[torch.Tensor] = []
+
+    def __getitem__(self, _grid):
+        def launch(*args, **_kwargs):
+            self.weights.append(args[3])
+
+        return launch
+
+
+@pytest.mark.parametrize("mode", ("decode", "prefill"))
+def test_dsa_topk_skips_weight_copy_for_contiguous_inputs(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
+    weights = _NoContiguousCallTensor(torch.empty((2, 2), dtype=torch.bfloat16))
+    index_k_cache = torch.zeros((64, 132), dtype=torch.uint8)
+    out = torch.empty((2, 512), dtype=torch.int32)
+    lens_out = torch.empty((2,), dtype=torch.int32)
+    fake_kernel = _FakeLaunchKernel()
+
+    monkeypatch.setattr(dsa_topk_gfx950, "_check_packed_fp8_inputs", lambda *a: 132)
+    monkeypatch.setattr(dsa_topk_gfx950, "_check_score_input_contract", lambda *a: None)
+    monkeypatch.setattr(
+        dsa_topk_gfx950, "_dsa_topk_indices", lambda *a, **k: (out, lens_out)
+    )
+
+    if mode == "decode":
+        monkeypatch.setattr(
+            dsa_topk_gfx950, "_dsa_decode_logits_fp8_kernel", fake_kernel
+        )
+        got_out, got_lens = gluon_dsa_decode_topk_fp8_gfx950(
+            q,
+            weights,
+            torch.tensor([64, 64], dtype=torch.int32),
+            torch.zeros((2, 1), dtype=torch.int32),
+            page_size=64,
+            topk=512,
+            softmax_scale=1.0,
+            index_k_cache=index_k_cache,
+            out=out,
+            lens_out=lens_out,
+        )
+    else:
+        monkeypatch.setattr(
+            dsa_topk_gfx950, "_dsa_prefill_logits_fp8_kernel", fake_kernel
+        )
+        got_out, got_lens = gluon_dsa_prefill_topk_fp8_gfx950(
+            q,
+            weights,
+            torch.arange(64, dtype=torch.int64),
+            torch.tensor([0, 8], dtype=torch.int32),
+            torch.tensor([8, 16], dtype=torch.int32),
+            topk=512,
+            softmax_scale=1.0,
+            index_k_cache=index_k_cache,
+            page_size=64,
+            out=out,
+            lens_out=lens_out,
+        )
+
+    assert got_out is out
+    assert got_lens is lens_out
+    assert fake_kernel.weights
+
+
 @pytest.mark.parametrize(
     ("max_seqlen_k", "expected_topk"),
     ((25, 512), (608, 1024), (1537, 2048)),
