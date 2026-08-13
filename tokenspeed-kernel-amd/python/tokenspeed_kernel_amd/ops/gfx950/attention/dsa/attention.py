@@ -25,16 +25,26 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import select_kv_splits
+from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+    gluon_mla_selected_attention_fp8_gfx950,
+)
 
 __all__ = [
     "gluon_dsa_decode_gfx950",
     "gluon_dsa_prefill_gfx950",
+    "gluon_dsa_prefill_h16n128_gfx950",
+    "gluon_dsa_prefill_legacy_gfx950",
 ]
 
 _REGISTERED_TOPK_WIDTHS = (512, 1024, 2048)
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _GFX950_COMPUTE_UNITS = 256
 _GLM52_SINGLE_ROW_DECODE_SPLITS = 16
+_DENSE_IMPL_AUTO = "auto"
+_DENSE_IMPL_H16N128 = "h16n128"
+_DENSE_IMPL_LEGACY = "legacy"
+_DENSE_IMPLS = frozenset({_DENSE_IMPL_AUTO, _DENSE_IMPL_H16N128, _DENSE_IMPL_LEGACY})
+_H16N128_PREFILL_MIN_TOKENS = 512
 
 
 @gluon.constexpr_function
@@ -1080,6 +1090,49 @@ def _run_dense_kv(
     return out
 
 
+def _run_dense_kv_h16n128(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    *,
+    softmax_scale: float,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return gluon_mla_selected_attention_fp8_gfx950(
+        q,
+        kv_cache,
+        topk_slots,
+        topk_lens,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        out=out,
+    )
+
+
+def _supports_h16n128_prefill(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    *,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> bool:
+    return (
+        q.dtype == torch.float8_e4m3fn
+        and kv_cache.dtype == torch.float8_e4m3fn
+        and q.shape[1] == 16
+        and int(qk_nope_head_dim) == 192
+        and int(kv_lora_rank) == 512
+        and int(qk_rope_head_dim) == 64
+    )
+
+
 def _run_dense_kv_scalar(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1169,7 +1222,12 @@ def _run_dsa(
     k_scale: float,
     out: torch.Tensor | None,
     max_seqlen_k: int,
+    dense_impl: str = _DENSE_IMPL_AUTO,
 ) -> torch.Tensor:
+    if dense_impl not in _DENSE_IMPLS:
+        raise ValueError(
+            f"dense_impl must be one of {sorted(_DENSE_IMPLS)}, got {dense_impl!r}"
+        )
     _check_inputs(
         q,
         topk_slots,
@@ -1205,6 +1263,8 @@ def _run_dsa(
     # FP8 rows use a different physical layout, so they use the packed sparse
     # implementation instead of the dense tiled implementation.
     if sparse_kv_cache is not None:
+        if dense_impl == _DENSE_IMPL_H16N128:
+            raise NotImplementedError("H16/N128 DSA prefill requires dense KV cache")
         result = _run_packed_kv(
             q,
             _flatten_packed_kv_cache(sparse_kv_cache).contiguous(),
@@ -1215,24 +1275,55 @@ def _run_dsa(
             qk_rope_head_dim=qk_rope_head_dim,
         )
     elif kv_cache is not None:
-        dense_kv = _flatten_dense_kv_cache(kv_cache).contiguous()
+        dense_kv_view = _flatten_dense_kv_cache(kv_cache)
+        supports_h16n128 = dense_kv_view.is_contiguous() and _supports_h16n128_prefill(
+            q,
+            dense_kv_view,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+        if dense_impl == _DENSE_IMPL_H16N128 and not supports_h16n128:
+            raise NotImplementedError(
+                "H16/N128 DSA prefill requires contiguous E4M3 q/KV, H=16, "
+                "and dimensions 512+64 with qk_nope_head_dim=192"
+            )
+        dense_kv = dense_kv_view.contiguous()
         use_tiled_kernel = (
             q.dtype == dense_kv.dtype
             and (q.dtype == torch.bfloat16 or q.dtype in _FP8_DTYPES)
             and int(kv_lora_rank) == 512
         )
         if use_tiled_kernel:
-            result = _run_dense_kv(
-                q,
-                dense_kv,
-                topk_slots,
-                topk_lens,
-                softmax_scale=softmax_scale,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                max_seqlen_k=max_seqlen_k,
-                out=out_view,
+            use_h16n128 = dense_impl == _DENSE_IMPL_H16N128 or (
+                dense_impl == _DENSE_IMPL_AUTO
+                and supports_h16n128
+                and q.shape[0] >= _H16N128_PREFILL_MIN_TOKENS
             )
+            if use_h16n128:
+                result = _run_dense_kv_h16n128(
+                    q,
+                    dense_kv,
+                    topk_slots,
+                    topk_lens,
+                    softmax_scale=softmax_scale,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    out=out_view,
+                )
+            else:
+                result = _run_dense_kv(
+                    q,
+                    dense_kv,
+                    topk_slots,
+                    topk_lens,
+                    softmax_scale=softmax_scale,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    max_seqlen_k=max_seqlen_k,
+                    out=out_view,
+                )
         else:
             result = _run_dense_kv_scalar(
                 q,
@@ -1244,6 +1335,8 @@ def _run_dsa(
                 qk_rope_head_dim=qk_rope_head_dim,
             )
     else:
+        if dense_impl == _DENSE_IMPL_H16N128:
+            raise NotImplementedError("H16/N128 DSA prefill requires dense KV cache")
         raise ValueError("Gluon DSA requires kv_cache or sparse_kv_cache")
     if out is None:
         return result
@@ -1287,6 +1380,7 @@ def gluon_dsa_decode_gfx950(
         k_scale=k_scale,
         out=out,
         max_seqlen_k=max_seqlen_k,
+        dense_impl=_DENSE_IMPL_LEGACY,
     )
 
 
@@ -1307,6 +1401,7 @@ def gluon_dsa_prefill_gfx950(
     k_scale: float = 1.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    dense_impl: str = _DENSE_IMPL_AUTO,
 ) -> torch.Tensor:
     del q_len_per_req
     if logit_cap != 0.0 or return_lse:
@@ -1325,4 +1420,17 @@ def gluon_dsa_prefill_gfx950(
         k_scale=k_scale,
         out=out,
         max_seqlen_k=max_seqlen_k,
+        dense_impl=dense_impl,
     )
+
+
+def gluon_dsa_prefill_h16n128_gfx950(*args, **kwargs) -> torch.Tensor:
+    """Force the H16/N128 selected-attention implementation."""
+    kwargs["dense_impl"] = _DENSE_IMPL_H16N128
+    return gluon_dsa_prefill_gfx950(*args, **kwargs)
+
+
+def gluon_dsa_prefill_legacy_gfx950(*args, **kwargs) -> torch.Tensor:
+    """Force the legacy H16/N32 selected-attention implementation."""
+    kwargs["dense_impl"] = _DENSE_IMPL_LEGACY
+    return gluon_dsa_prefill_gfx950(*args, **kwargs)

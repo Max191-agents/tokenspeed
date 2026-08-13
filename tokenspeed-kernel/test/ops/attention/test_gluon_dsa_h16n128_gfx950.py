@@ -1,0 +1,263 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+from utils import is_cdna4
+
+if not is_cdna4():
+    pytest.skip("AMD CDNA4 is required for gfx950 DSA tests", allow_module_level=True)
+
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
+    gluon_dsa_prefill_h16n128_gfx950,
+    gluon_dsa_prefill_legacy_gfx950,
+)
+
+_NUM_HEADS = 16
+_KV_LORA_RANK = 512
+_ROPE_DIM = 64
+_HEAD_DIM = _KV_LORA_RANK + _ROPE_DIM
+_TOPK = 2048
+_SOFTMAX_SCALE = 1.0 / math.sqrt(256)
+
+
+def _make_inputs(
+    valid_lengths: tuple[int, ...],
+    *,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(seed)
+    num_slots = 2112
+    q = torch.randn(
+        len(valid_lengths),
+        _NUM_HEADS,
+        _HEAD_DIM,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).to(torch.float8_e4m3fn)
+    kv = torch.randn(
+        num_slots,
+        _HEAD_DIM,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).to(torch.float8_e4m3fn)
+    slots = torch.full(
+        (len(valid_lengths), _TOPK), -1, device="cuda", dtype=torch.int32
+    )
+    lens = torch.tensor(valid_lengths, device="cuda", dtype=torch.int32)
+    for row, valid_len in enumerate(valid_lengths):
+        if valid_len == 0:
+            continue
+        values = torch.randperm(
+            num_slots, device="cuda", dtype=torch.int32, generator=generator
+        )[:valid_len]
+        if valid_len > 2:
+            values[1] = values[0]
+        slots[row, :valid_len] = values
+    return q, kv, slots, lens
+
+
+def _run(
+    implementation,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    slots: torch.Tensor,
+    lens: torch.Tensor,
+    *,
+    k_scale: float = 1.0,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return implementation(
+        q=q,
+        kv_cache=kv,
+        sparse_kv_cache=None,
+        topk_slots=slots,
+        topk_lens=lens,
+        max_seqlen_k=80_000,
+        qk_nope_head_dim=192,
+        kv_lora_rank=_KV_LORA_RANK,
+        qk_rope_head_dim=_ROPE_DIM,
+        softmax_scale=_SOFTMAX_SCALE,
+        page_size=64,
+        k_scale=k_scale,
+        out=out,
+    )
+
+
+def _online_fp8_reference(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    slots: torch.Tensor,
+    lens: torch.Tensor,
+    *,
+    k_scale: float,
+) -> torch.Tensor:
+    output = torch.zeros(
+        (q.shape[0], q.shape[1], _KV_LORA_RANK),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    for row in range(q.shape[0]):
+        running_max = torch.full(
+            (q.shape[1],), -float("inf"), device=q.device, dtype=torch.float32
+        )
+        denominator = torch.zeros_like(running_max)
+        accumulator = torch.zeros_like(output[row])
+        valid_len = max(0, min(int(lens[row].item()), slots.shape[1]))
+        for start in range(0, valid_len, 128):
+            selected = slots[row, start : min(start + 128, valid_len)].long()
+            valid = selected >= 0
+            safe_selected = torch.where(valid, selected, 0)
+            keys = kv[safe_selected]
+            scores = torch.matmul(q[row].float(), keys.float().T)
+            scores *= _SOFTMAX_SCALE * k_scale
+            scores[:, ~valid] = -float("inf")
+            tile_max = scores.amax(dim=1)
+            new_max = torch.maximum(running_max, tile_max)
+            safe_max = torch.where(torch.isfinite(new_max), new_max, 0.0)
+            old_scale = torch.exp(running_max - safe_max)
+            probabilities = torch.exp(scores - safe_max[:, None])
+            denominator = denominator * old_scale + probabilities.sum(dim=1)
+            accumulator *= old_scale[:, None]
+            accumulator += torch.matmul(
+                probabilities.to(torch.float8_e4m3fn).float(),
+                keys[:, :_KV_LORA_RANK].float(),
+            )
+            running_max = new_max
+        output[row] = torch.where(
+            denominator[:, None] > 0,
+            accumulator
+            / torch.where(denominator[:, None] > 0, denominator[:, None], 1.0),
+            0.0,
+        )
+    return output.to(torch.bfloat16)
+
+
+def test_h16n128_matches_legacy_for_selected_slot_edge_cases() -> None:
+    lengths = (0, 1, 127, 128, 129, 255, 256, 257, 1539, 2047, 2048)
+    q, kv, slots, lens = _make_inputs(lengths, seed=10_201)
+    slots[8, 32:64] = -1
+    expected = _run(gluon_dsa_prefill_legacy_gfx950, q, kv, slots, lens, k_scale=0.75)
+    actual = _run(gluon_dsa_prefill_h16n128_gfx950, q, kv, slots, lens, k_scale=0.75)
+
+    assert actual.dtype == torch.bfloat16
+    assert actual.shape == expected.shape
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual[0], torch.zeros_like(actual[0]))
+    # N32 and N128 use different online-softmax grouping and FP8 probability
+    # rounding. The independent N128 reference below carries the tighter gate.
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=2e-2)
+
+
+def test_h16n128_matches_online_fp8_reference_with_invalid_tile() -> None:
+    q, kv, slots, lens = _make_inputs((0, 129), seed=10_211)
+    slots[1, :128] = -1
+    expected = _online_fp8_reference(q, kv, slots, lens, k_scale=1.25)
+
+    actual = _run(
+        gluon_dsa_prefill_h16n128_gfx950,
+        q,
+        kv,
+        slots,
+        lens,
+        k_scale=1.25,
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=2e-3)
+
+
+def test_h16n128_single_key_is_exact_and_repeatable() -> None:
+    q, kv, slots, lens = _make_inputs((1, 1, 1, 1), seed=10_212)
+    chosen = torch.tensor((0, 63, 64, 2111), device="cuda", dtype=torch.int32)
+    slots[:, 0] = chosen
+    expected = (
+        kv[chosen.long(), :_KV_LORA_RANK]
+        .unsqueeze(1)
+        .expand(-1, _NUM_HEADS, -1)
+        .to(torch.bfloat16)
+    )
+
+    first = _run(gluon_dsa_prefill_h16n128_gfx950, q, kv, slots, lens)
+    second = _run(gluon_dsa_prefill_h16n128_gfx950, q, kv, slots, lens)
+
+    torch.testing.assert_close(first, expected, rtol=0, atol=0)
+    torch.testing.assert_close(second, first, rtol=0, atol=0)
+
+
+def test_h16n128_graph_replay_uses_live_query_slots_and_lengths() -> None:
+    q, kv, slots, lens = _make_inputs((2048, 2048), seed=10_221)
+    warm_out = torch.empty(
+        (2, _NUM_HEADS, _KV_LORA_RANK), device="cuda", dtype=torch.bfloat16
+    )
+    _run(gluon_dsa_prefill_h16n128_gfx950, q, kv, slots, lens, out=warm_out)
+    torch.cuda.synchronize()
+
+    graph_out = torch.empty_like(warm_out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run(
+            gluon_dsa_prefill_h16n128_gfx950,
+            q,
+            kv,
+            slots,
+            lens,
+            out=graph_out,
+        )
+    assert captured.data_ptr() == graph_out.data_ptr()
+
+    replacement_q, _, replacement_slots, replacement_lens = _make_inputs(
+        (0, 1539), seed=10_222
+    )
+    q.copy_(replacement_q)
+    slots.copy_(replacement_slots)
+    lens.copy_(replacement_lens)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected = _run(gluon_dsa_prefill_h16n128_gfx950, q, kv, slots, lens)
+    torch.testing.assert_close(graph_out[0], torch.zeros_like(graph_out[0]))
+    torch.testing.assert_close(graph_out, expected, rtol=0, atol=0)
+
+
+def test_h16n128_uses_scratch_when_output_aliases_cache() -> None:
+    q, kv, slots, lens = _make_inputs((2048, 1539, 65, 0), seed=10_231)
+    expected = _run(gluon_dsa_prefill_h16n128_gfx950, q, kv, slots, lens)
+    aliased_out = (
+        kv.view(torch.bfloat16).reshape(-1)[: expected.numel()].view_as(expected)
+    )
+
+    actual = _run(
+        gluon_dsa_prefill_h16n128_gfx950,
+        q,
+        kv,
+        slots,
+        lens,
+        out=aliased_out,
+    )
+
+    assert actual.data_ptr() == aliased_out.data_ptr()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

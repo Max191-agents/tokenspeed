@@ -1649,6 +1649,20 @@ def test_gluon_dsa_prefill_topk_exact_override_checks_page_size() -> None:
         _attention_dsa_prefill_topk(page_size=32, override=kernel_name)
 
 
+def test_gluon_dsa_prefill_diagnostic_variants_do_not_win_auto_selection() -> None:
+    registry = KernelRegistry.get()
+    production = registry.get_by_name("gluon_dsa_prefill_fp8_dense_gfx950")
+    candidate = registry.get_by_name("gluon_dsa_prefill_fp8_dense_h16n128_gfx950")
+    legacy = registry.get_by_name("gluon_dsa_prefill_fp8_dense_legacy_gfx950")
+    if production is None or candidate is None or legacy is None:
+        pytest.skip("Gluon DSA prefill is AMD-only")
+
+    assert candidate.priority == legacy.priority == 0
+    assert production.priority > candidate.priority
+    assert "diagnostic" in candidate.tags
+    assert "diagnostic" in legacy.tags
+
+
 def test_gluon_mxfp4_apply_priority_prefers_dynamic_over_precomputed() -> None:
     """The dynamic gluon mxfp4 apply outranks the precomputed one.
 

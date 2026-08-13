@@ -70,6 +70,7 @@ class AttentionConfig:
     REGIME: gl.constexpr
     IS_FP8_Q: gl.constexpr
     RETURN_LSE: gl.constexpr
+    SELECTED_SLOTS: gl.constexpr
     stride_q_nope_bs: gl.constexpr
     stride_q_nope_h: gl.constexpr
     stride_q_pe_bs: gl.constexpr
@@ -120,6 +121,7 @@ class AttentionConfig:
         REGIME,
         IS_FP8_Q,
         RETURN_LSE,
+        SELECTED_SLOTS,
         stride_q_nope_bs,
         stride_q_nope_h,
         stride_q_pe_bs,
@@ -611,6 +613,7 @@ class AttentionConfig:
         self.REGIME = gl.constexpr(REGIME)
         self.IS_FP8_Q = gl.constexpr(IS_FP8_Q)
         self.RETURN_LSE = gl.constexpr(RETURN_LSE)
+        self.SELECTED_SLOTS = gl.constexpr(SELECTED_SLOTS)
         self.stride_q_nope_bs = gl.constexpr(stride_q_nope_bs)
         self.stride_q_nope_h = gl.constexpr(stride_q_nope_h)
         self.stride_q_pe_bs = gl.constexpr(stride_q_pe_bs)
@@ -743,6 +746,10 @@ class AttentionProgram:
         # B_seq_len = cache_seqlens[batch].
         batch_page_start = cfg.stride_req_to_tokens_bs * cur_batch
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch)
+        if cfg.SELECTED_SLOTS:
+            cur_batch_seq_len = gl.minimum(
+                gl.maximum(cur_batch_seq_len, 0), cfg.stride_req_to_tokens_bs
+            )
 
         num_pages = gl.cdiv(cur_batch_seq_len, cfg.PAGE_SIZE)
         pages_per_split = gl.cdiv(num_pages, cfg.NUM_KV_SPLITS)
@@ -880,9 +887,17 @@ class AttentionProgram:
         cfg = self.cfg
         offs_n_page = start_n + gl.arange(0, cfg.BLOCK_N, layout=cfg.blocked_page)
         offs_page = self.batch_page_start + offs_n_page // cfg.PAGE_SIZE
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            buf, self.Req_to_tokens, offs_page, offs_n_page < self.split_kv_end
-        )
+        if cfg.SELECTED_SLOTS:
+            # All registered selected widths are multiples of BLOCK_N. Loading
+            # the padded tail keeps every wave's asynchronous-copy schedule
+            # uniform; logical validity is applied to the score tile later.
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                buf, self.Req_to_tokens, offs_page
+            )
+        else:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                buf, self.Req_to_tokens, offs_page, offs_n_page < self.split_kv_end
+            )
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
@@ -890,6 +905,10 @@ class AttentionProgram:
         self, page_number, token_offset, WITHIN_2GB: gl.constexpr
     ):
         cfg = self.cfg
+        if cfg.SELECTED_SLOTS:
+            # Selected attention permits negative sentinels inside the logical
+            # prefix. Use row zero for the masked load and exclude it in softmax.
+            page_number = gl.maximum(page_number, 0)
         page_offset = token_offset % cfg.PAGE_SIZE
         if WITHIN_2GB:
             # Keep the buffer-load specialization in 32-bit arithmetic; its
@@ -904,13 +923,32 @@ class AttentionProgram:
         return location
 
     @gluon.jit
+    def valid_kv_mask(self, page_number, token_offset):
+        valid = token_offset < self.split_kv_end
+        if self.cfg.SELECTED_SLOTS:
+            valid &= page_number >= 0
+        return valid
+
+    @gluon.jit
     def issue_kv_load(self, smem, ptr, offsets, mask):
         # Buffer loads use 32-bit offsets. Large pools use 64-bit global loads;
         # initialized page scratch keeps addresses for tail lanes in bounds.
         if self.cfg.WITHIN_2GB:
-            gl.amd.cdna4.async_copy.buffer_load_to_shared(smem, ptr, offsets, mask=mask)
+            if self.cfg.SELECTED_SLOTS:
+                # Invalid selected IDs have already been redirected to row 0.
+                # Do not predicate CDNA4 asynchronous copies per wave: a
+                # sparse mask gives producer and consumer waves different
+                # wait-group histories when PV redistributes N across waves.
+                gl.amd.cdna4.async_copy.buffer_load_to_shared(smem, ptr, offsets)
+            else:
+                gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                    smem, ptr, offsets, mask=mask
+                )
         else:
-            gl.amd.cdna4.async_copy.global_load_to_shared(smem, ptr + offsets)
+            if self.cfg.SELECTED_SLOTS:
+                gl.amd.cdna4.async_copy.global_load_to_shared(smem, ptr + offsets)
+            else:
+                gl.amd.cdna4.async_copy.global_load_to_shared(smem, ptr + offsets)
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
@@ -942,10 +980,25 @@ class AttentionProgram:
             + offs_base
             + gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.mfma_layout))
         )
-        qk = gl.where(offs_n_qk[None, :] < self.split_kv_end, qk, float("-inf"))
+        valid = offs_n_qk < self.split_kv_end
+        if cfg.SELECTED_SLOTS:
+            selected_slots = gl.amd.cdna4.buffer_load(
+                ptr=self.Req_to_tokens,
+                offsets=self.batch_page_start + offs_n_qk,
+                mask=valid,
+                other=-1,
+            )
+            valid &= selected_slots >= 0
+        qk = gl.where(valid[None, :], qk, float("-inf"))
         n_e_max = gl.maximum(gl.max(qk, 1), e_max)
-        re_scale = gl.exp2((e_max - n_e_max) * _INV_LN2)
-        p = gl.exp2((qk - n_e_max[:, None]) * _INV_LN2)
+        if cfg.SELECTED_SLOTS:
+            # Keep the true running max at -inf across an all-invalid tile, but
+            # use a finite subtraction origin so a later valid tile can recover.
+            safe_n_e_max = gl.where(n_e_max > -float("inf"), n_e_max, 0.0)
+        else:
+            safe_n_e_max = n_e_max
+        re_scale = gl.exp2((e_max - safe_n_e_max) * _INV_LN2)
+        p = gl.exp2((qk - safe_n_e_max[:, None]) * _INV_LN2)
         e_sum = e_sum * re_scale + gl.sum(p, 1)
         e_max = n_e_max
         p = p.to(dtype)
@@ -984,8 +1037,16 @@ class AttentionProgram:
             + offs_d_ckv_o[None, :]
         )
         acc *= self.kv_scale
-        rcp = 1.0 / e_sum
-        stored_value = (acc * rcp[:, None]).to(out_dtype)
+        if cfg.SELECTED_SLOTS:
+            safe_e_sum = gl.where(e_sum > 0.0, e_sum, 1.0)
+            stored_value = gl.where(
+                e_sum[:, None] > 0.0,
+                acc / safe_e_sum[:, None],
+                0.0,
+            ).to(out_dtype)
+        else:
+            rcp = 1.0 / e_sum
+            stored_value = (acc * rcp[:, None]).to(out_dtype)
         if cfg.NHEAD < cfg.BLOCK_H:
             gl.amd.cdna4.buffer_store(
                 stored_value,
@@ -995,6 +1056,33 @@ class AttentionProgram:
             )
         else:
             gl.amd.cdna4.buffer_store(stored_value, ptr=self.Out, offsets=offs_o)
+
+    @gluon.jit
+    def store_empty_output(self):
+        cfg = self.cfg
+        cur_head_o = self.cur_head_id * cfg.BLOCK_H + gl.arange(
+            0, cfg.BLOCK_H, layout=gl.SliceLayout(1, cfg.mfma_layout)
+        )
+        offs_d_ckv_o = gl.arange(
+            0, cfg.HEAD_DIM_CKV, layout=gl.SliceLayout(0, cfg.mfma_layout)
+        )
+        offs_o = (
+            self.cur_batch * cfg.stride_o_b
+            + cur_head_o[:, None] * cfg.stride_o_h
+            + self.split_kv_id * cfg.stride_o_s
+            + offs_d_ckv_o[None, :]
+        )
+        zeros = gl.zeros(
+            [cfg.BLOCK_H, cfg.HEAD_DIM_CKV],
+            dtype=gl.float32,
+            layout=cfg.mfma_layout,
+        ).to(self.Out.type.element_ty)
+        gl.amd.cdna4.buffer_store(
+            zeros,
+            ptr=self.Out,
+            offsets=offs_o,
+            mask=(cur_head_o < cfg.NHEAD)[:, None],
+        )
 
     @gluon.jit
     def store_lse(self, e_max, e_sum, Mid_lse, Final_lse):
@@ -1087,6 +1175,7 @@ def _mla_decode_gluon(
     REGIME: gl.constexpr,
     IS_FP8_Q: gl.constexpr,
     RETURN_LSE: gl.constexpr,
+    SELECTED_SLOTS: gl.constexpr,
 ):
     cfg = AttentionConfig(
         BLOCK_H,
@@ -1102,6 +1191,7 @@ def _mla_decode_gluon(
         REGIME,
         IS_FP8_Q,
         RETURN_LSE,
+        SELECTED_SLOTS,
         stride_q_nope_bs,
         stride_q_nope_h,
         stride_q_pe_bs,
@@ -1132,6 +1222,8 @@ def _mla_decode_gluon(
     )
 
     if program.split_kv_start >= program.split_kv_end:
+        if cfg.SELECTED_SLOTS:
+            program.store_empty_output()
         return
 
     dtype = Q_nope.type.element_ty
@@ -1236,7 +1328,7 @@ def _mla_decode_gluon(
         bufs_kv0,
         program.Kv_c_cache,
         offs_k_c0,
-        offs_n_nope0[None, :] < program.split_kv_end,
+        program.valid_kv_mask(kv_page_number_0, offs_n_nope0)[None, :],
     )
 
     # global load K_pe
@@ -1252,7 +1344,7 @@ def _mla_decode_gluon(
         bufs_kpe.index(0),
         program.K_pe_cache,
         offs_k_pe,
-        offs_n_pe0[None, :] < program.split_kv_end,
+        program.valid_kv_mask(kv_page_number_pe, offs_n_pe0)[None, :],
     )
 
     # local load page number for slice 1
@@ -1272,7 +1364,7 @@ def _mla_decode_gluon(
         bufs_kv1,
         program.Kv_c_cache,
         offs_k_c1,
-        offs_n_nope1[None, :] < program.split_kv_end,
+        program.valid_kv_mask(kv_page_number_1, offs_n_nope1)[None, :],
     )
 
     buf_idx = 0
@@ -1307,7 +1399,7 @@ def _mla_decode_gluon(
             bufs_kv0,
             program.Kv_c_cache,
             offs_k_c0,
-            offs_n_nope0[None, :] < program.split_kv_end,
+            program.valid_kv_mask(kv_page_number_0, offs_n_nope0)[None, :],
         )
 
         # local load page_number_pe + global load K_pe
@@ -1332,7 +1424,7 @@ def _mla_decode_gluon(
             bufs_kpe.index(async_idx),
             program.K_pe_cache,
             offs_k_pe,
-            offs_n_pe[None, :] < program.split_kv_end,
+            program.valid_kv_mask(kv_page_number_pe, offs_n_pe)[None, :],
         )
 
         # dot (part0)
@@ -1356,7 +1448,7 @@ def _mla_decode_gluon(
             bufs_kv1,
             program.Kv_c_cache,
             offs_k_c1,
-            offs_n1[None, :] < program.split_kv_end,
+            program.valid_kv_mask(kv_page_number_1, offs_n1)[None, :],
         )
 
         # softmax + dot (part1)
@@ -1400,7 +1492,7 @@ def _mla_decode_gluon(
             bufs_kv.index(async_idx),
             program.Kv_c_cache,
             offs_k_c,
-            offs_n_nope[None, :] < program.split_kv_end,
+            program.valid_kv_mask(kv_page_number, offs_n_nope)[None, :],
         )
         # global load K_pe
         offs_d_kpe_1 = gl.arange(
@@ -1415,7 +1507,7 @@ def _mla_decode_gluon(
             bufs_kpe.index(async_idx),
             program.K_pe_cache,
             offs_k_pe,
-            offs_n_pe[None, :] < program.split_kv_end,
+            program.valid_kv_mask(kv_page_number_pe, offs_n_pe)[None, :],
         )
 
         # dot, softmax, dot
@@ -1615,6 +1707,8 @@ def _gluon_mla_decode_gfx950(
     value_weight: torch.Tensor | None = None,
     gate: torch.Tensor | None = None,
     projected_out: torch.Tensor | None = None,
+    selected_slots: bool = False,
+    num_kv_splits_override: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch one fixed absorbed MLA decode regime."""
     if regime not in _MLA_DECODE_REGIMES:
@@ -1724,6 +1818,13 @@ def _gluon_mla_decode_gfx950(
         raise ValueError(f"cache_seqlens must be int32, got {cache_seqlens.dtype}")
     if page_table.dtype != torch.int32:
         raise ValueError(f"page_table must be int32, got {page_table.dtype}")
+    if selected_slots:
+        if regime != "bh16bn128" or page_size != 1:
+            raise ValueError(
+                "selected-slot MLA requires the bh16bn128 regime and page_size=1"
+            )
+        if return_lse or value_weight is not None:
+            raise ValueError("selected-slot MLA does not support LSE or projection")
 
     q_nope = q[:, 0, :, :kv_lora_rank]
     q_pe = q[:, 0, :, kv_lora_rank:]
@@ -1753,7 +1854,11 @@ def _gluon_mla_decode_gfx950(
     max_kv_bytes = kv_c.shape[0] * kv_c.stride(0) * kv_c.element_size()
     within_2gb = max_kv_bytes <= 0x80000000
 
-    if small_batch_h64:
+    if num_kv_splits_override is not None:
+        num_kv_splits = int(num_kv_splits_override)
+        if num_kv_splits < 1:
+            raise ValueError("num_kv_splits_override must be positive")
+    elif small_batch_h64:
         num_kv_splits = _select_num_kv_splits_small_batch(
             batch=batch_size,
             nhead=nhead,
@@ -1813,6 +1918,7 @@ def _gluon_mla_decode_gfx950(
         "REGIME": regime,
         "IS_FP8_Q": is_fp8_q,
         "RETURN_LSE": return_lse,
+        "SELECTED_SLOTS": selected_slots,
         "num_warps": 4,
     }
 
@@ -2110,6 +2216,92 @@ def gluon_mla_decode_fp8xfp8_gfx950(
         return_lse=return_lse,
         out=out,
     )
+
+
+def gluon_mla_selected_attention_fp8_gfx950(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    selected_lens: torch.Tensor,
+    *,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run H16/N128 MLA over per-query physical token selections.
+
+    Each selected physical token is represented as a one-token page, so this
+    adapter reuses the optimized MLA data path without gathering the KV cache.
+    """
+    if q.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
+        raise NotImplementedError("selected-slot MLA requires matching E4M3 q and KV")
+    if q.dim() != 3 or not 1 <= q.shape[1] <= 16:
+        raise ValueError(f"q must be [tokens, heads<=16, 576], got {tuple(q.shape)}")
+    qk_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
+    if q.shape[2] != qk_dim or kv_cache.dim() != 2 or kv_cache.shape[1] != qk_dim:
+        raise ValueError(
+            f"q and kv_cache must have head dimension {qk_dim}, got "
+            f"{tuple(q.shape)}/{tuple(kv_cache.shape)}"
+        )
+    if not q.is_contiguous() or not kv_cache.is_contiguous():
+        raise ValueError("selected-slot MLA requires contiguous q and kv_cache")
+    if (
+        selected_slots.dtype != torch.int32
+        or selected_slots.dim() != 2
+        or not selected_slots.is_contiguous()
+    ):
+        raise ValueError("selected_slots must be contiguous int32 [tokens, topk]")
+    if (
+        selected_lens.dtype != torch.int32
+        or selected_lens.shape != (q.shape[0],)
+        or not selected_lens.is_contiguous()
+    ):
+        raise ValueError("selected_lens must be contiguous int32 [tokens]")
+    if selected_slots.shape[0] != q.shape[0]:
+        raise ValueError("selected_slots and q must have the same token count")
+    if selected_slots.shape[1] < 2 * 128 or selected_slots.shape[1] % 128 != 0:
+        raise ValueError(
+            "selected-slot MLA requires a selection width divisible by 128 "
+            "and at least 256"
+        )
+    if kv_cache.shape[0] == 0:
+        raise ValueError("selected-slot MLA requires nonempty selection and KV widths")
+    if out is not None and (
+        out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or out.shape != (q.shape[0], q.shape[1], kv_lora_rank)
+    ):
+        raise ValueError("out must be contiguous BF16 [tokens, heads, kv_lora_rank]")
+    if out is not None:
+        out_storage = out.untyped_storage().data_ptr()
+        if any(
+            tensor.untyped_storage().data_ptr() == out_storage
+            for tensor in (q, kv_cache, selected_slots, selected_lens)
+        ):
+            raise ValueError(
+                "out must not share storage with selected-attention inputs"
+            )
+
+    result = _gluon_mla_decode_gfx950(
+        q=q.view(q.shape[0], 1, q.shape[1], q.shape[2]),
+        kv_cache=kv_cache.view(kv_cache.shape[0], 1, 1, kv_cache.shape[1]),
+        page_table=selected_slots,
+        cache_seqlens=selected_lens,
+        max_seqlen_k=selected_slots.shape[1],
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        regime="bh16bn128",
+        out=out,
+        selected_slots=True,
+        num_kv_splits_override=1,
+    )
+    if out is not None:
+        return out
+    return result.view(q.shape[0], q.shape[1], kv_lora_rank)
 
 
 def gluon_mla_decode_projected_value_gfx950(
