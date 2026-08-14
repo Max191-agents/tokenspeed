@@ -22,29 +22,119 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import select_kv_splits
 from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-    gluon_mla_selected_attention_fp8_gfx950,
+    gluon_mla_selected_attention_gfx950,
 )
 
 __all__ = [
     "gluon_dsa_decode_gfx950",
+    "gluon_dsa_prefill_dense_gfx950",
     "gluon_dsa_prefill_gfx950",
-    "gluon_dsa_prefill_h16n128_gfx950",
-    "gluon_dsa_prefill_legacy_gfx950",
+    "gluon_dsa_prefill_packed_gfx950",
 ]
 
 _REGISTERED_TOPK_WIDTHS = (512, 1024, 2048)
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _GFX950_COMPUTE_UNITS = 256
 _GLM52_SINGLE_ROW_DECODE_SPLITS = 16
-_DENSE_IMPL_AUTO = "auto"
-_DENSE_IMPL_H16N128 = "h16n128"
-_DENSE_IMPL_LEGACY = "legacy"
-_DENSE_IMPLS = frozenset({_DENSE_IMPL_AUTO, _DENSE_IMPL_H16N128, _DENSE_IMPL_LEGACY})
-_H16N128_PREFILL_MIN_TOKENS = 512
+
+
+@dataclass(frozen=True)
+class _DensePrefillSchedule:
+    name: str
+    q_dtype: torch.dtype
+    kv_lora_rank: int
+    block_h: int
+    block_n: int
+    waves_per_cta: tuple[int, int]
+    num_warps: int
+    qk_k_width: int
+    pv_k_width: int
+    pipeline_stages: int
+    kv_load_slices: int
+    num_kv_splits: int
+    layout_id: str
+
+    @property
+    def score_fragments_per_wave(self) -> int:
+        return (self.block_h // 16) * (self.block_n // 16) // self.num_warps
+
+    @property
+    def value_fragments_per_wave(self) -> int:
+        return (self.block_h // 16) * (self.kv_lora_rank // 16) // self.num_warps
+
+
+_DENSE_PREFILL_SCHEDULES = {
+    (torch.bfloat16, 128): _DensePrefillSchedule(
+        name="bf16_r128_h16n64",
+        q_dtype=torch.bfloat16,
+        kv_lora_rank=128,
+        block_h=16,
+        block_n=64,
+        waves_per_cta=(1, 4),
+        num_warps=4,
+        qk_k_width=8,
+        pv_k_width=8,
+        pipeline_stages=2,
+        kv_load_slices=2,
+        num_kv_splits=1,
+        layout_id="selected_bf16_r128_h16n64",
+    ),
+    (torch.bfloat16, 512): _DensePrefillSchedule(
+        name="bf16_r512_h16n64",
+        q_dtype=torch.bfloat16,
+        kv_lora_rank=512,
+        block_h=16,
+        block_n=64,
+        waves_per_cta=(1, 4),
+        num_warps=4,
+        qk_k_width=8,
+        pv_k_width=8,
+        pipeline_stages=2,
+        kv_load_slices=2,
+        num_kv_splits=1,
+        layout_id="selected_bf16_r512_h16n64",
+    ),
+    (torch.float8_e4m3fn, 512): _DensePrefillSchedule(
+        name="e4m3_r512_h16n128",
+        q_dtype=torch.float8_e4m3fn,
+        kv_lora_rank=512,
+        block_h=16,
+        block_n=128,
+        waves_per_cta=(1, 4),
+        num_warps=4,
+        qk_k_width=16,
+        pv_k_width=8,
+        pipeline_stages=2,
+        kv_load_slices=2,
+        num_kv_splits=1,
+        layout_id="selected_e4m3_r512_h16n128",
+    ),
+    (torch.float8_e5m2, 512): _DensePrefillSchedule(
+        name="e5m2_r512_h16n128",
+        q_dtype=torch.float8_e5m2,
+        kv_lora_rank=512,
+        block_h=16,
+        block_n=128,
+        waves_per_cta=(1, 4),
+        num_warps=4,
+        qk_k_width=16,
+        pv_k_width=8,
+        pipeline_stages=2,
+        kv_load_slices=2,
+        num_kv_splits=1,
+        layout_id="selected_e5m2_r512_h16n128",
+    ),
+}
+
+_DENSE_PREFILL_SCHEDULES_BY_NAME = {
+    schedule.name: schedule for schedule in _DENSE_PREFILL_SCHEDULES.values()
+}
 
 
 @gluon.constexpr_function
@@ -1090,7 +1180,39 @@ def _run_dense_kv(
     return out
 
 
-def _run_dense_kv_h16n128(
+def _select_dense_prefill_schedule(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    *,
+    kv_lora_rank: int,
+    selected_width: int,
+) -> _DensePrefillSchedule:
+    if q.dtype != kv_cache.dtype:
+        raise NotImplementedError(
+            "dense DSA prefill requires matching query and cache dtypes, got "
+            f"{q.dtype}/{kv_cache.dtype}"
+        )
+    schedule = _DENSE_PREFILL_SCHEDULES.get((q.dtype, int(kv_lora_rank)))
+    if schedule is None:
+        raise NotImplementedError(
+            "dense DSA prefill has no selected-attention schedule for "
+            f"dtype={q.dtype}, rank={kv_lora_rank}"
+        )
+    if selected_width not in _REGISTERED_TOPK_WIDTHS:
+        raise ValueError(
+            "dense DSA prefill requires a registered selected width, got "
+            f"{selected_width}"
+        )
+    if selected_width % schedule.block_n:
+        raise AssertionError(
+            f"schedule {schedule.name} does not tile selected width {selected_width}"
+        )
+    if q.shape[1] < 1:
+        raise ValueError("dense DSA prefill requires at least one attention head")
+    return schedule
+
+
+def _run_dense_prefill_schedule(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     topk_slots: torch.Tensor,
@@ -1100,9 +1222,15 @@ def _run_dense_kv_h16n128(
     qk_nope_head_dim: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    schedule: _DensePrefillSchedule,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return gluon_mla_selected_attention_fp8_gfx950(
+    if schedule is not _DENSE_PREFILL_SCHEDULES.get((q.dtype, int(kv_lora_rank))):
+        raise ValueError(
+            f"schedule {schedule.name!r} does not match dtype={q.dtype}, "
+            f"rank={kv_lora_rank}"
+        )
+    return gluon_mla_selected_attention_gfx950(
         q,
         kv_cache,
         topk_slots,
@@ -1111,25 +1239,17 @@ def _run_dense_kv_h16n128(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
+        layout_id=schedule.layout_id,
+        block_h=schedule.block_h,
+        block_n=schedule.block_n,
+        waves_per_cta=schedule.waves_per_cta,
+        num_warps=schedule.num_warps,
+        qk_k_width=schedule.qk_k_width,
+        pv_k_width=schedule.pv_k_width,
+        pipeline_stages=schedule.pipeline_stages,
+        kv_load_slices=schedule.kv_load_slices,
+        num_kv_splits=schedule.num_kv_splits,
         out=out,
-    )
-
-
-def _supports_h16n128_prefill(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    *,
-    qk_nope_head_dim: int,
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-) -> bool:
-    return (
-        q.dtype == torch.float8_e4m3fn
-        and kv_cache.dtype == torch.float8_e4m3fn
-        and q.shape[1] == 16
-        and int(qk_nope_head_dim) == 192
-        and int(kv_lora_rank) == 512
-        and int(qk_rope_head_dim) == 64
     )
 
 
@@ -1222,12 +1342,11 @@ def _run_dsa(
     k_scale: float,
     out: torch.Tensor | None,
     max_seqlen_k: int,
-    dense_impl: str = _DENSE_IMPL_AUTO,
+    prefill_layout: str | None = None,
+    dense_schedule: _DensePrefillSchedule | None = None,
 ) -> torch.Tensor:
-    if dense_impl not in _DENSE_IMPLS:
-        raise ValueError(
-            f"dense_impl must be one of {sorted(_DENSE_IMPLS)}, got {dense_impl!r}"
-        )
+    if prefill_layout not in (None, "auto", "dense", "packed"):
+        raise ValueError(f"unknown DSA prefill layout {prefill_layout!r}")
     _check_inputs(
         q,
         topk_slots,
@@ -1263,8 +1382,8 @@ def _run_dsa(
     # FP8 rows use a different physical layout, so they use the packed sparse
     # implementation instead of the dense tiled implementation.
     if sparse_kv_cache is not None:
-        if dense_impl == _DENSE_IMPL_H16N128:
-            raise NotImplementedError("H16/N128 DSA prefill requires dense KV cache")
+        if prefill_layout == "dense":
+            raise ValueError("dense DSA prefill does not accept a packed cache")
         result = _run_packed_kv(
             q,
             _flatten_packed_kv_cache(sparse_kv_cache).contiguous(),
@@ -1275,44 +1394,35 @@ def _run_dsa(
             qk_rope_head_dim=qk_rope_head_dim,
         )
     elif kv_cache is not None:
-        dense_kv_view = _flatten_dense_kv_cache(kv_cache)
-        supports_h16n128 = dense_kv_view.is_contiguous() and _supports_h16n128_prefill(
-            q,
-            dense_kv_view,
-            qk_nope_head_dim=qk_nope_head_dim,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-        )
-        if dense_impl == _DENSE_IMPL_H16N128 and not supports_h16n128:
-            raise NotImplementedError(
-                "H16/N128 DSA prefill requires contiguous E4M3 q/KV, H=16, "
-                "and dimensions 512+64 with qk_nope_head_dim=192"
+        if prefill_layout == "packed":
+            raise ValueError("packed DSA prefill requires a packed cache")
+        dense_kv = _flatten_dense_kv_cache(kv_cache).contiguous()
+        if prefill_layout is not None:
+            schedule = dense_schedule or _select_dense_prefill_schedule(
+                q,
+                dense_kv,
+                kv_lora_rank=kv_lora_rank,
+                selected_width=topk_slots.shape[1],
             )
-        dense_kv = dense_kv_view.contiguous()
-        use_tiled_kernel = (
-            q.dtype == dense_kv.dtype
-            and (q.dtype == torch.bfloat16 or q.dtype in _FP8_DTYPES)
-            and int(kv_lora_rank) == 512
-        )
-        if use_tiled_kernel:
-            use_h16n128 = dense_impl == _DENSE_IMPL_H16N128 or (
-                dense_impl == _DENSE_IMPL_AUTO
-                and supports_h16n128
-                and q.shape[0] >= _H16N128_PREFILL_MIN_TOKENS
+            result = _run_dense_prefill_schedule(
+                q,
+                dense_kv,
+                topk_slots,
+                topk_lens,
+                softmax_scale=softmax_scale,
+                qk_nope_head_dim=qk_nope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                schedule=schedule,
+                out=out_view,
             )
-            if use_h16n128:
-                result = _run_dense_kv_h16n128(
-                    q,
-                    dense_kv,
-                    topk_slots,
-                    topk_lens,
-                    softmax_scale=softmax_scale,
-                    qk_nope_head_dim=qk_nope_head_dim,
-                    kv_lora_rank=kv_lora_rank,
-                    qk_rope_head_dim=qk_rope_head_dim,
-                    out=out_view,
-                )
-            else:
+        else:
+            use_tiled_kernel = (
+                q.dtype == dense_kv.dtype
+                and (q.dtype == torch.bfloat16 or q.dtype in _FP8_DTYPES)
+                and int(kv_lora_rank) == 512
+            )
+            if use_tiled_kernel:
                 result = _run_dense_kv(
                     q,
                     dense_kv,
@@ -1324,19 +1434,17 @@ def _run_dsa(
                     max_seqlen_k=max_seqlen_k,
                     out=out_view,
                 )
-        else:
-            result = _run_dense_kv_scalar(
-                q,
-                dense_kv,
-                topk_slots,
-                topk_lens,
-                softmax_scale=softmax_scale,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-            )
+            else:
+                result = _run_dense_kv_scalar(
+                    q,
+                    dense_kv,
+                    topk_slots,
+                    topk_lens,
+                    softmax_scale=softmax_scale,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                )
     else:
-        if dense_impl == _DENSE_IMPL_H16N128:
-            raise NotImplementedError("H16/N128 DSA prefill requires dense KV cache")
         raise ValueError("Gluon DSA requires kv_cache or sparse_kv_cache")
     if out is None:
         return result
@@ -1380,11 +1488,10 @@ def gluon_dsa_decode_gfx950(
         k_scale=k_scale,
         out=out,
         max_seqlen_k=max_seqlen_k,
-        dense_impl=_DENSE_IMPL_LEGACY,
     )
 
 
-def gluon_dsa_prefill_gfx950(
+def _gluon_dsa_prefill_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor | None,
     sparse_kv_cache: torch.Tensor | None,
@@ -1401,7 +1508,9 @@ def gluon_dsa_prefill_gfx950(
     k_scale: float = 1.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
-    dense_impl: str = _DENSE_IMPL_AUTO,
+    *,
+    prefill_layout: str,
+    dense_schedule: _DensePrefillSchedule | None = None,
 ) -> torch.Tensor:
     del q_len_per_req
     if logit_cap != 0.0 or return_lse:
@@ -1420,17 +1529,37 @@ def gluon_dsa_prefill_gfx950(
         k_scale=k_scale,
         out=out,
         max_seqlen_k=max_seqlen_k,
-        dense_impl=dense_impl,
+        prefill_layout=prefill_layout,
+        dense_schedule=dense_schedule,
     )
 
 
-def gluon_dsa_prefill_h16n128_gfx950(*args, **kwargs) -> torch.Tensor:
-    """Force the H16/N128 selected-attention implementation."""
-    kwargs["dense_impl"] = _DENSE_IMPL_H16N128
-    return gluon_dsa_prefill_gfx950(*args, **kwargs)
+def gluon_dsa_prefill_dense_gfx950(*args, **kwargs) -> torch.Tensor:
+    """Run dense-cache prefill through the selected-attention schedule family."""
+    return _gluon_dsa_prefill_gfx950(*args, prefill_layout="dense", **kwargs)
 
 
-def gluon_dsa_prefill_legacy_gfx950(*args, **kwargs) -> torch.Tensor:
-    """Force the legacy H16/N32 selected-attention implementation."""
-    kwargs["dense_impl"] = _DENSE_IMPL_LEGACY
-    return gluon_dsa_prefill_gfx950(*args, **kwargs)
+def gluon_dsa_prefill_packed_gfx950(*args, **kwargs) -> torch.Tensor:
+    """Run packed-cache prefill through the packed selected-row implementation."""
+    return _gluon_dsa_prefill_gfx950(*args, prefill_layout="packed", **kwargs)
+
+
+def gluon_dsa_prefill_gfx950(*args, **kwargs) -> torch.Tensor:
+    """Compatibility entry point that derives layout from cache presence."""
+    return _gluon_dsa_prefill_gfx950(*args, prefill_layout="auto", **kwargs)
+
+
+def _gluon_dsa_prefill_schedule_gfx950(
+    *args, schedule_name: str, **kwargs
+) -> torch.Tensor:
+    """Private benchmark hook for one validated dense prefill schedule."""
+    try:
+        schedule = _DENSE_PREFILL_SCHEDULES_BY_NAME[schedule_name]
+    except KeyError as exc:
+        raise ValueError(f"unknown dense prefill schedule {schedule_name!r}") from exc
+    return _gluon_dsa_prefill_gfx950(
+        *args,
+        prefill_layout="dense",
+        dense_schedule=schedule,
+        **kwargs,
+    )

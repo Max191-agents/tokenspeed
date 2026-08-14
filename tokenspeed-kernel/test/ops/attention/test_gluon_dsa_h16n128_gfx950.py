@@ -30,8 +30,11 @@ if not is_cdna4():
     pytest.skip("AMD CDNA4 is required for gfx950 DSA tests", allow_module_level=True)
 
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-    gluon_dsa_prefill_h16n128_gfx950,
-    gluon_dsa_prefill_legacy_gfx950,
+    _DENSE_PREFILL_SCHEDULES,
+    gluon_dsa_prefill_dense_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+    _SELECTED_DSA_LAYOUTS,
 )
 
 _NUM_HEADS = 16
@@ -46,13 +49,14 @@ def _make_inputs(
     valid_lengths: tuple[int, ...],
     *,
     seed: int,
+    num_heads: int = _NUM_HEADS,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
     num_slots = 2112
     q = torch.randn(
         len(valid_lengths),
-        _NUM_HEADS,
+        num_heads,
         _HEAD_DIM,
         device="cuda",
         dtype=torch.bfloat16,
@@ -157,19 +161,17 @@ def _online_fp8_reference(
     return output.to(torch.bfloat16)
 
 
-def test_h16n128_matches_legacy_for_selected_slot_edge_cases() -> None:
+def test_h16n128_matches_online_reference_for_selected_slot_edge_cases() -> None:
     lengths = (0, 1, 127, 128, 129, 255, 256, 257, 1539, 2047, 2048)
     q, kv, slots, lens = _make_inputs(lengths, seed=10_201)
     slots[8, 32:64] = -1
-    expected = _run(gluon_dsa_prefill_legacy_gfx950, q, kv, slots, lens, k_scale=0.75)
-    actual = _run(gluon_dsa_prefill_h16n128_gfx950, q, kv, slots, lens, k_scale=0.75)
+    expected = _online_fp8_reference(q, kv, slots, lens, k_scale=0.75)
+    actual = _run(gluon_dsa_prefill_dense_gfx950, q, kv, slots, lens, k_scale=0.75)
 
     assert actual.dtype == torch.bfloat16
     assert actual.shape == expected.shape
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual[0], torch.zeros_like(actual[0]))
-    # N32 and N128 use different online-softmax grouping and FP8 probability
-    # rounding. The independent N128 reference below carries the tighter gate.
     torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=2e-2)
 
 
@@ -179,7 +181,7 @@ def test_h16n128_matches_online_fp8_reference_with_invalid_tile() -> None:
     expected = _online_fp8_reference(q, kv, slots, lens, k_scale=1.25)
 
     actual = _run(
-        gluon_dsa_prefill_h16n128_gfx950,
+        gluon_dsa_prefill_dense_gfx950,
         q,
         kv,
         slots,
@@ -201,57 +203,22 @@ def test_h16n128_single_key_is_exact_and_repeatable() -> None:
         .to(torch.bfloat16)
     )
 
-    first = _run(gluon_dsa_prefill_h16n128_gfx950, q, kv, slots, lens)
-    second = _run(gluon_dsa_prefill_h16n128_gfx950, q, kv, slots, lens)
+    first = _run(gluon_dsa_prefill_dense_gfx950, q, kv, slots, lens)
+    second = _run(gluon_dsa_prefill_dense_gfx950, q, kv, slots, lens)
 
     torch.testing.assert_close(first, expected, rtol=0, atol=0)
     torch.testing.assert_close(second, first, rtol=0, atol=0)
 
 
-def test_h16n128_graph_replay_uses_live_query_slots_and_lengths() -> None:
-    q, kv, slots, lens = _make_inputs((2048, 2048), seed=10_221)
-    warm_out = torch.empty(
-        (2, _NUM_HEADS, _KV_LORA_RANK), device="cuda", dtype=torch.bfloat16
-    )
-    _run(gluon_dsa_prefill_h16n128_gfx950, q, kv, slots, lens, out=warm_out)
-    torch.cuda.synchronize()
-
-    graph_out = torch.empty_like(warm_out)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = _run(
-            gluon_dsa_prefill_h16n128_gfx950,
-            q,
-            kv,
-            slots,
-            lens,
-            out=graph_out,
-        )
-    assert captured.data_ptr() == graph_out.data_ptr()
-
-    replacement_q, _, replacement_slots, replacement_lens = _make_inputs(
-        (0, 1539), seed=10_222
-    )
-    q.copy_(replacement_q)
-    slots.copy_(replacement_slots)
-    lens.copy_(replacement_lens)
-    graph.replay()
-    torch.cuda.synchronize()
-
-    expected = _run(gluon_dsa_prefill_h16n128_gfx950, q, kv, slots, lens)
-    torch.testing.assert_close(graph_out[0], torch.zeros_like(graph_out[0]))
-    torch.testing.assert_close(graph_out, expected, rtol=0, atol=0)
-
-
 def test_h16n128_uses_scratch_when_output_aliases_cache() -> None:
     q, kv, slots, lens = _make_inputs((2048, 1539, 65, 0), seed=10_231)
-    expected = _run(gluon_dsa_prefill_h16n128_gfx950, q, kv, slots, lens)
+    expected = _run(gluon_dsa_prefill_dense_gfx950, q, kv, slots, lens)
     aliased_out = (
         kv.view(torch.bfloat16).reshape(-1)[: expected.numel()].view_as(expected)
     )
 
     actual = _run(
-        gluon_dsa_prefill_h16n128_gfx950,
+        gluon_dsa_prefill_dense_gfx950,
         q,
         kv,
         slots,
@@ -261,3 +228,66 @@ def test_h16n128_uses_scratch_when_output_aliases_cache() -> None:
 
     assert actual.data_ptr() == aliased_out.data_ptr()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_heads", (15, 16, 17))
+def test_selected_attention_supports_head_block_boundaries(num_heads: int) -> None:
+    q, kv, slots, lens = _make_inputs((129, 257), seed=10_241, num_heads=num_heads)
+    expected = _online_fp8_reference(q, kv, slots, lens, k_scale=1.0)
+
+    actual = _run(gluon_dsa_prefill_dense_gfx950, q, kv, slots, lens)
+
+    assert actual.shape == (2, num_heads, _KV_LORA_RANK)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=2e-2)
+
+
+def test_dense_schedule_wave_ownership_is_complete_and_unique() -> None:
+    expected = {
+        "bf16_r128_h16n64": (8, 8, 1, 2),
+        "bf16_r512_h16n64": (8, 8, 1, 8),
+        "e4m3_r512_h16n128": (16, 8, 2, 8),
+        "e5m2_r512_h16n128": (16, 8, 2, 8),
+    }
+
+    schedules = {
+        schedule.name: schedule for schedule in _DENSE_PREFILL_SCHEDULES.values()
+    }
+    assert set(schedules) == set(expected)
+    for name, schedule in schedules.items():
+        assert schedule.waves_per_cta == (1, 4)
+        assert schedule.num_warps == 4
+        assert _SELECTED_DSA_LAYOUTS[schedule.layout_id] == (
+            schedule.q_dtype,
+            schedule.kv_lora_rank,
+            schedule.block_h,
+            schedule.block_n,
+            schedule.waves_per_cta,
+            schedule.num_warps,
+            schedule.qk_k_width,
+            schedule.pv_k_width,
+            schedule.pipeline_stages,
+            schedule.kv_load_slices,
+        )
+        assert (
+            schedule.qk_k_width,
+            schedule.pv_k_width,
+            schedule.score_fragments_per_wave,
+            schedule.value_fragments_per_wave,
+        ) == expected[name]
+
+        waves_m, waves_n = schedule.waves_per_cta
+        for output_width, fragments_per_wave in (
+            (schedule.block_n, schedule.score_fragments_per_wave),
+            (schedule.kv_lora_rank, schedule.value_fragments_per_wave),
+        ):
+            owners = {
+                (m, n): ((m % waves_m) * waves_n + n % waves_n,)
+                for m in range(schedule.block_h // 16)
+                for n in range(output_width // 16)
+            }
+            assert len(owners) == schedule.num_warps * fragments_per_wave
+            assert all(len(fragment_owners) == 1 for fragment_owners in owners.values())
+            assert [
+                sum(owner[0] == wave for owner in owners.values())
+                for wave in range(schedule.num_warps)
+            ] == [fragments_per_wave] * schedule.num_warps

@@ -39,18 +39,29 @@ from tokenspeed_kernel.signature import (
 if current_platform().is_amd:
     _DSA_FULL_TOPK_WIDTHS = frozenset({512, 1024, 2048})
     _DSA_PREFILL_TOPK_WIDTHS = _DSA_FULL_TOPK_WIDTHS
+    _DSA_PREFILL_DENSE_PROFILES = frozenset(
+        {
+            (torch.bfloat16, 128),
+            (torch.bfloat16, 512),
+            (torch.float8_e4m3fn, 512),
+            (torch.float8_e5m2, 512),
+        }
+    )
+    _DSA_PREFILL_PACKED_PROFILES = frozenset(
+        {
+            (torch.bfloat16, 128),
+            (torch.bfloat16, 512),
+        }
+    )
 
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         gluon_dsa_decode_gfx950 as _dsa_decode_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_prefill_gfx950 as _dsa_prefill_impl,
+        gluon_dsa_prefill_dense_gfx950 as _dsa_prefill_dense_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_prefill_h16n128_gfx950 as _dsa_prefill_h16n128_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_prefill_legacy_gfx950 as _dsa_prefill_legacy_impl,
+        gluon_dsa_prefill_packed_gfx950 as _dsa_prefill_packed_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
         gluon_dsa_decode_topk_fp8_gfx950 as _dsa_decode_topk_impl,
@@ -1068,7 +1079,45 @@ if current_platform().is_amd:
     @register_kernel(
         "attention",
         "dsa_prefill",
-        name="gluon_dsa_prefill_gfx950",
+        name="gluon_dsa_prefill_dense_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(q=dense_tensor_format(torch.bfloat16)),
+                format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
+                format_signature(q=dense_tensor_format(torch.float8_e5m2)),
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "page_size": frozenset({64}),
+            "q_len_per_req": frozenset({1}),
+            "qk_nope_head_dim": frozenset({128, 192}),
+            "kv_lora_rank": frozenset({128, 512}),
+            "dsa_prefill_profile": _DSA_PREFILL_DENSE_PROFILES,
+            "qk_rope_head_dim": frozenset({64}),
+            "topk": _DSA_PREFILL_TOPK_WIDTHS,
+            "kv_cache_available": frozenset({True}),
+            "sparse_kv_cache_available": frozenset({False}),
+            "kv_cache_layout": frozenset({"dense"}),
+            "topk_layout": frozenset({"global_slots"}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+        },
+        tags={"amd", "gfx950", "dense"},
+    )
+    def gluon_dsa_prefill_dense_gfx950(*args, **kwargs):
+        return _dsa_prefill_dense_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsa_prefill",
+        name="gluon_dsa_prefill_packed_gfx950",
         solution="gluon",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 5),
@@ -1086,115 +1135,20 @@ if current_platform().is_amd:
             "q_len_per_req": frozenset({1}),
             "qk_nope_head_dim": frozenset({128, 192}),
             "kv_lora_rank": frozenset({128, 512}),
+            "dsa_prefill_profile": _DSA_PREFILL_PACKED_PROFILES,
             "qk_rope_head_dim": frozenset({64}),
             "topk": _DSA_PREFILL_TOPK_WIDTHS,
             "kv_cache_available": frozenset({False, True}),
-            "sparse_kv_cache_available": frozenset({False, True}),
+            "sparse_kv_cache_available": frozenset({True}),
+            "kv_cache_layout": frozenset({"packed"}),
             "topk_layout": frozenset({"global_slots"}),
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
         },
+        tags={"amd", "gfx950", "packed"},
     )
-    def gluon_dsa_prefill_gfx950(*args, **kwargs):
-        return _dsa_prefill_impl(*args, **kwargs)
-
-    @register_kernel(
-        "attention",
-        "dsa_prefill",
-        name="gluon_dsa_prefill_fp8_dense_gfx950",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset(
-            {
-                format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
-                format_signature(q=dense_tensor_format(torch.float8_e5m2)),
-            }
-        ),
-        priority=Priority.SPECIALIZED,
-        traits={
-            "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1}),
-            "qk_nope_head_dim": frozenset({128, 192}),
-            "kv_lora_rank": frozenset({512}),
-            "qk_rope_head_dim": frozenset({64}),
-            "topk": _DSA_PREFILL_TOPK_WIDTHS,
-            "kv_cache_available": frozenset({True}),
-            "sparse_kv_cache_available": frozenset({False}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_logit_cap": frozenset({False}),
-            "return_lse": frozenset({False}),
-        },
-    )
-    def gluon_dsa_prefill_fp8_dense_gfx950(*args, **kwargs):
-        return _dsa_prefill_impl(*args, **kwargs)
-
-    @register_kernel(
-        "attention",
-        "dsa_prefill",
-        name="gluon_dsa_prefill_fp8_dense_h16n128_gfx950",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset(
-            {format_signature(q=dense_tensor_format(torch.float8_e4m3fn))}
-        ),
-        priority=Priority.REFERENCE,
-        traits={
-            "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1}),
-            "qk_nope_head_dim": frozenset({192}),
-            "kv_lora_rank": frozenset({512}),
-            "qk_rope_head_dim": frozenset({64}),
-            "topk": _DSA_PREFILL_TOPK_WIDTHS,
-            "kv_cache_available": frozenset({True}),
-            "sparse_kv_cache_available": frozenset({False}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_logit_cap": frozenset({False}),
-            "return_lse": frozenset({False}),
-        },
-        tags={"amd", "gfx950", "diagnostic", "h16n128"},
-    )
-    def gluon_dsa_prefill_fp8_dense_h16n128_gfx950(*args, **kwargs):
-        return _dsa_prefill_h16n128_impl(*args, **kwargs)
-
-    @register_kernel(
-        "attention",
-        "dsa_prefill",
-        name="gluon_dsa_prefill_fp8_dense_legacy_gfx950",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
-        ),
-        signatures=frozenset(
-            {format_signature(q=dense_tensor_format(torch.float8_e4m3fn))}
-        ),
-        priority=Priority.REFERENCE,
-        traits={
-            "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1}),
-            "qk_nope_head_dim": frozenset({192}),
-            "kv_lora_rank": frozenset({512}),
-            "qk_rope_head_dim": frozenset({64}),
-            "topk": _DSA_PREFILL_TOPK_WIDTHS,
-            "kv_cache_available": frozenset({True}),
-            "sparse_kv_cache_available": frozenset({False}),
-            "topk_layout": frozenset({"global_slots"}),
-            "support_logit_cap": frozenset({False}),
-            "return_lse": frozenset({False}),
-        },
-        tags={"amd", "gfx950", "diagnostic", "legacy"},
-    )
-    def gluon_dsa_prefill_fp8_dense_legacy_gfx950(*args, **kwargs):
-        return _dsa_prefill_legacy_impl(*args, **kwargs)
+    def gluon_dsa_prefill_packed_gfx950(*args, **kwargs):
+        return _dsa_prefill_packed_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

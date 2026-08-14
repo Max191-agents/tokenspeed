@@ -1038,6 +1038,78 @@ def _dsa_reference(
     return torch.stack(refs, dim=0).to(torch.bfloat16)
 
 
+@pytest.mark.skipif(
+    not is_cdna4(), reason="packed prefill profiles are specific to gfx950"
+)
+@pytest.mark.parametrize(
+    ("kv_lora_rank", "topk"),
+    (
+        pytest.param(128, 512, id="bf16-r128-w512"),
+        pytest.param(128, 1024, id="bf16-r128-w1024"),
+        pytest.param(128, 2048, id="bf16-r128-w2048"),
+        pytest.param(512, 512, id="bf16-r512-w512"),
+        pytest.param(512, 1024, id="bf16-r512-w1024"),
+        pytest.param(512, 2048, id="bf16-r512-w2048"),
+    ),
+)
+def test_dsa_prefill_registered_packed_cache_profiles(
+    kv_lora_rank: int,
+    topk: int,
+) -> None:
+    device = "cuda"
+    tokens = 2
+    num_heads = 2
+    num_slots = topk + 17
+    valid_len = topk // 4 + 3
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 192 if kv_lora_rank == 512 else 128
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    generator = _generator(device, 13_100 + topk + kv_lora_rank)
+    q = _randn_bf16(
+        (tokens, num_heads, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=generator,
+    )
+    latent = _randn_bf16((num_slots, kv_lora_rank), device=device, generator=generator)
+    rope = _randn_bf16(
+        (num_slots, qk_rope_head_dim), device=device, generator=generator
+    )
+    packed_kv, dequant_latent = _pack_sparse_kv(latent, rope)
+    topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
+    topk_lens = torch.tensor((0, valid_len), device=device, dtype=torch.int32)
+    selected = torch.randperm(
+        num_slots, device=device, dtype=torch.int32, generator=generator
+    )[:valid_len]
+    selected[1] = selected[0]
+    topk_slots[1, :valid_len] = selected
+
+    out = gluon_dsa_prefill(
+        q=q,
+        kv_cache=None,
+        sparse_kv_cache=packed_kv,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=num_slots,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=64,
+    )
+
+    ref = _dsa_reference(
+        q,
+        dequant_latent,
+        rope,
+        topk_slots,
+        topk_lens,
+        softmax_scale,
+    )
+    assert out.shape == (tokens, num_heads, kv_lora_rank)
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
 def _dsa_visible_ranges(case: _DSACase, device: str) -> tuple[list[range], int]:
     if case.mode == "decode":
         assert case.visible_lens is not None
@@ -1222,7 +1294,93 @@ def test_dsa_dense_kvcache(
         count = int(topk_lens[token].item())
         topk_slots[token, :count] = torch.randperm(num_slots, device=device)[:count]
 
-    out = api(
+    kwargs = {
+        "q": q,
+        "kv_cache": kv_cache,
+        "sparse_kv_cache": None,
+        "topk_slots": topk_slots,
+        "topk_lens": topk_lens,
+        "max_seqlen_k": num_slots,
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "softmax_scale": softmax_scale,
+        "page_size": 64,
+    }
+    if (
+        is_cdna4()
+        and mode == "prefill"
+        and q_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        and kv_lora_rank == 128
+    ):
+        with pytest.raises(NotImplementedError, match="no selected-attention schedule"):
+            api(**kwargs)
+        return
+
+    out = api(**kwargs)
+
+    ref = _dsa_reference(
+        q,
+        dequant_latent,
+        dequant_rope,
+        topk_slots,
+        topk_lens,
+        softmax_scale,
+    )
+    assert out.shape == (tokens, num_heads, kv_lora_rank)
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="dense schedules are specific to gfx950")
+@pytest.mark.parametrize("topk", (512, 1024, 2048))
+@pytest.mark.parametrize(
+    ("q_dtype", "kv_lora_rank"),
+    (
+        pytest.param(torch.bfloat16, 128, id="bf16-r128"),
+        pytest.param(torch.bfloat16, 512, id="bf16-r512"),
+        pytest.param(torch.float8_e4m3fn, 512, id="e4m3-r512"),
+        pytest.param(torch.float8_e5m2, 512, id="e5m2-r512"),
+    ),
+)
+def test_dsa_prefill_registered_dense_schedules(
+    q_dtype: torch.dtype,
+    kv_lora_rank: int,
+    topk: int,
+) -> None:
+    device = "cuda"
+    tokens = 2
+    num_heads = 17
+    num_slots = topk + 17
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 192 if kv_lora_rank == 512 else 128
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(12_800 + topk + kv_lora_rank)
+    q = torch.randn(
+        tokens,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).to(q_dtype)
+    kv_cache = torch.randn(
+        num_slots,
+        kv_lora_rank + qk_rope_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).to(q_dtype)
+    topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
+    topk_lens = torch.tensor((0, topk - 1), device=device, dtype=torch.int32)
+    selected = torch.randperm(
+        num_slots, device=device, dtype=torch.int32, generator=generator
+    )[: topk - 1]
+    selected[1] = selected[0]
+    topk_slots[1, : topk - 1] = selected
+
+    out = gluon_dsa_prefill(
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1238,8 +1396,8 @@ def test_dsa_dense_kvcache(
 
     ref = _dsa_reference(
         q,
-        dequant_latent,
-        dequant_rope,
+        kv_cache[:, :kv_lora_rank].float().to(torch.bfloat16),
+        kv_cache[:, kv_lora_rank:].float().to(torch.bfloat16),
         topk_slots,
         topk_lens,
         softmax_scale,

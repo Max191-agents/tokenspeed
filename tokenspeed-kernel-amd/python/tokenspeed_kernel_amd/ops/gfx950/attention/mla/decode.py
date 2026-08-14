@@ -68,6 +68,13 @@ class AttentionConfig:
     NUM_XCDS: gl.constexpr
     NHEAD: gl.constexpr
     REGIME: gl.constexpr
+    LAYOUT_ID: gl.constexpr
+    WAVES_M: gl.constexpr
+    WAVES_N: gl.constexpr
+    QK_K_WIDTH: gl.constexpr
+    PV_K_WIDTH: gl.constexpr
+    PIPELINE_STAGES: gl.constexpr
+    KV_LOAD_SLICES: gl.constexpr
     IS_FP8_Q: gl.constexpr
     RETURN_LSE: gl.constexpr
     SELECTED_SLOTS: gl.constexpr
@@ -102,6 +109,7 @@ class AttentionConfig:
     blocked_page: gl.constexpr
     blocked_kv_slice: gl.constexpr
     linear_v: gl.constexpr
+    DIRECT_V_LOAD: gl.constexpr
     shared_page: gl.constexpr
     blocked_lse: gl.constexpr
 
@@ -119,6 +127,13 @@ class AttentionConfig:
         NUM_XCDS,
         NHEAD,
         REGIME,
+        LAYOUT_ID,
+        WAVES_M,
+        WAVES_N,
+        QK_K_WIDTH,
+        PV_K_WIDTH,
+        PIPELINE_STAGES,
+        KV_LOAD_SLICES,
         IS_FP8_Q,
         RETURN_LSE,
         SELECTED_SLOTS,
@@ -138,9 +153,48 @@ class AttentionConfig:
         stride_final_lse_b,
         stride_final_lse_h,
     ):
-        # Q-side layouts + mfma_layout: switch by BLOCK_H.
+        assert WAVES_M * WAVES_N == 4, "MLA attention uses 4 waves"
+        assert PIPELINE_STAGES == 2, "MLA attention uses 2 stages"
+        assert KV_LOAD_SLICES == 2, "MLA attention uses 2 KV slices"
+        assert (
+            BLOCK_N % KV_LOAD_SLICES == 0
+        ), "MLA key tile must divide evenly across its load slices"
+        # Q-side layouts + mfma_layout: switch by the validated static schedule.
         # bh64 has BLOCK_H=64 (warps tile M); bh16bn64 has BLOCK_H=16 (warps tile K).
-        if BLOCK_H == 64:
+        if LAYOUT_ID == "selected_bf16_r128_h16n64":
+            assert BLOCK_H == 16, "rank-128 selected attention uses H16"
+            assert (
+                HEAD_DIM_CKV == 128
+            ), "rank-128 selected attention requires a 128-wide latent cache"
+            assert BLOCK_N == 64, "rank-128 selected attention uses N64"
+            blocked_q_nope = gl.BlockedLayout(
+                size_per_thread=[1, 8],
+                threads_per_warp=[4, 16],
+                warps_per_cta=[4, 1],
+                order=[1, 0],
+            )
+            shared_q_nope = gl.PaddedSharedLayout.with_identity_for(
+                [[512, 16]],
+                [16, 128],
+                [1, 0],
+            )
+            blocked_q_pe = gl.DistributedLinearLayout(
+                reg_bases=((0, 1), (0, 2), (0, 4)),
+                lane_bases=((0, 8), (0, 16), (0, 32), (1, 0), (2, 0), (4, 0)),
+                warp_bases=((8, 0), (0, 0)),
+                block_bases=[],
+                shape=[16, 64],
+            )
+            shared_q_pe = gl.SwizzledSharedLayout(
+                vec=8, per_phase=2, max_phase=8, order=[1, 0]
+            )
+            mfma_layout = gl.amd.AMDMFMALayout(
+                version=4,
+                instr_shape=[16, 16, 32],
+                transposed=True,
+                warps_per_cta=[WAVES_M, WAVES_N],
+            )
+        elif BLOCK_H == 64:
             # bh64: Q is [64, 512] / [64, 64]; warps tile M.
             blocked_q_nope = gl.BlockedLayout(
                 size_per_thread=[1, 8],
@@ -200,7 +254,7 @@ class AttentionConfig:
                 version=4,
                 instr_shape=[16, 16, 32],
                 transposed=True,
-                warps_per_cta=[4, 1],
+                warps_per_cta=[WAVES_M, WAVES_N],
             )
         elif IS_FP8_Q:
             # Stage FP8 Q as [K, H] so K is the contiguous 16-byte DMA
@@ -277,7 +331,7 @@ class AttentionConfig:
                 version=4,
                 instr_shape=[16, 16, 32],
                 transposed=True,
-                warps_per_cta=[1, 4],
+                warps_per_cta=[WAVES_M, WAVES_N],
             )
         else:
             # bh16bn64: Q is [16, 512] / [16, 64]; warps tile K.
@@ -321,12 +375,63 @@ class AttentionConfig:
                 version=4,
                 instr_shape=[16, 16, 32],
                 transposed=True,
-                warps_per_cta=[1, 4],
+                warps_per_cta=[WAVES_M, WAVES_N],
             )
 
         # FP8 KV uses a 128-token tile; BF16 KV uses 64. These layouts are
         # adapted from AITER's bh16bn128/bh16bn64 implementation.
-        if BLOCK_N == 128:
+        if LAYOUT_ID == "selected_bf16_r128_h16n64":
+            blocked_kv = gl.BlockedLayout(
+                size_per_thread=[8, 1],
+                threads_per_warp=[16, 4],
+                warps_per_cta=[1, 4],
+                order=[0, 1],
+            )
+            shared_kv = gl.PaddedSharedLayout.with_identity_for(
+                [[512, 16]],
+                [128, 64],
+                [0, 1],
+            )
+            blocked_kpe = gl.DistributedLinearLayout(
+                reg_bases=((1, 0), (2, 0), (4, 0), (0, 32)),
+                lane_bases=((8, 0), (16, 0), (32, 0), (0, 4), (0, 8), (0, 16)),
+                warp_bases=((0, 1), (0, 2)),
+                block_bases=[],
+                shape=[64, 64],
+            )
+            shared_kpe = gl.PaddedSharedLayout(
+                interval_padding_pairs=[[512, 16]],
+                offset_bases=[
+                    [1, 0],
+                    [2, 0],
+                    [4, 0],
+                    [8, 0],
+                    [16, 0],
+                    [32, 0],
+                    [0, 4],
+                    [0, 8],
+                    [0, 16],
+                    [0, 1],
+                    [0, 2],
+                    [0, 32],
+                ],
+                cga_layout=[],
+                shape=[64, 64],
+            )
+            blocked_page = gl.DistributedLinearLayout(
+                reg_bases=((0,),),
+                lane_bases=((1,), (2,), (4,), (8,), (16,), (32,)),
+                warp_bases=((0,), (0,)),
+                block_bases=[],
+                shape=[64],
+            )
+            blocked_kv_slice = gl.BlockedLayout(
+                size_per_thread=[8, 1],
+                threads_per_warp=[16, 4],
+                warps_per_cta=[1, 4],
+                order=[0, 1],
+            )
+        elif BLOCK_N == 128:
             blocked_kv = gl.DistributedLinearLayout(
                 reg_bases=(
                     (1, 0),
@@ -525,7 +630,12 @@ class AttentionConfig:
         # V is the latent slice of K, read back transposed for the PV dot.
         # bh64 tiles M across warps (degenerate warp_bases + extra reg bases);
         # bh16bn64 tiles the 64-wide K across warps.
-        if BLOCK_H == 64:
+        direct_v_load = LAYOUT_ID == "selected_bf16_r128_h16n64"
+        if direct_v_load:
+            # The rank-128 tile is already distributed like operand B after
+            # transposition, so it does not need the rank-512 redistribution.
+            linear_v = blocked_kv
+        elif BLOCK_H == 64:
             linear_v = gl.DistributedLinearLayout(
                 reg_bases=(
                     (0, 1),
@@ -577,19 +687,17 @@ class AttentionConfig:
                 shape=[512, 64],
             )
 
-        qk_k_width = 16 if IS_FP8_Q else 8
-        pv_k_width = 8
         q_layout = gl.DotOperandLayout(
-            operand_index=0, parent=mfma_layout, k_width=qk_k_width
+            operand_index=0, parent=mfma_layout, k_width=QK_K_WIDTH
         )
         k_layout = gl.DotOperandLayout(
-            operand_index=1, parent=mfma_layout, k_width=qk_k_width
+            operand_index=1, parent=mfma_layout, k_width=QK_K_WIDTH
         )
         p_layout = gl.DotOperandLayout(
-            operand_index=0, parent=mfma_layout, k_width=pv_k_width
+            operand_index=0, parent=mfma_layout, k_width=PV_K_WIDTH
         )
         v_layout = gl.DotOperandLayout(
-            operand_index=1, parent=mfma_layout, k_width=pv_k_width
+            operand_index=1, parent=mfma_layout, k_width=PV_K_WIDTH
         )
         # Page-number scratch + lse store layouts (regime-independent).
         shared_page = gl.SwizzledSharedLayout(
@@ -611,6 +719,13 @@ class AttentionConfig:
         self.NUM_XCDS = gl.constexpr(NUM_XCDS)
         self.NHEAD = gl.constexpr(NHEAD)
         self.REGIME = gl.constexpr(REGIME)
+        self.LAYOUT_ID = gl.constexpr(LAYOUT_ID)
+        self.WAVES_M = gl.constexpr(WAVES_M)
+        self.WAVES_N = gl.constexpr(WAVES_N)
+        self.QK_K_WIDTH = gl.constexpr(QK_K_WIDTH)
+        self.PV_K_WIDTH = gl.constexpr(PV_K_WIDTH)
+        self.PIPELINE_STAGES = gl.constexpr(PIPELINE_STAGES)
+        self.KV_LOAD_SLICES = gl.constexpr(KV_LOAD_SLICES)
         self.IS_FP8_Q = gl.constexpr(IS_FP8_Q)
         self.RETURN_LSE = gl.constexpr(RETURN_LSE)
         self.SELECTED_SLOTS = gl.constexpr(SELECTED_SLOTS)
@@ -645,6 +760,7 @@ class AttentionConfig:
         self.blocked_page = gl.constexpr(blocked_page)
         self.blocked_kv_slice = gl.constexpr(blocked_kv_slice)
         self.linear_v = gl.constexpr(linear_v)
+        self.DIRECT_V_LOAD = gl.constexpr(direct_v_load)
         self.shared_page = gl.constexpr(shared_page)
         self.blocked_lse = gl.constexpr(blocked_lse)
 
@@ -723,7 +839,11 @@ class AttentionProgram:
         sm_scale,
         kv_scale,
     ):
-        if cfg.REGIME == "bh64":
+        if cfg.SELECTED_SLOTS:
+            cur_batch = gl.program_id(0)
+            cur_head_id = gl.program_id(1)
+            split_kv_id = gl.program_id(2)
+        elif cfg.REGIME == "bh64":
             cur_batch = (
                 gl.program_id(0)
                 + (gl.program_id(2) // cfg.NUM_KV_SPLITS) * cfg.NUM_XCDS
@@ -812,7 +932,11 @@ class AttentionProgram:
                 + cur_head[:, None] * cfg.stride_q_nope_h
                 + offs_d_ckv[None, :]
             )
-            mask = (cur_head < cfg.NHEAD)[:, None] if cfg.NHEAD < cfg.BLOCK_H else None
+            mask = (
+                (cur_head < cfg.NHEAD)[:, None]
+                if cfg.SELECTED_SLOTS or cfg.NHEAD < cfg.BLOCK_H
+                else None
+            )
         # For nhead < BLOCK_H, mask OOB heads to zero on Q load and skip OOB O
         # stores; wasted MFMA lanes are free (memory-bound).
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -852,7 +976,9 @@ class AttentionProgram:
                 + offs_d_kpe[None, :]
             )
             mask = (
-                (cur_head_qpe < cfg.NHEAD)[:, None] if cfg.NHEAD < cfg.BLOCK_H else None
+                (cur_head_qpe < cfg.NHEAD)[:, None]
+                if cfg.SELECTED_SLOTS or cfg.NHEAD < cfg.BLOCK_H
+                else None
             )
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             buf,
@@ -1010,13 +1136,16 @@ class AttentionProgram:
     def compute_pv(self, p, acc, kv_buf, RELAXED: gl.constexpr):
         cfg = self.cfg
         dtype = self.Q_nope.type.element_ty
-        if RELAXED:
-            v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_buf, cfg.linear_v)
+        if cfg.DIRECT_V_LOAD:
+            v_c = kv_buf.permute([1, 0]).load(layout=cfg.v_layout)
         else:
-            v_c = kv_buf.load(layout=cfg.linear_v)
+            if RELAXED:
+                v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_buf, cfg.linear_v)
+            else:
+                v_c = kv_buf.load(layout=cfg.linear_v)
+            v_c = gl.permute(v_c, [1, 0])
+            v_c = gl.convert_layout(v_c, cfg.v_layout)
         v_c = v_c.to(dtype)
-        v_c = gl.permute(v_c, [1, 0])
-        v_c = gl.convert_layout(v_c, cfg.v_layout)
         acc = gl.amd.cdna4.mfma(p, v_c, acc)
         return acc
 
@@ -1047,7 +1176,7 @@ class AttentionProgram:
         else:
             rcp = 1.0 / e_sum
             stored_value = (acc * rcp[:, None]).to(out_dtype)
-        if cfg.NHEAD < cfg.BLOCK_H:
+        if cfg.SELECTED_SLOTS or cfg.NHEAD < cfg.BLOCK_H:
             gl.amd.cdna4.buffer_store(
                 stored_value,
                 ptr=self.Out,
@@ -1173,6 +1302,13 @@ def _mla_decode_gluon(
     NUM_XCDS: gl.constexpr,
     NHEAD: gl.constexpr,
     REGIME: gl.constexpr,
+    LAYOUT_ID: gl.constexpr,
+    WAVES_M: gl.constexpr,
+    WAVES_N: gl.constexpr,
+    QK_K_WIDTH: gl.constexpr,
+    PV_K_WIDTH: gl.constexpr,
+    PIPELINE_STAGES: gl.constexpr,
+    KV_LOAD_SLICES: gl.constexpr,
     IS_FP8_Q: gl.constexpr,
     RETURN_LSE: gl.constexpr,
     SELECTED_SLOTS: gl.constexpr,
@@ -1189,6 +1325,13 @@ def _mla_decode_gluon(
         NUM_XCDS,
         NHEAD,
         REGIME,
+        LAYOUT_ID,
+        WAVES_M,
+        WAVES_N,
+        QK_K_WIDTH,
+        PV_K_WIDTH,
+        PIPELINE_STAGES,
+        KV_LOAD_SLICES,
         IS_FP8_Q,
         RETURN_LSE,
         SELECTED_SLOTS,
@@ -1264,7 +1407,9 @@ def _mla_decode_gluon(
 
     # bufs of page_number
     bufs_page = gl.allocate_shared_memory(
-        gl.int32, shape=[2, cfg.BLOCK_N], layout=cfg.shared_page
+        gl.int32,
+        shape=[cfg.PIPELINE_STAGES, cfg.BLOCK_N],
+        layout=cfg.shared_page,
     )
     if not cfg.WITHIN_2GB:
         # Large-cache global loads are unmasked, so every page-ID lane must be
@@ -1286,10 +1431,14 @@ def _mla_decode_gluon(
 
     # move here to work around allocate_shared_memory bug
     bufs_kv = gl.allocate_shared_memory(
-        kvtype, shape=[2, cfg.HEAD_DIM_CKV, cfg.BLOCK_N], layout=cfg.shared_kv
+        kvtype,
+        shape=[cfg.PIPELINE_STAGES, cfg.HEAD_DIM_CKV, cfg.BLOCK_N],
+        layout=cfg.shared_kv,
     )
     bufs_kpe = gl.allocate_shared_memory(
-        kvtype, shape=[2, cfg.HEAD_DIM_KPE, cfg.BLOCK_N], layout=cfg.shared_kpe
+        kvtype,
+        shape=[cfg.PIPELINE_STAGES, cfg.HEAD_DIM_KPE, cfg.BLOCK_N],
+        layout=cfg.shared_kpe,
     )
 
     # global load K (first tile)
@@ -1307,12 +1456,14 @@ def _mla_decode_gluon(
     )
 
     # local load page number for slice 0
-    bufs_page_0 = bufs_page.index(0).slice(0, cfg.BLOCK_N // 2, 0)
+    bufs_page_0 = bufs_page.index(0).slice(0, cfg.BLOCK_N // cfg.KV_LOAD_SLICES, 0)
     kv_page_number_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(
         bufs_page_0, gl.SliceLayout(0, cfg.blocked_kv_slice)
     )
     offs_n_nope0 = split_kv_start + gl.arange(
-        0, cfg.BLOCK_N // 2, layout=gl.SliceLayout(0, cfg.blocked_kv_slice)
+        0,
+        cfg.BLOCK_N // cfg.KV_LOAD_SLICES,
+        layout=gl.SliceLayout(0, cfg.blocked_kv_slice),
     )
     kv_loc0 = program.physical_token_location(
         kv_page_number_0, offs_n_nope0, cfg.WITHIN_2GB
@@ -1323,7 +1474,7 @@ def _mla_decode_gluon(
         0, cfg.HEAD_DIM_CKV, layout=gl.SliceLayout(1, cfg.blocked_kv_slice)
     )
     offs_k_c0 = kv_loc0[None, :] * cfg.stride_kv_c_bs + offs_d_ckv_10[:, None]
-    bufs_kv0 = bufs_kv.index(0).slice(0, cfg.BLOCK_N // 2, 1)
+    bufs_kv0 = bufs_kv.index(0).slice(0, cfg.BLOCK_N // cfg.KV_LOAD_SLICES, 1)
     program.issue_kv_load(
         bufs_kv0,
         program.Kv_c_cache,
@@ -1348,17 +1499,25 @@ def _mla_decode_gluon(
     )
 
     # local load page number for slice 1
-    bufs_page_1 = bufs_page.index(0).slice(cfg.BLOCK_N // 2, cfg.BLOCK_N // 2, 0)
+    bufs_page_1 = bufs_page.index(0).slice(
+        cfg.BLOCK_N // cfg.KV_LOAD_SLICES,
+        cfg.BLOCK_N // cfg.KV_LOAD_SLICES,
+        0,
+    )
     kv_page_number_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(
         bufs_page_1, gl.SliceLayout(0, cfg.blocked_kv_slice)
     )
-    offs_n_nope1 = offs_n_nope0 + cfg.BLOCK_N // 2
+    offs_n_nope1 = offs_n_nope0 + cfg.BLOCK_N // cfg.KV_LOAD_SLICES
     kv_loc1 = program.physical_token_location(
         kv_page_number_1, offs_n_nope1, cfg.WITHIN_2GB
     )
 
     # global load K_nope slice 1
-    bufs_kv1 = bufs_kv.index(0).slice(cfg.BLOCK_N // 2, cfg.BLOCK_N // 2, 1)
+    bufs_kv1 = bufs_kv.index(0).slice(
+        cfg.BLOCK_N // cfg.KV_LOAD_SLICES,
+        cfg.BLOCK_N // cfg.KV_LOAD_SLICES,
+        1,
+    )
     offs_k_c1 = kv_loc1[None, :] * cfg.stride_kv_c_bs + offs_d_ckv_10[:, None]
     program.issue_kv_load(
         bufs_kv1,
@@ -1370,22 +1529,32 @@ def _mla_decode_gluon(
     buf_idx = 0
     # main loop
     for i in range(num_iter - 2):
-        async_idx = (buf_idx + 1) % 2
+        async_idx = (buf_idx + 1) % cfg.PIPELINE_STAGES
 
         gl.amd.cdna4.async_copy.wait_group(0)
         # global load page number (prefetch tile i+2)
         program.issue_page_load(bufs_page.index(buf_idx), start_n + cfg.BLOCK_N)
 
         # global load K slice 0
-        bufs_kv0 = bufs_kv.index(async_idx).slice(0, cfg.BLOCK_N // 2, 1)
-        bufs_kv1 = bufs_kv.index(async_idx).slice(cfg.BLOCK_N // 2, cfg.BLOCK_N // 2, 1)
+        bufs_kv0 = bufs_kv.index(async_idx).slice(
+            0, cfg.BLOCK_N // cfg.KV_LOAD_SLICES, 1
+        )
+        bufs_kv1 = bufs_kv.index(async_idx).slice(
+            cfg.BLOCK_N // cfg.KV_LOAD_SLICES,
+            cfg.BLOCK_N // cfg.KV_LOAD_SLICES,
+            1,
+        )
         # local load page number for slice 0
-        bufs_page_0 = bufs_page.index(async_idx).slice(0, cfg.BLOCK_N // 2, 0)
+        bufs_page_0 = bufs_page.index(async_idx).slice(
+            0, cfg.BLOCK_N // cfg.KV_LOAD_SLICES, 0
+        )
         kv_page_number_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(
             bufs_page_0, gl.SliceLayout(0, cfg.blocked_kv_slice)
         )
         offs_n_nope0 = start_n + gl.arange(
-            0, cfg.BLOCK_N // 2, layout=gl.SliceLayout(0, cfg.blocked_kv_slice)
+            0,
+            cfg.BLOCK_N // cfg.KV_LOAD_SLICES,
+            layout=gl.SliceLayout(0, cfg.blocked_kv_slice),
         )
         kv_loc0 = program.physical_token_location(
             kv_page_number_0, offs_n_nope0, cfg.WITHIN_2GB
@@ -1434,12 +1603,14 @@ def _mla_decode_gluon(
 
         # local load page number for slice 1 + global load K_nope slice 1
         bufs_page_1 = bufs_page.index(async_idx).slice(
-            cfg.BLOCK_N // 2, cfg.BLOCK_N // 2, 0
+            cfg.BLOCK_N // cfg.KV_LOAD_SLICES,
+            cfg.BLOCK_N // cfg.KV_LOAD_SLICES,
+            0,
         )
         kv_page_number_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(
             bufs_page_1, gl.SliceLayout(0, cfg.blocked_kv_slice)
         )
-        offs_n1 = offs_n_nope0 + cfg.BLOCK_N // 2
+        offs_n1 = offs_n_nope0 + cfg.BLOCK_N // cfg.KV_LOAD_SLICES
         kv_loc1 = program.physical_token_location(
             kv_page_number_1, offs_n1, cfg.WITHIN_2GB
         )
@@ -1456,12 +1627,12 @@ def _mla_decode_gluon(
         acc = program.compute_pv(p, acc, bufs_kv.index(buf_idx), True)
 
         start_n += cfg.BLOCK_N
-        buf_idx = (buf_idx + 1) % 2
+        buf_idx = (buf_idx + 1) % cfg.PIPELINE_STAGES
 
     # epilogue 1
     # Runtime guard: a split can cover fewer than 2 KV blocks (short sequences).
     if num_iter >= 2:
-        async_idx = (buf_idx + 1) % 2
+        async_idx = (buf_idx + 1) % cfg.PIPELINE_STAGES
 
         # global load K (full tile)
         gl.amd.cdna4.async_copy.wait_group(3)
@@ -1521,7 +1692,7 @@ def _mla_decode_gluon(
         acc = program.compute_pv(p, acc, bufs_kv.index(buf_idx), False)
 
         start_n += cfg.BLOCK_N
-        buf_idx = (buf_idx + 1) % 2
+        buf_idx = (buf_idx + 1) % cfg.PIPELINE_STAGES
 
     # epilogue 2
     # dot, softmax, dot
@@ -1624,6 +1795,57 @@ _MLA_DECODE_REGIMES = frozenset(
     {"bh16bn128", "bh16bn64", "bh64", "bh16-multiblock", "bh64-small"}
 )
 
+_SELECTED_DSA_LAYOUTS = {
+    "selected_bf16_r128_h16n64": (
+        torch.bfloat16,
+        128,
+        16,
+        64,
+        (1, 4),
+        4,
+        8,
+        8,
+        2,
+        2,
+    ),
+    "selected_bf16_r512_h16n64": (
+        torch.bfloat16,
+        512,
+        16,
+        64,
+        (1, 4),
+        4,
+        8,
+        8,
+        2,
+        2,
+    ),
+    "selected_e4m3_r512_h16n128": (
+        torch.float8_e4m3fn,
+        512,
+        16,
+        128,
+        (1, 4),
+        4,
+        16,
+        8,
+        2,
+        2,
+    ),
+    "selected_e5m2_r512_h16n128": (
+        torch.float8_e5m2,
+        512,
+        16,
+        128,
+        (1, 4),
+        4,
+        16,
+        8,
+        2,
+        2,
+    ),
+}
+
 
 def _select_num_kv_splits_bh16bn64(
     *, batch: int, max_seqlen_k: int, block_n: int
@@ -1709,6 +1931,15 @@ def _gluon_mla_decode_gfx950(
     projected_out: torch.Tensor | None = None,
     selected_slots: bool = False,
     num_kv_splits_override: int | None = None,
+    selected_layout_id: str | None = None,
+    selected_block_h: int | None = None,
+    selected_block_n: int | None = None,
+    selected_waves_per_cta: tuple[int, int] | None = None,
+    selected_num_warps: int | None = None,
+    selected_qk_k_width: int | None = None,
+    selected_pv_k_width: int | None = None,
+    selected_pipeline_stages: int | None = None,
+    selected_kv_load_slices: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch one fixed absorbed MLA decode regime."""
     if regime not in _MLA_DECODE_REGIMES:
@@ -1725,7 +1956,7 @@ def _gluon_mla_decode_gfx950(
     qk_dim = kv_lora_rank + qk_rope_head_dim
     if q.shape[-1] != qk_dim:
         raise ValueError(f"q head dim must be {qk_dim}, got {q.shape[-1]}")
-    if kv_lora_rank != 512 or qk_rope_head_dim != 64:
+    if selected_layout_id is None and (kv_lora_rank != 512 or qk_rope_head_dim != 64):
         raise NotImplementedError(
             "gluon MLA decode requires kv_lora_rank=512, qk_rope_head_dim=64, "
             f"got {kv_lora_rank}/{qk_rope_head_dim}"
@@ -1747,7 +1978,55 @@ def _gluon_mla_decode_gfx950(
 
     batch_size, _, nhead, _ = q.shape
     small_batch_h64 = regime in _SMALL_BATCH_REGIMES
-    if regime == "bh16bn128":
+    if selected_layout_id is not None:
+        expected = _SELECTED_DSA_LAYOUTS.get(selected_layout_id)
+        if expected is None:
+            raise ValueError(
+                f"unknown selected-attention layout {selected_layout_id!r}"
+            )
+        (
+            expected_dtype,
+            expected_rank,
+            block_h,
+            block_n,
+            waves_per_cta,
+            num_warps,
+            qk_k_width,
+            pv_k_width,
+            pipeline_stages,
+            kv_load_slices,
+        ) = expected
+        if (
+            q.dtype != expected_dtype
+            or kv_cache.dtype != expected_dtype
+            or kv_lora_rank != expected_rank
+            or qk_rope_head_dim != 64
+        ):
+            raise NotImplementedError(
+                f"selected-attention layout {selected_layout_id!r} requires "
+                f"matching {expected_dtype} q/KV with rank {expected_rank} and "
+                "RoPE width 64"
+            )
+        if (
+            selected_block_h != block_h
+            or selected_block_n != block_n
+            or selected_waves_per_cta != waves_per_cta
+            or selected_num_warps != num_warps
+            or selected_qk_k_width != qk_k_width
+            or selected_pv_k_width != pv_k_width
+            or selected_pipeline_stages != pipeline_stages
+            or selected_kv_load_slices != kv_load_slices
+        ):
+            raise ValueError(
+                f"selected-attention layout {selected_layout_id!r} requires "
+                f"H{block_h}/N{block_n}, waves {waves_per_cta}, {num_warps} "
+                f"warps, QK/PV widths {qk_k_width}/{pv_k_width}, and "
+                f"pipeline {pipeline_stages}x{kv_load_slices}"
+            )
+        if nhead < 1:
+            raise ValueError("selected attention requires at least one query head")
+        num_xcds = 1
+    elif regime == "bh16bn128":
         if not is_fp8_kv:
             raise NotImplementedError(
                 "gluon MLA decode (bh16bn128) requires an FP8 kv_cache"
@@ -1759,6 +2038,12 @@ def _gluon_mla_decode_gfx950(
             )
         block_h = 16
         block_n = 128
+        waves_per_cta = (1, 4)
+        num_warps = 4
+        qk_k_width = 16 if is_fp8_q else 8
+        pv_k_width = 8
+        pipeline_stages = 2
+        kv_load_slices = 2
         num_xcds = 1
     elif regime == "bh16bn64":
         if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
@@ -1772,6 +2057,12 @@ def _gluon_mla_decode_gfx950(
             )
         block_h = 16
         block_n = 64
+        waves_per_cta = (1, 4)
+        num_warps = 4
+        qk_k_width = 8
+        pv_k_width = 8
+        pipeline_stages = 2
+        kv_load_slices = 2
         num_xcds = 1
     elif regime == "bh64":
         if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
@@ -1783,6 +2074,12 @@ def _gluon_mla_decode_gfx950(
             )
         block_h = 64
         block_n = 64
+        waves_per_cta = (4, 1)
+        num_warps = 4
+        qk_k_width = 8
+        pv_k_width = 8
+        pipeline_stages = 2
+        kv_load_slices = 2
         num_xcds = _NUM_XCDS
         if batch_size % 64 != 0:
             raise NotImplementedError(
@@ -1802,6 +2099,12 @@ def _gluon_mla_decode_gfx950(
             )
         block_h = 16 if regime == "bh16-multiblock" else 64
         block_n = 64
+        waves_per_cta = (1, 4) if block_h == 16 else (4, 1)
+        num_warps = 4
+        qk_k_width = 8
+        pv_k_width = 8
+        pipeline_stages = 2
+        kv_load_slices = 2
         num_xcds = 1
     if kv_cache.dim() == 4:
         if kv_cache.shape[2] != 1 or kv_cache.shape[3] != qk_dim:
@@ -1819,9 +2122,9 @@ def _gluon_mla_decode_gfx950(
     if page_table.dtype != torch.int32:
         raise ValueError(f"page_table must be int32, got {page_table.dtype}")
     if selected_slots:
-        if regime != "bh16bn128" or page_size != 1:
+        if selected_layout_id is None or page_size != 1:
             raise ValueError(
-                "selected-slot MLA requires the bh16bn128 regime and page_size=1"
+                "selected-slot MLA requires a static layout and page_size=1"
             )
         if return_lse or value_weight is not None:
             raise ValueError("selected-slot MLA does not support LSE or projection")
@@ -1893,6 +2196,8 @@ def _gluon_mla_decode_gfx950(
         )
 
     def _grid(splits: int) -> tuple[int, ...]:
+        if selected_slots:
+            return (batch_size, (nhead + block_h - 1) // block_h, splits)
         if regime == "bh64":
             # 3-D XCD-aware: (NUM_XCDS, head_block, (batch // NUM_XCDS) * splits).
             return (
@@ -1916,10 +2221,17 @@ def _gluon_mla_decode_gfx950(
         "NUM_XCDS": num_xcds,
         "NHEAD": nhead,
         "REGIME": regime,
+        "LAYOUT_ID": selected_layout_id or regime,
+        "WAVES_M": waves_per_cta[0],
+        "WAVES_N": waves_per_cta[1],
+        "QK_K_WIDTH": qk_k_width,
+        "PV_K_WIDTH": pv_k_width,
+        "PIPELINE_STAGES": pipeline_stages,
+        "KV_LOAD_SLICES": kv_load_slices,
         "IS_FP8_Q": is_fp8_q,
         "RETURN_LSE": return_lse,
         "SELECTED_SLOTS": selected_slots,
-        "num_warps": 4,
+        "num_warps": num_warps,
     }
 
     if num_kv_splits == 1:
@@ -2218,7 +2530,7 @@ def gluon_mla_decode_fp8xfp8_gfx950(
     )
 
 
-def gluon_mla_selected_attention_fp8_gfx950(
+def gluon_mla_selected_attention_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     selected_slots: torch.Tensor,
@@ -2228,17 +2540,67 @@ def gluon_mla_selected_attention_fp8_gfx950(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     softmax_scale: float,
+    layout_id: str,
+    block_h: int,
+    block_n: int,
+    waves_per_cta: tuple[int, int],
+    num_warps: int,
+    qk_k_width: int,
+    pv_k_width: int,
+    pipeline_stages: int,
+    kv_load_slices: int,
+    num_kv_splits: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run H16/N128 MLA over per-query physical token selections.
+    """Run one static MLA schedule over per-query physical token selections.
 
     Each selected physical token is represented as a one-token page, so this
     adapter reuses the optimized MLA data path without gathering the KV cache.
     """
-    if q.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
-        raise NotImplementedError("selected-slot MLA requires matching E4M3 q and KV")
-    if q.dim() != 3 or not 1 <= q.shape[1] <= 16:
-        raise ValueError(f"q must be [tokens, heads<=16, 576], got {tuple(q.shape)}")
+    schedule = _SELECTED_DSA_LAYOUTS.get(layout_id)
+    if schedule is None:
+        raise ValueError(f"unknown selected-attention layout {layout_id!r}")
+    (
+        expected_dtype,
+        expected_rank,
+        expected_h,
+        expected_n,
+        expected_waves,
+        expected_warps,
+        expected_qk_width,
+        expected_pv_width,
+        expected_pipeline_stages,
+        expected_kv_load_slices,
+    ) = schedule
+    if q.dtype != expected_dtype or kv_cache.dtype != expected_dtype:
+        raise NotImplementedError(
+            f"selected-attention layout {layout_id!r} requires matching "
+            f"{expected_dtype} q and KV"
+        )
+    if (
+        int(kv_lora_rank) != expected_rank
+        or int(block_h) != expected_h
+        or int(block_n) != expected_n
+        or tuple(waves_per_cta) != expected_waves
+        or int(num_warps) != expected_warps
+        or int(qk_k_width) != expected_qk_width
+        or int(pv_k_width) != expected_pv_width
+        or int(pipeline_stages) != expected_pipeline_stages
+        or int(kv_load_slices) != expected_kv_load_slices
+    ):
+        raise ValueError(
+            f"selected-attention layout {layout_id!r} requires rank "
+            f"{expected_rank}, H{expected_h}/N{expected_n}, waves "
+            f"{expected_waves}, {expected_warps} warps, QK/PV widths "
+            f"{expected_qk_width}/{expected_pv_width}, and pipeline "
+            f"{expected_pipeline_stages}x{expected_kv_load_slices}"
+        )
+    if num_kv_splits < 1:
+        raise ValueError("selected attention requires at least one KV split")
+    if q.dim() != 3 or q.shape[1] < 1:
+        raise ValueError(
+            f"q must be [tokens, heads, rank + rope], got {tuple(q.shape)}"
+        )
     qk_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
     if q.shape[2] != qk_dim or kv_cache.dim() != 2 or kv_cache.shape[1] != qk_dim:
         raise ValueError(
@@ -2261,10 +2623,10 @@ def gluon_mla_selected_attention_fp8_gfx950(
         raise ValueError("selected_lens must be contiguous int32 [tokens]")
     if selected_slots.shape[0] != q.shape[0]:
         raise ValueError("selected_slots and q must have the same token count")
-    if selected_slots.shape[1] < 2 * 128 or selected_slots.shape[1] % 128 != 0:
+    if selected_slots.shape[1] < 2 * block_n or selected_slots.shape[1] % block_n != 0:
         raise ValueError(
-            "selected-slot MLA requires a selection width divisible by 128 "
-            "and at least 256"
+            "selected-slot MLA requires a selection width divisible by its "
+            f"N{block_n} tile and at least {2 * block_n}"
         )
     if kv_cache.shape[0] == 0:
         raise ValueError("selected-slot MLA requires nonempty selection and KV widths")
@@ -2294,14 +2656,59 @@ def gluon_mla_selected_attention_fp8_gfx950(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
-        regime="bh16bn128",
+        regime="bh16bn128" if block_n == 128 else "bh16bn64",
         out=out,
         selected_slots=True,
-        num_kv_splits_override=1,
+        num_kv_splits_override=num_kv_splits,
+        selected_layout_id=layout_id,
+        selected_block_h=block_h,
+        selected_block_n=block_n,
+        selected_waves_per_cta=waves_per_cta,
+        selected_num_warps=num_warps,
+        selected_qk_k_width=qk_k_width,
+        selected_pv_k_width=pv_k_width,
+        selected_pipeline_stages=pipeline_stages,
+        selected_kv_load_slices=kv_load_slices,
     )
     if out is not None:
         return out
     return result.view(q.shape[0], q.shape[1], kv_lora_rank)
+
+
+def gluon_mla_selected_attention_fp8_gfx950(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    selected_lens: torch.Tensor,
+    *,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compatibility wrapper for the original E4M3 rank-512 schedule."""
+    return gluon_mla_selected_attention_gfx950(
+        q,
+        kv_cache,
+        selected_slots,
+        selected_lens,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        layout_id="selected_e4m3_r512_h16n128",
+        block_h=16,
+        block_n=128,
+        waves_per_cta=(1, 4),
+        num_warps=4,
+        qk_k_width=16,
+        pv_k_width=8,
+        pipeline_stages=2,
+        kv_load_slices=2,
+        num_kv_splits=1,
+        out=out,
+    )
 
 
 def gluon_mla_decode_projected_value_gfx950(

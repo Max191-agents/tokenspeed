@@ -107,6 +107,7 @@ from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel, spec_matches_traits
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _RELOAD_MODULES = [
     # Attention registration modules.
@@ -1332,6 +1333,35 @@ def _attention_dsa_prefill_fp8_packed_rank512() -> object:
     )
 
 
+def _attention_dsa_prefill_variant(
+    *,
+    dtype: torch.dtype,
+    rank: int,
+    dense_cache: bool,
+    packed_cache: bool,
+) -> object:
+    q = torch.empty((2, 8, rank + 64), dtype=dtype)
+    kv_cache = torch.empty((64, rank + 64), dtype=dtype) if dense_cache else None
+    sparse_kv_cache = (
+        torch.empty((64, rank + 144), dtype=torch.uint8) if packed_cache else None
+    )
+    topk_slots = torch.empty((2, 512), dtype=torch.int32)
+    topk_lens = torch.empty((2,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_prefill(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=sparse_kv_cache,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=512,
+        qk_nope_head_dim=192,
+        kv_lora_rank=rank,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+    )
+
+
 def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
     weights = torch.empty((2, 2), dtype=weights_dtype)
@@ -1649,18 +1679,209 @@ def test_gluon_dsa_prefill_topk_exact_override_checks_page_size() -> None:
         _attention_dsa_prefill_topk(page_size=32, override=kernel_name)
 
 
-def test_gluon_dsa_prefill_diagnostic_variants_do_not_win_auto_selection() -> None:
+def _gfx950_dsa_prefill_specs():
     registry = KernelRegistry.get()
-    production = registry.get_by_name("gluon_dsa_prefill_fp8_dense_gfx950")
-    candidate = registry.get_by_name("gluon_dsa_prefill_fp8_dense_h16n128_gfx950")
-    legacy = registry.get_by_name("gluon_dsa_prefill_fp8_dense_legacy_gfx950")
-    if production is None or candidate is None or legacy is None:
+    gfx950 = ArchVersion(9, 5)
+    specs = [
+        spec
+        for spec in registry.list_kernels("attention", "dsa_prefill")
+        if spec.solution == "gluon"
+        and spec.capability.min_arch_version == gfx950
+        and spec.capability.max_arch_version == gfx950
+    ]
+    if not specs:
         pytest.skip("Gluon DSA prefill is AMD-only")
+    return specs
 
-    assert candidate.priority == legacy.priority == 0
-    assert production.priority > candidate.priority
-    assert "diagnostic" in candidate.tags
-    assert "diagnostic" in legacy.tags
+
+def test_gluon_gfx950_exposes_exactly_dense_and_packed_dsa_prefill_specs() -> None:
+    specs = _gfx950_dsa_prefill_specs()
+    by_name = {spec.name: spec for spec in specs}
+
+    assert set(by_name) == {
+        "gluon_dsa_prefill_dense_gfx950",
+        "gluon_dsa_prefill_packed_gfx950",
+    }
+    assert all("diagnostic" not in spec.tags for spec in specs)
+
+    dense = by_name["gluon_dsa_prefill_dense_gfx950"]
+    assert {
+        signature.storage_dtype_for("q") for signature in dense.format_signatures
+    } == {torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2}
+    assert dense.traits["dsa_prefill_profile"] == frozenset(
+        {
+            (torch.bfloat16, 128),
+            (torch.bfloat16, 512),
+            (torch.float8_e4m3fn, 512),
+            (torch.float8_e5m2, 512),
+        }
+    )
+    assert dense.traits["kv_cache_layout"] == frozenset({"dense"})
+    assert dense.traits["kv_cache_available"] == frozenset({True})
+    assert dense.traits["sparse_kv_cache_available"] == frozenset({False})
+
+    packed = by_name["gluon_dsa_prefill_packed_gfx950"]
+    assert {
+        signature.storage_dtype_for("q") for signature in packed.format_signatures
+    } == {torch.bfloat16}
+    assert packed.traits["dsa_prefill_profile"] == frozenset(
+        {(torch.bfloat16, 128), (torch.bfloat16, 512)}
+    )
+    assert packed.traits["kv_cache_layout"] == frozenset({"packed"})
+    assert packed.traits["kv_cache_available"] == frozenset({False, True})
+    assert packed.traits["sparse_kv_cache_available"] == frozenset({True})
+
+    for spec in specs:
+        assert spec.traits["page_size"] == frozenset({64})
+        assert spec.traits["qk_nope_head_dim"] == frozenset({128, 192})
+        assert spec.traits["kv_lora_rank"] == frozenset({128, 512})
+        assert spec.traits["qk_rope_head_dim"] == frozenset({64})
+        assert spec.traits["topk"] == frozenset({512, 1024, 2048})
+
+
+@pytest.mark.parametrize(
+    ("dtype", "rank", "layout", "expected"),
+    [
+        pytest.param(
+            torch.bfloat16,
+            128,
+            "dense",
+            "gluon_dsa_prefill_dense_gfx950",
+            id="bf16-rank128-dense",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            128,
+            "packed",
+            "gluon_dsa_prefill_packed_gfx950",
+            id="bf16-rank128-packed",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            512,
+            "dense",
+            "gluon_dsa_prefill_dense_gfx950",
+            id="bf16-rank512-dense",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            512,
+            "packed",
+            "gluon_dsa_prefill_packed_gfx950",
+            id="bf16-rank512-packed",
+        ),
+        pytest.param(torch.float8_e4m3fn, 128, "dense", None, id="e4m3-rank128-dense"),
+        pytest.param(
+            torch.float8_e4m3fn, 128, "packed", None, id="e4m3-rank128-packed"
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            512,
+            "dense",
+            "gluon_dsa_prefill_dense_gfx950",
+            id="e4m3-rank512-dense",
+        ),
+        pytest.param(
+            torch.float8_e4m3fn, 512, "packed", None, id="e4m3-rank512-packed"
+        ),
+        pytest.param(torch.float8_e5m2, 128, "dense", None, id="e5m2-rank128-dense"),
+        pytest.param(torch.float8_e5m2, 128, "packed", None, id="e5m2-rank128-packed"),
+        pytest.param(
+            torch.float8_e5m2,
+            512,
+            "dense",
+            "gluon_dsa_prefill_dense_gfx950",
+            id="e5m2-rank512-dense",
+        ),
+        pytest.param(torch.float8_e5m2, 512, "packed", None, id="e5m2-rank512-packed"),
+    ],
+)
+def test_gluon_gfx950_dsa_prefill_dtype_rank_layout_truth_table(
+    dtype: torch.dtype,
+    rank: int,
+    layout: str,
+    expected: str | None,
+) -> None:
+    specs = _gfx950_dsa_prefill_specs()
+    signature = format_signature(q=dense_tensor_format(dtype))
+    traits = {
+        "page_size": 64,
+        "q_len_per_req": 1,
+        "qk_nope_head_dim": 192,
+        "kv_lora_rank": rank,
+        "dsa_prefill_profile": (dtype, rank),
+        "qk_rope_head_dim": 64,
+        "topk": 2048,
+        "kv_cache_available": layout == "dense",
+        "sparse_kv_cache_available": layout == "packed",
+        "kv_cache_layout": layout,
+        "topk_layout": "global_slots",
+        "support_logit_cap": False,
+        "return_lse": False,
+    }
+
+    matches = sorted(
+        spec.name
+        for spec in specs
+        if spec.supports_format_signature(signature)
+        and spec_matches_traits(spec, traits)
+    )
+    assert matches == ([] if expected is None else [expected])
+
+
+@pytest.mark.parametrize(
+    ("dense_cache", "packed_cache", "expected_layout"),
+    [
+        pytest.param(True, False, "dense", id="dense-only"),
+        pytest.param(False, True, "packed", id="packed-only"),
+        pytest.param(True, True, "packed", id="packed-precedence"),
+    ],
+)
+def test_dsa_prefill_requests_effective_cache_layout(
+    dense_cache: bool,
+    packed_cache: bool,
+    expected_layout: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_traits = {}
+
+    def fake_select_kernel(*args, **kwargs):
+        captured_traits.update(kwargs["traits"])
+        return SelectedKernel(
+            name="test_dsa_prefill",
+            impl=lambda **kernel_kwargs: torch.empty_like(kernel_kwargs["q"]),
+        )
+
+    monkeypatch.setattr(_attention_pkg, "select_kernel", fake_select_kernel)
+
+    _attention_dsa_prefill_variant(
+        dtype=torch.bfloat16,
+        rank=512,
+        dense_cache=dense_cache,
+        packed_cache=packed_cache,
+    )
+
+    assert captured_traits["dsa_prefill_profile"] == (torch.bfloat16, 512)
+    assert captured_traits["kv_cache_layout"] == expected_layout
+    assert captured_traits["kv_cache_available"] is dense_cache
+    assert captured_traits["sparse_kv_cache_available"] is packed_cache
+
+
+def test_dsa_prefill_rejects_missing_cache_before_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_select_kernel(*args, **kwargs):
+        raise AssertionError("selection must not run without a cache")
+
+    monkeypatch.setattr(_attention_pkg, "select_kernel", unexpected_select_kernel)
+
+    with pytest.raises(ValueError, match="requires kv_cache or sparse_kv_cache"):
+        _attention_dsa_prefill_variant(
+            dtype=torch.bfloat16,
+            rank=512,
+            dense_cache=False,
+            packed_cache=False,
+        )
 
 
 def test_gluon_mxfp4_apply_priority_prefers_dynamic_over_precomputed() -> None:
@@ -2646,15 +2867,36 @@ _CASES = [
         "cdna4",
         "attention",
         "dsa_prefill",
-        "gluon_dsa_prefill_gfx950",
+        "gluon_dsa_prefill_packed_gfx950",
         _attention_dsa_prefill,
     ),
     _case(
         _is_cdna4,
         "cdna4",
         "attention",
+        "dsa_prefill_bf16_dense_rank128",
+        "gluon_dsa_prefill_dense_gfx950",
+        _attention_dsa_prefill_bf16_dense_rank128,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_prefill_bf16_both_caches_rank512",
+        "gluon_dsa_prefill_packed_gfx950",
+        lambda: _attention_dsa_prefill_variant(
+            dtype=torch.bfloat16,
+            rank=512,
+            dense_cache=True,
+            packed_cache=True,
+        ),
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
         "dsa_prefill_fp8_dense_rank512",
-        "gluon_dsa_prefill_fp8_dense_gfx950",
+        "gluon_dsa_prefill_dense_gfx950",
         _attention_dsa_prefill_fp8_dense,
     ),
     _case(
@@ -2662,7 +2904,7 @@ _CASES = [
         "cdna4",
         "attention",
         "dsa_prefill_fp8_e5m2_dense_rank512",
-        "gluon_dsa_prefill_fp8_dense_gfx950",
+        "gluon_dsa_prefill_dense_gfx950",
         _attention_dsa_prefill_fp8_e5m2_dense,
     ),
     _case(

@@ -361,6 +361,26 @@ class TestSpecMatchesTraits:
         assert not spec_matches_traits(spec, {"b_layout": frozenset({"KM"})})
         assert not spec_matches_traits(spec, {"b_layout": frozenset({"KN", "KM"})})
 
+    def test_tuple_requested_value_is_matched_atomically(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={
+                "profile": frozenset(
+                    {
+                        (torch.bfloat16, 128),
+                        (torch.float8_e4m3fn, 512),
+                    }
+                )
+            },
+        )
+
+        assert spec_matches_traits(spec, {"profile": (torch.bfloat16, 128)})
+        assert spec_matches_traits(spec, {"profile": (torch.float8_e4m3fn, 512)})
+        assert not spec_matches_traits(spec, {"profile": (torch.bfloat16, 512)})
+        assert not spec_matches_traits(spec, {"profile": (torch.float8_e4m3fn, 128)})
+
     def test_missing_trait_is_ignored_by_default(self):
         spec = KernelSpec(name="k", family="f", mode="m", traits={})
 
@@ -537,6 +557,39 @@ class TestMakeCacheKey:
             "fa4",
         )
         assert k1 != k2
+
+    def test_tuple_profile_and_layout_are_selection_relevant(self):
+        common = (
+            "attention",
+            "dsa_prefill",
+            INPUT_BF16,
+            "gfx950",
+            SelectionObjective.DEFAULT,
+            None,
+        )
+        dense_rank128 = _make_cache_key(
+            *common,
+            {
+                "dsa_prefill_profile": (torch.bfloat16, 128),
+                "kv_cache_layout": "dense",
+            },
+        )
+        dense_rank512 = _make_cache_key(
+            *common,
+            {
+                "dsa_prefill_profile": (torch.bfloat16, 512),
+                "kv_cache_layout": "dense",
+            },
+        )
+        packed_rank128 = _make_cache_key(
+            *common,
+            {
+                "dsa_prefill_profile": (torch.bfloat16, 128),
+                "kv_cache_layout": "packed",
+            },
+        )
+
+        assert len({dense_rank128, dense_rank512, packed_rank128}) == 3
 
 
 class TestSelectKernel:
