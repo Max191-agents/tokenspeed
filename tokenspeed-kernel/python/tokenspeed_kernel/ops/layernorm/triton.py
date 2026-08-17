@@ -74,6 +74,8 @@ def _rmsnorm_fused_parallel_kernel(
     variance2 = tl.sum(input2 * input2, axis=0) / n_cols2
     weight2 = tl.load(weight2_ptr + offsets2, mask=mask2, other=0.0).to(tl.float32)
     output2 = input2 * tl.rsqrt(variance2 + eps) * weight2
+    if output2_ptr.dtype.element_ty == tl.float8e4nv:
+        output2 = output2.to(input2_ptr.dtype.element_ty).to(tl.float32)
     tl.store(output2_ptr + output2_offsets, output2, mask=mask2)
 
 
@@ -466,6 +468,11 @@ def rmsnorm_fused_parallel(
     eps: float,
     enable_pdl: bool = False,
 ) -> None:
+    """Normalize two inputs in parallel into caller-provided destinations.
+
+    ``output2`` normally matches ``input2``. On AMD, BF16 ``input2`` may
+    instead write E4M3 after reproducing the BF16 rounding boundary.
+    """
     del enable_pdl
     if input1.shape[0] == 0:
         return
@@ -493,6 +500,20 @@ def rmsnorm_fused_parallel(
             f"weight2 shape {tuple(weight2.shape)} does not match hidden size "
             f"{input2.shape[-1]}"
         )
+    output2_is_fp8 = output2.dtype == torch.float8_e4m3fn
+    if output2_is_fp8:
+        if input2.dtype != torch.bfloat16:
+            raise TypeError(
+                f"E4M3 output2 requires BF16 input2; got input2={input2.dtype}"
+            )
+        if not current_platform().is_amd:
+            raise RuntimeError("BF16-to-E4M3 output2 is only supported on AMD")
+    elif output2.dtype != input2.dtype:
+        raise TypeError(
+            f"output2 dtype {output2.dtype} does not match input2 dtype {input2.dtype}"
+        )
+    if output2.device != input2.device:
+        raise ValueError(f"output2 must be on {input2.device}, got {output2.device}")
     tensors = (input1, weight1, output1, input2, weight2, output2)
     if any(t.stride(-1) != 1 for t in tensors):
         raise ValueError("rmsnorm_fused_parallel requires contiguous last dimension")

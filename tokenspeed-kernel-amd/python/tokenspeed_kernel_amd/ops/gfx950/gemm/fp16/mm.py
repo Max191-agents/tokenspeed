@@ -44,6 +44,17 @@ WARP_REDUCE_OUTPUTS = 1
 WARP_REDUCE_BLOCK_K = 1024
 BMM_M1_BLOCK_N = 32
 BMM_M1_NUM_WARPS = 4
+SKINNY_BMM_MAX_BATCH = 64
+SKINNY_BMM_MAX_M = 32
+SKINNY_BMM_MAX_K = 1024
+SKINNY_BMM_BLOCK_N = 32
+SKINNY_BMM_BLOCK_K = 64
+SKINNY_BMM_ROW_MAX_M = 4
+SKINNY_BMM_LOAD_ALIGNMENT_BYTES = 16
+SKINNY_BMM_LOAD_ALIGNMENT_ELEMENTS = (
+    SKINNY_BMM_LOAD_ALIGNMENT_BYTES // torch.bfloat16.itemsize
+)
+BUFFER_OFFSET_I32_MAX = (1 << 31) - 1
 CDNA_WAVEFRONT_SIZE = 64
 MFMA_LDS_BLOCK_N = 256
 MFMA_LDS_BLOCK_K = 64
@@ -255,6 +266,41 @@ def _mfma_lds_gload_layout_b(block_n: int, block_k: int, _num_warps: int):
 
 
 @gluon.constexpr_function
+def _mfma_lds_gload_layout_b_n_contiguous(block_n: int, block_k: int, num_warps: int):
+    """Map a [K, N] tile to 128-bit loads when N is contiguous."""
+    if block_n != 32 or num_warps != 4:
+        raise ValueError("N-contiguous B loads require BLOCK_N=32 and four warps")
+    if block_k not in (64, 128, 256, 512):
+        raise ValueError(f"unsupported N-contiguous B tile depth: {block_k}")
+    register_bases = [[0, 1], [0, 2], [0, 4]]
+    if block_k >= 128:
+        register_bases += [[64, 0]]
+    if block_k >= 256:
+        register_bases += [[128, 0]]
+    if block_k >= 512:
+        register_bases += [[256, 0]]
+    return gl.DistributedLinearLayout(
+        reg_bases=register_bases,
+        lane_bases=[[0, 8], [0, 16], [1, 0], [2, 0], [4, 0], [8, 0]],
+        warp_bases=[[16, 0], [32, 0]],
+        block_bases=[],
+        shape=[block_k, block_n],
+    )
+
+
+@gluon.constexpr_function
+def _mfma_lds_select_gload_layout_b(
+    block_n: int,
+    block_k: int,
+    num_warps: int,
+    n_contiguous: bool,
+):
+    if n_contiguous:
+        return _mfma_lds_gload_layout_b_n_contiguous(block_n, block_k, num_warps)
+    return _mfma_lds_gload_layout_b(block_n, block_k, num_warps)
+
+
+@gluon.constexpr_function
 def _mfma_lds_manual_shared_offsets_a(block_m: int, block_k: int):
     bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32]]
     if block_k >= 128:
@@ -317,6 +363,26 @@ def _mfma_lds_manual_shared_layout_b(block_n: int, block_k: int):
 
 
 @gluon.constexpr_function
+def _mfma_lds_manual_shared_layout_b_n_contiguous(block_n: int, block_k: int):
+    if block_n != 32 or block_k not in (64, 128, 256, 512):
+        raise ValueError("N-contiguous shared B layout requires N=32 and K=64..512")
+    bases = [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]]
+    bases += [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]]
+    if block_k >= 128:
+        bases += [[64, 0]]
+    if block_k >= 256:
+        bases += [[128, 0]]
+    if block_k >= 512:
+        bases += [[256, 0]]
+    return gl.PaddedSharedLayout(
+        [[512, 16]],
+        bases,
+        [],
+        [block_k, block_n],
+    )
+
+
+@gluon.constexpr_function
 def _mfma_lds_shared_layout_a(dot_layout_a, block_m: int, block_k: int, dtype):
     if block_m <= 64:
         return _mfma_lds_manual_shared_layout_a(block_m, block_k)
@@ -344,6 +410,19 @@ def _mfma_lds_shared_layout_b(dot_layout_b, block_n: int, block_k: int, dtype):
     if layout is not None:
         return layout
     return _mfma_lds_manual_shared_layout_b(block_n, block_k)
+
+
+@gluon.constexpr_function
+def _mfma_lds_select_shared_layout_b(
+    dot_layout_b,
+    block_n: int,
+    block_k: int,
+    dtype,
+    n_contiguous: bool,
+):
+    if n_contiguous:
+        return _mfma_lds_manual_shared_layout_b_n_contiguous(block_n, block_k)
+    return _mfma_lds_shared_layout_b(dot_layout_b, block_n, block_k, dtype)
 
 
 @gluon.jit
@@ -459,6 +538,64 @@ def _bmm_a16w16_m1_kernel(
     gl.store(
         output_ptr + batch * output_batch_stride + offs_n,
         result.to(output_ptr.dtype.element_ty),
+    )
+
+
+@gluon.jit
+def _bmm_a16w16_skinny_row_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    M,
+    a_batch_stride,
+    a_m_stride,
+    b_batch_stride,
+    b_k_stride,
+    output_batch_stride,
+    output_m_stride,
+    K: gl.constexpr,
+    N: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    WAVEFRONT_SIZE: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    num_pid_n: gl.constexpr = N // BLOCK_N
+    row = pid // num_pid_n
+    batch = row // M
+    m = row - batch * M
+    pid_n = pid % num_pid_n
+    batch_i64 = batch.to(gl.int64)
+    a_batch_ptr = a_ptr + batch_i64 * a_batch_stride
+    b_batch_ptr = b_ptr + batch_i64 * b_batch_stride
+    output_batch_ptr = output_ptr + batch_i64 * output_batch_stride
+    layout: gl.constexpr = gl.BlockedLayout(
+        [BLOCK_N // NUM_WARPS, 1],
+        [1, WAVEFRONT_SIZE],
+        [NUM_WARPS, 1],
+        [1, 0],
+    )
+    n_layout: gl.constexpr = gl.SliceLayout(1, layout)
+    k_layout: gl.constexpr = gl.SliceLayout(0, layout)
+    offs_n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=n_layout)
+    offs_k = gl.arange(0, BLOCK_K, layout=k_layout)
+    acc = gl.zeros([BLOCK_N], gl.float32, n_layout)
+    for k_base in range(0, K, BLOCK_K):
+        k = k_base + offs_k
+        a = cdna4.buffer_load(
+            a_batch_ptr,
+            (m * a_m_stride + k).to(gl.int32),
+        ).to(gl.float32)
+        b = cdna4.buffer_load(
+            b_batch_ptr,
+            (offs_n[:, None] + k[None, :] * b_k_stride).to(gl.int32),
+        ).to(gl.float32)
+        acc += gl.sum(b * gl.convert_layout(a[None, :], layout), axis=1)
+    rounded = acc.to(gl.bfloat16)
+    gl.store(
+        output_batch_ptr + m * output_m_stride + offs_n,
+        rounded.to(output_ptr.dtype.element_ty),
     )
 
 
@@ -731,6 +868,9 @@ def _mfma_lds_mediumm_kernel(
     stride_addend_an,
     stride_addend_bm,
     stride_addend_bn,
+    stride_ab,
+    stride_bb,
+    stride_cb,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
@@ -739,12 +879,21 @@ def _mfma_lds_mediumm_kernel(
     NUM_BUFFERS: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     ADD3: gl.constexpr,
+    BATCHED: gl.constexpr,
+    STAGE_BF16: gl.constexpr,
 ):
-    """MFMA/LDS dense16 GEMM for selected 8 <= M <= 128 decode tiles."""
-    pid = gl.program_id(axis=0)
+    """MFMA/LDS dense16 GEMM for selected small and medium M tiles."""
+    tile_id = gl.program_id(axis=0)
+    batch_i32 = gl.program_id(axis=1).to(gl.int32)
     num_pid_m = gl.cdiv(M, BLOCK_M)
     num_pid_n = gl.cdiv(N, BLOCK_N)
-    pid_m, pid_n = _tile_to_pid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
+    if BATCHED:
+        gl.static_assert(not ADD3, "batched MFMA GEMM does not support addends")
+    batch_i64 = batch_i32.to(gl.int64)
+    a_batch_ptr = a_ptr + batch_i64 * stride_ab
+    b_batch_ptr = b_ptr + batch_i64 * stride_bb
+    c_batch_ptr = c_ptr + batch_i64 * stride_cb
+    pid_m, pid_n = _tile_to_pid(tile_id, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     gl.static_assert(
         BLOCK_M % 16 == 0, "tiled MFMA GEMM requires BLOCK_M multiple of 16"
@@ -781,7 +930,9 @@ def _mfma_lds_mediumm_kernel(
             "1024-depth tiled MFMA GEMM fits LDS only as 16x16x1024 with two buffers",
         )
     gLoadLayoutA: gl.constexpr = _mfma_lds_gload_layout_a(BLOCK_M, BLOCK_K, NUM_WARPS)
-    gLoadLayoutB: gl.constexpr = _mfma_lds_gload_layout_b(BLOCK_N, BLOCK_K, NUM_WARPS)
+    gLoadLayoutB: gl.constexpr = _mfma_lds_select_gload_layout_b(
+        BLOCK_N, BLOCK_K, NUM_WARPS, BATCHED
+    )
 
     mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
@@ -798,8 +949,12 @@ def _mfma_lds_mediumm_kernel(
     sharedLayoutA: gl.constexpr = _mfma_lds_shared_layout_a(
         dotOpLayoutA, BLOCK_M, BLOCK_K, a_ptr.dtype.element_ty
     )
-    sharedLayoutB: gl.constexpr = _mfma_lds_shared_layout_b(
-        dotOpLayoutB, BLOCK_N, BLOCK_K, b_ptr.dtype.element_ty
+    sharedLayoutB: gl.constexpr = _mfma_lds_select_shared_layout_b(
+        dotOpLayoutB,
+        BLOCK_N,
+        BLOCK_K,
+        b_ptr.dtype.element_ty,
+        BATCHED,
     )
 
     smemA = gl.allocate_shared_memory(
@@ -850,9 +1005,11 @@ def _mfma_lds_mediumm_kernel(
     acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfmaLayout)
 
     if NUM_BUFFERS == 1:
-        async_copy.buffer_load_to_shared(smemA.index(0), a_ptr, a_offs0, mask=a_mask)
+        async_copy.buffer_load_to_shared(
+            smemA.index(0), a_batch_ptr, a_offs0, mask=a_mask
+        )
         async_copy.commit_group()
-        async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+        async_copy.buffer_load_to_shared(smemB.index(0), b_batch_ptr, b_offs0)
         async_copy.commit_group()
         async_copy.wait_group(0)
         a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
@@ -860,13 +1017,17 @@ def _mfma_lds_mediumm_kernel(
         acc = cdna4.mfma(a, b, acc)
 
     elif NUM_BUFFERS == 2:
-        async_copy.buffer_load_to_shared(smemA.index(0), a_ptr, a_offs0, mask=a_mask)
+        async_copy.buffer_load_to_shared(
+            smemA.index(0), a_batch_ptr, a_offs0, mask=a_mask
+        )
         async_copy.commit_group()
-        async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+        async_copy.buffer_load_to_shared(smemB.index(0), b_batch_ptr, b_offs0)
         async_copy.commit_group()
-        async_copy.buffer_load_to_shared(smemA.index(1), a_ptr, a_offs1, mask=a_mask)
+        async_copy.buffer_load_to_shared(
+            smemA.index(1), a_batch_ptr, a_offs1, mask=a_mask
+        )
         async_copy.commit_group()
-        async_copy.buffer_load_to_shared(smemB.index(1), b_ptr, b_offs1)
+        async_copy.buffer_load_to_shared(smemB.index(1), b_batch_ptr, b_offs1)
         async_copy.commit_group()
         a_offs0 = (a_offs0 + a_kstep).to(gl.int32)
         a_offs1 = (a_offs1 + a_kstep).to(gl.int32)
@@ -886,10 +1047,10 @@ def _mfma_lds_mediumm_kernel(
                 a = async_copy.load_shared_relaxed(smemA.index(1), dotOpLayoutA)
                 b = async_copy.load_shared_relaxed(smemB.index(1), dotOpLayoutB)
                 async_copy.buffer_load_to_shared(
-                    smemA.index(0), a_ptr, a_offs0, mask=a_mask
+                    smemA.index(0), a_batch_ptr, a_offs0, mask=a_mask
                 )
                 async_copy.commit_group()
-                async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+                async_copy.buffer_load_to_shared(smemB.index(0), b_batch_ptr, b_offs0)
                 async_copy.commit_group()
 
             with gl.amd.warp_pipeline_stage("mfma", priority=0):
@@ -899,10 +1060,10 @@ def _mfma_lds_mediumm_kernel(
                 a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
                 b = async_copy.load_shared_relaxed(smemB.index(0), dotOpLayoutB)
                 async_copy.buffer_load_to_shared(
-                    smemA.index(1), a_ptr, a_offs1, mask=a_mask
+                    smemA.index(1), a_batch_ptr, a_offs1, mask=a_mask
                 )
                 async_copy.commit_group()
-                async_copy.buffer_load_to_shared(smemB.index(1), b_ptr, b_offs1)
+                async_copy.buffer_load_to_shared(smemB.index(1), b_batch_ptr, b_offs1)
                 async_copy.commit_group()
                 a_offs0 = (a_offs0 + a_kstep).to(gl.int32)
                 a_offs1 = (a_offs1 + a_kstep).to(gl.int32)
@@ -921,10 +1082,10 @@ def _mfma_lds_mediumm_kernel(
 
         if tiles_remaining > 2:
             async_copy.buffer_load_to_shared(
-                smemA.index(0), a_ptr, a_offs0, mask=a_mask
+                smemA.index(0), a_batch_ptr, a_offs0, mask=a_mask
             )
             async_copy.commit_group()
-            async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+            async_copy.buffer_load_to_shared(smemB.index(0), b_batch_ptr, b_offs0)
             async_copy.commit_group()
             async_copy.wait_group(0)
             a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
@@ -932,17 +1093,23 @@ def _mfma_lds_mediumm_kernel(
             acc = cdna4.mfma(a, b, acc)
 
     else:
-        async_copy.buffer_load_to_shared(smemA.index(0), a_ptr, a_offs0, mask=a_mask)
+        async_copy.buffer_load_to_shared(
+            smemA.index(0), a_batch_ptr, a_offs0, mask=a_mask
+        )
         async_copy.commit_group()
-        async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+        async_copy.buffer_load_to_shared(smemB.index(0), b_batch_ptr, b_offs0)
         async_copy.commit_group()
-        async_copy.buffer_load_to_shared(smemA.index(1), a_ptr, a_offs1, mask=a_mask)
+        async_copy.buffer_load_to_shared(
+            smemA.index(1), a_batch_ptr, a_offs1, mask=a_mask
+        )
         async_copy.commit_group()
-        async_copy.buffer_load_to_shared(smemB.index(1), b_ptr, b_offs1)
+        async_copy.buffer_load_to_shared(smemB.index(1), b_batch_ptr, b_offs1)
         async_copy.commit_group()
-        async_copy.buffer_load_to_shared(smemA.index(2), a_ptr, a_offs2, mask=a_mask)
+        async_copy.buffer_load_to_shared(
+            smemA.index(2), a_batch_ptr, a_offs2, mask=a_mask
+        )
         async_copy.commit_group()
-        async_copy.buffer_load_to_shared(smemB.index(2), b_ptr, b_offs2)
+        async_copy.buffer_load_to_shared(smemB.index(2), b_batch_ptr, b_offs2)
         async_copy.commit_group()
         a_offs0 = (a_offs0 + a_kstep).to(gl.int32)
         a_offs1 = (a_offs1 + a_kstep).to(gl.int32)
@@ -964,10 +1131,10 @@ def _mfma_lds_mediumm_kernel(
                 a = async_copy.load_shared_relaxed(smemA.index(1), dotOpLayoutA)
                 b = async_copy.load_shared_relaxed(smemB.index(1), dotOpLayoutB)
                 async_copy.buffer_load_to_shared(
-                    smemA.index(0), a_ptr, a_offs0, mask=a_mask
+                    smemA.index(0), a_batch_ptr, a_offs0, mask=a_mask
                 )
                 async_copy.commit_group()
-                async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+                async_copy.buffer_load_to_shared(smemB.index(0), b_batch_ptr, b_offs0)
                 async_copy.commit_group()
 
             async_copy.wait_group(2)
@@ -977,10 +1144,10 @@ def _mfma_lds_mediumm_kernel(
                 a = async_copy.load_shared_relaxed(smemA.index(2), dotOpLayoutA)
                 b = async_copy.load_shared_relaxed(smemB.index(2), dotOpLayoutB)
                 async_copy.buffer_load_to_shared(
-                    smemA.index(1), a_ptr, a_offs1, mask=a_mask
+                    smemA.index(1), a_batch_ptr, a_offs1, mask=a_mask
                 )
                 async_copy.commit_group()
-                async_copy.buffer_load_to_shared(smemB.index(1), b_ptr, b_offs1)
+                async_copy.buffer_load_to_shared(smemB.index(1), b_batch_ptr, b_offs1)
                 async_copy.commit_group()
 
             async_copy.wait_group(2)
@@ -990,10 +1157,10 @@ def _mfma_lds_mediumm_kernel(
                 a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
                 b = async_copy.load_shared_relaxed(smemB.index(0), dotOpLayoutB)
                 async_copy.buffer_load_to_shared(
-                    smemA.index(2), a_ptr, a_offs2, mask=a_mask
+                    smemA.index(2), a_batch_ptr, a_offs2, mask=a_mask
                 )
                 async_copy.commit_group()
-                async_copy.buffer_load_to_shared(smemB.index(2), b_ptr, b_offs2)
+                async_copy.buffer_load_to_shared(smemB.index(2), b_batch_ptr, b_offs2)
                 async_copy.commit_group()
                 a_offs0 = (a_offs0 + a_kstep).to(gl.int32)
                 a_offs1 = (a_offs1 + a_kstep).to(gl.int32)
@@ -1018,10 +1185,10 @@ def _mfma_lds_mediumm_kernel(
 
         if tiles_remaining > 3:
             async_copy.buffer_load_to_shared(
-                smemA.index(0), a_ptr, a_offs0, mask=a_mask
+                smemA.index(0), a_batch_ptr, a_offs0, mask=a_mask
             )
             async_copy.commit_group()
-            async_copy.buffer_load_to_shared(smemB.index(0), b_ptr, b_offs0)
+            async_copy.buffer_load_to_shared(smemB.index(0), b_batch_ptr, b_offs0)
             async_copy.commit_group()
             async_copy.wait_group(0)
             a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
@@ -1030,10 +1197,10 @@ def _mfma_lds_mediumm_kernel(
 
         if tiles_remaining > 4:
             async_copy.buffer_load_to_shared(
-                smemA.index(1), a_ptr, a_offs1, mask=a_mask
+                smemA.index(1), a_batch_ptr, a_offs1, mask=a_mask
             )
             async_copy.commit_group()
-            async_copy.buffer_load_to_shared(smemB.index(1), b_ptr, b_offs1)
+            async_copy.buffer_load_to_shared(smemB.index(1), b_batch_ptr, b_offs1)
             async_copy.commit_group()
             async_copy.wait_group(0)
             a = async_copy.load_shared_relaxed(smemA.index(1), dotOpLayoutA)
@@ -1076,13 +1243,21 @@ def _mfma_lds_mediumm_kernel(
             mask=c_mask,
             other=0.0,
         )
-    c_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
-    cdna4.buffer_store(
-        ptr=c_base,
-        offsets=c_offsets,
-        stored_value=acc_store.to(c_ptr.dtype.element_ty),
-        mask=c_mask,
-    )
+    c_base = c_batch_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
+    if STAGE_BF16:
+        rounded = acc_store.to(gl.bfloat16)
+        gl.store(
+            c_base + c_offsets,
+            rounded.to(c_ptr.dtype.element_ty),
+            mask=c_mask,
+        )
+    else:
+        cdna4.buffer_store(
+            ptr=c_base,
+            offsets=c_offsets,
+            stored_value=acc_store.to(c_ptr.dtype.element_ty),
+            mask=c_mask,
+        )
 
 
 def _allocate_partial_scratch(
@@ -1168,6 +1343,55 @@ def _resolve_output(
     return out
 
 
+def _max_nonnegative_offset(
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+) -> int | None:
+    if (
+        len(shape) != len(strides)
+        or any(size <= 0 for size in shape)
+        or any(stride < 0 for stride in strides)
+    ):
+        return None
+    return sum((size - 1) * stride for size, stride in zip(shape, strides))
+
+
+def _fits_i32_buffer_offsets(
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+    element_size: int,
+) -> bool:
+    """Return whether each complete element fits the byte-addressed buffer range."""
+    max_offset = _max_nonnegative_offset(shape, strides)
+    return (
+        max_offset is not None
+        and element_size > 0
+        and (max_offset + 1) * element_size <= BUFFER_OFFSET_I32_MAX
+    )
+
+
+def _fits_i32_element_offsets(
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+) -> bool:
+    """Return whether every element offset fits a signed 32-bit index."""
+    max_offset = _max_nonnegative_offset(shape, strides)
+    return max_offset is not None and max_offset <= BUFFER_OFFSET_I32_MAX
+
+
+def _has_skinny_bmm_load_alignment(A: torch.Tensor, B: torch.Tensor) -> bool:
+    """Check the base and row alignment required by 128-bit BF16 loads."""
+    strides = (A.stride(0), A.stride(1), B.stride(0), B.stride(2))
+    return (
+        A.data_ptr() % SKINNY_BMM_LOAD_ALIGNMENT_BYTES == 0
+        and B.data_ptr() % SKINNY_BMM_LOAD_ALIGNMENT_BYTES == 0
+        and all(
+            stride >= 0 and stride % SKINNY_BMM_LOAD_ALIGNMENT_ELEMENTS == 0
+            for stride in strides
+        )
+    )
+
+
 def _use_warp_reduce_smallm(M: int, _N: int, K: int) -> bool:
     return (M in (1, 2) and K <= 2048) or (M == 4 and K <= 1024)
 
@@ -1194,6 +1418,40 @@ def _use_mfma_lds_smallm(_M: int, _N: int, _K: int) -> bool:
     # Keep the split-K kernels available for direct experiments, but do not
     # route them by default until they are consistently faster than torch.mm.
     return False
+
+
+def _choose_skinny_bmm_mfma_config(
+    M: int, N: int, K: int
+) -> tuple[int, int, int, int, int, int] | None:
+    """Choose the batched MFMA tile for aligned small-M BF16 GEMMs."""
+    if (
+        M <= SKINNY_BMM_ROW_MAX_M
+        or M > SKINNY_BMM_MAX_M
+        or N <= 0
+        or N % SKINNY_BMM_BLOCK_N != 0
+        or K < DENSE16_BLOCK_K
+        or K > SKINNY_BMM_MAX_K
+        or K % DENSE16_BLOCK_K != 0
+    ):
+        return None
+
+    block_m = 16 if M <= 16 else 32
+    block_n = SKINNY_BMM_BLOCK_N
+    if K == DENSE16_BLOCK_K:
+        return block_m, block_n, DENSE16_BLOCK_K, 2, 2, 1
+    if K == SKINNY_BMM_MAX_K:
+        # Keep this tile within the LDS configuration already exercised by the
+        # medium-M path. M > 16 uses two M tiles instead of a larger LDS tile.
+        return 16, block_n, 512, 2, 2, 2
+    if K % 256 == 0 and K // 256 >= 2:
+        block_k = 256
+    elif K % 128 == 0 and K // 128 >= 2:
+        block_k = 128
+    else:
+        block_k = DENSE16_BLOCK_K
+    k_tiles = K // block_k
+    num_buffers = 2 if k_tiles == 2 else 3
+    return block_m, block_n, block_k, 2, 2, num_buffers
 
 
 def _choose_mfma_lds_mediumm_config(
@@ -1381,6 +1639,126 @@ def gluon_bmm_a16w16_gfx950(
     return C
 
 
+def gluon_bmm_a16w16_skinny_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Compute aligned small-M batched BF16 GEMM with BF16 or E4M3 output."""
+    if A.ndim != 3 or B.ndim != 3:
+        return None
+    if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
+        return None
+    if out_dtype not in (torch.bfloat16, torch.float8_e4m3fn) or alpha is not None:
+        return None
+    if not A.is_cuda or not B.is_cuda or A.device != B.device:
+        return None
+
+    batch, M, K = A.shape
+    batch_b, N, K_b = B.shape
+    if (
+        batch <= 0
+        or batch > SKINNY_BMM_MAX_BATCH
+        or batch_b != batch
+        or M <= 0
+        or M > SKINNY_BMM_MAX_M
+        or N <= 0
+        or N % SKINNY_BMM_BLOCK_N != 0
+        or K < DENSE16_BLOCK_K
+        or K > SKINNY_BMM_MAX_K
+        or K % DENSE16_BLOCK_K != 0
+        or K_b != K
+    ):
+        return None
+    if A.stride(-1) != 1 or B.stride(1) != 1:
+        return None
+    if not _has_skinny_bmm_load_alignment(A, B):
+        return None
+    if not _fits_i32_buffer_offsets(
+        (M, K), (A.stride(1), A.stride(2)), A.element_size()
+    ):
+        return None
+    if not _fits_i32_buffer_offsets(
+        (N, K), (B.stride(1), B.stride(2)), B.element_size()
+    ):
+        return None
+
+    C = _resolve_output(A, (batch, M, N), out_dtype, out, "skinny BF16 BMM")
+    if not _fits_i32_element_offsets((M, N), (C.stride(1), C.stride(2))):
+        return None
+    if M <= SKINNY_BMM_ROW_MAX_M:
+        num_warps = 4
+        _bmm_a16w16_skinny_row_kernel[
+            (batch * M * triton.cdiv(N, SKINNY_BMM_BLOCK_N),)
+        ](
+            A,
+            B,
+            C,
+            M,
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            C.stride(0),
+            C.stride(1),
+            K=K,
+            N=N,
+            BLOCK_N=SKINNY_BMM_BLOCK_N,
+            BLOCK_K=SKINNY_BMM_BLOCK_K,
+            NUM_WARPS=num_warps,
+            WAVEFRONT_SIZE=CDNA_WAVEFRONT_SIZE,
+            num_warps=num_warps,
+            num_stages=1,
+            waves_per_eu=0,
+        )
+        return C
+
+    config = _choose_skinny_bmm_mfma_config(M, N, K)
+    if config is None:
+        return None
+    block_m, block_n, block_k, warps_m, warps_n, num_buffers = config
+    grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), batch)
+    _mfma_lds_mediumm_kernel[grid](
+        A,
+        B,
+        C,
+        C,
+        C,
+        M,
+        N,
+        K,
+        A.stride(1),
+        A.stride(2),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
+        C.stride(1),
+        C.stride(2),
+        C.stride(1),
+        C.stride(2),
+        A.stride(0),
+        B.stride(0),
+        C.stride(0),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_BUFFERS=num_buffers,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
+        BATCHED=True,
+        STAGE_BF16=True,
+        num_warps=warps_m * warps_n,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    return C
+
+
 def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1549,7 +1927,7 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
 
     block_m, block_n, block_k, warps_m, warps_n, num_buffers = config
     C = _resolve_output(A, (M, N), out_dtype, out, "medium-M dense16 MFMA LDS GEMM")
-    grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
+    grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), 1)
     _mfma_lds_mediumm_kernel[grid](
         A,
         B,
@@ -1569,6 +1947,9 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
         C.stride(1),
         C.stride(0),
         C.stride(1),
+        0,
+        0,
+        0,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -1577,6 +1958,8 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
         NUM_BUFFERS=num_buffers,
         GROUP_SIZE_M=GROUP_SIZE_M,
         ADD3=False,
+        BATCHED=False,
+        STAGE_BF16=False,
         num_warps=warps_m * warps_n,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
@@ -1619,7 +2002,7 @@ def gluon_mm_a16w16_add3_m16_gfx950(
     C = A.new_empty((16, 7168))
     block_m, block_n, block_k = 16, 32, 128
     warps_m, warps_n, num_buffers = 2, 2, 3
-    grid = (triton.cdiv(7168, block_n),)
+    grid = (triton.cdiv(7168, block_n), 1)
     _mfma_lds_mediumm_kernel[grid](
         A,
         B,
@@ -1639,6 +2022,9 @@ def gluon_mm_a16w16_add3_m16_gfx950(
         addend_a.stride(1),
         addend_b.stride(0),
         addend_b.stride(1),
+        0,
+        0,
+        0,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
@@ -1647,6 +2033,8 @@ def gluon_mm_a16w16_add3_m16_gfx950(
         NUM_BUFFERS=num_buffers,
         GROUP_SIZE_M=1,
         ADD3=True,
+        BATCHED=False,
+        STAGE_BF16=False,
         num_warps=warps_m * warps_n,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )

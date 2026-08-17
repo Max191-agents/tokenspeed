@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.attention import (
     dsa_decode_topk,
     dsa_prefill_topk,
 )
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -70,6 +71,7 @@ from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _INDEXER_PREFILL_MAX_LOGITS_MB_ARG = "deepseek_v4_indexer_prefill_max_logits_mb"
+_is_amd = current_platform().is_amd
 
 
 @dataclass
@@ -777,8 +779,34 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         )
         kv_a = latent_cache[..., : self.kv_lora_rank]
         q_norm = torch.empty_like(q_a)
+        prepare_fp8_key = (
+            _is_amd
+            and self._mla_kv_is_fp8(ctx, getattr(self.attn_mqa, "k_scale_float", 1.0))
+            and self.rotary_emb is not None
+        )
+        key_fp8 = (
+            torch.empty(
+                latent_cache.shape[:-1] + (1, latent_cache.shape[-1]),
+                dtype=torch.float8_e4m3fn,
+                device=latent_cache.device,
+            )
+            if prepare_fp8_key
+            else None
+        )
         if q_a.size(0) > 0:
-            self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
+            if key_fp8 is None:
+                self.fused_qk_layernorm(
+                    input_q_a=q_a,
+                    input_kv_a=kv_a,
+                    output_q_a=q_norm,
+                )
+            else:
+                self.fused_qk_layernorm(
+                    input_q_a=q_a,
+                    input_kv_a=kv_a,
+                    output_q_a=q_norm,
+                    output_kv_a=key_fp8[:, 0, : self.kv_lora_rank],
+                )
 
         decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         num_attn_tokens = int(q_norm.shape[0])
@@ -838,15 +866,27 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 raise RuntimeError(
                     "GLM DSA sparse prefill requires computed top-k indices."
                 )
-            self.forward_dsa_sparse_prefill(
-                positions[:num_prefill_tokens],
-                q[:num_prefill_tokens],
-                latent_cache[:num_prefill_tokens],
-                prefill_ctx,
-                out_cache_loc[:num_prefill_tokens],
-                attn_output[:num_prefill_tokens],
-                prefill_topk=ctx.dsa_prefill_topk,
-            )
+            if key_fp8 is None:
+                self.forward_dsa_sparse_prefill(
+                    positions[:num_prefill_tokens],
+                    q[:num_prefill_tokens],
+                    latent_cache[:num_prefill_tokens],
+                    prefill_ctx,
+                    out_cache_loc[:num_prefill_tokens],
+                    attn_output[:num_prefill_tokens],
+                    prefill_topk=ctx.dsa_prefill_topk,
+                )
+            else:
+                self.forward_dsa_sparse_prefill(
+                    positions[:num_prefill_tokens],
+                    q[:num_prefill_tokens],
+                    latent_cache[:num_prefill_tokens],
+                    prefill_ctx,
+                    out_cache_loc[:num_prefill_tokens],
+                    attn_output[:num_prefill_tokens],
+                    prefill_topk=ctx.dsa_prefill_topk,
+                    key_fp8=key_fp8[:num_prefill_tokens],
+                )
 
         if num_decode_tokens > 0:
             decode_ctx = replace(
@@ -865,16 +905,29 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 decode_start,
                 decode_end,
             )
-            self.forward_absorb(
-                positions[decode_start:decode_end],
-                q[decode_start:decode_end],
-                latent_cache[decode_start:decode_end],
-                decode_ctx,
-                out_cache_loc[decode_start:decode_end],
-                attn_output[decode_start:decode_end],
-                topk_indices=topk_indices,
-                topk_lens=topk_lens,
-            )
+            if key_fp8 is None:
+                self.forward_absorb(
+                    positions[decode_start:decode_end],
+                    q[decode_start:decode_end],
+                    latent_cache[decode_start:decode_end],
+                    decode_ctx,
+                    out_cache_loc[decode_start:decode_end],
+                    attn_output[decode_start:decode_end],
+                    topk_indices=topk_indices,
+                    topk_lens=topk_lens,
+                )
+            else:
+                self.forward_absorb(
+                    positions[decode_start:decode_end],
+                    q[decode_start:decode_end],
+                    latent_cache[decode_start:decode_end],
+                    decode_ctx,
+                    out_cache_loc[decode_start:decode_end],
+                    attn_output[decode_start:decode_end],
+                    topk_indices=topk_indices,
+                    topk_lens=topk_lens,
+                    key_fp8=key_fp8[decode_start:decode_end],
+                )
 
         if ctx.accept_lengths is not None:
             attn_output = attn_output.index_select(0, ctx.gather_ids)
@@ -891,14 +944,25 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         output: torch.Tensor,
         *,
         prefill_topk: GlmDsaPrefillTopK,
+        key_fp8: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        Q, _ = self.forward_absorb_qkv_proj(
-            q,
-            latent_cache,
-            positions,
-            ctx,
-            out_cache_loc,
-        )
+        if key_fp8 is None:
+            Q, _ = self.forward_absorb_qkv_proj(
+                q,
+                latent_cache,
+                positions,
+                ctx,
+                out_cache_loc,
+            )
+        else:
+            Q, _ = self.forward_absorb_qkv_proj(
+                q,
+                latent_cache,
+                positions,
+                ctx,
+                out_cache_loc,
+                key_fp8=key_fp8,
+            )
         attn_output = ctx.attn_backend.forward_sparse_prefill(
             q=Q,
             layer=self.attn_mqa,
@@ -929,14 +993,25 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         output: torch.Tensor,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
+        key_fp8: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        Q, K = self.forward_absorb_qkv_proj(
-            q,
-            latent_cache,
-            positions,
-            ctx,
-            out_cache_loc,
-        )
+        if key_fp8 is None:
+            Q, K = self.forward_absorb_qkv_proj(
+                q,
+                latent_cache,
+                positions,
+                ctx,
+                out_cache_loc,
+            )
+        else:
+            Q, K = self.forward_absorb_qkv_proj(
+                q,
+                latent_cache,
+                positions,
+                ctx,
+                out_cache_loc,
+                key_fp8=key_fp8,
+            )
         return self.forward_absorb_attn_v_proj(
             Q,
             K,

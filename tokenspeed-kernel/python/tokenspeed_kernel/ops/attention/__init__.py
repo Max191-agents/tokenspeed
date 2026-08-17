@@ -42,6 +42,7 @@ from tokenspeed_kernel.ops.attention.kda_utils import (
     KdaFusedDecodeResult,
     KdaPrefillResult,
 )
+from tokenspeed_kernel.ops.attention.mla_prepare import mla_prepare_fp8_query
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -146,6 +147,7 @@ __all__ = [
     "mla_use_absorbed_extend",
     "mla_extend_with_kvcache",
     "mla_normalize_project_query",
+    "mla_prepare_fp8_query",
     "mla_project_value",
     "mla_project_value_prefers_contiguous_weight",
     "mla_decode_with_kvcache",

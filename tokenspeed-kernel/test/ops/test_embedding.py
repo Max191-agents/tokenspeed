@@ -26,7 +26,12 @@ from tokenspeed_kernel.ops.embedding import (
     FusedSetKVBufferArg,
     apply_rope,
     apply_rope_mla,
+    rope_mla_fp8_producer,
 )
+from tokenspeed_kernel.ops.embedding.triton import _fp8_quantize, apply_rope_triton
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
@@ -545,3 +550,271 @@ def test_rope_mla_quantize(
     assert key_fp8.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(query_fp8.float(), q_ref.float(), rtol=0, atol=0.5)
     torch.testing.assert_close(key_fp8.float(), k_ref.float(), rtol=0, atol=0.5)
+
+
+@pytest.mark.parametrize("preserve_key_prefix", [False, True])
+@pytest.mark.parametrize("tensor_scales", [False, True])
+@pytest.mark.parametrize("is_neox", [False, True])
+def test_rope_mla_fp8_producer_outputs(
+    device: str,
+    require,
+    preserve_key_prefix: bool,
+    tensor_scales: bool,
+    is_neox: bool,
+) -> None:
+    require(
+        "embedding",
+        "rope_mla_fp8_producer",
+        "triton",
+        torch.bfloat16,
+        "q_rope",
+    )
+    torch.manual_seed(27)
+    tokens, q_heads, kv_heads = 5, 16, 1
+    latent_dim, rope_dim = 512, 64
+    positions = torch.tensor([1, 7, 19, 43, 87], device=device, dtype=torch.int32)
+    frequency = torch.randn(128, rope_dim // 2, device=device)
+    cos_sin_cache = torch.cat((frequency.cos(), frequency.sin()), dim=-1)
+    q_rope = torch.randn(tokens, q_heads, rope_dim, device=device, dtype=torch.bfloat16)
+    k_rope = torch.randn(
+        tokens, kv_heads, rope_dim, device=device, dtype=torch.bfloat16
+    )
+    k_nope = torch.randn(
+        tokens, kv_heads, latent_dim, device=device, dtype=torch.bfloat16
+    )
+    query_out = torch.empty(
+        tokens,
+        q_heads,
+        latent_dim + rope_dim,
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+    query_prefix = torch.full(
+        (tokens, q_heads, latent_dim),
+        7.0,
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+    query_out[..., :latent_dim].copy_(query_prefix)
+
+    key_out = None
+    key_prefix = torch.full(
+        (tokens, kv_heads, latent_dim),
+        11.0,
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+    if preserve_key_prefix:
+        key_out = torch.empty(
+            tokens,
+            kv_heads,
+            latent_dim + rope_dim,
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        key_out[..., :latent_dim].copy_(key_prefix)
+
+    scale_q_value = 1.25
+    scale_kv_value = 0.75
+    scale_q = (
+        torch.tensor(scale_q_value, device=device) if tensor_scales else scale_q_value
+    )
+    scale_kv = (
+        torch.tensor(scale_kv_value, device=device) if tensor_scales else scale_kv_value
+    )
+    actual_query, actual_key = rope_mla_fp8_producer(
+        positions=positions,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        k_nope=k_nope,
+        cos_sin_cache=cos_sin_cache,
+        query_out=query_out,
+        key_out=key_out,
+        quant_scale_q=scale_q,
+        quant_scale_kv=scale_kv,
+        is_neox=is_neox,
+        solution="triton",
+        enable_pdl=True,
+    )
+
+    q_rope_staged = torch.empty_like(q_rope)
+    k_rope_staged = torch.empty_like(k_rope)
+    q_tail_staged = torch.empty_like(q_rope, dtype=torch.float8_e4m3fn)
+    k_tail_staged = torch.empty_like(k_rope, dtype=torch.float8_e4m3fn)
+    apply_rope_triton(
+        positions=positions,
+        query=q_rope,
+        key=k_rope,
+        head_size=rope_dim,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        rotary_dim=rope_dim,
+        output_q_rope=q_rope_staged,
+        output_k_rope=k_rope_staged,
+    )
+    _fp8_quantize(q_rope_staged, q_tail_staged, scale_q, enable_pdl=False)
+    _fp8_quantize(k_rope_staged, k_tail_staged, scale_kv, enable_pdl=False)
+
+    assert actual_query is query_out
+    if preserve_key_prefix:
+        assert actual_key is key_out
+        expected_key_prefix = key_prefix
+    else:
+        assert key_out is None
+        expected_key_prefix = (k_nope.float() * scale_kv_value).to(torch.float8_e4m3fn)
+    assert torch.equal(
+        actual_query[..., :latent_dim].view(torch.uint8),
+        query_prefix.view(torch.uint8),
+    )
+    assert torch.equal(
+        actual_key[..., :latent_dim].view(torch.uint8),
+        expected_key_prefix.view(torch.uint8),
+    )
+    assert torch.equal(
+        actual_query[..., latent_dim:].view(torch.uint8),
+        q_tail_staged.view(torch.uint8),
+    )
+    assert torch.equal(
+        actual_key[..., latent_dim:].view(torch.uint8),
+        k_tail_staged.view(torch.uint8),
+    )
+
+
+def test_rope_mla_fp8_producer_has_no_nvidia_kernel(h100_platform) -> None:
+    signature = format_signature(
+        q_rope=dense_tensor_format(torch.bfloat16),
+        k_rope=dense_tensor_format(torch.bfloat16),
+        k_nope=dense_tensor_format(torch.bfloat16),
+    )
+    registry = KernelRegistry.get()
+    registry.clear_cache()
+    try:
+        with pytest.raises(NoKernelFoundError):
+            select_kernel(
+                "embedding",
+                "rope_mla_fp8_producer",
+                signature,
+                platform=h100_platform,
+                traits={
+                    "is_neox": True,
+                    "has_scale_q_tensor": False,
+                    "has_scale_kv_tensor": False,
+                    "preserve_key_prefix": True,
+                },
+            )
+    finally:
+        registry.clear_cache()
+
+
+def test_rope_mla_fp8_producer_selects_on_amd(mi450_platform) -> None:
+    signature = format_signature(
+        q_rope=dense_tensor_format(torch.bfloat16),
+        k_rope=dense_tensor_format(torch.bfloat16),
+        k_nope=dense_tensor_format(torch.bfloat16),
+    )
+    registry = KernelRegistry.get()
+    registry.clear_cache()
+    try:
+        selected = select_kernel(
+            "embedding",
+            "rope_mla_fp8_producer",
+            signature,
+            platform=mi450_platform,
+            traits={
+                "is_neox": True,
+                "has_scale_q_tensor": False,
+                "has_scale_kv_tensor": False,
+                "preserve_key_prefix": True,
+            },
+        )
+    finally:
+        registry.clear_cache()
+
+    assert selected.name == "triton_embedding_rope_mla_fp8_producer_amd"
+
+
+def test_rope_mla_fp8_producer_captures_and_replays(
+    device: str,
+    require,
+) -> None:
+    require(
+        "embedding",
+        "rope_mla_fp8_producer",
+        "triton",
+        torch.bfloat16,
+        "q_rope",
+    )
+    torch.manual_seed(31)
+    tokens, q_heads, kv_heads = 3, 16, 1
+    latent_dim, rope_dim = 512, 64
+    positions = torch.arange(tokens, device=device, dtype=torch.int32)
+    frequency = torch.randn(16, rope_dim // 2, device=device)
+    cos_sin_cache = torch.cat((frequency.cos(), frequency.sin()), dim=-1)
+    q_rope = torch.randn(tokens, q_heads, rope_dim, device=device, dtype=torch.bfloat16)
+    k_rope = torch.randn(
+        tokens, kv_heads, rope_dim, device=device, dtype=torch.bfloat16
+    )
+    k_nope = torch.randn(
+        tokens, kv_heads, latent_dim, device=device, dtype=torch.bfloat16
+    )
+    query_out = torch.empty(
+        tokens,
+        q_heads,
+        latent_dim + rope_dim,
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+    key_out = torch.empty(
+        tokens,
+        kv_heads,
+        latent_dim + rope_dim,
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+    query_out[..., :latent_dim].fill_(7.0)
+    key_out[..., :latent_dim].fill_(11.0)
+    query_prefix = query_out[..., :latent_dim].clone()
+    key_prefix = key_out[..., :latent_dim].clone()
+
+    rope_mla_fp8_producer(
+        positions,
+        q_rope,
+        k_rope,
+        k_nope,
+        cos_sin_cache,
+        query_out,
+        key_out=key_out,
+        enable_pdl=True,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_query, captured_key = rope_mla_fp8_producer(
+            positions,
+            q_rope,
+            k_rope,
+            k_nope,
+            cos_sin_cache,
+            query_out,
+            key_out=key_out,
+            enable_pdl=True,
+        )
+    assert captured_query is query_out
+    assert captured_key is key_out
+
+    q_rope.zero_()
+    k_rope.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        query_out[..., :latent_dim].view(torch.uint8),
+        query_prefix.view(torch.uint8),
+    )
+    assert torch.equal(
+        key_out[..., :latent_dim].view(torch.uint8),
+        key_prefix.view(torch.uint8),
+    )
+    assert torch.count_nonzero(query_out[..., latent_dim:]) == 0
+    assert torch.count_nonzero(key_out[..., latent_dim:]) == 0

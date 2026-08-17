@@ -433,8 +433,10 @@ class FusedRMSNorm(nn.Module):
         Normalize two tensors in parallel using fused computation.
 
         Args:
-            input_q_a: Q tensor to normalize
-            input_kv_a: KV tensor to normalize
+            input_q_a: Q tensor to normalize.
+            input_kv_a: KV tensor to normalize.
+            output_q_a: Optional destination for the normalized Q tensor.
+            output_kv_a: Optional destination for the normalized KV tensor.
 
         Returns:
             Tuple of (normalized_q_a, normalized_kv_a)

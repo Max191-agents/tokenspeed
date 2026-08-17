@@ -32,9 +32,22 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
+_BMM_FP8_OUTPUT_SIGNATURES = frozenset(
+    {
+        format_signature(
+            a=dense_tensor_format(torch.bfloat16),
+            b=dense_tensor_format(torch.bfloat16),
+            out=dense_tensor_format(torch.float8_e4m3fn),
+        )
+    }
+)
+
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        gluon_bmm_a16w16_skinny_gfx950 as _bmm_a16w16_skinny_impl,
     )
 
     try:
@@ -110,6 +123,61 @@ if current_platform().is_amd:
         if alpha is not None:
             output.mul_(alpha.to(device=output.device, dtype=output.dtype))
         return output
+
+    @register_kernel(
+        "gemm",
+        "bmm_fp8_output",
+        name="gluon_bmm_a16w16_skinny_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=_BMM_FP8_OUTPUT_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        # The implementation supports a wider opt-in envelope. Keep automatic
+        # dispatch on the production family whose full M=1..32 sweep passed;
+        # broader batch, output-width, and reduction-width shapes remain opt-in.
+        traits={
+            "batch": frozenset({16}),
+            "m": frozenset(range(1, 33)),
+            "n": frozenset({512}),
+            "k": frozenset({192}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_n_stride_one": frozenset({True}),
+            "out_inner_stride_one": frozenset({True}),
+            "a_load_16b_aligned": frozenset({True}),
+            "b_load_16b_aligned": frozenset({True}),
+            "native_fp8_output": frozenset({True}),
+        },
+        tags={"throughput"},
+    )
+    def gluon_bmm_a16w16_skinny_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """Run the gfx950 skinny BMM or the registered portable composition."""
+        output = _bmm_a16w16_skinny_impl(
+            A,
+            B,
+            torch.float8_e4m3fn,
+            out=out,
+        )
+        if output is not None:
+            return output
+
+        from tokenspeed_kernel.ops.gemm.triton import composite_bmm_fp8_output
+
+        return composite_bmm_fp8_output(
+            A,
+            B,
+            out=out,
+            enable_pdl=enable_pdl,
+        )
 
     if _linear_attnres_partials_impl is not None:
 
