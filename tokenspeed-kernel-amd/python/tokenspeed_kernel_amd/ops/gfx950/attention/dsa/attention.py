@@ -58,7 +58,6 @@ class _DensePrefillSchedule:
     pipeline_stages: int
     kv_load_slices: int
     num_kv_splits: int
-    layout_id: str
 
     @property
     def score_fragments_per_wave(self) -> int:
@@ -83,7 +82,6 @@ _DENSE_PREFILL_SCHEDULES = {
         pipeline_stages=2,
         kv_load_slices=2,
         num_kv_splits=1,
-        layout_id="selected_bf16_r128_h16n64",
     ),
     (torch.bfloat16, 512): _DensePrefillSchedule(
         name="bf16_r512_h16n64",
@@ -98,7 +96,6 @@ _DENSE_PREFILL_SCHEDULES = {
         pipeline_stages=2,
         kv_load_slices=2,
         num_kv_splits=1,
-        layout_id="selected_bf16_r512_h16n64",
     ),
     (torch.float8_e4m3fn, 512): _DensePrefillSchedule(
         name="e4m3_r512_h16n128",
@@ -113,7 +110,6 @@ _DENSE_PREFILL_SCHEDULES = {
         pipeline_stages=2,
         kv_load_slices=2,
         num_kv_splits=1,
-        layout_id="selected_e4m3_r512_h16n128",
     ),
     (torch.float8_e5m2, 512): _DensePrefillSchedule(
         name="e5m2_r512_h16n128",
@@ -128,7 +124,6 @@ _DENSE_PREFILL_SCHEDULES = {
         pipeline_stages=2,
         kv_load_slices=2,
         num_kv_splits=1,
-        layout_id="selected_e5m2_r512_h16n128",
     ),
 }
 
@@ -1239,7 +1234,6 @@ def _run_dense_prefill_schedule(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
-        layout_id=schedule.layout_id,
         block_h=schedule.block_h,
         block_n=schedule.block_n,
         waves_per_cta=schedule.waves_per_cta,

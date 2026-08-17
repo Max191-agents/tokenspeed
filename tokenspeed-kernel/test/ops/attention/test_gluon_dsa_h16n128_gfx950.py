@@ -34,7 +34,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
     gluon_dsa_prefill_dense_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
-    _SELECTED_DSA_LAYOUTS,
+    _require_selected_attention_schedule,
 )
 
 _NUM_HEADS = 16
@@ -256,9 +256,20 @@ def test_dense_schedule_wave_ownership_is_complete_and_unique() -> None:
     for name, schedule in schedules.items():
         assert schedule.waves_per_cta == (1, 4)
         assert schedule.num_warps == 4
-        assert _SELECTED_DSA_LAYOUTS[schedule.layout_id] == (
-            schedule.q_dtype,
-            schedule.kv_lora_rank,
+        assert _require_selected_attention_schedule(
+            q_dtype=schedule.q_dtype,
+            kv_dtype=schedule.q_dtype,
+            kv_lora_rank=schedule.kv_lora_rank,
+            qk_rope_head_dim=_ROPE_DIM,
+            block_h=schedule.block_h,
+            block_n=schedule.block_n,
+            waves_per_cta=schedule.waves_per_cta,
+            num_warps=schedule.num_warps,
+            qk_k_width=schedule.qk_k_width,
+            pv_k_width=schedule.pv_k_width,
+            pipeline_stages=schedule.pipeline_stages,
+            kv_load_slices=schedule.kv_load_slices,
+        ) == (
             schedule.block_h,
             schedule.block_n,
             schedule.waves_per_cta,

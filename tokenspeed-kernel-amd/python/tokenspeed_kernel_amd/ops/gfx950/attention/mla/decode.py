@@ -68,7 +68,6 @@ class AttentionConfig:
     NUM_XCDS: gl.constexpr
     NHEAD: gl.constexpr
     REGIME: gl.constexpr
-    LAYOUT_ID: gl.constexpr
     WAVES_M: gl.constexpr
     WAVES_N: gl.constexpr
     QK_K_WIDTH: gl.constexpr
@@ -127,7 +126,6 @@ class AttentionConfig:
         NUM_XCDS,
         NHEAD,
         REGIME,
-        LAYOUT_ID,
         WAVES_M,
         WAVES_N,
         QK_K_WIDTH,
@@ -159,9 +157,17 @@ class AttentionConfig:
         assert (
             BLOCK_N % KV_LOAD_SLICES == 0
         ), "MLA key tile must divide evenly across its load slices"
-        # Q-side layouts + mfma_layout: switch by the validated static schedule.
+        selected_bf16_rank128 = (
+            SELECTED_SLOTS
+            and not IS_FP8_Q
+            and HEAD_DIM_CKV == 128
+            and BLOCK_H == 16
+            and BLOCK_N == 64
+        )
+
+        # Q-side layouts + mfma_layout: switch by structural schedule shape.
         # bh64 has BLOCK_H=64 (warps tile M); bh16bn64 has BLOCK_H=16 (warps tile K).
-        if LAYOUT_ID == "selected_bf16_r128_h16n64":
+        if selected_bf16_rank128:
             assert BLOCK_H == 16, "rank-128 selected attention uses H16"
             assert (
                 HEAD_DIM_CKV == 128
@@ -380,7 +386,7 @@ class AttentionConfig:
 
         # FP8 KV uses a 128-token tile; BF16 KV uses 64. These layouts are
         # adapted from AITER's bh16bn128/bh16bn64 implementation.
-        if LAYOUT_ID == "selected_bf16_r128_h16n64":
+        if selected_bf16_rank128:
             blocked_kv = gl.BlockedLayout(
                 size_per_thread=[8, 1],
                 threads_per_warp=[16, 4],
@@ -630,7 +636,7 @@ class AttentionConfig:
         # V is the latent slice of K, read back transposed for the PV dot.
         # bh64 tiles M across warps (degenerate warp_bases + extra reg bases);
         # bh16bn64 tiles the 64-wide K across warps.
-        direct_v_load = LAYOUT_ID == "selected_bf16_r128_h16n64"
+        direct_v_load = selected_bf16_rank128
         if direct_v_load:
             # The rank-128 tile is already distributed like operand B after
             # transposition, so it does not need the rank-512 redistribution.
@@ -719,7 +725,6 @@ class AttentionConfig:
         self.NUM_XCDS = gl.constexpr(NUM_XCDS)
         self.NHEAD = gl.constexpr(NHEAD)
         self.REGIME = gl.constexpr(REGIME)
-        self.LAYOUT_ID = gl.constexpr(LAYOUT_ID)
         self.WAVES_M = gl.constexpr(WAVES_M)
         self.WAVES_N = gl.constexpr(WAVES_N)
         self.QK_K_WIDTH = gl.constexpr(QK_K_WIDTH)
@@ -1302,7 +1307,6 @@ def _mla_decode_gluon(
     NUM_XCDS: gl.constexpr,
     NHEAD: gl.constexpr,
     REGIME: gl.constexpr,
-    LAYOUT_ID: gl.constexpr,
     WAVES_M: gl.constexpr,
     WAVES_N: gl.constexpr,
     QK_K_WIDTH: gl.constexpr,
@@ -1325,7 +1329,6 @@ def _mla_decode_gluon(
         NUM_XCDS,
         NHEAD,
         REGIME,
-        LAYOUT_ID,
         WAVES_M,
         WAVES_N,
         QK_K_WIDTH,
@@ -1795,57 +1798,6 @@ _MLA_DECODE_REGIMES = frozenset(
     {"bh16bn128", "bh16bn64", "bh64", "bh16-multiblock", "bh64-small"}
 )
 
-_SELECTED_DSA_LAYOUTS = {
-    "selected_bf16_r128_h16n64": (
-        torch.bfloat16,
-        128,
-        16,
-        64,
-        (1, 4),
-        4,
-        8,
-        8,
-        2,
-        2,
-    ),
-    "selected_bf16_r512_h16n64": (
-        torch.bfloat16,
-        512,
-        16,
-        64,
-        (1, 4),
-        4,
-        8,
-        8,
-        2,
-        2,
-    ),
-    "selected_e4m3_r512_h16n128": (
-        torch.float8_e4m3fn,
-        512,
-        16,
-        128,
-        (1, 4),
-        4,
-        16,
-        8,
-        2,
-        2,
-    ),
-    "selected_e5m2_r512_h16n128": (
-        torch.float8_e5m2,
-        512,
-        16,
-        128,
-        (1, 4),
-        4,
-        16,
-        8,
-        2,
-        2,
-    ),
-}
-
 
 def _select_num_kv_splits_bh16bn64(
     *, batch: int, max_seqlen_k: int, block_n: int
@@ -1911,6 +1863,92 @@ def _select_num_kv_splits_small_batch(
     return max(1, min(occupancy_splits, blocks))
 
 
+def _require_selected_attention_schedule(
+    *,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_h: int | None,
+    block_n: int | None,
+    waves_per_cta: tuple[int, int] | None,
+    num_warps: int | None,
+    qk_k_width: int | None,
+    pv_k_width: int | None,
+    pipeline_stages: int | None,
+    kv_load_slices: int | None,
+) -> tuple[int, int, tuple[int, int], int, int, int, int, int]:
+    if any(
+        value is None
+        for value in (
+            block_h,
+            block_n,
+            waves_per_cta,
+            num_warps,
+            qk_k_width,
+            pv_k_width,
+            pipeline_stages,
+            kv_load_slices,
+        )
+    ):
+        raise ValueError("selected-slot MLA requires an explicit static schedule")
+    block_h = int(block_h)
+    block_n = int(block_n)
+    waves_per_cta = tuple(waves_per_cta)
+    num_warps = int(num_warps)
+    qk_k_width = int(qk_k_width)
+    pv_k_width = int(pv_k_width)
+    pipeline_stages = int(pipeline_stages)
+    kv_load_slices = int(kv_load_slices)
+
+    if q_dtype != kv_dtype:
+        raise NotImplementedError(
+            "selected-slot MLA requires matching query and KV dtypes, got "
+            f"{q_dtype}/{kv_dtype}"
+        )
+    if qk_rope_head_dim != 64:
+        raise NotImplementedError("selected-slot MLA requires RoPE width 64")
+    if (
+        block_h != 16
+        or waves_per_cta != (1, 4)
+        or num_warps != 4
+        or pipeline_stages != 2
+        or kv_load_slices != 2
+    ):
+        raise ValueError(
+            "selected-slot MLA requires H16, waves (1, 4), 4 warps, and a "
+            "2-stage/2-slice KV pipeline"
+        )
+
+    if q_dtype == torch.bfloat16:
+        if kv_lora_rank not in (128, 512) or block_n != 64:
+            raise NotImplementedError(
+                "selected-slot BF16 MLA requires rank 128 or 512 with N64"
+            )
+        if qk_k_width != 8 or pv_k_width != 8:
+            raise ValueError("selected-slot BF16 MLA requires QK/PV widths 8/8")
+    elif q_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        if kv_lora_rank != 512 or block_n != 128:
+            raise NotImplementedError(
+                "selected-slot FP8 MLA requires rank 512 with N128"
+            )
+        if qk_k_width != 16 or pv_k_width != 8:
+            raise ValueError("selected-slot FP8 MLA requires QK/PV widths 16/8")
+    else:
+        raise NotImplementedError(f"selected-slot MLA does not support dtype {q_dtype}")
+
+    return (
+        block_h,
+        block_n,
+        waves_per_cta,
+        num_warps,
+        qk_k_width,
+        pv_k_width,
+        pipeline_stages,
+        kv_load_slices,
+    )
+
+
 def _gluon_mla_decode_gfx950(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1931,7 +1969,6 @@ def _gluon_mla_decode_gfx950(
     projected_out: torch.Tensor | None = None,
     selected_slots: bool = False,
     num_kv_splits_override: int | None = None,
-    selected_layout_id: str | None = None,
     selected_block_h: int | None = None,
     selected_block_n: int | None = None,
     selected_waves_per_cta: tuple[int, int] | None = None,
@@ -1956,7 +1993,7 @@ def _gluon_mla_decode_gfx950(
     qk_dim = kv_lora_rank + qk_rope_head_dim
     if q.shape[-1] != qk_dim:
         raise ValueError(f"q head dim must be {qk_dim}, got {q.shape[-1]}")
-    if selected_layout_id is None and (kv_lora_rank != 512 or qk_rope_head_dim != 64):
+    if not selected_slots and (kv_lora_rank != 512 or qk_rope_head_dim != 64):
         raise NotImplementedError(
             "gluon MLA decode requires kv_lora_rank=512, qk_rope_head_dim=64, "
             f"got {kv_lora_rank}/{qk_rope_head_dim}"
@@ -1978,15 +2015,8 @@ def _gluon_mla_decode_gfx950(
 
     batch_size, _, nhead, _ = q.shape
     small_batch_h64 = regime in _SMALL_BATCH_REGIMES
-    if selected_layout_id is not None:
-        expected = _SELECTED_DSA_LAYOUTS.get(selected_layout_id)
-        if expected is None:
-            raise ValueError(
-                f"unknown selected-attention layout {selected_layout_id!r}"
-            )
+    if selected_slots:
         (
-            expected_dtype,
-            expected_rank,
             block_h,
             block_n,
             waves_per_cta,
@@ -1995,34 +2025,20 @@ def _gluon_mla_decode_gfx950(
             pv_k_width,
             pipeline_stages,
             kv_load_slices,
-        ) = expected
-        if (
-            q.dtype != expected_dtype
-            or kv_cache.dtype != expected_dtype
-            or kv_lora_rank != expected_rank
-            or qk_rope_head_dim != 64
-        ):
-            raise NotImplementedError(
-                f"selected-attention layout {selected_layout_id!r} requires "
-                f"matching {expected_dtype} q/KV with rank {expected_rank} and "
-                "RoPE width 64"
-            )
-        if (
-            selected_block_h != block_h
-            or selected_block_n != block_n
-            or selected_waves_per_cta != waves_per_cta
-            or selected_num_warps != num_warps
-            or selected_qk_k_width != qk_k_width
-            or selected_pv_k_width != pv_k_width
-            or selected_pipeline_stages != pipeline_stages
-            or selected_kv_load_slices != kv_load_slices
-        ):
-            raise ValueError(
-                f"selected-attention layout {selected_layout_id!r} requires "
-                f"H{block_h}/N{block_n}, waves {waves_per_cta}, {num_warps} "
-                f"warps, QK/PV widths {qk_k_width}/{pv_k_width}, and "
-                f"pipeline {pipeline_stages}x{kv_load_slices}"
-            )
+        ) = _require_selected_attention_schedule(
+            q_dtype=q.dtype,
+            kv_dtype=kv_cache.dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_h=selected_block_h,
+            block_n=selected_block_n,
+            waves_per_cta=selected_waves_per_cta,
+            num_warps=selected_num_warps,
+            qk_k_width=selected_qk_k_width,
+            pv_k_width=selected_pv_k_width,
+            pipeline_stages=selected_pipeline_stages,
+            kv_load_slices=selected_kv_load_slices,
+        )
         if nhead < 1:
             raise ValueError("selected attention requires at least one query head")
         num_xcds = 1
@@ -2122,10 +2138,8 @@ def _gluon_mla_decode_gfx950(
     if page_table.dtype != torch.int32:
         raise ValueError(f"page_table must be int32, got {page_table.dtype}")
     if selected_slots:
-        if selected_layout_id is None or page_size != 1:
-            raise ValueError(
-                "selected-slot MLA requires a static layout and page_size=1"
-            )
+        if page_size != 1:
+            raise ValueError("selected-slot MLA requires page_size=1")
         if return_lse or value_weight is not None:
             raise ValueError("selected-slot MLA does not support LSE or projection")
 
@@ -2221,7 +2235,6 @@ def _gluon_mla_decode_gfx950(
         "NUM_XCDS": num_xcds,
         "NHEAD": nhead,
         "REGIME": regime,
-        "LAYOUT_ID": selected_layout_id or regime,
         "WAVES_M": waves_per_cta[0],
         "WAVES_N": waves_per_cta[1],
         "QK_K_WIDTH": qk_k_width,
@@ -2540,7 +2553,6 @@ def gluon_mla_selected_attention_gfx950(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     softmax_scale: float,
-    layout_id: str,
     block_h: int,
     block_n: int,
     waves_per_cta: tuple[int, int],
@@ -2557,44 +2569,29 @@ def gluon_mla_selected_attention_gfx950(
     Each selected physical token is represented as a one-token page, so this
     adapter reuses the optimized MLA data path without gathering the KV cache.
     """
-    schedule = _SELECTED_DSA_LAYOUTS.get(layout_id)
-    if schedule is None:
-        raise ValueError(f"unknown selected-attention layout {layout_id!r}")
     (
-        expected_dtype,
-        expected_rank,
-        expected_h,
-        expected_n,
-        expected_waves,
-        expected_warps,
-        expected_qk_width,
-        expected_pv_width,
-        expected_pipeline_stages,
-        expected_kv_load_slices,
-    ) = schedule
-    if q.dtype != expected_dtype or kv_cache.dtype != expected_dtype:
-        raise NotImplementedError(
-            f"selected-attention layout {layout_id!r} requires matching "
-            f"{expected_dtype} q and KV"
-        )
-    if (
-        int(kv_lora_rank) != expected_rank
-        or int(block_h) != expected_h
-        or int(block_n) != expected_n
-        or tuple(waves_per_cta) != expected_waves
-        or int(num_warps) != expected_warps
-        or int(qk_k_width) != expected_qk_width
-        or int(pv_k_width) != expected_pv_width
-        or int(pipeline_stages) != expected_pipeline_stages
-        or int(kv_load_slices) != expected_kv_load_slices
-    ):
-        raise ValueError(
-            f"selected-attention layout {layout_id!r} requires rank "
-            f"{expected_rank}, H{expected_h}/N{expected_n}, waves "
-            f"{expected_waves}, {expected_warps} warps, QK/PV widths "
-            f"{expected_qk_width}/{expected_pv_width}, and pipeline "
-            f"{expected_pipeline_stages}x{expected_kv_load_slices}"
-        )
+        block_h,
+        block_n,
+        waves_per_cta,
+        num_warps,
+        qk_k_width,
+        pv_k_width,
+        pipeline_stages,
+        kv_load_slices,
+    ) = _require_selected_attention_schedule(
+        q_dtype=q.dtype,
+        kv_dtype=kv_cache.dtype,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_h=block_h,
+        block_n=block_n,
+        waves_per_cta=waves_per_cta,
+        num_warps=num_warps,
+        qk_k_width=qk_k_width,
+        pv_k_width=pv_k_width,
+        pipeline_stages=pipeline_stages,
+        kv_load_slices=kv_load_slices,
+    )
     if num_kv_splits < 1:
         raise ValueError("selected attention requires at least one KV split")
     if q.dim() != 3 or q.shape[1] < 1:
@@ -2660,7 +2657,6 @@ def gluon_mla_selected_attention_gfx950(
         out=out,
         selected_slots=True,
         num_kv_splits_override=num_kv_splits,
-        selected_layout_id=layout_id,
         selected_block_h=block_h,
         selected_block_n=block_n,
         selected_waves_per_cta=waves_per_cta,
@@ -2697,7 +2693,6 @@ def gluon_mla_selected_attention_fp8_gfx950(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
-        layout_id="selected_e4m3_r512_h16n128",
         block_h=16,
         block_n=128,
         waves_per_cta=(1, 4),
