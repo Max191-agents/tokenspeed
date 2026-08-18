@@ -400,11 +400,200 @@ def apply_rope_mla(
     return query_fp8, key_fp8
 
 
+def rope_mla_fp8_producer(
+    positions: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    query_out: torch.Tensor,
+    *,
+    key_out: torch.Tensor | None = None,
+    is_neox: bool = True,
+    quant_scale_q: float | torch.Tensor = 1.0,
+    quant_scale_kv: float | torch.Tensor = 1.0,
+    enable_pdl: bool = False,
+    solution: str | None = None,
+    override: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Finish producer-owned combined FP8 MLA outputs on AMD.
+
+    The caller must populate the non-RoPE prefix of ``query_out`` before this
+    operation. The selected kernel writes rotated query data directly to its
+    suffix. When ``key_out`` is supplied, its prefix is likewise preserved;
+    otherwise a combined key output is allocated and ``k_nope`` is quantized
+    into its prefix.
+
+    Args:
+        positions: Token positions with one entry per input token.
+        q_rope: BF16 query RoPE channels shaped
+            ``[tokens, query_heads, rope_dim]``.
+        k_rope: BF16 key RoPE channels shaped
+            ``[tokens, kv_heads, rope_dim]``.
+        k_nope: BF16 key non-RoPE channels shaped
+            ``[tokens, kv_heads, latent_dim]``.
+        cos_sin_cache: Packed RoPE cache shaped ``[positions, rope_dim]``.
+        query_out: Contiguous E4M3 output shaped
+            ``[tokens, query_heads, latent_dim + rope_dim]`` with a populated
+            latent prefix.
+        key_out: Optional contiguous E4M3 output shaped
+            ``[tokens, kv_heads, latent_dim + rope_dim]`` with a populated
+            latent prefix.
+        is_neox: Whether to use Neox-style half-split rotation.
+        quant_scale_q: Scale applied before query E4M3 conversion.
+        quant_scale_kv: Scale applied before key E4M3 conversion.
+        enable_pdl: Accepted for producer API compatibility. The AMD kernel
+            relies on stream ordering rather than Programmatic Dependent Launch.
+        solution: Optional registered solution to select.
+        override: Optional exact kernel-name or solution override.
+
+    Returns:
+        ``(query_out, key_fp8)``. A supplied ``key_out`` is returned by identity.
+    """
+    tensors = (
+        ("q_rope", q_rope),
+        ("k_rope", k_rope),
+        ("k_nope", k_nope),
+    )
+    for name, tensor in tensors:
+        if tensor.ndim != 3:
+            raise ValueError(f"{name} must be rank 3")
+        if tensor.dtype != torch.bfloat16:
+            raise TypeError(f"{name} must use torch.bfloat16, got {tensor.dtype}")
+        if tensor.device != q_rope.device:
+            raise ValueError(f"{name} must be on {q_rope.device}, got {tensor.device}")
+        if tensor.stride(-1) != 1:
+            raise ValueError(f"{name} must have a contiguous last dimension")
+
+    num_tokens, _, rope_dim = q_rope.shape
+    if k_rope.shape[0] != num_tokens or k_nope.shape[:-1] != k_rope.shape[:-1]:
+        raise ValueError("k_nope and k_rope leading dimensions must match")
+    if k_rope.shape[-1] != rope_dim or rope_dim <= 0 or rope_dim % 2:
+        raise ValueError("q_rope and k_rope widths must be equal, positive, and even")
+    latent_dim = k_nope.shape[-1]
+    if latent_dim <= 0:
+        raise ValueError("k_nope width must be positive")
+
+    positions = positions.flatten()
+    if positions.dtype not in (torch.int32, torch.int64):
+        raise TypeError("positions must use torch.int32 or torch.int64")
+    if positions.numel() != num_tokens:
+        raise ValueError("positions must contain one entry per token")
+    if positions.device != q_rope.device:
+        raise ValueError("positions must share the input device")
+    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[-1] != rope_dim:
+        raise ValueError("cos_sin_cache must have shape [positions, rope_dim]")
+    if cos_sin_cache.device != q_rope.device:
+        raise ValueError("cos_sin_cache must share the input device")
+    if cos_sin_cache.stride(-1) != 1:
+        raise ValueError("cos_sin_cache must have a contiguous last dimension")
+
+    for name, scale in (
+        ("quant_scale_q", quant_scale_q),
+        ("quant_scale_kv", quant_scale_kv),
+    ):
+        if isinstance(scale, torch.Tensor):
+            if scale.numel() != 1:
+                raise ValueError(f"{name} must contain one value")
+            if scale.device != q_rope.device:
+                raise ValueError(f"{name} must share the input device")
+
+    def validate_output(
+        name: str,
+        output: torch.Tensor,
+        leading_shape: torch.Size,
+    ) -> None:
+        expected_shape = leading_shape + (latent_dim + rope_dim,)
+        if output.shape != expected_shape:
+            raise ValueError(
+                f"{name} shape {tuple(output.shape)} does not match {expected_shape}"
+            )
+        if output.dtype != torch.float8_e4m3fn:
+            raise TypeError(f"{name} must use torch.float8_e4m3fn, got {output.dtype}")
+        if output.device != q_rope.device:
+            raise ValueError(f"{name} must be on {q_rope.device}, got {output.device}")
+        if not output.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    validate_output("query_out", query_out, q_rope.shape[:-1])
+    preserve_key_prefix = key_out is not None
+    if key_out is None:
+        key_out = torch.empty(
+            k_rope.shape[:-1] + (latent_dim + rope_dim,),
+            dtype=torch.float8_e4m3fn,
+            device=k_rope.device,
+        )
+    else:
+        validate_output("key_out", key_out, k_rope.shape[:-1])
+
+    traits = {
+        "is_neox": bool(is_neox),
+        "has_scale_q_tensor": isinstance(quant_scale_q, torch.Tensor),
+        "has_scale_kv_tensor": isinstance(quant_scale_kv, torch.Tensor),
+        "preserve_key_prefix": preserve_key_prefix,
+    }
+    signature = format_signature(
+        q_rope=dense_tensor_format(q_rope.dtype),
+        k_rope=dense_tensor_format(k_rope.dtype),
+        k_nope=dense_tensor_format(k_nope.dtype),
+    )
+    kernel = select_kernel(
+        "embedding",
+        "rope_mla_fp8_producer",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    if num_tokens == 0:
+        return query_out, key_out
+
+    shape_params = {
+        "num_tokens": num_tokens,
+        "q_heads": q_rope.shape[1],
+        "kv_heads": k_rope.shape[1],
+        "latent_dim": latent_dim,
+        "rope_dim": rope_dim,
+        "is_neox": bool(is_neox),
+        "preserve_key_prefix": preserve_key_prefix,
+    }
+    ShapeCapture.get().record(
+        "embedding",
+        "rope_mla_fp8_producer",
+        kernel.name,
+        q_rope.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "embedding",
+        "rope_mla_fp8_producer",
+        q_rope.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel(
+            positions=positions,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            k_nope=k_nope,
+            cos_sin_cache=cos_sin_cache,
+            query_out=query_out,
+            key_out=key_out,
+            is_neox=is_neox,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
+            preserve_key_prefix=preserve_key_prefix,
+            enable_pdl=enable_pdl,
+        )
+    return query_out, key_out
+
+
 __all__ = [
     "FusedMLASetKVBufferArg",
     "FusedSetKVBufferArg",
     "apply_rope",
     "apply_rope_mla",
+    "rope_mla_fp8_producer",
     "supports_fused_mla_kv_write",
 ]
 
