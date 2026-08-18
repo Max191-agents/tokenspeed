@@ -51,14 +51,15 @@ class _DensePrefillSchedule:
     kv_lora_rank: int
     block_h: int
     block_n: int
-    waves_per_cta: tuple[int, int]
+    head_waves: int
+    key_waves: int
     qk_k_width: int
     pv_k_width: int
     num_kv_splits: int
 
     @property
     def num_warps(self) -> int:
-        return self.waves_per_cta[0] * self.waves_per_cta[1]
+        return self.head_waves * self.key_waves
 
     @property
     def score_fragments_per_wave(self) -> int:
@@ -76,7 +77,8 @@ _DENSE_PREFILL_SCHEDULES = {
         kv_lora_rank=128,
         block_h=16,
         block_n=64,
-        waves_per_cta=(1, 4),
+        head_waves=1,
+        key_waves=4,
         qk_k_width=8,
         pv_k_width=8,
         num_kv_splits=1,
@@ -87,7 +89,8 @@ _DENSE_PREFILL_SCHEDULES = {
         kv_lora_rank=512,
         block_h=16,
         block_n=64,
-        waves_per_cta=(1, 4),
+        head_waves=1,
+        key_waves=4,
         qk_k_width=8,
         pv_k_width=8,
         num_kv_splits=1,
@@ -98,7 +101,8 @@ _DENSE_PREFILL_SCHEDULES = {
         kv_lora_rank=512,
         block_h=16,
         block_n=128,
-        waves_per_cta=(1, 4),
+        head_waves=1,
+        key_waves=4,
         qk_k_width=16,
         pv_k_width=8,
         num_kv_splits=1,
@@ -109,7 +113,8 @@ _DENSE_PREFILL_SCHEDULES = {
         kv_lora_rank=512,
         block_h=16,
         block_n=128,
-        waves_per_cta=(1, 4),
+        head_waves=1,
+        key_waves=4,
         qk_k_width=16,
         pv_k_width=8,
         num_kv_splits=1,
@@ -1225,7 +1230,8 @@ def _run_dense_prefill_schedule(
         softmax_scale=softmax_scale,
         block_h=schedule.block_h,
         block_n=schedule.block_n,
-        waves_per_cta=schedule.waves_per_cta,
+        head_waves=schedule.head_waves,
+        key_waves=schedule.key_waves,
         qk_k_width=schedule.qk_k_width,
         pv_k_width=schedule.pv_k_width,
         num_kv_splits=schedule.num_kv_splits,

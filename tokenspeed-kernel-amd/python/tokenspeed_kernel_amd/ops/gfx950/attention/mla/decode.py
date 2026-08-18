@@ -68,8 +68,8 @@ class AttentionConfig:
     NUM_XCDS: gl.constexpr
     NHEAD: gl.constexpr
     REGIME: gl.constexpr
-    WAVES_M: gl.constexpr
-    WAVES_N: gl.constexpr
+    HEAD_WAVES: gl.constexpr
+    KEY_WAVES: gl.constexpr
     QK_K_WIDTH: gl.constexpr
     PV_K_WIDTH: gl.constexpr
     PIPELINE_STAGES: gl.constexpr
@@ -126,8 +126,8 @@ class AttentionConfig:
         NUM_XCDS,
         NHEAD,
         REGIME,
-        WAVES_M,
-        WAVES_N,
+        HEAD_WAVES,
+        KEY_WAVES,
         QK_K_WIDTH,
         PV_K_WIDTH,
         IS_FP8_Q,
@@ -149,7 +149,7 @@ class AttentionConfig:
         stride_final_lse_b,
         stride_final_lse_h,
     ):
-        assert WAVES_M * WAVES_N == 4, "MLA attention uses 4 waves"
+        assert HEAD_WAVES * KEY_WAVES == 4, "MLA attention uses 4 waves"
         kv_load_slices = 2
         assert (
             BLOCK_N % kv_load_slices == 0
@@ -195,7 +195,7 @@ class AttentionConfig:
                 version=4,
                 instr_shape=[16, 16, 32],
                 transposed=True,
-                warps_per_cta=[WAVES_M, WAVES_N],
+                warps_per_cta=[HEAD_WAVES, KEY_WAVES],
             )
         elif BLOCK_H == 64:
             # bh64: Q is [64, 512] / [64, 64]; warps tile M.
@@ -257,7 +257,7 @@ class AttentionConfig:
                 version=4,
                 instr_shape=[16, 16, 32],
                 transposed=True,
-                warps_per_cta=[WAVES_M, WAVES_N],
+                warps_per_cta=[HEAD_WAVES, KEY_WAVES],
             )
         elif IS_FP8_Q:
             # Stage FP8 Q as [K, H] so K is the contiguous 16-byte DMA
@@ -334,7 +334,7 @@ class AttentionConfig:
                 version=4,
                 instr_shape=[16, 16, 32],
                 transposed=True,
-                warps_per_cta=[WAVES_M, WAVES_N],
+                warps_per_cta=[HEAD_WAVES, KEY_WAVES],
             )
         else:
             # bh16bn64: Q is [16, 512] / [16, 64]; warps tile K.
@@ -378,7 +378,7 @@ class AttentionConfig:
                 version=4,
                 instr_shape=[16, 16, 32],
                 transposed=True,
-                warps_per_cta=[WAVES_M, WAVES_N],
+                warps_per_cta=[HEAD_WAVES, KEY_WAVES],
             )
 
         # FP8 KV uses a 128-token tile; BF16 KV uses 64. These layouts are
@@ -722,8 +722,8 @@ class AttentionConfig:
         self.NUM_XCDS = gl.constexpr(NUM_XCDS)
         self.NHEAD = gl.constexpr(NHEAD)
         self.REGIME = gl.constexpr(REGIME)
-        self.WAVES_M = gl.constexpr(WAVES_M)
-        self.WAVES_N = gl.constexpr(WAVES_N)
+        self.HEAD_WAVES = gl.constexpr(HEAD_WAVES)
+        self.KEY_WAVES = gl.constexpr(KEY_WAVES)
         self.QK_K_WIDTH = gl.constexpr(QK_K_WIDTH)
         self.PV_K_WIDTH = gl.constexpr(PV_K_WIDTH)
         self.PIPELINE_STAGES = gl.constexpr(2)
@@ -1304,8 +1304,8 @@ def _mla_decode_gluon(
     NUM_XCDS: gl.constexpr,
     NHEAD: gl.constexpr,
     REGIME: gl.constexpr,
-    WAVES_M: gl.constexpr,
-    WAVES_N: gl.constexpr,
+    HEAD_WAVES: gl.constexpr,
+    KEY_WAVES: gl.constexpr,
     QK_K_WIDTH: gl.constexpr,
     PV_K_WIDTH: gl.constexpr,
     IS_FP8_Q: gl.constexpr,
@@ -1324,8 +1324,8 @@ def _mla_decode_gluon(
         NUM_XCDS,
         NHEAD,
         REGIME,
-        WAVES_M,
-        WAVES_N,
+        HEAD_WAVES,
+        KEY_WAVES,
         QK_K_WIDTH,
         PV_K_WIDTH,
         IS_FP8_Q,
@@ -1864,16 +1864,18 @@ def _require_selected_attention_schedule(
     qk_rope_head_dim: int,
     block_h: int | None,
     block_n: int | None,
-    waves_per_cta: tuple[int, int] | None,
+    head_waves: int | None,
+    key_waves: int | None,
     qk_k_width: int | None,
     pv_k_width: int | None,
-) -> tuple[int, int, tuple[int, int], int, int, int]:
+) -> tuple[int, int, int, int, int, int, int]:
     if any(
         value is None
         for value in (
             block_h,
             block_n,
-            waves_per_cta,
+            head_waves,
+            key_waves,
             qk_k_width,
             pv_k_width,
         )
@@ -1881,10 +1883,11 @@ def _require_selected_attention_schedule(
         raise ValueError("selected-slot MLA requires an explicit static schedule")
     block_h = int(block_h)
     block_n = int(block_n)
-    waves_per_cta = tuple(waves_per_cta)
+    head_waves = int(head_waves)
+    key_waves = int(key_waves)
     qk_k_width = int(qk_k_width)
     pv_k_width = int(pv_k_width)
-    num_warps = waves_per_cta[0] * waves_per_cta[1]
+    num_warps = head_waves * key_waves
 
     if q_dtype != kv_dtype:
         raise NotImplementedError(
@@ -1893,9 +1896,10 @@ def _require_selected_attention_schedule(
         )
     if qk_rope_head_dim != 64:
         raise NotImplementedError("selected-slot MLA requires RoPE width 64")
-    if block_h != 16 or waves_per_cta != (1, 4) or num_warps != 4:
+    if block_h != 16 or head_waves != 1 or key_waves != 4 or num_warps != 4:
         raise ValueError(
-            "selected-slot MLA requires H16 with four waves split as (1, 4)"
+            "selected-slot MLA requires H16 with four waves split as "
+            "head_waves=1, key_waves=4"
         )
 
     if q_dtype == torch.bfloat16:
@@ -1918,7 +1922,8 @@ def _require_selected_attention_schedule(
     return (
         block_h,
         block_n,
-        waves_per_cta,
+        head_waves,
+        key_waves,
         num_warps,
         qk_k_width,
         pv_k_width,
@@ -1947,7 +1952,8 @@ def _gluon_mla_decode_gfx950(
     num_kv_splits_override: int | None = None,
     selected_block_h: int | None = None,
     selected_block_n: int | None = None,
-    selected_waves_per_cta: tuple[int, int] | None = None,
+    selected_head_waves: int | None = None,
+    selected_key_waves: int | None = None,
     selected_qk_k_width: int | None = None,
     selected_pv_k_width: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -1992,7 +1998,8 @@ def _gluon_mla_decode_gfx950(
         (
             block_h,
             block_n,
-            waves_per_cta,
+            head_waves,
+            key_waves,
             num_warps,
             qk_k_width,
             pv_k_width,
@@ -2003,7 +2010,8 @@ def _gluon_mla_decode_gfx950(
             qk_rope_head_dim=qk_rope_head_dim,
             block_h=selected_block_h,
             block_n=selected_block_n,
-            waves_per_cta=selected_waves_per_cta,
+            head_waves=selected_head_waves,
+            key_waves=selected_key_waves,
             qk_k_width=selected_qk_k_width,
             pv_k_width=selected_pv_k_width,
         )
@@ -2022,7 +2030,8 @@ def _gluon_mla_decode_gfx950(
             )
         block_h = 16
         block_n = 128
-        waves_per_cta = (1, 4)
+        head_waves = 1
+        key_waves = 4
         num_warps = 4
         qk_k_width = 16 if is_fp8_q else 8
         pv_k_width = 8
@@ -2039,7 +2048,8 @@ def _gluon_mla_decode_gfx950(
             )
         block_h = 16
         block_n = 64
-        waves_per_cta = (1, 4)
+        head_waves = 1
+        key_waves = 4
         num_warps = 4
         qk_k_width = 8
         pv_k_width = 8
@@ -2054,7 +2064,8 @@ def _gluon_mla_decode_gfx950(
             )
         block_h = 64
         block_n = 64
-        waves_per_cta = (4, 1)
+        head_waves = 4
+        key_waves = 1
         num_warps = 4
         qk_k_width = 8
         pv_k_width = 8
@@ -2077,7 +2088,8 @@ def _gluon_mla_decode_gfx950(
             )
         block_h = 16 if regime == "bh16-multiblock" else 64
         block_n = 64
-        waves_per_cta = (1, 4) if block_h == 16 else (4, 1)
+        head_waves = 1 if block_h == 16 else 4
+        key_waves = 4 if block_h == 16 else 1
         num_warps = 4
         qk_k_width = 8
         pv_k_width = 8
@@ -2195,8 +2207,8 @@ def _gluon_mla_decode_gfx950(
         "NUM_XCDS": num_xcds,
         "NHEAD": nhead,
         "REGIME": regime,
-        "WAVES_M": waves_per_cta[0],
-        "WAVES_N": waves_per_cta[1],
+        "HEAD_WAVES": head_waves,
+        "KEY_WAVES": key_waves,
         "QK_K_WIDTH": qk_k_width,
         "PV_K_WIDTH": pv_k_width,
         "IS_FP8_Q": is_fp8_q,
@@ -2513,7 +2525,8 @@ def gluon_mla_selected_attention_gfx950(
     softmax_scale: float,
     block_h: int,
     block_n: int,
-    waves_per_cta: tuple[int, int],
+    head_waves: int,
+    key_waves: int,
     qk_k_width: int,
     pv_k_width: int,
     num_kv_splits: int,
@@ -2527,7 +2540,8 @@ def gluon_mla_selected_attention_gfx950(
     (
         block_h,
         block_n,
-        waves_per_cta,
+        head_waves,
+        key_waves,
         _num_warps,
         qk_k_width,
         pv_k_width,
@@ -2538,7 +2552,8 @@ def gluon_mla_selected_attention_gfx950(
         qk_rope_head_dim=qk_rope_head_dim,
         block_h=block_h,
         block_n=block_n,
-        waves_per_cta=waves_per_cta,
+        head_waves=head_waves,
+        key_waves=key_waves,
         qk_k_width=qk_k_width,
         pv_k_width=pv_k_width,
     )
@@ -2609,7 +2624,8 @@ def gluon_mla_selected_attention_gfx950(
         num_kv_splits_override=num_kv_splits,
         selected_block_h=block_h,
         selected_block_n=block_n,
-        selected_waves_per_cta=waves_per_cta,
+        selected_head_waves=head_waves,
+        selected_key_waves=key_waves,
         selected_qk_k_width=qk_k_width,
         selected_pv_k_width=pv_k_width,
     )
@@ -2642,7 +2658,8 @@ def gluon_mla_selected_attention_fp8_gfx950(
         softmax_scale=softmax_scale,
         block_h=16,
         block_n=128,
-        waves_per_cta=(1, 4),
+        head_waves=1,
+        key_waves=4,
         qk_k_width=16,
         pv_k_width=8,
         num_kv_splits=1,

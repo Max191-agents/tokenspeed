@@ -254,7 +254,8 @@ def test_dense_schedule_wave_ownership_is_complete_and_unique() -> None:
     }
     assert set(schedules) == set(expected)
     for name, schedule in schedules.items():
-        assert schedule.waves_per_cta == (1, 4)
+        assert schedule.head_waves == 1
+        assert schedule.key_waves == 4
         assert schedule.num_warps == 4
         assert _require_selected_attention_schedule(
             q_dtype=schedule.q_dtype,
@@ -263,13 +264,15 @@ def test_dense_schedule_wave_ownership_is_complete_and_unique() -> None:
             qk_rope_head_dim=_ROPE_DIM,
             block_h=schedule.block_h,
             block_n=schedule.block_n,
-            waves_per_cta=schedule.waves_per_cta,
+            head_waves=schedule.head_waves,
+            key_waves=schedule.key_waves,
             qk_k_width=schedule.qk_k_width,
             pv_k_width=schedule.pv_k_width,
         ) == (
             schedule.block_h,
             schedule.block_n,
-            schedule.waves_per_cta,
+            schedule.head_waves,
+            schedule.key_waves,
             schedule.num_warps,
             schedule.qk_k_width,
             schedule.pv_k_width,
@@ -281,13 +284,15 @@ def test_dense_schedule_wave_ownership_is_complete_and_unique() -> None:
             schedule.value_fragments_per_wave,
         ) == expected[name]
 
-        waves_m, waves_n = schedule.waves_per_cta
         for output_width, fragments_per_wave in (
             (schedule.block_n, schedule.score_fragments_per_wave),
             (schedule.kv_lora_rank, schedule.value_fragments_per_wave),
         ):
             owners = {
-                (m, n): ((m % waves_m) * waves_n + n % waves_n,)
+                (m, n): (
+                    (m % schedule.head_waves) * schedule.key_waves
+                    + n % schedule.key_waves,
+                )
                 for m in range(schedule.block_h // 16)
                 for n in range(output_width // 16)
             }
