@@ -558,7 +558,7 @@ class TestMakeCacheKey:
         )
         assert k1 != k2
 
-    def test_tuple_profile_and_layout_are_selection_relevant(self):
+    def test_tuple_profile_and_cache_presence_are_selection_relevant(self):
         common = (
             "attention",
             "dsa_prefill",
@@ -571,21 +571,24 @@ class TestMakeCacheKey:
             *common,
             {
                 "dsa_prefill_profile": (torch.bfloat16, 128),
-                "kv_cache_layout": "dense",
+                "kv_cache_available": True,
+                "sparse_kv_cache_available": False,
             },
         )
         dense_rank512 = _make_cache_key(
             *common,
             {
                 "dsa_prefill_profile": (torch.bfloat16, 512),
-                "kv_cache_layout": "dense",
+                "kv_cache_available": True,
+                "sparse_kv_cache_available": False,
             },
         )
         packed_rank128 = _make_cache_key(
             *common,
             {
                 "dsa_prefill_profile": (torch.bfloat16, 128),
-                "kv_cache_layout": "packed",
+                "kv_cache_available": True,
+                "sparse_kv_cache_available": True,
             },
         )
 

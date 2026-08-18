@@ -2836,11 +2836,7 @@ def dsa_prefill(
     solution: str | None = None,
 ) -> AttentionResult:
     """Sparse DSA prefill over selected global KV slots."""
-    if sparse_kv_cache is not None:
-        kv_cache_layout = "packed"
-    elif kv_cache is not None:
-        kv_cache_layout = "dense"
-    else:
+    if kv_cache is None and sparse_kv_cache is None:
         raise ValueError("dsa_prefill requires kv_cache or sparse_kv_cache")
 
     if q.dim() == 4:
@@ -2861,7 +2857,6 @@ def dsa_prefill(
         "topk": int(topk_slots.shape[-1]),
         "kv_cache_available": kv_cache is not None,
         "sparse_kv_cache_available": sparse_kv_cache is not None,
-        "kv_cache_layout": kv_cache_layout,
         "topk_layout": "global_slots",
         "support_logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,

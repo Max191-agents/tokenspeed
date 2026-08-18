@@ -1716,7 +1716,6 @@ def test_gluon_gfx950_exposes_exactly_dense_and_packed_dsa_prefill_specs() -> No
             (torch.float8_e5m2, 512),
         }
     )
-    assert dense.traits["kv_cache_layout"] == frozenset({"dense"})
     assert dense.traits["kv_cache_available"] == frozenset({True})
     assert dense.traits["sparse_kv_cache_available"] == frozenset({False})
 
@@ -1727,7 +1726,6 @@ def test_gluon_gfx950_exposes_exactly_dense_and_packed_dsa_prefill_specs() -> No
     assert packed.traits["dsa_prefill_profile"] == frozenset(
         {(torch.bfloat16, 128), (torch.bfloat16, 512)}
     )
-    assert packed.traits["kv_cache_layout"] == frozenset({"packed"})
     assert packed.traits["kv_cache_available"] == frozenset({False, True})
     assert packed.traits["sparse_kv_cache_available"] == frozenset({True})
 
@@ -1814,7 +1812,6 @@ def test_gluon_gfx950_dsa_prefill_dtype_rank_layout_truth_table(
         "topk": 2048,
         "kv_cache_available": layout == "dense",
         "sparse_kv_cache_available": layout == "packed",
-        "kv_cache_layout": layout,
         "topk_layout": "global_slots",
         "support_logit_cap": False,
         "return_lse": False,
@@ -1830,17 +1827,16 @@ def test_gluon_gfx950_dsa_prefill_dtype_rank_layout_truth_table(
 
 
 @pytest.mark.parametrize(
-    ("dense_cache", "packed_cache", "expected_layout"),
+    ("dense_cache", "packed_cache"),
     [
-        pytest.param(True, False, "dense", id="dense-only"),
-        pytest.param(False, True, "packed", id="packed-only"),
-        pytest.param(True, True, "packed", id="packed-precedence"),
+        pytest.param(True, False, id="dense-only"),
+        pytest.param(False, True, id="packed-only"),
+        pytest.param(True, True, id="packed-precedence"),
     ],
 )
-def test_dsa_prefill_requests_effective_cache_layout(
+def test_dsa_prefill_requests_cache_presence_traits(
     dense_cache: bool,
     packed_cache: bool,
-    expected_layout: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_traits = {}
@@ -1862,7 +1858,7 @@ def test_dsa_prefill_requests_effective_cache_layout(
     )
 
     assert captured_traits["dsa_prefill_profile"] == (torch.bfloat16, 512)
-    assert captured_traits["kv_cache_layout"] == expected_layout
+    assert "kv_cache_layout" not in captured_traits
     assert captured_traits["kv_cache_available"] is dense_cache
     assert captured_traits["sparse_kv_cache_available"] is packed_cache
 
