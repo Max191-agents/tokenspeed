@@ -65,9 +65,13 @@ from tokenspeed.runtime.layers.utils import (
 )
 
 _platform = current_platform()
+_is_amd = _platform.is_amd
 _is_blackwell = _platform.is_blackwell
 _is_hopper_plus = _platform.is_hopper_plus
 _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
+
+if _is_amd:
+    from tokenspeed_kernel.ops.attention import mla_prepare_fp8_query
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -849,6 +853,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         absorbed_query: torch.Tensor | None = None,
+        key_fp8: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Model-owned KV writes route their locations through the backend:
         # identity on the legacy path (base AttentionBackend hook), the
@@ -856,17 +861,25 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc = ctx.attn_backend.select_out_cache_loc(
             self.attn_mqa, out_cache_loc, ctx.forward_mode
         )
+        use_fp8_mla_producer = _is_amd and self._mla_kv_is_fp8(
+            ctx, getattr(self.attn_mqa, "k_scale_float", 1.0)
+        )
+
         if absorbed_query is None:
             q = q.view(-1, self.num_local_heads, self.qk_head_dim)
             q_nope, q_pe = q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
-            Q = torch.empty(
-                q_nope.size(0),
-                self.num_local_heads,
-                self.kv_lora_rank + self.qk_rope_head_dim,
-                dtype=q_nope.dtype,
-                device=q_nope.device,
+            Q = (
+                None
+                if use_fp8_mla_producer
+                else torch.empty(
+                    q_nope.size(0),
+                    self.num_local_heads,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    dtype=q_nope.dtype,
+                    device=q_nope.device,
+                )
             )
             query_pe_written = False
         else:
@@ -876,6 +889,41 @@ class DeepseekV3AttentionMLA(nn.Module):
             query_pe_written = True
         # latent_cache contains normalized kv_a and k_pe before rotate.
         K = latent_cache.unsqueeze(1)
+        if use_fp8_mla_producer:
+            k_scale = getattr(self.attn_mqa, "k_scale_float", 1.0)
+            query_fp8, key_fp8 = mla_prepare_fp8_query(
+                q_nope=q_nope,
+                projection_weight=self.w_kc.transpose(1, 2),
+                positions=positions,
+                q_rope=q_pe,
+                k_nope=K[..., : self.kv_lora_rank],
+                k_rope=K[..., self.kv_lora_rank :],
+                cos_sin_cache=(
+                    self.rotary_emb.cos_sin_cache
+                    if self.rotary_emb is not None
+                    else None
+                ),
+                is_neox=(
+                    getattr(self.rotary_emb, "is_neox_style", True)
+                    if self.rotary_emb is not None
+                    else False
+                ),
+                quant_scale_q=1.0,
+                quant_scale_kv=k_scale,
+                absorbed_query=Q,
+                prequantized_key=key_fp8,
+                enable_pdl=pdl_enabled(),
+            )
+
+            # Write FP8 KV cache (single write, no double-write)
+            ctx.token_to_kv_pool.set_mla_kv_buffer(
+                self.attn_mqa,
+                out_cache_loc,
+                cache_k_nope=key_fp8[..., : self.kv_lora_rank],
+                cache_k_rope=key_fp8[..., self.kv_lora_rank :],
+            )
+            return query_fp8, key_fp8
+
         bmm(
             q_nope.transpose(0, 1),
             self.w_kc.transpose(1, 2),
