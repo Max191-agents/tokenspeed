@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "bmm",
+    "bmm_fp8_output",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
     "kimi3_latent_projection",
@@ -323,6 +324,16 @@ def _validate_gemm_out(
         raise ValueError(f"{op} out expects device {device}, got {out.device}")
     if out.stride(-1) != 1:
         raise ValueError(f"{op} out must have stride(-1) == 1")
+
+
+def _validate_non_overlapping_out(out: torch.Tensor, *, op: str) -> None:
+    required_stride = 1
+    for size, stride in sorted(zip(out.shape, out.stride()), key=lambda item: item[1]):
+        if size <= 1:
+            continue
+        if stride < required_stride:
+            raise ValueError(f"{op} out must not have internal overlap")
+        required_stride = stride * size
 
 
 def mm(
@@ -659,3 +670,134 @@ def bmm(
         else:
             output = output + bias_view
     return output
+
+
+def bmm_fp8_output(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+    solution: str | None = None,
+    override: str | None = None,
+) -> torch.Tensor:
+    """BF16 batched matrix multiply with staged E4M3 output.
+
+    The operation applies the ordinary selected BF16 BMM semantics,
+    materializes that BF16 result, and then saturates and converts it to E4M3.
+    Native backends may fuse these stages while preserving the same BF16
+    staging boundary. ``A`` uses ``[B, M, K]`` layout, ``B`` uses
+    ``[B, N, K]`` layout, and the result uses ``[B, M, N]`` layout.
+
+    Args:
+        A: BF16 activation batch ``[batch, M, K]``.
+        B: BF16 weight batch ``[batch, N, K]``.
+        out: Optional E4M3 output buffer. It may be a strided view but must
+            have contiguous rows and non-overlapping outer strides.
+        enable_pdl: Forwarded to the selected implementation.
+        solution: Restrict selection to one registered backend solution.
+        override: Force selection of a specific registered implementation.
+
+    Returns:
+        The E4M3 result. When ``out`` is provided, the same tensor is returned.
+    """
+    if A.ndim != 3:
+        raise ValueError(
+            f"bmm_fp8_output expects A with shape [B, M, K], got {tuple(A.shape)}"
+        )
+    if B.ndim != 3:
+        raise ValueError(
+            f"bmm_fp8_output expects B with shape [B, N, K], got {tuple(B.shape)}"
+        )
+    if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
+        raise TypeError(
+            "bmm_fp8_output expects BF16 inputs, got "
+            f"A dtype={A.dtype}, B dtype={B.dtype}"
+        )
+    if B.device != A.device:
+        raise ValueError(
+            f"bmm_fp8_output device mismatch: A device={A.device}, B device={B.device}"
+        )
+
+    batch, M, K = A.shape
+    B_batch, N, B_K = B.shape
+    if B_batch != batch:
+        raise ValueError(
+            f"bmm_fp8_output batch mismatch: A batch={batch}, B batch={B_batch}"
+        )
+    if B_K != K:
+        raise ValueError(f"bmm_fp8_output K mismatch: A K={K}, B K={B_K}")
+    if batch <= 0 or M <= 0 or N <= 0 or K <= 0:
+        raise ValueError(
+            "bmm_fp8_output expects positive batch/M/N/K dimensions, got "
+            f"batch={batch}, M={M}, N={N}, K={K}"
+        )
+
+    has_out = out is not None
+    if out is None:
+        out = torch.empty(
+            (batch, M, N),
+            dtype=torch.float8_e4m3fn,
+            device=A.device,
+        )
+    else:
+        _validate_gemm_out(
+            out,
+            shape=(batch, M, N),
+            dtype=torch.float8_e4m3fn,
+            device=A.device,
+            op="bmm_fp8_output",
+        )
+        _validate_non_overlapping_out(out, op="bmm_fp8_output")
+
+    bf16_per_16_bytes = 16 // torch.bfloat16.itemsize
+    a_load_16b_aligned = A.data_ptr() % 16 == 0 and all(
+        stride >= 0 and stride % bf16_per_16_bytes == 0
+        for stride in (A.stride(0), A.stride(1))
+    )
+    b_load_16b_aligned = B.data_ptr() % 16 == 0 and all(
+        stride >= 0 and stride % bf16_per_16_bytes == 0
+        for stride in (B.stride(0), B.stride(2))
+    )
+    traits: dict[str, object] = {
+        "batch": batch,
+        "m": M,
+        "n": N,
+        "k": K,
+        "a_inner_stride_one": A.stride(-1) == 1,
+        "b_n_stride_one": B.stride(1) == 1,
+        "out_inner_stride_one": out.stride(-1) == 1,
+        "a_load_16b_aligned": a_load_16b_aligned,
+        "b_load_16b_aligned": b_load_16b_aligned,
+    }
+    signature = format_signature(
+        a=dense_tensor_format(A.dtype),
+        b=dense_tensor_format(B.dtype),
+        out=dense_tensor_format(out.dtype),
+    )
+    kernel = select_kernel(
+        "gemm",
+        "bmm_fp8_output",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {"B": batch, "M": M, "N": N, "K": K}
+    ShapeCapture.get().record(
+        "gemm",
+        "bmm_fp8_output",
+        kernel.name,
+        A.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "gemm",
+        "bmm_fp8_output",
+        A.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+        has_out=has_out,
+    ):
+        return kernel(A, B, out=out, enable_pdl=enable_pdl)
