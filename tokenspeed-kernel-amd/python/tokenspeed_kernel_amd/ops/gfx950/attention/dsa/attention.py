@@ -52,12 +52,13 @@ class _DensePrefillSchedule:
     block_h: int
     block_n: int
     waves_per_cta: tuple[int, int]
-    num_warps: int
     qk_k_width: int
     pv_k_width: int
-    pipeline_stages: int
-    kv_load_slices: int
     num_kv_splits: int
+
+    @property
+    def num_warps(self) -> int:
+        return self.waves_per_cta[0] * self.waves_per_cta[1]
 
     @property
     def score_fragments_per_wave(self) -> int:
@@ -76,11 +77,8 @@ _DENSE_PREFILL_SCHEDULES = {
         block_h=16,
         block_n=64,
         waves_per_cta=(1, 4),
-        num_warps=4,
         qk_k_width=8,
         pv_k_width=8,
-        pipeline_stages=2,
-        kv_load_slices=2,
         num_kv_splits=1,
     ),
     (torch.bfloat16, 512): _DensePrefillSchedule(
@@ -90,11 +88,8 @@ _DENSE_PREFILL_SCHEDULES = {
         block_h=16,
         block_n=64,
         waves_per_cta=(1, 4),
-        num_warps=4,
         qk_k_width=8,
         pv_k_width=8,
-        pipeline_stages=2,
-        kv_load_slices=2,
         num_kv_splits=1,
     ),
     (torch.float8_e4m3fn, 512): _DensePrefillSchedule(
@@ -104,11 +99,8 @@ _DENSE_PREFILL_SCHEDULES = {
         block_h=16,
         block_n=128,
         waves_per_cta=(1, 4),
-        num_warps=4,
         qk_k_width=16,
         pv_k_width=8,
-        pipeline_stages=2,
-        kv_load_slices=2,
         num_kv_splits=1,
     ),
     (torch.float8_e5m2, 512): _DensePrefillSchedule(
@@ -118,11 +110,8 @@ _DENSE_PREFILL_SCHEDULES = {
         block_h=16,
         block_n=128,
         waves_per_cta=(1, 4),
-        num_warps=4,
         qk_k_width=16,
         pv_k_width=8,
-        pipeline_stages=2,
-        kv_load_slices=2,
         num_kv_splits=1,
     ),
 }
@@ -1237,11 +1226,8 @@ def _run_dense_prefill_schedule(
         block_h=schedule.block_h,
         block_n=schedule.block_n,
         waves_per_cta=schedule.waves_per_cta,
-        num_warps=schedule.num_warps,
         qk_k_width=schedule.qk_k_width,
         pv_k_width=schedule.pv_k_width,
-        pipeline_stages=schedule.pipeline_stages,
-        kv_load_slices=schedule.kv_load_slices,
         num_kv_splits=schedule.num_kv_splits,
         out=out,
     )

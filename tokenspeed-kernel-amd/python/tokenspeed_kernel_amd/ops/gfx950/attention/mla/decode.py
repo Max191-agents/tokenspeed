@@ -130,8 +130,6 @@ class AttentionConfig:
         WAVES_N,
         QK_K_WIDTH,
         PV_K_WIDTH,
-        PIPELINE_STAGES,
-        KV_LOAD_SLICES,
         IS_FP8_Q,
         RETURN_LSE,
         SELECTED_SLOTS,
@@ -152,10 +150,9 @@ class AttentionConfig:
         stride_final_lse_h,
     ):
         assert WAVES_M * WAVES_N == 4, "MLA attention uses 4 waves"
-        assert PIPELINE_STAGES == 2, "MLA attention uses 2 stages"
-        assert KV_LOAD_SLICES == 2, "MLA attention uses 2 KV slices"
+        kv_load_slices = 2
         assert (
-            BLOCK_N % KV_LOAD_SLICES == 0
+            BLOCK_N % kv_load_slices == 0
         ), "MLA key tile must divide evenly across its load slices"
         selected_bf16_rank128 = (
             SELECTED_SLOTS
@@ -729,8 +726,8 @@ class AttentionConfig:
         self.WAVES_N = gl.constexpr(WAVES_N)
         self.QK_K_WIDTH = gl.constexpr(QK_K_WIDTH)
         self.PV_K_WIDTH = gl.constexpr(PV_K_WIDTH)
-        self.PIPELINE_STAGES = gl.constexpr(PIPELINE_STAGES)
-        self.KV_LOAD_SLICES = gl.constexpr(KV_LOAD_SLICES)
+        self.PIPELINE_STAGES = gl.constexpr(2)
+        self.KV_LOAD_SLICES = gl.constexpr(kv_load_slices)
         self.IS_FP8_Q = gl.constexpr(IS_FP8_Q)
         self.RETURN_LSE = gl.constexpr(RETURN_LSE)
         self.SELECTED_SLOTS = gl.constexpr(SELECTED_SLOTS)
@@ -1311,8 +1308,6 @@ def _mla_decode_gluon(
     WAVES_N: gl.constexpr,
     QK_K_WIDTH: gl.constexpr,
     PV_K_WIDTH: gl.constexpr,
-    PIPELINE_STAGES: gl.constexpr,
-    KV_LOAD_SLICES: gl.constexpr,
     IS_FP8_Q: gl.constexpr,
     RETURN_LSE: gl.constexpr,
     SELECTED_SLOTS: gl.constexpr,
@@ -1333,8 +1328,6 @@ def _mla_decode_gluon(
         WAVES_N,
         QK_K_WIDTH,
         PV_K_WIDTH,
-        PIPELINE_STAGES,
-        KV_LOAD_SLICES,
         IS_FP8_Q,
         RETURN_LSE,
         SELECTED_SLOTS,
@@ -1872,34 +1865,26 @@ def _require_selected_attention_schedule(
     block_h: int | None,
     block_n: int | None,
     waves_per_cta: tuple[int, int] | None,
-    num_warps: int | None,
     qk_k_width: int | None,
     pv_k_width: int | None,
-    pipeline_stages: int | None,
-    kv_load_slices: int | None,
-) -> tuple[int, int, tuple[int, int], int, int, int, int, int]:
+) -> tuple[int, int, tuple[int, int], int, int, int]:
     if any(
         value is None
         for value in (
             block_h,
             block_n,
             waves_per_cta,
-            num_warps,
             qk_k_width,
             pv_k_width,
-            pipeline_stages,
-            kv_load_slices,
         )
     ):
         raise ValueError("selected-slot MLA requires an explicit static schedule")
     block_h = int(block_h)
     block_n = int(block_n)
     waves_per_cta = tuple(waves_per_cta)
-    num_warps = int(num_warps)
     qk_k_width = int(qk_k_width)
     pv_k_width = int(pv_k_width)
-    pipeline_stages = int(pipeline_stages)
-    kv_load_slices = int(kv_load_slices)
+    num_warps = waves_per_cta[0] * waves_per_cta[1]
 
     if q_dtype != kv_dtype:
         raise NotImplementedError(
@@ -1908,16 +1893,9 @@ def _require_selected_attention_schedule(
         )
     if qk_rope_head_dim != 64:
         raise NotImplementedError("selected-slot MLA requires RoPE width 64")
-    if (
-        block_h != 16
-        or waves_per_cta != (1, 4)
-        or num_warps != 4
-        or pipeline_stages != 2
-        or kv_load_slices != 2
-    ):
+    if block_h != 16 or waves_per_cta != (1, 4) or num_warps != 4:
         raise ValueError(
-            "selected-slot MLA requires H16, waves (1, 4), 4 warps, and a "
-            "2-stage/2-slice KV pipeline"
+            "selected-slot MLA requires H16 with four waves split as (1, 4)"
         )
 
     if q_dtype == torch.bfloat16:
@@ -1944,8 +1922,6 @@ def _require_selected_attention_schedule(
         num_warps,
         qk_k_width,
         pv_k_width,
-        pipeline_stages,
-        kv_load_slices,
     )
 
 
@@ -1972,11 +1948,8 @@ def _gluon_mla_decode_gfx950(
     selected_block_h: int | None = None,
     selected_block_n: int | None = None,
     selected_waves_per_cta: tuple[int, int] | None = None,
-    selected_num_warps: int | None = None,
     selected_qk_k_width: int | None = None,
     selected_pv_k_width: int | None = None,
-    selected_pipeline_stages: int | None = None,
-    selected_kv_load_slices: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch one fixed absorbed MLA decode regime."""
     if regime not in _MLA_DECODE_REGIMES:
@@ -2023,8 +1996,6 @@ def _gluon_mla_decode_gfx950(
             num_warps,
             qk_k_width,
             pv_k_width,
-            pipeline_stages,
-            kv_load_slices,
         ) = _require_selected_attention_schedule(
             q_dtype=q.dtype,
             kv_dtype=kv_cache.dtype,
@@ -2033,11 +2004,8 @@ def _gluon_mla_decode_gfx950(
             block_h=selected_block_h,
             block_n=selected_block_n,
             waves_per_cta=selected_waves_per_cta,
-            num_warps=selected_num_warps,
             qk_k_width=selected_qk_k_width,
             pv_k_width=selected_pv_k_width,
-            pipeline_stages=selected_pipeline_stages,
-            kv_load_slices=selected_kv_load_slices,
         )
         if nhead < 1:
             raise ValueError("selected attention requires at least one query head")
@@ -2058,8 +2026,6 @@ def _gluon_mla_decode_gfx950(
         num_warps = 4
         qk_k_width = 16 if is_fp8_q else 8
         pv_k_width = 8
-        pipeline_stages = 2
-        kv_load_slices = 2
         num_xcds = 1
     elif regime == "bh16bn64":
         if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
@@ -2077,8 +2043,6 @@ def _gluon_mla_decode_gfx950(
         num_warps = 4
         qk_k_width = 8
         pv_k_width = 8
-        pipeline_stages = 2
-        kv_load_slices = 2
         num_xcds = 1
     elif regime == "bh64":
         if q.dtype != torch.bfloat16 or kv_cache.dtype != torch.bfloat16:
@@ -2094,8 +2058,6 @@ def _gluon_mla_decode_gfx950(
         num_warps = 4
         qk_k_width = 8
         pv_k_width = 8
-        pipeline_stages = 2
-        kv_load_slices = 2
         num_xcds = _NUM_XCDS
         if batch_size % 64 != 0:
             raise NotImplementedError(
@@ -2119,8 +2081,6 @@ def _gluon_mla_decode_gfx950(
         num_warps = 4
         qk_k_width = 8
         pv_k_width = 8
-        pipeline_stages = 2
-        kv_load_slices = 2
         num_xcds = 1
     if kv_cache.dim() == 4:
         if kv_cache.shape[2] != 1 or kv_cache.shape[3] != qk_dim:
@@ -2239,8 +2199,6 @@ def _gluon_mla_decode_gfx950(
         "WAVES_N": waves_per_cta[1],
         "QK_K_WIDTH": qk_k_width,
         "PV_K_WIDTH": pv_k_width,
-        "PIPELINE_STAGES": pipeline_stages,
-        "KV_LOAD_SLICES": kv_load_slices,
         "IS_FP8_Q": is_fp8_q,
         "RETURN_LSE": return_lse,
         "SELECTED_SLOTS": selected_slots,
@@ -2556,11 +2514,8 @@ def gluon_mla_selected_attention_gfx950(
     block_h: int,
     block_n: int,
     waves_per_cta: tuple[int, int],
-    num_warps: int,
     qk_k_width: int,
     pv_k_width: int,
-    pipeline_stages: int,
-    kv_load_slices: int,
     num_kv_splits: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -2573,11 +2528,9 @@ def gluon_mla_selected_attention_gfx950(
         block_h,
         block_n,
         waves_per_cta,
-        num_warps,
+        _num_warps,
         qk_k_width,
         pv_k_width,
-        pipeline_stages,
-        kv_load_slices,
     ) = _require_selected_attention_schedule(
         q_dtype=q.dtype,
         kv_dtype=kv_cache.dtype,
@@ -2586,11 +2539,8 @@ def gluon_mla_selected_attention_gfx950(
         block_h=block_h,
         block_n=block_n,
         waves_per_cta=waves_per_cta,
-        num_warps=num_warps,
         qk_k_width=qk_k_width,
         pv_k_width=pv_k_width,
-        pipeline_stages=pipeline_stages,
-        kv_load_slices=kv_load_slices,
     )
     if num_kv_splits < 1:
         raise ValueError("selected attention requires at least one KV split")
@@ -2660,11 +2610,8 @@ def gluon_mla_selected_attention_gfx950(
         selected_block_h=block_h,
         selected_block_n=block_n,
         selected_waves_per_cta=waves_per_cta,
-        selected_num_warps=num_warps,
         selected_qk_k_width=qk_k_width,
         selected_pv_k_width=pv_k_width,
-        selected_pipeline_stages=pipeline_stages,
-        selected_kv_load_slices=kv_load_slices,
     )
     if out is not None:
         return out
@@ -2696,11 +2643,8 @@ def gluon_mla_selected_attention_fp8_gfx950(
         block_h=16,
         block_n=128,
         waves_per_cta=(1, 4),
-        num_warps=4,
         qk_k_width=16,
         pv_k_width=8,
-        pipeline_stages=2,
-        kv_load_slices=2,
         num_kv_splits=1,
         out=out,
     )

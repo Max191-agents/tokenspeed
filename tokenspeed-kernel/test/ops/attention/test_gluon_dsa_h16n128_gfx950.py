@@ -264,11 +264,8 @@ def test_dense_schedule_wave_ownership_is_complete_and_unique() -> None:
             block_h=schedule.block_h,
             block_n=schedule.block_n,
             waves_per_cta=schedule.waves_per_cta,
-            num_warps=schedule.num_warps,
             qk_k_width=schedule.qk_k_width,
             pv_k_width=schedule.pv_k_width,
-            pipeline_stages=schedule.pipeline_stages,
-            kv_load_slices=schedule.kv_load_slices,
         ) == (
             schedule.block_h,
             schedule.block_n,
@@ -276,8 +273,6 @@ def test_dense_schedule_wave_ownership_is_complete_and_unique() -> None:
             schedule.num_warps,
             schedule.qk_k_width,
             schedule.pv_k_width,
-            schedule.pipeline_stages,
-            schedule.kv_load_slices,
         )
         assert (
             schedule.qk_k_width,
