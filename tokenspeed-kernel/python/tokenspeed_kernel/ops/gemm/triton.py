@@ -33,6 +33,7 @@ from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platf
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
+    dense_tensor_format,
     format_signature,
     format_signatures,
     tensor_format,
@@ -64,6 +65,272 @@ _FP8_CHANNEL_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="channel",
 )
+_BMM_FP8_OUTPUT_SIGNATURES = frozenset(
+    {
+        format_signature(
+            a=dense_tensor_format(torch.bfloat16),
+            b=dense_tensor_format(torch.bfloat16),
+            out=dense_tensor_format(torch.float8_e4m3fn),
+        )
+    }
+)
+
+
+@triton.jit
+def _bmm_fp8_output_quantize_kernel(
+    x_ptr,
+    out_ptr,
+    M,
+    N,
+    stride_xb,
+    stride_xm,
+    stride_xn,
+    stride_ob,
+    stride_om,
+    stride_on,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    n_tile = tl.program_id(1)
+    batch = row // M
+    m = row % M
+    offsets_n = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offsets_n < N
+
+    x_offsets = batch * stride_xb + m * stride_xm + offsets_n * stride_xn
+    values = tl.load(x_ptr + x_offsets, mask=mask).to(tl.float32)
+    values = tl.clamp(values, -448.0, 448.0).to(tl.float8e4nv)
+    out_offsets = batch * stride_ob + m * stride_om + offsets_n * stride_on
+    tl.store(out_ptr + out_offsets, values, mask=mask)
+
+
+def _quantize_bmm_fp8_output(
+    x: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Convert a BF16 BMM result into an arbitrary valid strided E4M3 view."""
+    if x.ndim != 3 or out.ndim != 3 or x.shape != out.shape:
+        raise ValueError(
+            "BMM FP8 conversion expects matching rank-3 tensors, got "
+            f"x shape={tuple(x.shape)}, out shape={tuple(out.shape)}"
+        )
+    if x.dtype != torch.bfloat16 or out.dtype != torch.float8_e4m3fn:
+        raise TypeError(
+            "BMM FP8 conversion expects BF16 input and E4M3 output, got "
+            f"x dtype={x.dtype}, out dtype={out.dtype}"
+        )
+    if x.device != out.device:
+        raise ValueError(
+            f"BMM FP8 conversion device mismatch: x={x.device}, out={out.device}"
+        )
+    if out.numel() == 0:
+        return out
+
+    batch, M, N = x.shape
+    block_n = min(256, triton.next_power_of_2(N))
+    _bmm_fp8_output_quantize_kernel[(batch * M, triton.cdiv(N, block_n))](
+        x,
+        out,
+        M,
+        N,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        BLOCK_N=block_n,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+@register_kernel(
+    "gemm",
+    "bmm_fp8_output",
+    name="composite_bmm_fp8_output",
+    solution="composite",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=_BMM_FP8_OUTPUT_SIGNATURES,
+    traits={},
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def composite_bmm_fp8_output(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Compose ordinary BF16 BMM with one strided E4M3 conversion launch."""
+    from tokenspeed_kernel.ops.gemm import bmm
+
+    _ = enable_pdl
+    batch, M, _ = A.shape
+    N = B.shape[1]
+    if out is None:
+        out = torch.empty(
+            (batch, M, N),
+            dtype=torch.float8_e4m3fn,
+            device=A.device,
+        )
+    scratch = torch.empty(
+        (batch, M, N),
+        dtype=torch.bfloat16,
+        device=A.device,
+    )
+    bmm(
+        A,
+        B,
+        out=scratch,
+        out_dtype=torch.bfloat16,
+    )
+    return _quantize_bmm_fp8_output(scratch, out)
+
+
+@triton.jit
+def _bmm_bf16_fp8_output_kernel(
+    a_ptr,
+    b_ptr,
+    output_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bn,
+    stride_bk,
+    stride_ob,
+    stride_om,
+    stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    batch = pid // (num_pid_m * num_pid_n)
+    tile = pid % (num_pid_m * num_pid_n)
+    pid_m = tile // num_pid_n
+    pid_n = tile % num_pid_n
+
+    offsets_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offsets_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offsets_k = tl.arange(0, BLOCK_K)
+    a_ptrs = (
+        a_ptr
+        + batch * stride_ab
+        + offsets_m[:, None] * stride_am
+        + offsets_k[None, :] * stride_ak
+    )
+    b_ptrs = (
+        b_ptr
+        + batch * stride_bb
+        + offsets_k[:, None] * stride_bk
+        + offsets_n[None, :] * stride_bn
+    )
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k_start in range(0, K, BLOCK_K):
+        k_mask = k_start + offsets_k < K
+        a = tl.load(
+            a_ptrs,
+            mask=(offsets_m[:, None] < M) & k_mask[None, :],
+            other=0.0,
+        )
+        b = tl.load(b_ptrs, mask=k_mask[:, None], other=0.0)
+        accumulator = tl.dot(a, b, accumulator)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    output_ptrs = (
+        output_ptr
+        + batch * stride_ob
+        + offsets_m[:, None] * stride_om
+        + offsets_n[None, :] * stride_on
+    )
+    # Match the original two-kernel path: GEMM rounds to BF16, then the
+    # standalone conversion rounds that stored BF16 value to E4M3.
+    output = accumulator.to(tl.bfloat16).to(tl.float32)
+    output = tl.clamp(output, -448.0, 448.0).to(tl.float8e4nv)
+    tl.store(
+        output_ptrs,
+        output,
+        mask=(offsets_m[:, None] < M) & (offsets_n[None, :] < N),
+    )
+
+
+@register_kernel(
+    "gemm",
+    "bmm_fp8_output",
+    name="triton_bmm_bf16_fp8_glm52",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=_BMM_FP8_OUTPUT_SIGNATURES,
+    # This exact GLM shape is faster in eager dispatch and matches the
+    # generalized skinny Gluon path under graph replay.
+    priority=Priority.SPECIALIZED + 1,
+    traits={
+        "batch": frozenset({16}),
+        "m": frozenset({1, 2, 4, 8, 16}),
+        "n": frozenset({512}),
+        "k": frozenset({192}),
+        "a_inner_stride_one": frozenset({True}),
+        "b_n_stride_one": frozenset({True}),
+        "out_inner_stride_one": frozenset({True}),
+        "native_fp8_output": frozenset({True}),
+    },
+)
+def triton_bmm_bf16_fp8_glm52(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Compute GLM's BF16 query BMM with staged E4M3 output."""
+    _ = enable_pdl
+    batch, M, K = A.shape
+    if B.shape != (batch, 512, K):
+        raise ValueError(f"unexpected GLM query BMM weights: {tuple(B.shape)}")
+    if batch != 16 or M not in (1, 2, 4, 8, 16) or K != 192:
+        raise ValueError(f"unexpected GLM query BMM shape: {tuple(A.shape)}")
+    if out is None:
+        out = torch.empty((batch, M, 512), dtype=torch.float8_e4m3fn, device=A.device)
+    grid = (batch * triton.cdiv(M, 16) * triton.cdiv(512, 64),)
+    _bmm_bf16_fp8_output_kernel[grid](
+        A,
+        B,
+        out,
+        M,
+        512,
+        192,
+        A.stride(0),
+        A.stride(1),
+        A.stride(2),
+        B.stride(0),
+        B.stride(1),
+        B.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        BLOCK_M=16,
+        BLOCK_N=64,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
 _MXFP8_FORMAT_SIGNATURES = (
     format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_BLOCK_SCALE)
     | format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_UE8M0_SCALE)
