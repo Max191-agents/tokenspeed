@@ -621,6 +621,141 @@ def _fp8_quantize(
 
 
 @triton.jit
+def _rope_mla_fp8_producer_kernel(
+    q_ptr,
+    k_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    scale_q,
+    scale_kv,
+    q_stride_t,
+    q_stride_h,
+    k_stride_t,
+    k_stride_h,
+    q_out_stride_t,
+    q_out_stride_h,
+    k_out_stride_t,
+    k_out_stride_h,
+    cache_stride_p,
+    num_q_heads,
+    rotary_dim: tl.constexpr,
+    HALF_DIM_PADDED: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    POSITION_INT64: tl.constexpr,
+    HAS_SCALE_Q_TENSOR: tl.constexpr,
+    HAS_SCALE_KV_TENSOR: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    is_query = head < num_q_heads
+    kv_head = head - num_q_heads
+
+    if POSITION_INT64:
+        position = tl.load(positions_ptr + token).to(tl.int64)
+    else:
+        position = tl.load(positions_ptr + token).to(tl.int32)
+    if HAS_SCALE_Q_TENSOR:
+        scale_q = tl.load(scale_q)
+    if HAS_SCALE_KV_TENSOR:
+        scale_kv = tl.load(scale_kv)
+
+    if is_query:
+        input_ptr = q_ptr + token * q_stride_t + head * q_stride_h
+        output_ptr = q_out_ptr + token * q_out_stride_t + head * q_out_stride_h
+        scale = scale_q
+    else:
+        input_ptr = k_ptr + token * k_stride_t + kv_head * k_stride_h
+        output_ptr = k_out_ptr + token * k_out_stride_t + kv_head * k_out_stride_h
+        scale = scale_kv
+
+    half = rotary_dim // 2
+    offsets = tl.arange(0, HALF_DIM_PADDED)
+    mask = offsets < half
+    cos = tl.load(
+        cos_sin_cache_ptr + position * cache_stride_p + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_cache_ptr + position * cache_stride_p + half + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    if IS_NEOX:
+        first_offsets = offsets
+        second_offsets = half + offsets
+    else:
+        first_offsets = 2 * offsets
+        second_offsets = 2 * offsets + 1
+    first = tl.load(input_ptr + first_offsets, mask=mask, other=0.0).to(tl.float32)
+    second = tl.load(input_ptr + second_offsets, mask=mask, other=0.0).to(tl.float32)
+    rotated_first = first * cos - second * sin
+    rotated_second = second * cos + first * sin
+    # Preserve the old temporary's rounding boundary before applying scale.
+    rounded_first = rotated_first.to(q_ptr.dtype.element_ty).to(tl.float32)
+    rounded_second = rotated_second.to(q_ptr.dtype.element_ty).to(tl.float32)
+    tl.store(
+        output_ptr + first_offsets,
+        (rounded_first * scale).to(tl.float8e4nv),
+        mask=mask,
+    )
+    tl.store(
+        output_ptr + second_offsets,
+        (rounded_second * scale).to(tl.float8e4nv),
+        mask=mask,
+    )
+
+
+def _rope_mla_fp8_producer(
+    *,
+    positions: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    k_rope_out: torch.Tensor,
+    is_neox: bool,
+    quant_scale_q: float | torch.Tensor,
+    quant_scale_kv: float | torch.Tensor,
+) -> None:
+    if isinstance(quant_scale_q, torch.Tensor):
+        quant_scale_q = quant_scale_q.contiguous()
+    if isinstance(quant_scale_kv, torch.Tensor):
+        quant_scale_kv = quant_scale_kv.contiguous()
+    rope_dim = q_rope.shape[-1]
+    _rope_mla_fp8_producer_kernel[(q_rope.shape[0], q_rope.shape[1] + k_rope.shape[1])](
+        q_rope,
+        k_rope,
+        q_rope_out,
+        k_rope_out,
+        cos_sin_cache,
+        positions,
+        quant_scale_q,
+        quant_scale_kv,
+        q_rope.stride(0),
+        q_rope.stride(1),
+        k_rope.stride(0),
+        k_rope.stride(1),
+        q_rope_out.stride(0),
+        q_rope_out.stride(1),
+        k_rope_out.stride(0),
+        k_rope_out.stride(1),
+        cos_sin_cache.stride(0),
+        q_rope.shape[1],
+        rotary_dim=rope_dim,
+        HALF_DIM_PADDED=max(16, _next_power_of_2(rope_dim // 2)),
+        IS_NEOX=is_neox,
+        POSITION_INT64=positions.dtype == torch.int64,
+        HAS_SCALE_Q_TENSOR=isinstance(quant_scale_q, torch.Tensor),
+        HAS_SCALE_KV_TENSOR=isinstance(quant_scale_kv, torch.Tensor),
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+@triton.jit
 def _mla_nope_quantize_fp8_kernel(
     q_nope,
     q_rope,
@@ -1031,3 +1166,60 @@ def triton_embedding_rope_mla(
         quant_scale_kv=quant_scale_kv,
         enable_pdl=enable_pdl,
     )
+
+
+@register_kernel(
+    "embedding",
+    "rope_mla_fp8_producer",
+    name="triton_embedding_rope_mla_fp8_producer_amd",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=format_signatures(
+        ("q_rope", "k_rope", "k_nope"),
+        "dense",
+        {torch.bfloat16},
+    ),
+    priority=Priority.SPECIALIZED,
+    traits={
+        "is_neox": frozenset({True, False}),
+        "has_scale_q_tensor": frozenset({True, False}),
+        "has_scale_kv_tensor": frozenset({True, False}),
+        "preserve_key_prefix": frozenset({True, False}),
+    },
+    tags={"amd", "fusion"},
+)
+def triton_embedding_rope_mla_fp8_producer_amd(
+    *,
+    positions: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    query_out: torch.Tensor,
+    key_out: torch.Tensor,
+    is_neox: bool = True,
+    quant_scale_q: float | torch.Tensor = 1.0,
+    quant_scale_kv: float | torch.Tensor = 1.0,
+    preserve_key_prefix: bool = False,
+    enable_pdl: bool = False,
+) -> None:
+    """Write RoPE suffixes directly to producer-owned AMD FP8 outputs."""
+    latent_dim = k_nope.shape[-1]
+    _rope_mla_fp8_producer(
+        positions=positions,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        cos_sin_cache=cos_sin_cache,
+        q_rope_out=query_out[..., latent_dim:],
+        k_rope_out=key_out[..., latent_dim:],
+        is_neox=is_neox,
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
+    )
+    if not preserve_key_prefix:
+        _fp8_quantize(
+            k_nope,
+            key_out[..., :latent_dim],
+            quant_scale_kv,
+            enable_pdl=False,
+        )
