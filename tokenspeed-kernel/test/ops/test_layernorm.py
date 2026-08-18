@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+import tokenspeed_kernel.ops.layernorm.triton as layernorm_triton
 import torch
 from tokenspeed_kernel.ops.layernorm.triton import (
     fused_qk_rmsnorm_rope,
     fused_qk_rmsnorm_rope_gate,
     qk_rmsnorm,
     rmsnorm,
+    rmsnorm_fused_parallel,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -54,6 +58,201 @@ def test_rmsnorm_with_residual(
     ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(residual_out, ref_residual, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_parallel_rmsnorm_preserves_same_dtype_behavior(
+    dtype: torch.dtype, device: str
+) -> None:
+    torch.manual_seed(48)
+    tokens = 11
+    eps = 1e-6
+    q = torch.randn(tokens, 384, device=device, dtype=dtype)
+    kv = torch.randn(tokens, 160, device=device, dtype=dtype)
+    q_weight = torch.randn(384, device=device, dtype=torch.float32)
+    kv_weight = torch.randn(160, device=device, dtype=torch.float32)
+    q_out = torch.empty_like(q)
+    kv_out = torch.empty_like(kv)
+
+    rmsnorm_fused_parallel(q, q_weight, q_out, kv, kv_weight, kv_out, eps)
+
+    q_variance = q.float().pow(2).mean(dim=-1, keepdim=True)
+    kv_variance = kv.float().pow(2).mean(dim=-1, keepdim=True)
+    q_ref = (q.float() * torch.rsqrt(q_variance + eps) * q_weight).to(dtype)
+    kv_ref = (kv.float() * torch.rsqrt(kv_variance + eps) * kv_weight).to(dtype)
+    torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(kv_out, kv_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not platform.is_amd, reason="FP8 output is an AMD-only extension")
+@pytest.mark.parametrize("placement", ["prefix", "suffix"])
+def test_fused_parallel_rmsnorm_writes_strided_fp8_output(
+    placement: str, device: str
+) -> None:
+    torch.manual_seed(49)
+    tokens = 11
+    eps = 1e-6
+    q = torch.randn(tokens, 1536, device=device, dtype=torch.bfloat16)
+    kv = torch.randn(tokens, 512, device=device, dtype=torch.bfloat16)
+    q_weight = torch.randn(1536, device=device, dtype=torch.float32)
+    kv_weight = torch.randn(512, device=device, dtype=torch.float32)
+    q_out = torch.empty_like(q)
+    combined_key = torch.full(
+        (tokens, 576), -6.0, device=device, dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    if placement == "prefix":
+        fp8_output = combined_key[:, :512]
+        untouched = combined_key[:, 512:]
+    else:
+        fp8_output = combined_key[:, 64:]
+        untouched = combined_key[:, :64]
+    untouched_before = untouched.view(torch.uint8).clone()
+
+    rmsnorm_fused_parallel(
+        q,
+        q_weight,
+        q_out,
+        kv,
+        kv_weight,
+        fp8_output,
+        eps,
+    )
+
+    q_variance = q.float().pow(2).mean(dim=-1, keepdim=True)
+    kv_variance = kv.float().pow(2).mean(dim=-1, keepdim=True)
+    q_ref = (q.float() * torch.rsqrt(q_variance + eps) * q_weight).to(q.dtype)
+    normalized_kv = kv.float() * torch.rsqrt(kv_variance + eps) * kv_weight
+    fp8_ref = normalized_kv.to(kv.dtype).to(torch.float8_e4m3fn)
+
+    torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(fp8_output.float(), fp8_ref.float(), atol=0.5, rtol=0)
+    assert torch.equal(untouched.view(torch.uint8), untouched_before)
+
+
+@pytest.mark.skipif(not platform.is_amd, reason="FP8 output is an AMD-only extension")
+def test_fused_parallel_rmsnorm_fp8_rounds_through_bf16_and_saturates(
+    device: str,
+) -> None:
+    hidden_size = 64
+    q = torch.ones((1, hidden_size), device=device, dtype=torch.bfloat16)
+    kv = torch.ones_like(q)
+    q_weight = torch.ones(hidden_size, device=device, dtype=torch.float32)
+    midpoint = 2.125 + 2**-10
+    kv_weight = torch.empty(hidden_size, device=device, dtype=torch.float32)
+    kv_weight[0::4] = midpoint
+    kv_weight[1::4] = -midpoint
+    kv_weight[2::4] = 465.0
+    kv_weight[3::4] = -465.0
+    q_out = torch.empty_like(q)
+    kv_fp8 = torch.empty_like(kv, dtype=torch.float8_e4m3fn)
+
+    rmsnorm_fused_parallel(q, q_weight, q_out, kv, kv_weight, kv_fp8, 0.0)
+
+    normalized = kv.float() * kv_weight
+    staged = normalized.to(torch.bfloat16).to(torch.float8_e4m3fn)
+    direct = normalized.to(torch.float8_e4m3fn)
+    assert torch.equal(kv_fp8.view(torch.uint8), staged.view(torch.uint8))
+    assert torch.all(staged.float()[:, 0::4] == 2.0)
+    assert torch.all(staged.float()[:, 1::4] == -2.0)
+    assert torch.all(direct.float()[:, 0::4] == 2.25)
+    assert torch.all(direct.float()[:, 1::4] == -2.25)
+    assert torch.all(kv_fp8.float()[:, 2::4] == 448.0)
+    assert torch.all(kv_fp8.float()[:, 3::4] == -448.0)
+    assert torch.isnan(direct.float()[:, 2::4]).all()
+    assert torch.isnan(direct.float()[:, 3::4]).all()
+
+
+@pytest.mark.skipif(not platform.is_amd, reason="FP8 output is an AMD-only extension")
+def test_fused_parallel_rmsnorm_fp8_cuda_graph_replay(device: str) -> None:
+    torch.manual_seed(50)
+    eps = 1e-6
+    q = torch.randn(4, 128, device=device, dtype=torch.bfloat16)
+    kv = torch.randn(4, 64, device=device, dtype=torch.bfloat16)
+    q_weight = torch.randn(128, device=device, dtype=torch.float32)
+    kv_weight = torch.randn(64, device=device, dtype=torch.float32)
+    q_out = torch.empty_like(q)
+    kv_fp8 = torch.empty_like(kv, dtype=torch.float8_e4m3fn)
+
+    rmsnorm_fused_parallel(q, q_weight, q_out, kv, kv_weight, kv_fp8, eps)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        rmsnorm_fused_parallel(q, q_weight, q_out, kv, kv_weight, kv_fp8, eps)
+
+    next_q = torch.randn_like(q)
+    next_kv = torch.randn_like(kv)
+    q.copy_(next_q)
+    kv.copy_(next_kv)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    q_variance = next_q.float().pow(2).mean(dim=-1, keepdim=True)
+    kv_variance = next_kv.float().pow(2).mean(dim=-1, keepdim=True)
+    q_ref = (next_q.float() * torch.rsqrt(q_variance + eps) * q_weight).to(
+        torch.bfloat16
+    )
+    kv_ref = (
+        (next_kv.float() * torch.rsqrt(kv_variance + eps) * kv_weight)
+        .to(torch.bfloat16)
+        .to(torch.float8_e4m3fn)
+    )
+    torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(kv_fp8.float(), kv_ref.float(), atol=0.5, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "input2_dtype,output2_dtype",
+    [
+        (torch.bfloat16, torch.float32),
+        (torch.float16, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+    ],
+)
+def test_fused_parallel_rmsnorm_rejects_invalid_output2_dtype(
+    input2_dtype: torch.dtype, output2_dtype: torch.dtype, device: str
+) -> None:
+    input1 = torch.ones((2, 32), device=device, dtype=torch.bfloat16)
+    input2 = torch.ones((2, 32), device=device, dtype=input2_dtype)
+    weight = torch.ones(32, device=device, dtype=torch.float32)
+    output1 = torch.empty_like(input1)
+    output2 = torch.empty_like(input2, dtype=output2_dtype)
+
+    with pytest.raises(TypeError, match="output2 dtype|E4M3 output2 requires BF16"):
+        rmsnorm_fused_parallel(input1, weight, output1, input2, weight, output2, 1e-6)
+
+
+def test_fused_parallel_rmsnorm_rejects_fp8_output_on_non_amd(
+    monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
+    monkeypatch.setattr(
+        layernorm_triton,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=False),
+    )
+    input1 = torch.ones((2, 32), device=device, dtype=torch.bfloat16)
+    input2 = torch.ones_like(input1)
+    weight = torch.ones(32, device=device, dtype=torch.float32)
+    output1 = torch.empty_like(input1)
+    output2 = torch.empty_like(input2, dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(
+        RuntimeError, match="BF16-to-E4M3 output2.*only supported on AMD"
+    ):
+        rmsnorm_fused_parallel(input1, weight, output1, input2, weight, output2, 1e-6)
+
+
+@pytest.mark.skipif(not platform.is_amd, reason="FP8 output is an AMD-only extension")
+def test_fused_parallel_rmsnorm_rejects_fp8_output_device_mismatch(
+    device: str,
+) -> None:
+    input1 = torch.ones((2, 32), device=device, dtype=torch.bfloat16)
+    input2 = torch.ones_like(input1)
+    weight = torch.ones(32, device=device, dtype=torch.float32)
+    output1 = torch.empty_like(input1)
+    output2 = torch.empty(input2.shape, device="cpu", dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="output2 must be on"):
+        rmsnorm_fused_parallel(input1, weight, output1, input2, weight, output2, 1e-6)
 
 
 def _gemma_ref(
