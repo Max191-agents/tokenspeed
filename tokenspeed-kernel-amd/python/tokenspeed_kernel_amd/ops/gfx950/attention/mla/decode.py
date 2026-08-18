@@ -50,12 +50,19 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.mla.reduce_project_value import 
 )
 
 # ===-----------------------------------------------------------------------===#
-# Kernel Config
+# Kernel Descriptor
 # ===-----------------------------------------------------------------------===#
 
 
 @gluon.aggregate
-class AttentionConfig:
+class AttentionDescriptor:
+    """Compile-time schedule descriptor for the shared MLA attention program.
+
+    The program keeps sequence traversal, masking, online softmax, and output
+    normalization shared. This descriptor owns the layouts and load/MFMA setup
+    that vary across the static schedules.
+    """
+
     BLOCK_H: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_KV_SPLITS: gl.constexpr
@@ -766,6 +773,148 @@ class AttentionConfig:
         self.shared_page = gl.constexpr(shared_page)
         self.blocked_lse = gl.constexpr(blocked_lse)
 
+    @gluon.jit
+    def issue_load_q_nope(self, Q_nope, buf, cur_batch, cur_head_id):
+        desc = self
+        if desc.IS_FP8_Q:
+            offs_d_ckv = gl.arange(
+                0, desc.HEAD_DIM_CKV, layout=gl.SliceLayout(1, desc.blocked_q_nope)
+            )
+            cur_head = cur_head_id * desc.BLOCK_H + gl.arange(
+                0, desc.BLOCK_H, layout=gl.SliceLayout(0, desc.blocked_q_nope)
+            )
+            offs_q_nope = (
+                cur_batch * desc.stride_q_nope_bs
+                + cur_head[None, :] * desc.stride_q_nope_h
+                + offs_d_ckv[:, None]
+            )
+            mask = (cur_head < desc.NHEAD)[None, :]
+        else:
+            offs_d_ckv = gl.arange(
+                0, desc.HEAD_DIM_CKV, layout=gl.SliceLayout(0, desc.blocked_q_nope)
+            )
+            cur_head = cur_head_id * desc.BLOCK_H + gl.arange(
+                0, desc.BLOCK_H, layout=gl.SliceLayout(1, desc.blocked_q_nope)
+            )
+            offs_q_nope = (
+                cur_batch * desc.stride_q_nope_bs
+                + cur_head[:, None] * desc.stride_q_nope_h
+                + offs_d_ckv[None, :]
+            )
+            mask = (
+                (cur_head < desc.NHEAD)[:, None]
+                if desc.SELECTED_SLOTS or desc.NHEAD < desc.BLOCK_H
+                else None
+            )
+        # For nhead < BLOCK_H, mask OOB heads to zero on Q load and skip OOB O
+        # stores; wasted MFMA lanes are free (memory-bound).
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            buf,
+            Q_nope,
+            offs_q_nope,
+            mask=mask,
+        )
+        gl.amd.cdna4.async_copy.commit_group()
+
+    @gluon.jit
+    def issue_load_q_pe(self, Q_pe, buf, cur_batch, cur_head_id):
+        desc = self
+        if desc.IS_FP8_Q:
+            offs_d_kpe = gl.arange(
+                0, desc.HEAD_DIM_KPE, layout=gl.SliceLayout(1, desc.blocked_q_pe)
+            )
+            cur_head_qpe = cur_head_id * desc.BLOCK_H + gl.arange(
+                0, desc.Q_PE_BLOCK_H, layout=gl.SliceLayout(0, desc.blocked_q_pe)
+            )
+            offs_q_pe = (
+                cur_batch * desc.stride_q_pe_bs
+                + cur_head_qpe[None, :] * desc.stride_q_pe_h
+                + offs_d_kpe[:, None]
+            )
+            mask = (cur_head_qpe < desc.NHEAD)[None, :]
+        else:
+            offs_d_kpe = gl.arange(
+                0, desc.HEAD_DIM_KPE, layout=gl.SliceLayout(0, desc.blocked_q_pe)
+            )
+            cur_head_qpe = cur_head_id * desc.BLOCK_H + gl.arange(
+                0, desc.BLOCK_H, layout=gl.SliceLayout(1, desc.blocked_q_pe)
+            )
+            offs_q_pe = (
+                cur_batch * desc.stride_q_pe_bs
+                + cur_head_qpe[:, None] * desc.stride_q_pe_h
+                + offs_d_kpe[None, :]
+            )
+            mask = (
+                (cur_head_qpe < desc.NHEAD)[:, None]
+                if desc.SELECTED_SLOTS or desc.NHEAD < desc.BLOCK_H
+                else None
+            )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            buf,
+            Q_pe,
+            offs_q_pe,
+            mask=mask,
+        )
+        gl.amd.cdna4.async_copy.commit_group()
+
+    @gluon.jit
+    def local_load_q(self, buf_q_nope, buf_q_pe):
+        desc = self
+        if desc.IS_FP8_Q:
+            q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                buf_q_nope.permute([1, 0]), desc.q_layout
+            )
+            q_pe_buffer = buf_q_pe.permute([1, 0])
+            if desc.Q_PE_BLOCK_H != desc.BLOCK_H:
+                q_pe_buffer = q_pe_buffer.slice(0, desc.BLOCK_H, 0)
+            q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                q_pe_buffer, desc.q_layout
+            )
+        else:
+            q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                buf_q_nope, desc.q_layout
+            )
+            q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, desc.q_layout)
+        return q_nope, q_pe
+
+    @gluon.jit
+    def compute_qk(self, Q_nope, q_nope, q_pe, kv_buf, kpe_buf, RELAXED: gl.constexpr):
+        desc = self
+        dtype = Q_nope.type.element_ty
+        if RELAXED:
+            k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_buf, desc.k_layout)
+        else:
+            k_c = kv_buf.load(layout=desc.k_layout)
+        zeros = gl.zeros(
+            [desc.BLOCK_H, desc.BLOCK_N],
+            dtype=gl.float32,
+            layout=desc.mfma_layout,
+        )
+        qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
+        if RELAXED:
+            k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(kpe_buf, desc.k_layout)
+        else:
+            k_pe = kpe_buf.load(layout=desc.k_layout)
+        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
+        return qk
+
+    @gluon.jit
+    def compute_pv(self, Q_nope, p, acc, kv_buf, RELAXED: gl.constexpr):
+        desc = self
+        dtype = Q_nope.type.element_ty
+        if desc.DIRECT_V_LOAD:
+            v_c = kv_buf.permute([1, 0]).load(layout=desc.v_layout)
+        else:
+            if RELAXED:
+                v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_buf, desc.linear_v)
+            else:
+                v_c = kv_buf.load(layout=desc.linear_v)
+            v_c = gl.permute(v_c, [1, 0])
+            v_c = gl.convert_layout(v_c, desc.v_layout)
+        v_c = v_c.to(dtype)
+        acc = gl.amd.cdna4.mfma(p, v_c, acc)
+        return acc
+
 
 # ===-----------------------------------------------------------------------===#
 # Kernel Program
@@ -908,107 +1057,15 @@ class AttentionProgram:
 
     @gluon.jit
     def issue_load_q_nope(self, buf):
-        cfg = self.cfg
-        if cfg.IS_FP8_Q:
-            offs_d_ckv = gl.arange(
-                0, cfg.HEAD_DIM_CKV, layout=gl.SliceLayout(1, cfg.blocked_q_nope)
-            )
-            cur_head = self.cur_head_id * cfg.BLOCK_H + gl.arange(
-                0, cfg.BLOCK_H, layout=gl.SliceLayout(0, cfg.blocked_q_nope)
-            )
-            offs_q_nope = (
-                self.cur_batch * cfg.stride_q_nope_bs
-                + cur_head[None, :] * cfg.stride_q_nope_h
-                + offs_d_ckv[:, None]
-            )
-            mask = (cur_head < cfg.NHEAD)[None, :]
-        else:
-            offs_d_ckv = gl.arange(
-                0, cfg.HEAD_DIM_CKV, layout=gl.SliceLayout(0, cfg.blocked_q_nope)
-            )
-            cur_head = self.cur_head_id * cfg.BLOCK_H + gl.arange(
-                0, cfg.BLOCK_H, layout=gl.SliceLayout(1, cfg.blocked_q_nope)
-            )
-            offs_q_nope = (
-                self.cur_batch * cfg.stride_q_nope_bs
-                + cur_head[:, None] * cfg.stride_q_nope_h
-                + offs_d_ckv[None, :]
-            )
-            mask = (
-                (cur_head < cfg.NHEAD)[:, None]
-                if cfg.SELECTED_SLOTS or cfg.NHEAD < cfg.BLOCK_H
-                else None
-            )
-        # For nhead < BLOCK_H, mask OOB heads to zero on Q load and skip OOB O
-        # stores; wasted MFMA lanes are free (memory-bound).
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            buf,
-            self.Q_nope,
-            offs_q_nope,
-            mask=mask,
-        )
-        gl.amd.cdna4.async_copy.commit_group()
+        self.cfg.issue_load_q_nope(self.Q_nope, buf, self.cur_batch, self.cur_head_id)
 
     @gluon.jit
     def issue_load_q_pe(self, buf):
-        cfg = self.cfg
-        if cfg.IS_FP8_Q:
-            offs_d_kpe = gl.arange(
-                0, cfg.HEAD_DIM_KPE, layout=gl.SliceLayout(1, cfg.blocked_q_pe)
-            )
-            cur_head_qpe = self.cur_head_id * cfg.BLOCK_H + gl.arange(
-                0, cfg.Q_PE_BLOCK_H, layout=gl.SliceLayout(0, cfg.blocked_q_pe)
-            )
-            offs_q_pe = (
-                self.cur_batch * cfg.stride_q_pe_bs
-                + cur_head_qpe[None, :] * cfg.stride_q_pe_h
-                + offs_d_kpe[:, None]
-            )
-            mask = (cur_head_qpe < cfg.NHEAD)[None, :]
-        else:
-            offs_d_kpe = gl.arange(
-                0, cfg.HEAD_DIM_KPE, layout=gl.SliceLayout(0, cfg.blocked_q_pe)
-            )
-            cur_head_qpe = self.cur_head_id * cfg.BLOCK_H + gl.arange(
-                0, cfg.BLOCK_H, layout=gl.SliceLayout(1, cfg.blocked_q_pe)
-            )
-            offs_q_pe = (
-                self.cur_batch * cfg.stride_q_pe_bs
-                + cur_head_qpe[:, None] * cfg.stride_q_pe_h
-                + offs_d_kpe[None, :]
-            )
-            mask = (
-                (cur_head_qpe < cfg.NHEAD)[:, None]
-                if cfg.SELECTED_SLOTS or cfg.NHEAD < cfg.BLOCK_H
-                else None
-            )
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            buf,
-            self.Q_pe,
-            offs_q_pe,
-            mask=mask,
-        )
-        gl.amd.cdna4.async_copy.commit_group()
+        self.cfg.issue_load_q_pe(self.Q_pe, buf, self.cur_batch, self.cur_head_id)
 
     @gluon.jit
     def local_load_q(self, buf_q_nope, buf_q_pe):
-        cfg = self.cfg
-        if cfg.IS_FP8_Q:
-            q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                buf_q_nope.permute([1, 0]), cfg.q_layout
-            )
-            q_pe_buffer = buf_q_pe.permute([1, 0])
-            if cfg.Q_PE_BLOCK_H != cfg.BLOCK_H:
-                q_pe_buffer = q_pe_buffer.slice(0, cfg.BLOCK_H, 0)
-            q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                q_pe_buffer, cfg.q_layout
-            )
-        else:
-            q_nope = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                buf_q_nope, cfg.q_layout
-            )
-            q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, cfg.q_layout)
-        return q_nope, q_pe
+        return self.cfg.local_load_q(buf_q_nope, buf_q_pe)
 
     @gluon.jit
     def issue_page_load(self, buf, start_n):
@@ -1081,22 +1138,7 @@ class AttentionProgram:
 
     @gluon.jit
     def compute_qk(self, q_nope, q_pe, kv_buf, kpe_buf, RELAXED: gl.constexpr):
-        cfg = self.cfg
-        dtype = self.Q_nope.type.element_ty
-        if RELAXED:
-            k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_buf, cfg.k_layout)
-        else:
-            k_c = kv_buf.load(layout=cfg.k_layout)
-        zeros = gl.zeros(
-            [cfg.BLOCK_H, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.mfma_layout
-        )
-        qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
-        if RELAXED:
-            k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(kpe_buf, cfg.k_layout)
-        else:
-            k_pe = kpe_buf.load(layout=cfg.k_layout)
-        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
-        return qk
+        return self.cfg.compute_qk(self.Q_nope, q_nope, q_pe, kv_buf, kpe_buf, RELAXED)
 
     @gluon.jit
     def softmax(self, qk, offs_base, e_max, e_sum, acc):
@@ -1136,20 +1178,7 @@ class AttentionProgram:
 
     @gluon.jit
     def compute_pv(self, p, acc, kv_buf, RELAXED: gl.constexpr):
-        cfg = self.cfg
-        dtype = self.Q_nope.type.element_ty
-        if cfg.DIRECT_V_LOAD:
-            v_c = kv_buf.permute([1, 0]).load(layout=cfg.v_layout)
-        else:
-            if RELAXED:
-                v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_buf, cfg.linear_v)
-            else:
-                v_c = kv_buf.load(layout=cfg.linear_v)
-            v_c = gl.permute(v_c, [1, 0])
-            v_c = gl.convert_layout(v_c, cfg.v_layout)
-        v_c = v_c.to(dtype)
-        acc = gl.amd.cdna4.mfma(p, v_c, acc)
-        return acc
+        return self.cfg.compute_pv(self.Q_nope, p, acc, kv_buf, RELAXED)
 
     @gluon.jit
     def store_output(self, acc, e_sum):
@@ -1312,7 +1341,7 @@ def _mla_decode_gluon(
     RETURN_LSE: gl.constexpr,
     SELECTED_SLOTS: gl.constexpr,
 ):
-    cfg = AttentionConfig(
+    cfg = AttentionDescriptor(
         BLOCK_H,
         BLOCK_N,
         NUM_KV_SPLITS,
