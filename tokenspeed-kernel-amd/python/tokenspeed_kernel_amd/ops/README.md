@@ -412,3 +412,19 @@ weights:
 The row tile is resolved from the gathered row count and expert count unless
 the caller pins it. Ragged M and N edges are masked rather than peeled, so a
 trailing partial tile loads only the rows that exist.
+
+## Residual
+
+### gfx950 mHC pre-mapping
+
+For four BF16 residual streams, FP32 projection weights, hidden width 4096 or
+7168, and 20 Sinkhorn iterations on gfx950, calls with 1–64 token rows use the
+existing reduction kernel, 65–256 rows use the portable Triton path, and
+eligible calls above 256 rows select the Gluon projection. Other
+configurations retain their existing registered backend.
+
+The projection computes 64 token rows and 24 outputs per workgroup. Four waves
+reuse each asynchronously staged FP32 weight tile while accumulating their own
+rows with FP32 matrix instructions. The shared pre-mapping path still performs
+the following reduction, normalization, and output mixing. Token count remains
+a runtime argument to the projection, so the final partial tile is masked.
