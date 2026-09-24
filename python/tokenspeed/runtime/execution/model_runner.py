@@ -28,6 +28,10 @@ import torch
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
+from tokenspeed.runtime.layers.quantization.base_config import (
+    finalize_quantized_weights_after_loading,
+    invalidate_quantized_weights_before_loading,
+)
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
@@ -327,7 +331,11 @@ class ModelRunner:
                     dist.broadcast(buf, src=0, group=pg)
                     yield name, buf
 
-            self.model.load_weights(_recv())
+            invalidate_quantized_weights_before_loading(self.model)
+            try:
+                self.model.load_weights(_recv())
+            finally:
+                finalize_quantized_weights_after_loading(self.model)
             torch.cuda.synchronize(device)
             return True, f"updated {len(names)} weights"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
