@@ -40,3 +40,14 @@ table.
 Scoring workspaces are row-tiled under `max_logits_bytes`. The cap includes
 the persistent sort or radix intermediates as well as logits; one row remains
 legal when its workspace exceeds the cap.
+
+## Decode selection on gfx950
+
+For GLM-5.3's four-query verification steps at batch sizes 2, 4, 8, and 16,
+the gfx950 path converts BF16 queries to FP8, scores the scaled FP8 index
+cache, and combines top-k selection with FlatKV slot mapping. It requires the
+model's 1/64 score scale. The registry selects by query shape and dtype, then
+the wrapper delegates other score scales to the portable decode path. Batch
+size and page-table capacity set graph-static workspace geometry; live
+sequence lengths and page-table contents remain device inputs so a
+captured graph can replay at different context lengths.

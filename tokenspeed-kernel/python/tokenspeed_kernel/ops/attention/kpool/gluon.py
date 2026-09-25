@@ -37,7 +37,9 @@ from tokenspeed_kernel.ops.attention.kpool.triton import (
     _DEFAULT_CHUNK_POOLS,
     _empty_result,
     _kpool_sort_topk_kernel,
+    _prepare_kpool_decode_metadata,
     expand_kpool_to_flat_kv,
+    triton_dense_kpool_decode_topk,
 )
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -50,7 +52,12 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 _IS_AMD = current_platform().is_amd
 
 if _IS_AMD:
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.query_quant import (
+        gluon_dsa_prepare_kpool_query_gfx950,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
+        _gluon_dsa_kpool_decode_logits_fp8_folded_gfx950,
+        gluon_dsa_kpool_decode_fused_slots_gfx950,
         gluon_dsa_kpool_prefill_logits_gfx950,
         gluon_dsa_kpool_prefill_plan_logits_gfx950,
         gluon_dsa_logical_topk_gfx950,
@@ -116,6 +123,25 @@ def _uses_deterministic_single_window_sort(
     window_width: int,
 ) -> bool:
     return max_num_pools <= window_width <= 2048
+
+
+def _uses_native_fp8_decode_scorer(
+    *,
+    num_tokens: int,
+    q_len_per_req: int,
+    max_seq_len: int | None,
+    max_num_pools: int,
+    topk_pools: int,
+    softmax_scale: float,
+) -> bool:
+    """Gate the GLM-5.3 decode contract without reading live lengths."""
+    return (
+        q_len_per_req == 4
+        and num_tokens in (8, 16, 32, 64)
+        and max_seq_len is not None
+        and max_num_pools > topk_pools
+        and abs(float(softmax_scale) - (1.0 / 64.0)) <= 1.0e-12
+    )
 
 
 @triton.jit
@@ -689,6 +715,151 @@ def gluon_kpool_prefill_topk_fp8_gfx950(*args, **kwargs):
     )
 
 
+def gluon_kpool_decode_topk_fp8_query_gfx950(
+    q: torch.Tensor,
+    pooled_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    index_block_table: torch.Tensor,
+    kv_block_table: torch.Tensor,
+    *,
+    pool_size: int,
+    page_size: int,
+    kv_page_size: int,
+    topk_pools: int,
+    softmax_scale: float,
+    q_len_per_req: int = 1,
+    apply_relu: bool = True,
+    append_tail: bool = True,
+    chunk_pools: int = _DEFAULT_CHUNK_POOLS,
+    max_seq_len: int | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score the exact B2/C4/B8/B16 MTP decode shapes with native FP8 operands.
+
+    Batch size and page-table capacity determine graph-static launch and
+    workspace geometry. Live sequence lengths, score-row bounds, and page-table
+    contents remain runtime values within that capacity. Other shapes or
+    model score scales retain the portable implementation.
+    """
+    pool_size = int(pool_size)
+    page_size = int(page_size)
+    topk_pools = int(topk_pools)
+    q_len_per_req = int(q_len_per_req)
+    _validate_specialization(
+        q,
+        weights,
+        pool_size=pool_size,
+        page_size=page_size,
+        topk_pools=topk_pools,
+        apply_relu=apply_relu,
+    )
+
+    num_tokens = int(q.shape[0])
+    if q_len_per_req < 1 or num_tokens % q_len_per_req:
+        raise ValueError(
+            f"q_len_per_req={q_len_per_req} must divide tokens={num_tokens}"
+        )
+    num_reqs = num_tokens // q_len_per_req
+    if seq_lens.numel() < num_reqs:
+        raise ValueError(
+            f"seq_lens must cover {num_reqs} requests, got {seq_lens.numel()}"
+        )
+    if max_seq_len is not None and int(max_seq_len) < 0:
+        raise ValueError(f"max_seq_len must be non-negative, got {max_seq_len}")
+    if num_tokens == 0:
+        return _empty_result(q, topk_pools, pool_size, append_tail)
+    if index_block_table.dim() != 2:
+        raise ValueError(
+            f"index_block_table must be 2-D, got shape={tuple(index_block_table.shape)}"
+        )
+
+    max_num_pools = max(int(index_block_table.shape[1]) * page_size, 1)
+    if max_seq_len is not None:
+        max_num_pools = min(
+            max_num_pools,
+            max(int(max_seq_len) // pool_size, 1),
+        )
+    if not _uses_native_fp8_decode_scorer(
+        num_tokens=num_tokens,
+        q_len_per_req=q_len_per_req,
+        max_seq_len=max_seq_len,
+        max_num_pools=max_num_pools,
+        topk_pools=topk_pools,
+        softmax_scale=softmax_scale,
+    ):
+        return triton_dense_kpool_decode_topk(
+            q,
+            pooled_k_cache,
+            weights,
+            seq_lens,
+            index_block_table,
+            kv_block_table,
+            pool_size=pool_size,
+            page_size=page_size,
+            kv_page_size=kv_page_size,
+            topk_pools=topk_pools,
+            softmax_scale=softmax_scale,
+            q_len_per_req=q_len_per_req,
+            apply_relu=apply_relu,
+            append_tail=append_tail,
+            chunk_pools=chunk_pools,
+            max_seq_len=max_seq_len,
+            out=out,
+            lens_out=lens_out,
+        )
+
+    if not q.is_cuda:
+        raise RuntimeError("KPool decode top-k requires CUDA tensors")
+
+    device = q.device
+    seq_lens = seq_lens.to(device=device).contiguous()
+    req_ids, causal_lens = _prepare_kpool_decode_metadata(
+        seq_lens,
+        num_tokens,
+        q_len_per_req,
+    )
+    source_weights = weights
+    if source_weights.dtype not in (torch.bfloat16, torch.float32):
+        source_weights = source_weights.to(torch.float32)
+    prepared_q, combined_weights = gluon_dsa_prepare_kpool_query_gfx950(
+        q.contiguous(),
+        source_weights.contiguous(),
+        float(softmax_scale),
+        q_out=None,
+        combined_weights_out=None,
+    )
+    logits, row_starts, row_ends = _gluon_dsa_kpool_decode_logits_fp8_folded_gfx950(
+        prepared_q,
+        pooled_k_cache,
+        combined_weights,
+        causal_lens,
+        req_ids,
+        index_block_table.to(
+            device=device,
+            dtype=torch.int32,
+        ).contiguous(),
+        max_candidates=max_num_pools,
+        pool_size=pool_size,
+        page_size=page_size,
+    )
+    return gluon_dsa_kpool_decode_fused_slots_gfx950(
+        logits,
+        row_starts,
+        row_ends,
+        causal_lens,
+        req_ids,
+        kv_block_table.to(device=device, dtype=torch.int32).contiguous(),
+        pool_size=pool_size,
+        kv_page_size=int(kv_page_size),
+        topk_pools=topk_pools,
+        append_tail=append_tail,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
 def gluon_kpool_prefill_topk_fp8_gfx1250(*args, **kwargs):
     return _kpool_prefill_topk_impl(
         *args,
@@ -700,6 +871,40 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(*args, **kwargs):
 
 
 if _IS_AMD:
+    register_kernel(
+        "attention",
+        "kpool_decode_topk",
+        name="gluon_kpool_decode_topk_fp8_query_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+        priority=Priority.PERFORMANT,
+        traits={
+            "batch_size": frozenset({2, 4, 8, 16}),
+            "index_heads": frozenset({32}),
+            "head_dim": frozenset({128}),
+            "pool_size": frozenset({4}),
+            "page_size": frozenset({16}),
+            "topk_pools": frozenset({512}),
+            "q_len": frozenset({4}),
+            "index_k_format": frozenset({"fp8_scaled"}),
+            "score_activation": frozenset({"relu"}),
+            "topk_layout": frozenset({"global_slots"}),
+        },
+        features={
+            "amd",
+            "gfx950",
+            "decode",
+            "experimental",
+            "fp8-query",
+            "folded-scale",
+            "kpool",
+        },
+    )(gluon_kpool_decode_topk_fp8_query_gfx950)
     register_kernel(
         "attention",
         "kpool_prefill_topk",
@@ -749,6 +954,7 @@ if _IS_AMD:
         },
     )(gluon_kpool_prefill_topk_fp8_gfx1250)
     __all__ = [
+        "gluon_kpool_decode_topk_fp8_query_gfx950",
         "gluon_kpool_prefill_topk_fp8_gfx950",
         "gluon_kpool_prefill_topk_fp8_gfx1250",
     ]

@@ -29,6 +29,9 @@ from typing import NamedTuple
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.decode_kpool_folded import (
+    _dsa_kpool_decode_logits_fp8_folded_kernel,
+)
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
     gluon_dsa_decode_topk_fp8_gfx950,
@@ -78,6 +81,7 @@ _persistent_topk_workspace_lock = Lock()
 __all__ = [
     "launch_gluon_dsa_decode_topk_fp8_gfx950",
     "launch_gluon_dsa_decode_topk_standard_gfx950",
+    "gluon_dsa_kpool_decode_fused_slots_gfx950",
     "gluon_dsa_kpool_prefill_logits_gfx950",
     "gluon_dsa_kpool_prefill_plan_logits_gfx950",
     "gluon_dsa_logical_topk_gfx950",
@@ -1007,6 +1011,94 @@ def _emit_compact_final_topk(
 
 
 @gluon.jit
+def _kpool_fused_slot_epilogue(
+    selected_pools,
+    row_starts,
+    row_ends,
+    causal_lens,
+    req_ids,
+    kv_block_table,
+    slots_out,
+    lens_out,
+    row,
+    selected_stride: gl.constexpr,
+    slots_stride: gl.constexpr,
+    logits_cols: gl.constexpr,
+    kv_table_stride: gl.constexpr,
+    kv_table_rows: gl.constexpr,
+    kv_table_cols: gl.constexpr,
+    pool_size: gl.constexpr,
+    kv_page_size: gl.constexpr,
+    topk_pools: gl.constexpr,
+    append_tail: gl.constexpr,
+    OUT_COLS: gl.constexpr,
+    OUT_BLOCK: gl.constexpr,
+):
+    # The radix emitters write selected_pools from every warp. All exits that
+    # call this helper are CTA-uniform, so no warp reads another's output early.
+    gl.barrier()
+    layout: gl.constexpr = _vector_layout(
+        gl.num_warps(), triton.cdiv(OUT_BLOCK, 64 * gl.num_warps())
+    )
+    cols = gl.arange(0, OUT_BLOCK, layout=layout)
+    raw_seq_len = gl.load(causal_lens + row).to(gl.int32)
+    seq_len = gl.maximum(raw_seq_len, 0)
+    num_pools = seq_len // pool_size
+    tail_count = seq_len - num_pools * pool_size
+    req = gl.load(req_ids + row).to(gl.int32)
+    score_start = gl.load(row_starts + row).to(gl.int32)
+    score_end = gl.load(row_ends + row).to(gl.int32)
+    # A truncated score row cannot be used to select the true top 512 pools.
+    # Fail closed on live metadata/capacity mismatch instead of returning a
+    # plausible but incorrect sparse read plan.
+    complete_scores = (
+        (raw_seq_len >= 0)
+        & (score_start == 0)
+        & (score_end == num_pools)
+        & (num_pools <= logits_cols)
+        & (req >= 0)
+        & (req < kv_table_rows)
+    )
+    history_len = gl.minimum(num_pools, topk_pools) * pool_size
+    pool_rank = cols // pool_size
+    pool_offset = cols - pool_rank * pool_size
+    is_history = (cols < OUT_COLS) & (cols < history_len)
+    selected = gl.load(
+        selected_pools + row * selected_stride + pool_rank,
+        mask=is_history & (pool_rank < topk_pools) & (num_pools > topk_pools),
+        other=-1,
+    ).to(gl.int32)
+    pool = gl.where(num_pools <= topk_pools, pool_rank, selected)
+    valid = is_history & (pool >= 0) & (pool < num_pools)
+    raw_slot = pool * pool_size + pool_offset
+    if append_tail:
+        is_tail = (cols < OUT_COLS) & (cols >= history_len)
+        is_tail &= cols < history_len + tail_count
+        raw_slot = gl.where(
+            is_tail, num_pools * pool_size + cols - history_len, raw_slot
+        )
+        valid |= is_tail
+    valid &= complete_scores & (raw_slot >= 0) & (raw_slot < seq_len)
+    page_idx = raw_slot // kv_page_size
+    valid &= (page_idx >= 0) & (page_idx < kv_table_cols)
+    safe_page_idx = gl.maximum(page_idx, 0)
+    safe_req = gl.maximum(req, 0)
+    page = gl.load(
+        kv_block_table + safe_req * kv_table_stride + safe_page_idx,
+        mask=valid,
+        other=-1,
+    ).to(gl.int32)
+    valid &= page >= 0
+    physical_slot = page * kv_page_size + raw_slot - page_idx * kv_page_size
+    gl.store(
+        slots_out + row * slots_stride + cols,
+        gl.where(valid, physical_slot, -1),
+        mask=cols < OUT_COLS,
+    )
+    gl.store(lens_out + row, gl.sum(valid.to(gl.int32), axis=0))
+
+
+@gluon.jit
 def _dsa_oneblock_manual_radix_topk_kernel(
     logits,
     block_table,
@@ -1029,6 +1121,21 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     LOAD_ELEMS: gl.constexpr,
     COMPACT_FINAL_BLOCK_N: gl.constexpr,
     USE_COMPACT_FINAL: gl.constexpr,
+    FUSED_KPOOL: gl.constexpr,
+    causal_lens,
+    req_ids,
+    kv_block_table,
+    slots_out,
+    slots_stride: gl.constexpr,
+    logits_cols: gl.constexpr,
+    kv_table_stride: gl.constexpr,
+    kv_table_rows: gl.constexpr,
+    kv_table_cols: gl.constexpr,
+    pool_size: gl.constexpr,
+    kv_page_size: gl.constexpr,
+    append_tail: gl.constexpr,
+    OUT_COLS: gl.constexpr,
+    OUT_BLOCK: gl.constexpr,
 ):
     row = gl.program_id(0)
     value_layout: gl.constexpr = _vector_layout(
@@ -1105,6 +1212,12 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         req = row
         candidate_start = gl.load(row_starts + row).to(gl.int32)
         candidate_end = gl.load(row_ends + row).to(gl.int32)
+    if FUSED_KPOOL:
+        # The scorer's zero-based live end is reloaded from device each replay.
+        # Clamp selection loads to the fixed logits allocation; the epilogue
+        # rejects a truncated or inconsistent live row after selection.
+        candidate_start = gl.full([], 0, gl.int32)
+        candidate_end = gl.minimum(gl.maximum(candidate_end, 0), logits_cols)
 
     candidate_len = gl.maximum(candidate_end - candidate_start, 0)
     selected_count = gl.minimum(candidate_len, topk).to(gl.int32)
@@ -1129,10 +1242,36 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             out + row * out_stride + output_offsets,
             gl.where(valid, indices, -1),
         )
+        if FUSED_KPOOL:
+            _kpool_fused_slot_epilogue(
+                out,
+                row_starts,
+                row_ends,
+                causal_lens,
+                req_ids,
+                kv_block_table,
+                slots_out,
+                lens_out,
+                row,
+                out_stride,
+                slots_stride,
+                logits_cols,
+                kv_table_stride,
+                kv_table_rows,
+                kv_table_cols,
+                pool_size,
+                kv_page_size,
+                topk,
+                append_tail,
+                OUT_COLS,
+                OUT_BLOCK,
+            )
         return
 
     shared_histogram.store(histogram_zeros)
     shared_output_counters.store(output_counter_zeros)
+    if FUSED_KPOOL:
+        gl.barrier()
 
     candidate_logits = logits + row * logits_stride + candidate_start
     vector_end = candidate_len & -4
@@ -1153,7 +1292,11 @@ def _dsa_oneblock_manual_radix_topk_kernel(
             shift = 0
 
         if pass_index != 0:
+            if FUSED_KPOOL:
+                gl.barrier()
             shared_histogram.store(histogram_zeros)
+            if FUSED_KPOOL:
+                gl.barrier()
 
         full_end = candidate_len & -BLOCK_N
         if USE_COMPACT_FINAL and pass_index == 2:
@@ -1294,6 +1437,8 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                     True,
                 )
 
+        if FUSED_KPOOL:
+            gl.barrier()
         counts = shared_histogram.load(histogram_layout)
         count_pairs = counts.reshape([MAX_BUCKETS // 2, 2])
         count_low, count_high = gl.split(count_pairs)
@@ -1312,7 +1457,8 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         group_selected_greater = group_greater + gl.where(select_low, 0, count_low)
         if pass_index == 1:
             group_selected_count = gl.where(select_low, count_low, count_high)
-        # Only one group is selected, so packed sums publish all fields in one reduction.
+        # Only one group is selected, so the packed sum publishes all fields
+        # in one reduction.
         if pass_index == 1 and USE_COMPACT_FINAL:
             packed_selection = (
                 group_bucket.to(gl.uint64)
@@ -1396,6 +1542,30 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                         out + row * out_stride + output_offsets,
                         page * page_size + block_offset,
                     )
+                if FUSED_KPOOL:
+                    _kpool_fused_slot_epilogue(
+                        out,
+                        row_starts,
+                        row_ends,
+                        causal_lens,
+                        req_ids,
+                        kv_block_table,
+                        slots_out,
+                        lens_out,
+                        row,
+                        out_stride,
+                        slots_stride,
+                        logits_cols,
+                        kv_table_stride,
+                        kv_table_rows,
+                        kv_table_cols,
+                        pool_size,
+                        kv_page_size,
+                        topk,
+                        append_tail,
+                        OUT_COLS,
+                        OUT_BLOCK,
+                    )
                 return
         if USE_COMPACT_FINAL and pass_index == 1:
             compact_count = selected_bucket_count
@@ -1417,6 +1587,30 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                 topk,
                 output_layout,
             )
+            if FUSED_KPOOL:
+                _kpool_fused_slot_epilogue(
+                    out,
+                    row_starts,
+                    row_ends,
+                    causal_lens,
+                    req_ids,
+                    kv_block_table,
+                    slots_out,
+                    lens_out,
+                    row,
+                    out_stride,
+                    slots_stride,
+                    logits_cols,
+                    kv_table_stride,
+                    kv_table_rows,
+                    kv_table_cols,
+                    pool_size,
+                    kv_page_size,
+                    topk,
+                    append_tail,
+                    OUT_COLS,
+                    OUT_BLOCK,
+                )
             return
 
     full_end = candidate_len & -BLOCK_N
@@ -1476,6 +1670,31 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         gl.store(
             out + row * out_stride + output_offsets,
             page * page_size + block_offset,
+        )
+
+    if FUSED_KPOOL:
+        _kpool_fused_slot_epilogue(
+            out,
+            row_starts,
+            row_ends,
+            causal_lens,
+            req_ids,
+            kv_block_table,
+            slots_out,
+            lens_out,
+            row,
+            out_stride,
+            slots_stride,
+            logits_cols,
+            kv_table_stride,
+            kv_table_rows,
+            kv_table_cols,
+            pool_size,
+            kv_page_size,
+            topk,
+            append_tail,
+            OUT_COLS,
+            OUT_BLOCK,
         )
 
 
@@ -1812,6 +2031,21 @@ def _dsa_oneblock_topk_indices(
         LOAD_ELEMS=plan.load_elems,
         COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
         USE_COMPACT_FINAL=plan.use_compact_final,
+        FUSED_KPOOL=False,
+        causal_lens=row_starts,
+        req_ids=row_starts,
+        kv_block_table=block_table,
+        slots_out=out,
+        slots_stride=out.stride(0),
+        logits_cols=logits.shape[1],
+        kv_table_stride=0,
+        kv_table_rows=0,
+        kv_table_cols=0,
+        pool_size=1,
+        kv_page_size=1,
+        append_tail=False,
+        OUT_COLS=0,
+        OUT_BLOCK=1,
         num_warps=16,
         # Preserve two resident workgroups only when the grid can use them.
         waves_per_eu=waves_per_eu,
@@ -1993,6 +2227,158 @@ def gluon_dsa_logical_topk_gfx950(
         out=out,
         lens_out=lens_out,
     )
+
+
+def gluon_dsa_kpool_decode_fused_slots_gfx950(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    causal_lens: torch.Tensor,
+    req_ids: torch.Tensor,
+    kv_block_table: torch.Tensor,
+    *,
+    pool_size: int,
+    kv_page_size: int,
+    topk_pools: int,
+    append_tail: bool,
+    out: torch.Tensor | None,
+    lens_out: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select KPool logits and emit physical FlatKV slots in one Gluon launch.
+
+    Args:
+        logits: Contiguous FP32 pooled scores shaped ``[rows, capacity_pools]``.
+        row_starts: Device int32 inclusive score starts; decode requires zero.
+        row_ends: Device int32 exclusive score ends, equal to live full pools.
+        causal_lens: Device int32 visible raw-token lengths per query row.
+        req_ids: Device int32 request row for each query row.
+        kv_block_table: Device int32 token-level FlatKV page table.
+        pool_size: Number of raw tokens represented by one score (must be four).
+        kv_page_size: Raw-token slots per FlatKV page.
+        topk_pools: Number of pools to retain (must be 512).
+        append_tail: Include the visible incomplete pool's zero to three slots.
+        out: Optional contiguous int32 physical-slot destination.
+        lens_out: Optional contiguous int32 valid-count destination.
+
+    Returns:
+        ``(slots, valid_counts)`` with fixed width 2051 when appending the tail.
+        Live lengths and page IDs remain device values for changed-length graph
+        replay; a score row truncated below its causal pool count fails closed.
+    """
+    pool_size = int(pool_size)
+    kv_page_size = int(kv_page_size)
+    topk_pools = int(topk_pools)
+    append_tail = bool(append_tail)
+    if pool_size != 4 or topk_pools != 512:
+        raise ValueError("fused GFX950 KPool requires pool_size=4 and topk_pools=512")
+    if kv_page_size <= 0:
+        raise ValueError("kv_page_size must be positive")
+    if logits.dim() != 2 or logits.dtype != torch.float32:
+        raise TypeError("logits must be FP32 [rows, capacity_pools]")
+    if not logits.is_cuda or not logits.is_contiguous():
+        raise ValueError("logits must be contiguous CUDA storage")
+    rows, cols = logits.shape
+    if cols <= 0 or cols > _ONEBLOCK_RADIX_MAX_COLS:
+        raise ValueError(
+            f"fused GFX950 KPool requires 1..{_ONEBLOCK_RADIX_MAX_COLS} score columns"
+        )
+    for name, tensor in (
+        ("row_starts", row_starts),
+        ("row_ends", row_ends),
+        ("causal_lens", causal_lens),
+        ("req_ids", req_ids),
+    ):
+        if (
+            tensor.shape != (rows,)
+            or tensor.dtype != torch.int32
+            or tensor.device != logits.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be contiguous int32[{rows}] on logits.device"
+            )
+    if (
+        kv_block_table.dim() != 2
+        or kv_block_table.shape[0] == 0
+        or kv_block_table.shape[1] == 0
+        or kv_block_table.dtype != torch.int32
+        or kv_block_table.device != logits.device
+        or not kv_block_table.is_contiguous()
+    ):
+        raise ValueError(
+            "kv_block_table must be a nonempty contiguous int32 page table"
+        )
+
+    out_cols = topk_pools * pool_size + (pool_size - 1 if append_tail else 0)
+    if out is None:
+        out = torch.empty((rows, out_cols), dtype=torch.int32, device=logits.device)
+    elif (
+        out.shape != (rows, out_cols)
+        or out.dtype != torch.int32
+        or out.device != logits.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(f"out must be contiguous int32[{rows}, {out_cols}]")
+    if lens_out is None:
+        lens_out = torch.empty(rows, dtype=torch.int32, device=logits.device)
+    elif (
+        lens_out.shape != (rows,)
+        or lens_out.dtype != torch.int32
+        or lens_out.device != logits.device
+        or not lens_out.is_contiguous()
+    ):
+        raise ValueError(f"lens_out must be contiguous int32[{rows}]")
+    if rows == 0:
+        return out, lens_out
+
+    # The selected-pool scratch is written and consumed inside this one CTA
+    # launch. During graph capture its allocation belongs to the graph pool;
+    # replay retains the captured address while all live metadata is reloaded.
+    selected_pools = torch.empty(
+        (rows, topk_pools), dtype=torch.int32, device=logits.device
+    )
+    plan = _oneblock_launch_plan(cols, is_decode=True)
+    _dsa_oneblock_manual_radix_topk_kernel[(rows,)](
+        logits,
+        row_starts,
+        row_starts,
+        row_ends,
+        selected_pools,
+        lens_out,
+        logits.stride(0),
+        selected_pools.stride(0),
+        0,
+        page_size=1,
+        topk=topk_pools,
+        q_len_per_req=1,
+        IS_DECODE=False,
+        RADIX0_BITS=_ONEBLOCK_RADIX_SCHEDULE[0],
+        RADIX1_BITS=_ONEBLOCK_RADIX_SCHEDULE[1],
+        RADIX2_BITS=_ONEBLOCK_RADIX_SCHEDULE[2],
+        MAX_BUCKETS=_ONEBLOCK_RADIX_BUCKETS,
+        BLOCK_N=plan.block_n,
+        LOAD_ELEMS=plan.load_elems,
+        COMPACT_FINAL_BLOCK_N=_ONEBLOCK_COMPACT_FINAL_BLOCK_N,
+        USE_COMPACT_FINAL=False,
+        FUSED_KPOOL=True,
+        causal_lens=causal_lens,
+        req_ids=req_ids,
+        kv_block_table=kv_block_table,
+        slots_out=out,
+        slots_stride=out.stride(0),
+        logits_cols=cols,
+        kv_table_stride=kv_block_table.stride(0),
+        kv_table_rows=kv_block_table.shape[0],
+        kv_table_cols=kv_block_table.shape[1],
+        pool_size=pool_size,
+        kv_page_size=kv_page_size,
+        append_tail=append_tail,
+        OUT_COLS=out_cols,
+        OUT_BLOCK=triton.next_power_of_2(out_cols),
+        num_warps=16,
+        waves_per_eu=0,
+    )
+    return out, lens_out
 
 
 def gluon_dsa_kpool_prefill_logits_gfx950(
@@ -2628,6 +3014,262 @@ def launch_gluon_dsa_prefill_topk_fp8_gfx950(
             lens_out=lens_out[start:end],
         )
     return out, lens_out
+
+
+def _kpool_decode_num_splits_gfx950(num_rows: int) -> int:
+    """Return AITER's GFX950 split count for the covered decode row counts."""
+    try:
+        # AITER rounds ceil(256 / rows) to a multiple of five, then uses two
+        # waves per execution unit. Eight rows therefore need 70 splits.
+        return {8: 70, 16: 40, 32: 20, 64: 10}[int(num_rows)]
+    except KeyError as error:
+        raise ValueError(
+            f"native FP8 KPool decode requires 8, 16, 32, or 64 rows, got {num_rows}"
+        ) from error
+
+
+def _gluon_dsa_kpool_decode_logits_fp8_folded_gfx950(
+    q: torch.Tensor,
+    pooled_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    causal_lens: torch.Tensor,
+    req_ids: torch.Tensor,
+    index_block_table: torch.Tensor,
+    *,
+    max_candidates: int,
+    pool_size: int,
+    page_size: int,
+    logits: torch.Tensor | None = None,
+    row_starts_out: torch.Tensor | None = None,
+    row_ends_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Score the exact B2/C4/B8/B16 native-FP8 KPool decode shapes.
+
+    The query is prepared E4M3 and ``weights`` is FP32 with both query and
+    model scales already folded in. The output allocation width is graph
+    static, while causal lengths, request ids, page-table contents, and the
+    scalar candidate bound remain runtime kernel inputs. Invalid logits are
+    intentionally left untouched; consumers must honor the returned int32 row
+    bounds.
+
+    Args:
+        q: Contiguous E4M3 queries shaped ``[8|16|32|64, 32, 128]``.
+        pooled_k_cache: Page-major scaled-E4M3 pooled keys. Each page stores
+            all E4M3 rows followed by one FP32 scale per row.
+        weights: Contiguous FP32 folded head weights shaped ``[rows, 32]``.
+        causal_lens: Contiguous int32 visible raw-token counts per query row.
+        req_ids: Contiguous int32 page-table row per query row.
+        index_block_table: Contiguous-column int32 pooled-cache page table.
+        max_candidates: Positive graph-static logits width and runtime scoring
+            bound. It may not exceed page-table capacity.
+        pool_size: Raw tokens represented by one pool. Must be ``4``.
+        page_size: Pooled rows per physical page. Must be ``16``.
+        logits: Optional contiguous FP32 destination.
+        row_starts_out: Optional contiguous int32 start-bound destination.
+        row_ends_out: Optional contiguous int32 exclusive end-bound destination.
+
+    Returns:
+        ``(logits, row_starts, row_ends)``. Starts are zero and ends are the
+        live complete-pool counts clamped to ``max_candidates``.
+    """
+    if isinstance(max_candidates, bool) or not isinstance(max_candidates, int):
+        raise TypeError(
+            f"max_candidates must be an int, got {type(max_candidates).__name__}"
+        )
+    pool_size = int(pool_size)
+    page_size = int(page_size)
+    if max_candidates <= 0:
+        raise ValueError(f"max_candidates must be positive, got {max_candidates}")
+    if pool_size != 4 or page_size != 16:
+        raise ValueError(
+            "native FP8 KPool decode requires pool_size=4 and page_size=16, got "
+            f"pool_size={pool_size}, page_size={page_size}"
+        )
+    if q.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"native FP8 KPool decode requires E4M3 q, got {q.dtype}")
+    if q.dim() != 3 or tuple(q.shape[1:]) != (32, 128):
+        raise ValueError(
+            "native FP8 KPool decode requires q=[8|16|32|64, 32, 128], got "
+            f"{tuple(q.shape)}"
+        )
+    num_rows = int(q.shape[0])
+    num_splits = _kpool_decode_num_splits_gfx950(num_rows)
+    if not q.is_contiguous():
+        raise ValueError("native FP8 KPool decode requires contiguous q")
+    if not q.is_cuda:
+        raise RuntimeError("native FP8 KPool decode requires CUDA tensors")
+    if weights.dtype != torch.float32:
+        raise TypeError(f"folded KPool weights must be FP32, got {weights.dtype}")
+    if weights.shape != q.shape[:2] or not weights.is_contiguous():
+        raise ValueError(
+            "folded KPool weights must be contiguous with shape "
+            f"{tuple(q.shape[:2])}, got shape={tuple(weights.shape)}, "
+            f"contiguous={weights.is_contiguous()}"
+        )
+
+    row_bytes = 128 + 4
+    compact_page_bytes = page_size * row_bytes
+    cache_shape_ok = (
+        pooled_k_cache.dim() == 2 and pooled_k_cache.shape[1] == compact_page_bytes
+    ) or (
+        pooled_k_cache.dim() == 3
+        and tuple(pooled_k_cache.shape[1:]) == (page_size, row_bytes)
+    )
+    cache_page_stride_bytes = int(pooled_k_cache.stride(0))
+    packed_within_page = (
+        pooled_k_cache.dim() == 2 or pooled_k_cache.stride(1) == row_bytes
+    )
+    if pooled_k_cache.dtype != torch.uint8:
+        raise TypeError(f"pooled_k_cache must be uint8, got {pooled_k_cache.dtype}")
+    if not cache_shape_ok or (
+        pooled_k_cache.stride(-1) != 1
+        or not packed_within_page
+        or cache_page_stride_bytes < compact_page_bytes
+        or cache_page_stride_bytes % 4
+        or pooled_k_cache.storage_offset() % 4
+    ):
+        raise ValueError(
+            "pooled_k_cache requires packed 16-row pages with a nonoverlapping, "
+            "4-byte-aligned page stride"
+        )
+
+    for name, value in (("causal_lens", causal_lens), ("req_ids", req_ids)):
+        if value.shape != (num_rows,):
+            raise ValueError(
+                f"{name} must have shape {(num_rows,)}, got {tuple(value.shape)}"
+            )
+        if value.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32, got {value.dtype}")
+        if not value.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    if index_block_table.dim() != 2:
+        raise ValueError(
+            "index_block_table must be two-dimensional, got "
+            f"{tuple(index_block_table.shape)}"
+        )
+    if index_block_table.dtype != torch.int32:
+        raise TypeError(
+            f"index_block_table must be int32, got {index_block_table.dtype}"
+        )
+    if index_block_table.stride(-1) != 1:
+        raise ValueError("index_block_table must have contiguous page columns")
+    table_capacity = int(index_block_table.shape[1]) * page_size
+    if max_candidates > table_capacity:
+        raise ValueError(
+            f"max_candidates={max_candidates} exceeds page-table capacity "
+            f"{table_capacity}"
+        )
+    if pooled_k_cache.shape[0] == 0 or index_block_table.shape[0] == 0:
+        raise ValueError("native FP8 KPool decode requires nonempty cache metadata")
+
+    for name, value in (
+        ("weights", weights),
+        ("pooled_k_cache", pooled_k_cache),
+        ("causal_lens", causal_lens),
+        ("req_ids", req_ids),
+        ("index_block_table", index_block_table),
+    ):
+        if value.device != q.device:
+            raise ValueError(f"{name} must be on the same device as q")
+
+    logits_shape = (num_rows, max_candidates)
+    if logits is None:
+        logits = torch.empty(logits_shape, dtype=torch.float32, device=q.device)
+    elif (
+        logits.shape != logits_shape
+        or logits.dtype != torch.float32
+        or logits.device != q.device
+        or not logits.is_contiguous()
+    ):
+        raise ValueError(
+            "logits must be contiguous FP32 on q.device with shape "
+            f"{logits_shape}; got shape={tuple(logits.shape)}, dtype={logits.dtype}, "
+            f"device={logits.device}, contiguous={logits.is_contiguous()}"
+        )
+
+    bounds_shape = (num_rows,)
+    if row_starts_out is None:
+        row_starts_out = torch.empty(bounds_shape, dtype=torch.int32, device=q.device)
+    elif (
+        row_starts_out.shape != bounds_shape
+        or row_starts_out.dtype != torch.int32
+        or row_starts_out.device != q.device
+        or not row_starts_out.is_contiguous()
+    ):
+        raise ValueError("row_starts_out must be contiguous int32 on q.device")
+    if row_ends_out is None:
+        row_ends_out = torch.empty(bounds_shape, dtype=torch.int32, device=q.device)
+    elif (
+        row_ends_out.shape != bounds_shape
+        or row_ends_out.dtype != torch.int32
+        or row_ends_out.device != q.device
+        or not row_ends_out.is_contiguous()
+    ):
+        raise ValueError("row_ends_out must be contiguous int32 on q.device")
+
+    outputs = (
+        ("logits", logits),
+        ("row_starts_out", row_starts_out),
+        ("row_ends_out", row_ends_out),
+    )
+    inputs = (
+        ("q", q),
+        ("weights", weights),
+        ("pooled_k_cache", pooled_k_cache),
+        ("causal_lens", causal_lens),
+        ("req_ids", req_ids),
+        ("index_block_table", index_block_table),
+    )
+    for output_index, (output_name, output) in enumerate(outputs):
+        for other_name, other in outputs[output_index + 1 :]:
+            if _shares_storage(output, other):
+                raise ValueError(f"{output_name} and {other_name} must not alias")
+        for input_name, input_value in inputs:
+            if _shares_storage(output, input_value):
+                raise ValueError(f"{output_name} must not alias {input_name}")
+
+    block_n = 64
+    num_warps = 2
+    _dsa_kpool_decode_logits_fp8_folded_kernel[(num_rows, num_splits)](
+        q,
+        pooled_k_cache.view(torch.float8_e4m3fn),
+        pooled_k_cache.view(torch.float32),
+        weights,
+        causal_lens,
+        req_ids,
+        index_block_table,
+        logits,
+        row_starts_out,
+        row_ends_out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        weights.stride(0),
+        weights.stride(1),
+        index_block_table.stride(0),
+        logits.stride(0),
+        max_candidates,
+        PAGE_SIZE=page_size,
+        PAGE_STRIDE_BYTES=cache_page_stride_bytes,
+        POOL_SIZE=pool_size,
+        NUM_HEADS=q.shape[1],
+        HEAD_DIM=q.shape[2],
+        BLOCK_N=block_n,
+        NUM_WARPS=num_warps,
+        USE_BUFFER_LOAD=pooled_k_cache.untyped_storage().nbytes() < 2**31,
+        USE_BUFFER_STORE=logits.nbytes < 2**31,
+        num_warps=num_warps,
+        waves_per_eu=4,
+    )
+    return logits, row_starts_out, row_ends_out
+
+
+def _shares_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
+    return bool(
+        left.numel()
+        and right.numel()
+        and left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
+    )
 
 
 def _check_standard_scorer_inputs(

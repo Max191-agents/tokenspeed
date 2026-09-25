@@ -385,8 +385,13 @@ def kpool_decode_topk(
         q, pooled_k_cache, weights, pool_size, topk_pools, page_size
     )
     tokens, num_heads, head_dim = q.shape
+    q_len_per_req = int(q_len_per_req)
+    if q_len_per_req < 1 or tokens % q_len_per_req:
+        raise ValueError(f"q_len_per_req={q_len_per_req} must divide tokens={tokens}")
     traits = {
-        "q_len": int(q_len_per_req),
+        "q_len": q_len_per_req,
+        "batch_size": int(tokens // q_len_per_req),
+        "index_heads": int(num_heads),
         "head_dim": int(head_dim),
         "page_size": int(page_size),
         "pool_size": int(pool_size),
